@@ -1,0 +1,266 @@
+// Copyright 2026 肖其顿 (XIAO QI DUN)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pdfgo
+
+import "fmt"
+
+// Annotation 保存注解类型、区域及原始字典，不执行动作
+type Annotation struct {
+	Subtype    Name
+	Rect       Rectangle
+	Dictionary Dictionary
+}
+
+// Destination 保存文档内目标，空参数表示保持阅读器当前值
+type Destination struct {
+	Page       Reference
+	Mode       Name
+	Parameters Array
+}
+
+// Annotations 按页面顺序读取注解，外观和动作由调用方解释
+// 返回: []Annotation 注解信息, error 错误信息
+func (p *Page) Annotations() ([]Annotation, error) {
+	value, err := p.reader.Resolve(p.Dictionary["Annots"])
+	if err != nil || value == nil {
+		return nil, err
+	}
+	array, ok := value.(Array)
+	if !ok {
+		return nil, fmt.Errorf("invalid page annotations")
+	}
+	result := make([]Annotation, 0, len(array))
+	for _, object := range array {
+		value, err := p.reader.Resolve(object)
+		if err != nil {
+			return nil, err
+		}
+		dict, ok := value.(Dictionary)
+		if !ok {
+			return nil, fmt.Errorf("invalid annotation dictionary")
+		}
+		subtype, ok := dict["Subtype"].(Name)
+		if !ok {
+			return nil, fmt.Errorf("missing annotation subtype")
+		}
+		box, err := p.reader.rectangle(dict["Rect"])
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, Annotation{Subtype: subtype, Rect: box, Dictionary: dict})
+	}
+	return result, nil
+}
+
+// BaseURI 读取文档声明的链接基准地址，不访问外部资源
+// 返回: string 基准地址，未声明时为空, error 错误信息
+func (r *Reader) BaseURI() (string, error) {
+	root, err := r.Resolve(r.Trailer["Root"])
+	if err != nil {
+		return "", err
+	}
+	catalog, ok := root.(Dictionary)
+	if !ok {
+		return "", fmt.Errorf("invalid catalog")
+	}
+	value, err := r.Resolve(catalog["URI"])
+	if err != nil || value == nil {
+		return "", err
+	}
+	dict, ok := value.(Dictionary)
+	if !ok {
+		return "", fmt.Errorf("invalid URI dictionary")
+	}
+	value, err = r.Resolve(dict["Base"])
+	if err != nil || value == nil {
+		return "", err
+	}
+	base, ok := value.(String)
+	if !ok {
+		return "", fmt.Errorf("invalid base URI")
+	}
+	return string(base), nil
+}
+
+// ReadDestination 解析直接目标或名称树中的命名目标，不跳转页面
+// 入参: object 目标数组、名称、字符串或引用
+// 返回: Destination 跳转目标, error 错误信息
+func (r *Reader) ReadDestination(object Object) (Destination, error) {
+	value, err := r.Resolve(object)
+	if err != nil {
+		return Destination{}, err
+	}
+	var name string
+	named, legacy := false, false
+	switch v := value.(type) {
+	case Name:
+		name = string(v)
+		named, legacy = true, true
+	case String:
+		name = string(v)
+		named = true
+	}
+	if named {
+		if err := r.readDestinations(); err != nil {
+			return Destination{}, err
+		}
+		target := r.destinations[name]
+		if legacy {
+			target = r.legacyDestinations[Name(name)]
+		}
+		value, err = r.Resolve(target)
+		if err != nil {
+			return Destination{}, err
+		}
+	}
+	if dict, ok := value.(Dictionary); ok {
+		value, err = r.Resolve(dict["D"])
+		if err != nil {
+			return Destination{}, err
+		}
+	}
+	array, ok := value.(Array)
+	if !ok || len(array) < 2 {
+		return Destination{}, fmt.Errorf("invalid or missing destination")
+	}
+	page, ok := array[0].(Reference)
+	if !ok {
+		return Destination{}, fmt.Errorf("invalid destination page")
+	}
+	mode, ok := array[1].(Name)
+	counts := map[Name]int{"XYZ": 3, "Fit": 0, "FitH": 1, "FitV": 1, "FitR": 4, "FitB": 0, "FitBH": 1, "FitBV": 1}
+	count, known := counts[mode]
+	if !ok || !known || len(array) != count+2 {
+		return Destination{}, fmt.Errorf("invalid destination mode or parameters")
+	}
+	parameters := make(Array, count)
+	for n, v := range array[2:] {
+		parameters[n], err = r.Resolve(v)
+		if err != nil {
+			return Destination{}, err
+		}
+		if parameters[n] != nil {
+			if _, err := r.number(parameters[n]); err != nil {
+				return Destination{}, err
+			}
+		}
+	}
+	return Destination{Page: page, Mode: mode, Parameters: parameters}, nil
+}
+
+// readDestinations 缓存旧式目标字典和名称树，检测递归引用
+// 返回: error 错误信息
+func (r *Reader) readDestinations() error {
+	if r.destinations != nil {
+		return nil
+	}
+	root, err := r.Resolve(r.Trailer["Root"])
+	if err != nil {
+		return err
+	}
+	catalog, ok := root.(Dictionary)
+	if !ok {
+		return fmt.Errorf("invalid catalog")
+	}
+	result := map[string]Object{}
+	var legacy Dictionary
+	value, err := r.Resolve(catalog["Dests"])
+	if err != nil {
+		return err
+	}
+	if value != nil {
+		dict, ok := value.(Dictionary)
+		if !ok {
+			return fmt.Errorf("invalid destinations dictionary")
+		}
+		legacy = dict
+	}
+	names, err := r.Resolve(catalog["Names"])
+	if err != nil {
+		return err
+	}
+	if names != nil {
+		dict, ok := names.(Dictionary)
+		if !ok {
+			return fmt.Errorf("invalid names dictionary")
+		}
+		seen := map[Reference]bool{}
+		var walk func(Object, int) error
+		walk = func(object Object, depth int) error {
+			if object == nil {
+				return nil
+			}
+			if depth > 256 {
+				return fmt.Errorf("destination name tree depth exceeded")
+			}
+			if ref, ok := object.(Reference); ok {
+				if seen[ref] {
+					return fmt.Errorf("repeated destination name tree node")
+				}
+				seen[ref] = true
+			}
+			value, err := r.Resolve(object)
+			if err != nil {
+				return err
+			}
+			node, ok := value.(Dictionary)
+			if !ok {
+				return fmt.Errorf("invalid destination name tree node")
+			}
+			value, err = r.Resolve(node["Names"])
+			if err != nil {
+				return err
+			}
+			if value != nil {
+				items, ok := value.(Array)
+				if !ok || len(items)%2 != 0 {
+					return fmt.Errorf("invalid destination name pairs")
+				}
+				for n := 0; n < len(items); n += 2 {
+					name, ok := items[n].(String)
+					if !ok {
+						return fmt.Errorf("invalid destination name")
+					}
+					if _, exists := result[string(name)]; exists {
+						return fmt.Errorf("duplicate destination name")
+					}
+					result[string(name)] = items[n+1]
+				}
+			}
+			value, err = r.Resolve(node["Kids"])
+			if err != nil {
+				return err
+			}
+			if value != nil {
+				kids, ok := value.(Array)
+				if !ok {
+					return fmt.Errorf("invalid destination name tree children")
+				}
+				for _, kid := range kids {
+					if err := walk(kid, depth+1); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+		if err := walk(dict["Dests"], 0); err != nil {
+			return err
+		}
+	}
+	r.destinations = result
+	r.legacyDestinations = legacy
+	return nil
+}

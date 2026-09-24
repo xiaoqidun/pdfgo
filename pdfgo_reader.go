@@ -25,14 +25,17 @@ import (
 
 // Reader 读取PDF对象，方法不可并发调用，返回对象不可并发修改
 type Reader struct {
-	Version string
-	Trailer Dictionary
-	source  io.ReaderAt
-	size    int64
-	closer  io.Closer
-	xref    map[int64]xrefEntry
-	cache   map[Reference]Object
-	loading map[Reference]bool
+	Version            string
+	Trailer            Dictionary
+	source             io.ReaderAt
+	size               int64
+	closer             io.Closer
+	xref               map[int64]xrefEntry
+	cache              map[Reference]Object
+	loading            map[Reference]bool
+	destinations       map[string]Object
+	legacyDestinations Dictionary
+	fonts              map[Reference]*Font
 }
 
 // xrefEntry 保存交叉引用类型、文件偏移或对象流索引

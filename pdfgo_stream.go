@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/ascii85"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -129,6 +130,8 @@ func (s *Stream) Decode() ([]byte, error) {
 }
 
 // validateASCII85 检查编码分组溢出并移除PDF空白
+// 入参: data 编码数据
+// 返回: []byte 有效编码数据, error 错误信息
 func validateASCII85(data []byte) ([]byte, error) {
 	encoded := make([]byte, 0, len(data))
 	var value uint64
@@ -171,6 +174,8 @@ func validateASCII85(data []byte) ([]byte, error) {
 }
 
 // decodeRunLength 解码游程压缩数据
+// 入参: data 压缩数据
+// 返回: []byte 解码数据, error 错误信息
 func decodeRunLength(data []byte) ([]byte, error) {
 	var out []byte
 	for i := 0; i < len(data); {
@@ -203,6 +208,8 @@ func decodeRunLength(data []byte) ([]byte, error) {
 }
 
 // integerDefault 读取整数属性或使用缺省值
+// 入参: dict 属性字典, key 属性名称, fallback 缺省值
+// 返回: int64 属性值, error 错误信息
 func integerDefault(dict Dictionary, key Name, fallback int64) (int64, error) {
 	v := dict[key]
 	if v == nil {
@@ -216,6 +223,8 @@ func integerDefault(dict Dictionary, key Name, fallback int64) (int64, error) {
 }
 
 // decodePredictor 还原TIFF或PNG预测后的样本字节
+// 入参: data 预测后的数据, params 预测参数
+// 返回: []byte 还原的样本数据, error 错误信息
 func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 	predictor, err := integerDefault(params, "Predictor", 1)
 	if err != nil {
@@ -236,7 +245,7 @@ func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if columns <= 0 || colors <= 0 || colors > 32 || columns > int64(len(data))*8 || (bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16) {
+	if columns <= 0 || colors <= 0 || (bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16) || uint64(columns) > uint64(1<<63-8)/uint64(colors)/uint64(bits) {
 		return nil, fmt.Errorf("invalid predictor dimensions")
 	}
 	row := (columns*colors*bits + 7) / 8
@@ -245,16 +254,15 @@ func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 		return nil, io.ErrUnexpectedEOF
 	}
 	if predictor == 2 {
-		if bits != 8 {
-			return nil, &UnsupportedError{Feature: "TIFF predictor with non-8-bit components"}
-		}
 		if int64(len(data))%row != 0 {
 			return nil, io.ErrUnexpectedEOF
 		}
 		out := bytes.Clone(data)
 		for start := int64(0); start < int64(len(out)); start += row {
-			for x := bpp; x < row; x++ {
-				out[start+x] += out[start+x-bpp]
+			line := out[start : start+row]
+			for x := int(colors); x < int(columns*colors); x++ {
+				value := packedSample(line, x, int(bits)) + packedSample(line, x-int(colors), int(bits))
+				setPackedSample(line, x, int(bits), value)
 			}
 		}
 		return out, nil
@@ -300,7 +308,34 @@ func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 	return out, nil
 }
 
+// packedSample 读取按高位优先排列的图像分量
+// 入参: data 行数据, index 分量索引, bits 分量位深
+// 返回: uint16 分量值
+func packedSample(data []byte, index, bits int) uint16 {
+	if bits == 16 {
+		return binary.BigEndian.Uint16(data[index*2:])
+	}
+	perByte := 8 / bits
+	shift := uint(8 - bits - index%perByte*bits)
+	return uint16(data[index/perByte]>>shift) & uint16((1<<bits)-1)
+}
+
+// setPackedSample 写入图像分量，保留同字节其他分量和行尾填充
+// 入参: data 行数据, index 分量索引, bits 分量位深, value 分量值
+func setPackedSample(data []byte, index, bits int, value uint16) {
+	if bits == 16 {
+		binary.BigEndian.PutUint16(data[index*2:], value)
+		return
+	}
+	perByte := 8 / bits
+	shift := uint(8 - bits - index%perByte*bits)
+	mask := byte((1<<bits)-1) << shift
+	data[index/perByte] = data[index/perByte]&^mask | byte(value<<shift)&mask
+}
+
 // paeth 计算PNG预测样本
+// 入参: a 左侧样本, b 上方样本, c 左上样本
+// 返回: byte 预测值
 func paeth(a, b, c byte) byte {
 	p := int(a) + int(b) - int(c)
 	abs := func(v int) int {

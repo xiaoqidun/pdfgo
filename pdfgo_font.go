@@ -36,10 +36,14 @@ type Font struct {
 	simpleCmap   []byte
 	symbolCmap   bool
 	symbolic     bool
+	cffGlyphs    map[uint32]uint16
+	cffNames     map[uint32]string
 }
 
-// Glyph 保存原始字符码、Unicode文本、字形编号和千分之一字宽
+// Glyph 保存原始字符码、Unicode文本、字形名称、编号和千分之一字宽
+// 缺少Unicode映射但具有字形编号时，Text为空，不推测字符含义
 type Glyph struct {
+	Name      string
 	Code      uint32
 	Text      string
 	ID        uint16
@@ -52,6 +56,10 @@ type Glyph struct {
 // 入参: object 字体字典或引用
 // 返回: *Font 字体资源, error 错误信息
 func (r *Reader) ReadFont(object Object) (*Font, error) {
+	ref, indirect := object.(Reference)
+	if indirect && r.fonts[ref] != nil {
+		return r.fonts[ref], nil
+	}
 	object, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -95,8 +103,8 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid descendant font")
 		}
-		if metrics["Subtype"] != Name("CIDFontType2") {
-			return nil, &UnsupportedError{Feature: "non-TrueType CID font"}
+		if metrics["Subtype"] != Name("CIDFontType2") && metrics["Subtype"] != Name("CIDFontType0") {
+			return nil, &UnsupportedError{Feature: "CID font subtype"}
 		}
 		font.defaultWidth = 1000
 		if metrics["DW"] != nil {
@@ -275,6 +283,24 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, err
 		}
 	}
+	if font.ProgramType == "Type1C" || font.ProgramType == "CIDFontType0C" {
+		if !font.composite && font.encoding != "" {
+			return nil, &UnsupportedError{Feature: "external CFF encoding"}
+		}
+		font.cffGlyphs, font.cffNames, err = cffFontMapping(font.Program, font.composite)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if font.composite && metrics["Subtype"] == Name("CIDFontType0") && font.cffGlyphs == nil {
+		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without bare CFF program"}
+	}
+	if indirect {
+		if r.fonts == nil {
+			r.fonts = map[Reference]*Font{}
+		}
+		r.fonts[ref] = font
+	}
 	return font, nil
 }
 
@@ -294,6 +320,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		raw := data[n : n+step]
 		code := uint32(codeNumber(raw))
 		text, ok := f.Unicode[string(raw)]
+		if !ok && f.cffGlyphs != nil {
+			_, ok = f.cffGlyphs[code]
+		}
 		if !ok {
 			if f.composite {
 				return nil, &UnsupportedError{Feature: "CID without Unicode mapping"}
@@ -352,6 +381,13 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 				} else {
 					glyph.ID = uint16(f.glyphMap[code*2])<<8 | uint16(f.glyphMap[code*2+1])
 				}
+			}
+		}
+		if f.cffGlyphs != nil {
+			glyph.ID, glyph.HasID = f.cffGlyphs[code]
+			glyph.Name = f.cffNames[code]
+			if !glyph.HasID {
+				return nil, fmt.Errorf("missing CFF glyph for code %d", code)
 			}
 		}
 		glyphs = append(glyphs, glyph)

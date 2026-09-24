@@ -27,9 +27,12 @@ type Matrix [6]float64
 type Point struct{ X, Y float64 }
 
 // Identity 返回单位矩阵
+// 返回: Matrix 单位矩阵
 func Identity() Matrix { return Matrix{1, 0, 0, 1, 0, 0} }
 
 // Mul 按当前矩阵乘以右侧矩阵进行坐标组合
+// 入参: n 右侧矩阵
+// 返回: Matrix 组合矩阵
 func (m Matrix) Mul(n Matrix) Matrix {
 	return Matrix{
 		m[0]*n[0] + m[2]*n[1], m[1]*n[0] + m[3]*n[1],
@@ -39,6 +42,8 @@ func (m Matrix) Mul(n Matrix) Matrix {
 }
 
 // Apply 将点变换到目标坐标空间
+// 入参: p 原始坐标点
+// 返回: Point 变换后的坐标点
 func (m Matrix) Apply(p Point) Point {
 	return Point{m[0]*p.X + m[2]*p.Y + m[4], m[1]*p.X + m[3]*p.Y + m[5]}
 }
@@ -64,13 +69,17 @@ type Paint struct {
 
 // Style 保存绘制状态及按顺序相交的裁剪路径
 type Style struct {
-	Fill, Stroke Paint
-	LineWidth    float64
-	Cap, Join    int
-	MiterLimit   float64
-	Dash         []float64
-	DashPhase    float64
-	Clips        []Path
+	Fill, Stroke    Paint
+	LineWidth       float64
+	Cap, Join       int
+	MiterLimit      float64
+	Dash            []float64
+	DashPhase       float64
+	Clips           []Path
+	StrokeAdjust    bool
+	FillOverprint   bool
+	StrokeOverprint bool
+	OverprintMode   int
 }
 
 // PathMark 表示一次路径绘制
@@ -98,11 +107,13 @@ type ImageMark struct {
 	Style  Style
 }
 
-// Visitor 按内容顺序接收页面绘制对象，未提供的回调不会丢弃对应对象
+// Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
+// Warning非空时允许恢复缺失的ExtGState资源并报告诊断，其他解析错误仍返回错误
 type Visitor struct {
-	Path  func(PathMark) error
-	Text  func(TextMark) error
-	Image func(ImageMark) error
+	Path    func(PathMark) error
+	Text    func(TextMark) error
+	Image   func(ImageMark) error
+	Warning func(Diagnostic)
 }
 
 // graphicsState 保存图形和文字操作的当前状态
@@ -131,10 +142,10 @@ type pageInterpreter struct {
 	pendingClip            bool
 	clipEvenOdd            bool
 	depth                  int
-	fonts                  map[Reference]*Font
+	opaqueGroup            bool
 }
 
-// WalkPage 解释页面内容并按绘制顺序访问可准确表达的图元
+// WalkPage 解释页面内容并按绘制顺序访问可准确表达的图元，注解由Page.Annotations读取
 // 入参: ctx 取消上下文, page 页面, visitor 图元访问器
 // 返回: error 错误信息
 func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) error {
@@ -177,21 +188,21 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			}
 		}
 	}
-	for _, key := range []Name{"Annots", "Trans"} {
-		if page.Dictionary[key] != nil {
-			return &UnsupportedError{Feature: fmt.Sprintf("page field %q", key)}
-		}
+	if page.Dictionary["Trans"] != nil {
+		return &UnsupportedError{Feature: `page field "Trans"`}
 	}
 	data, err := page.Content()
 	if err != nil {
 		return err
 	}
-	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, fonts: map[Reference]*Font{}}
+	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx}
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
 	return interpreter.run(data)
 }
 
 // run 解释单个页面或表单的完整内容
+// 入参: data 解码后的内容流
+// 返回: error 错误信息
 func (p *pageInterpreter) run(data []byte) error {
 	err := WalkOperations(p.ctx, data, p.operation)
 	if err != nil {
@@ -204,6 +215,8 @@ func (p *pageInterpreter) run(data []byte) error {
 }
 
 // numbers 检查操作数数量并读取有限数值
+// 入参: operands 操作数, count 预期数量
+// 返回: []float64 数值列表, error 错误信息
 func numbers(operands []Object, count int) ([]float64, error) {
 	if len(operands) != count {
 		return nil, fmt.Errorf("expected %d operands, got %d", count, len(operands))
@@ -223,6 +236,8 @@ func numbers(operands []Object, count int) ([]float64, error) {
 }
 
 // operation 执行内容操作，未知可见操作返回明确错误
+// 入参: op 内容操作
+// 返回: error 错误信息
 func (p *pageInterpreter) operation(op Operation) error {
 	a := op.Operands
 	count := map[string]int{"q": 0, "Q": 0, "cm": 6, "w": 1, "J": 1, "j": 1, "M": 1, "m": 2, "l": 2, "c": 6, "v": 4, "y": 4, "h": 0, "re": 4, "S": 0, "s": 0, "f": 0, "F": 0, "f*": 0, "B": 0, "B*": 0, "b": 0, "b*": 0, "n": 0, "W": 0, "W*": 0, "g": 1, "G": 1, "rg": 3, "RG": 3, "k": 4, "K": 4, "BT": 0, "ET": 0, "Tc": 1, "Tw": 1, "Tz": 1, "TL": 1, "Tr": 1, "Ts": 1, "Td": 2, "TD": 2, "Tm": 6, "T*": 0}
@@ -498,16 +513,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if err != nil {
 			return err
 		}
-		ref, indirect := object.(Reference)
-		font := p.fonts[ref]
-		if !indirect || font == nil {
-			font, err = p.reader.ReadFont(object)
-			if err != nil {
-				return err
-			}
-			if indirect {
-				p.fonts[ref] = font
-			}
+		font, err := p.reader.ReadFont(object)
+		if err != nil {
+			return err
 		}
 		p.state.font = font
 		p.state.fontSize = size[0]
@@ -591,7 +599,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 	case "Do":
 		return p.xobject(a)
 	case "gs":
-		return p.extState(a)
+		return p.extState(a, op.Offset)
 	case "ri":
 		if len(a) != 1 || a[0] != Name("RelativeColorimetric") {
 			return &UnsupportedError{Feature: "rendering intent"}
@@ -613,6 +621,8 @@ func (p *pageInterpreter) operation(op Operation) error {
 }
 
 // showText 保留逐字定位并更新文字矩阵
+// 入参: data 编码后的文字字节
+// 返回: error 错误信息
 func (p *pageInterpreter) showText(data []byte) error {
 	if !p.inText || p.state.font == nil {
 		return fmt.Errorf("text without active font")
@@ -651,6 +661,8 @@ func (p *pageInterpreter) showText(data []byte) error {
 }
 
 // resource 从当前作用域读取资源引用
+// 入参: kind 资源类别, name 资源名称
+// 返回: Object 资源对象或引用, error 错误信息
 func (p *pageInterpreter) resource(kind, name Name) (Object, error) {
 	value, err := p.reader.Resolve(p.resources[kind])
 	if err != nil {
@@ -664,6 +676,8 @@ func (p *pageInterpreter) resource(kind, name Name) (Object, error) {
 }
 
 // xobject 解释图像或表单资源并限制递归
+// 入参: a XObject操作数
+// 返回: error 错误信息
 func (p *pageInterpreter) xobject(a []Object) error {
 	if len(a) != 1 {
 		return fmt.Errorf("invalid XObject operands")
@@ -689,6 +703,9 @@ func (p *pageInterpreter) xobject(a []Object) error {
 		if err != nil {
 			return err
 		}
+		if p.opaqueGroup && (image.Mask != nil || image.SoftMask != nil || image.ImageMask) {
+			return &UnsupportedError{Feature: "masked image in isolated group"}
+		}
 		if p.visitor.Image == nil {
 			return fmt.Errorf("image visitor missing")
 		}
@@ -700,12 +717,26 @@ func (p *pageInterpreter) xobject(a []Object) error {
 	if p.depth >= 32 {
 		return fmt.Errorf("form recursion limit exceeded")
 	}
-	for _, key := range []Name{"Group", "Ref", "OC"} {
+	for _, key := range []Name{"Ref", "OC"} {
 		if stream.Dictionary[key] != nil {
 			return &UnsupportedError{Feature: fmt.Sprintf("form field %q", key)}
 		}
 	}
 	child := *p
+	if stream.Dictionary["Group"] != nil {
+		value, err := p.reader.Resolve(stream.Dictionary["Group"])
+		if err != nil {
+			return err
+		}
+		group, ok := value.(Dictionary)
+		if !ok || group["S"] != Name("Transparency") || group["I"] != Boolean(true) || group["K"] != nil && group["K"] != Boolean(false) || group["CS"] != nil && group["CS"] != Name("DeviceRGB") {
+			return &UnsupportedError{Feature: "form transparency group"}
+		}
+		if p.state.style.Fill.Alpha != 1 || p.state.style.Stroke.Alpha != 1 {
+			return &UnsupportedError{Feature: "transparent form group boundary"}
+		}
+		child.opaqueGroup = true
+	}
 	child.depth++
 	child.stack = nil
 	child.path = Path{}
@@ -753,7 +784,9 @@ func (p *pageInterpreter) xobject(a []Object) error {
 }
 
 // extState 读取可表达的外部图形状态，不忽略未知绘制效果
-func (p *pageInterpreter) extState(a []Object) error {
+// 入参: a 图形状态操作数, offset 当前内容流中的字节位置
+// 返回: error 错误信息
+func (p *pageInterpreter) extState(a []Object, offset int64) error {
 	if len(a) != 1 {
 		return fmt.Errorf("invalid graphics state operands")
 	}
@@ -761,9 +794,22 @@ func (p *pageInterpreter) extState(a []Object) error {
 	if !ok {
 		return fmt.Errorf("invalid graphics state name")
 	}
-	object, err := p.resource("ExtGState", name)
+	resources, err := p.reader.Resolve(p.resources["ExtGState"])
 	if err != nil {
 		return err
+	}
+	dictionary, ok := resources.(Dictionary)
+	if resources != nil && !ok {
+		return fmt.Errorf("invalid ExtGState dictionary")
+	}
+	object := dictionary[name]
+	if object == nil {
+		message := fmt.Sprintf("undefined ExtGState resource %s; current graphics state retained", name)
+		if p.visitor.Warning == nil {
+			return fmt.Errorf("%s", message)
+		}
+		p.visitor.Warning(Diagnostic{Offset: offset, Message: message})
+		return nil
 	}
 	value, err := p.reader.Resolve(object)
 	if err != nil {
@@ -788,6 +834,9 @@ func (p *pageInterpreter) extState(a []Object) error {
 			if n[0] < 0 || n[0] > 1 {
 				return fmt.Errorf("invalid alpha")
 			}
+			if p.opaqueGroup && n[0] != 1 {
+				return &UnsupportedError{Feature: "transparent group content"}
+			}
 			if key == "ca" {
 				p.state.style.Fill.Alpha = n[0]
 			} else {
@@ -806,10 +855,31 @@ func (p *pageInterpreter) extState(a []Object) error {
 			if value != Name("None") {
 				return &UnsupportedError{Feature: "soft mask graphics state"}
 			}
-		case "AIS", "OP", "op":
+		case "AIS":
 			if value != Boolean(false) {
 				return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
 			}
+		case "SA", "OP", "op":
+			flag, ok := value.(Boolean)
+			if !ok {
+				return fmt.Errorf("invalid graphics state flag %q", key)
+			}
+			switch key {
+			case "SA":
+				p.state.style.StrokeAdjust = bool(flag)
+			case "OP":
+				p.state.style.StrokeOverprint = bool(flag)
+				if dict["op"] == nil {
+					p.state.style.FillOverprint = bool(flag)
+				}
+			case "op":
+				p.state.style.FillOverprint = bool(flag)
+			}
+		case "OPM":
+			if value != Integer(0) && value != Integer(1) {
+				return fmt.Errorf("invalid overprint mode")
+			}
+			p.state.style.OverprintMode = int(value.(Integer))
 		default:
 			return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
 		}

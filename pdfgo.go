@@ -17,6 +17,14 @@ package pdfgo
 
 import "fmt"
 
+// Diagnostic 记录可恢复的源文件问题，Page从1开始，未知页码为0
+// Offset为解码后当前页面或表单内容流内的字节位置
+type Diagnostic struct {
+	Page    int
+	Offset  int64
+	Message string
+}
+
 // SyntaxError 表示PDF语法错误及其字节位置
 type SyntaxError struct {
 	Offset  int64
