@@ -16,9 +16,13 @@ package pdfgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 )
+
+// ErrDestinationNotFound 表示命名目标在文档目标表中不存在
+var ErrDestinationNotFound = errors.New("destination not found")
 
 // Annotation 保存注解类型、区域及原始字典，不执行动作
 type Annotation struct {
@@ -193,6 +197,9 @@ func (r *Reader) ReadDestination(object Object) (Destination, error) {
 		target := r.destinations[name]
 		if legacy {
 			target = r.legacyDestinations[Name(name)]
+		}
+		if target == nil {
+			return Destination{}, fmt.Errorf("%w: %q", ErrDestinationNotFound, name)
 		}
 		value, err = r.Resolve(target)
 		if err != nil {

@@ -124,6 +124,9 @@ func (i *Image) DecodeImage() (image.Image, error) {
 		return nil, err
 	}
 	components := 0
+	var calibrated *calRGBSpace
+	var iccGray *iccGraySpace
+	var iccRGB *iccRGBSpace
 	switch i.ColorSpace {
 	case Name("DeviceGray"):
 		components = 1
@@ -131,6 +134,36 @@ func (i *Image) DecodeImage() (image.Image, error) {
 		components = 3
 	case Name("DeviceCMYK"):
 		components = 4
+	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("CalRGB") {
+		calibrated, err = i.reader.readCalRGB(space)
+		if err != nil {
+			return nil, err
+		}
+		components = 3
+	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
+		profile, err := i.reader.Resolve(space[1])
+		if err != nil {
+			return nil, err
+		}
+		stream, ok := profile.(*Stream)
+		if !ok {
+			return nil, fmt.Errorf("invalid ICC profile stream")
+		}
+		switch stream.Dictionary["N"] {
+		case Integer(1):
+			iccGray, err = i.reader.readICCGray(space)
+			components = 1
+		case Integer(3):
+			iccRGB, err = i.reader.readICCRGB(space)
+			components = 3
+		default:
+			return nil, &UnsupportedError{Feature: "image ICC component count"}
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	if i.ImageMask {
 		components = 1
@@ -177,6 +210,7 @@ func (i *Image) DecodeImage() (image.Image, error) {
 		return nil, err
 	}
 	out := image.NewNRGBA64(samples.Bounds())
+	intent, _ := i.Stream.Dictionary["Intent"].(Name)
 	maximum := float64((uint32(1) << i.BitsPerComponent) - 1)
 	for y := 0; y < i.Height; y++ {
 		for x := 0; x < i.Width; x++ {
@@ -207,6 +241,16 @@ func (i *Image) DecodeImage() (image.Image, error) {
 			if palette != nil {
 				index := int(math.Max(0, math.Min(float64(len(palette)-1), math.Round(values[0]))))
 				pixel = palette[index]
+			} else if iccGray != nil {
+				pixel = iccGray.color(values[0])
+			} else if iccRGB != nil {
+				converted, err := iccRGB.color(values[:3], intent)
+				if err != nil {
+					return nil, err
+				}
+				pixel = color.NRGBA64{R: uint16(math.Round(converted[0] * 65535)), G: uint16(math.Round(converted[1] * 65535)), B: uint16(math.Round(converted[2] * 65535)), A: 65535}
+			} else if calibrated != nil {
+				pixel = calibrated.color(values[0], values[1], values[2])
 			} else if components == 4 {
 				cmyk := color.CMYK{C: uint8(math.Round(values[0] * 255)), M: uint8(math.Round(values[1] * 255)), Y: uint8(math.Round(values[2] * 255)), K: uint8(math.Round(values[3] * 255))}
 				pixel = color.NRGBA64Model.Convert(cmyk).(color.NRGBA64)
@@ -234,6 +278,9 @@ func (i *Image) DecodeImage() (image.Image, error) {
 func (i *Image) palette() ([]color.NRGBA64, error) {
 	array, ok := i.ColorSpace.(Array)
 	if !ok {
+		return nil, nil
+	}
+	if len(array) == 2 && (array[0] == Name("CalRGB") || array[0] == Name("ICCBased")) {
 		return nil, nil
 	}
 	if len(array) != 4 || array[0] != Name("Indexed") {
@@ -501,6 +548,25 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Indexed") {
 		components = 1
+	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("CalRGB") {
+		components = 3
+	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
+		profile, err := i.reader.Resolve(space[1])
+		if err != nil {
+			return nil, err
+		}
+		stream, ok := profile.(*Stream)
+		if !ok {
+			return nil, fmt.Errorf("invalid ICC profile stream")
+		}
+		switch stream.Dictionary["N"] {
+		case Integer(1), Integer(3):
+			components = int(stream.Dictionary["N"].(Integer))
+		default:
+			return nil, &UnsupportedError{Feature: "image ICC component count"}
+		}
 	}
 	if components == 0 {
 		return nil, &UnsupportedError{Feature: "raw image color space"}
