@@ -82,6 +82,7 @@ type Style struct {
 	StrokeOverprint bool
 	OverprintMode   int
 	RenderingIntent Name
+	BlendMode       Name
 	SoftMask        *SoftMask
 }
 
@@ -719,12 +720,6 @@ func (p *pageInterpreter) showText(data []byte) error {
 	if err := p.validatePaint(p.state.mode == 0 || p.state.mode == 2, p.state.mode == 1 || p.state.mode == 2); err != nil {
 		return err
 	}
-	if p.state.mode == 1 || p.state.mode == 2 {
-		m := p.textMatrix
-		if math.Abs(math.Hypot(m[0], m[1])-1) > 1e-8 || math.Abs(math.Hypot(m[2], m[3])-1) > 1e-8 || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8 {
-			return &UnsupportedError{Feature: "scaled text stroke matrix"}
-		}
-	}
 	glyphs, err := p.state.font.Decode(data)
 	if err != nil {
 		return err
@@ -986,9 +981,10 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				return err
 			}
 		case "BM":
-			if value != Name("Normal") && value != Name("Compatible") {
+			if value != Name("Normal") && value != Name("Compatible") && value != Name("Multiply") {
 				return &UnsupportedError{Feature: "blend mode"}
 			}
+			p.state.style.BlendMode = value.(Name)
 		case "SMask":
 			if value == Name("None") {
 				p.state.style.SoftMask = nil

@@ -14,7 +14,11 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+	"math"
+)
 
 // Annotation 保存注解类型、区域及原始字典，不执行动作
 type Annotation struct {
@@ -62,6 +66,76 @@ func (p *Page) Annotations() ([]Annotation, error) {
 		result = append(result, Annotation{Subtype: subtype, Rect: box, Dictionary: dict})
 	}
 	return result, nil
+}
+
+// WalkAnnotationAppearance 解释注解当前外观并映射到页面用户空间
+// 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器
+// 返回: error 外观缺失、解析或访问错误
+func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annotation Annotation, visitor Visitor) error {
+	if page.reader != r {
+		return fmt.Errorf("page belongs to another reader")
+	}
+	value, err := r.Resolve(annotation.Dictionary["AP"])
+	if err != nil {
+		return err
+	}
+	appearance, ok := value.(Dictionary)
+	if !ok {
+		return &UnsupportedError{Feature: "annotation appearance"}
+	}
+	value, err = r.Resolve(appearance["N"])
+	if err != nil {
+		return err
+	}
+	if states, ok := value.(Dictionary); ok {
+		state, ok := annotation.Dictionary["AS"].(Name)
+		if !ok {
+			return fmt.Errorf("missing annotation appearance state")
+		}
+		value, err = r.Resolve(states[state])
+		if err != nil {
+			return err
+		}
+	}
+	stream, ok := value.(*Stream)
+	if !ok || stream.Dictionary["Subtype"] != Name("Form") {
+		return &UnsupportedError{Feature: "annotation appearance stream"}
+	}
+	box, err := r.rectangle(stream.Dictionary["BBox"])
+	if err != nil {
+		return err
+	}
+	matrix := Identity()
+	if stream.Dictionary["Matrix"] != nil {
+		value, err := r.Resolve(stream.Dictionary["Matrix"])
+		if err != nil {
+			return err
+		}
+		array, ok := value.(Array)
+		if !ok {
+			return fmt.Errorf("invalid appearance matrix")
+		}
+		values, err := numbers(array, 6)
+		if err != nil {
+			return err
+		}
+		matrix = Matrix(values)
+	}
+	minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
+	for _, point := range []Point{{box.XMin, box.YMin}, {box.XMax, box.YMin}, {box.XMax, box.YMax}, {box.XMin, box.YMax}} {
+		point = matrix.Apply(point)
+		minX, minY = math.Min(minX, point.X), math.Min(minY, point.Y)
+		maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
+	}
+	if math.IsInf(minX, 0) || math.IsInf(minY, 0) || math.IsInf(maxX, 0) || math.IsInf(maxY, 0) || math.IsNaN(minX) || math.IsNaN(minY) || math.IsNaN(maxX) || math.IsNaN(maxY) || minX == maxX || minY == maxY {
+		return fmt.Errorf("invalid appearance bounds")
+	}
+	rect := annotation.Rect
+	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
+	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx}
+	interpreter.patternMatrix = Identity()
+	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
+	return interpreter.form(stream)
 }
 
 // BaseURI 读取文档声明的链接基准地址，不访问外部资源
