@@ -84,6 +84,7 @@ type Style struct {
 	RenderingIntent Name
 	BlendMode       Name
 	SoftMask        *SoftMask
+	Smoothness      *float64
 }
 
 // PathMark 表示一次路径绘制
@@ -118,14 +119,22 @@ type GroupMark struct {
 	SoftMask *SoftMask
 }
 
+// MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标记的标签
+type MarkedContentMark struct {
+	Tag        Name
+	Properties Dictionary
+	Operator   string
+}
+
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
-// Warning非空时允许恢复缺失的ExtGState资源并报告诊断，其他解析错误仍返回错误
+// Warning非空时报告缺失的ExtGState资源及未保留的内容语义，其他解析错误仍返回错误
 type Visitor struct {
-	Path    func(PathMark) error
-	Text    func(TextMark) error
-	Image   func(ImageMark) error
-	Group   func(GroupMark, func(Visitor) error) error
-	Warning func(Diagnostic)
+	Path          func(PathMark) error
+	Text          func(TextMark) error
+	Image         func(ImageMark) error
+	Group         func(GroupMark, func(Visitor) error) error
+	MarkedContent func(MarkedContentMark) error
+	Warning       func(Diagnostic)
 }
 
 // graphicsState 保存图形和文字操作的当前状态
@@ -137,6 +146,7 @@ type graphicsState struct {
 	mode                                                  int
 	fillSpace, strokeSpace                                Name
 	fillICC, strokeICC                                    *iccRGBSpace
+	fillSeparation, strokeSeparation                      *separationSpace
 }
 
 // pageInterpreter 按内容顺序解释页面或表单
@@ -147,6 +157,7 @@ type pageInterpreter struct {
 	ctx                    context.Context
 	state                  graphicsState
 	stack                  []graphicsState
+	marked                 []Name
 	textMatrix, lineMatrix Matrix
 	inText                 bool
 	path                   Path
@@ -158,6 +169,7 @@ type pageInterpreter struct {
 	opaqueGroup            bool
 	maskGroup              bool
 	patternMatrix          Matrix
+	type3                  bool
 }
 
 // WalkPage 解释页面内容并按绘制顺序访问可准确表达的图元，注解由Page.Annotations读取
@@ -216,6 +228,34 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	return interpreter.run(data)
 }
 
+// WalkType3Glyph 按文字位置解释Type3字形内容流并访问其中的图元
+// 入参: ctx 取消上下文, mark 文字绘制信息, index 字形下标, visitor 图元访问器
+// 返回: error 解析或访问错误
+func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, visitor Visitor) error {
+	font := mark.Font
+	if font == nil || font.Subtype != Name("Type3") || index < 0 || index >= len(mark.Glyphs) {
+		return fmt.Errorf("invalid Type3 glyph")
+	}
+	object, err := r.Resolve(font.type3Procs[Name(mark.Glyphs[index].Name)])
+	if err != nil {
+		return err
+	}
+	stream, ok := object.(*Stream)
+	if !ok {
+		return fmt.Errorf("missing Type3 character procedure")
+	}
+	data, err := stream.Decode()
+	if err != nil {
+		return err
+	}
+	position := mark.Positions[index]
+	text := Matrix{mark.Size * mark.HorizontalScale, 0, 0, mark.Size, position.X, position.Y}
+	interpreter := pageInterpreter{reader: r, resources: font.type3Resources, visitor: visitor, ctx: ctx, type3: true}
+	interpreter.patternMatrix = Identity()
+	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
+	return interpreter.run(data)
+}
+
 // run 解释单个页面或表单的完整内容
 // 入参: data 解码后的内容流
 // 返回: error 错误信息
@@ -224,8 +264,66 @@ func (p *pageInterpreter) run(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if len(p.stack) != 0 || p.inText {
-		return fmt.Errorf("unbalanced graphics or text state")
+	if len(p.stack) != 0 || p.inText || len(p.marked) != 0 {
+		return fmt.Errorf("unbalanced graphics, text or marked content state")
+	}
+	return nil
+}
+
+// markedContent 解析内容标记并向调用方交付其语义属性
+// 入参: op 内容标记操作
+// 返回: error 错误信息
+func (p *pageInterpreter) markedContent(op Operation) error {
+	mark := MarkedContentMark{Operator: op.Operator}
+	if op.Operator == "EMC" {
+		if len(op.Operands) != 0 || len(p.marked) == 0 {
+			return fmt.Errorf("unmatched marked content end")
+		}
+		mark.Tag = p.marked[len(p.marked)-1]
+		p.marked = p.marked[:len(p.marked)-1]
+	} else {
+		count := 1
+		if op.Operator == "BDC" || op.Operator == "DP" {
+			count = 2
+		}
+		if len(op.Operands) != count {
+			return fmt.Errorf("invalid marked content operands")
+		}
+		var ok bool
+		mark.Tag, ok = op.Operands[0].(Name)
+		if !ok {
+			return fmt.Errorf("invalid marked content tag")
+		}
+		if count == 2 {
+			object := op.Operands[1]
+			if name, ok := object.(Name); ok {
+				var err error
+				object, err = p.resource("Properties", name)
+				if err != nil {
+					return err
+				}
+			}
+			value, err := p.reader.Resolve(object)
+			if err != nil {
+				return err
+			}
+			mark.Properties, ok = value.(Dictionary)
+			if !ok {
+				return fmt.Errorf("invalid marked content properties")
+			}
+		}
+		if op.Operator == "BMC" || op.Operator == "BDC" {
+			p.marked = append(p.marked, mark.Tag)
+		}
+	}
+	if p.visitor.MarkedContent != nil {
+		return p.visitor.MarkedContent(mark)
+	}
+	if op.Operator != "EMC" {
+		if p.visitor.Warning == nil {
+			return &UnsupportedError{Feature: "marked content requiring semantic preservation"}
+		}
+		p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: fmt.Sprintf("marked content %s not preserved", mark.Tag)})
 	}
 	return nil
 }
@@ -256,7 +354,7 @@ func numbers(operands []Object, count int) ([]float64, error) {
 // 返回: error 错误信息
 func (p *pageInterpreter) operation(op Operation) error {
 	a := op.Operands
-	count := map[string]int{"q": 0, "Q": 0, "cm": 6, "w": 1, "J": 1, "j": 1, "M": 1, "m": 2, "l": 2, "c": 6, "v": 4, "y": 4, "h": 0, "re": 4, "S": 0, "s": 0, "f": 0, "F": 0, "f*": 0, "B": 0, "B*": 0, "b": 0, "b*": 0, "n": 0, "W": 0, "W*": 0, "g": 1, "G": 1, "rg": 3, "RG": 3, "k": 4, "K": 4, "BT": 0, "ET": 0, "Tc": 1, "Tw": 1, "Tz": 1, "TL": 1, "Tr": 1, "Ts": 1, "Td": 2, "TD": 2, "Tm": 6, "T*": 0}
+	count := map[string]int{"q": 0, "Q": 0, "cm": 6, "w": 1, "J": 1, "j": 1, "M": 1, "m": 2, "l": 2, "c": 6, "v": 4, "y": 4, "h": 0, "re": 4, "S": 0, "s": 0, "f": 0, "F": 0, "f*": 0, "B": 0, "B*": 0, "b": 0, "b*": 0, "n": 0, "W": 0, "W*": 0, "g": 1, "G": 1, "rg": 3, "RG": 3, "k": 4, "K": 4, "BT": 0, "ET": 0, "Tc": 1, "Tw": 1, "Tz": 1, "TL": 1, "Tr": 1, "Ts": 1, "Td": 2, "TD": 2, "Tm": 6, "T*": 0, "d0": 2, "d1": 6}
 	var v []float64
 	if n, ok := count[op.Operator]; ok {
 		var err error
@@ -268,6 +366,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 	point := func(x, y float64) Point { return p.state.matrix.Apply(Point{x, y}) }
 	add := func(name string, points ...Point) { p.path.Segments = append(p.path.Segments, Segment{name, points}) }
 	switch op.Operator {
+	case "d0", "d1":
+		if !p.type3 {
+			return &UnsupportedError{Feature: "Type3 glyph metrics outside character procedure"}
+		}
 	case "q":
 		if len(p.stack) >= 256 {
 			return fmt.Errorf("graphics stack limit exceeded")
@@ -434,6 +536,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 		if op.Operator == "G" || op.Operator == "RG" || op.Operator == "K" {
 			p.state.strokeICC = nil
+			p.state.strokeSeparation = nil
 			p.state.style.Stroke.RGB = rgb
 			p.state.style.Stroke.CMYK = cmyk
 			p.state.style.Stroke.Axial = nil
@@ -447,6 +550,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		} else {
 			p.state.style.Fill.RGB = rgb
 			p.state.fillICC = nil
+			p.state.fillSeparation = nil
 			p.state.style.Fill.CMYK = cmyk
 			p.state.style.Fill.Axial = nil
 			if len(v) == 1 {
@@ -466,6 +570,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("invalid color space name")
 		}
 		var profile *iccRGBSpace
+		var separation *separationSpace
 		if name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK" && name != "Pattern" {
 			object, err := p.resource("ColorSpace", name)
 			if err != nil {
@@ -481,6 +586,12 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 			if len(space) == 1 && space[0] == Name("Pattern") {
 				name = "Pattern"
+			} else if space[0] == Name("Separation") {
+				separation, err = p.reader.readSeparation(space)
+				if err != nil {
+					return err
+				}
+				name = "Separation"
 			} else {
 				profile, err = p.reader.readICCRGB(space)
 				if err != nil {
@@ -492,6 +603,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if op.Operator == "cs" {
 			p.state.fillSpace = name
 			p.state.fillICC = profile
+			p.state.fillSeparation = separation
 			p.state.style.Fill.RGB = [3]float64{}
 			p.state.style.Fill.CMYK = nil
 			p.state.style.Fill.Axial = nil
@@ -501,6 +613,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		} else {
 			p.state.strokeSpace = name
 			p.state.strokeICC = profile
+			p.state.strokeSeparation = separation
 			p.state.style.Stroke.RGB = [3]float64{}
 			p.state.style.Stroke.CMYK = nil
 			p.state.style.Stroke.Axial = nil
@@ -511,11 +624,35 @@ func (p *pageInterpreter) operation(op Operation) error {
 	case "sc", "scn", "SC", "SCN":
 		space := p.state.fillSpace
 		profile := p.state.fillICC
+		separation := p.state.fillSeparation
 		operator := "g"
 		if op.Operator == "SC" || op.Operator == "SCN" {
 			space = p.state.strokeSpace
 			profile = p.state.strokeICC
+			separation = p.state.strokeSeparation
 			operator = "G"
+		}
+		if space == "Separation" {
+			values, err := numbers(a, 1)
+			if err != nil {
+				return err
+			}
+			paint, err := separation.paint(values[0])
+			if err != nil {
+				return err
+			}
+			if operator == "g" {
+				if separation.name != "None" {
+					paint.Alpha = p.state.style.Fill.Alpha
+				}
+				p.state.style.Fill = paint
+			} else {
+				if separation.name != "None" {
+					paint.Alpha = p.state.style.Stroke.Alpha
+				}
+				p.state.style.Stroke = paint
+			}
+			return nil
 		}
 		if space == "ICCBased" {
 			values, err := numbers(a, 3)
@@ -703,7 +840,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("invalid flatness")
 		}
 	case "BMC", "BDC", "EMC", "MP", "DP":
-		return &UnsupportedError{Feature: "marked content requiring semantic preservation"}
+		return p.markedContent(op)
 	default:
 		return &UnsupportedError{Feature: "content operator " + op.Operator}
 	}
@@ -860,6 +997,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	}
 	child.depth++
 	child.stack = nil
+	child.marked = nil
 	child.path = Path{}
 	child.hasPoint = false
 	child.pendingClip = false
@@ -1020,6 +1158,16 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				return fmt.Errorf("invalid overprint mode")
 			}
 			p.state.style.OverprintMode = int(value.(Integer))
+		case "SM":
+			n, err := numbers([]Object{value}, 1)
+			if err != nil || n[0] < 0 || n[0] > 1 {
+				return fmt.Errorf("invalid smoothness tolerance")
+			}
+			p.state.style.Smoothness = &n[0]
+		case "BG2", "UCR2":
+			if value != Name("Default") {
+				return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
+			}
 		default:
 			return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
 		}

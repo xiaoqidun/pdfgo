@@ -17,7 +17,7 @@ package pdfgo
 
 import "fmt"
 
-// Diagnostic 记录可恢复的源文件问题，Page从1开始，未知页码为0
+// Diagnostic 记录可恢复的问题或未保留的语义，Page从1开始，未知页码为0
 // Offset为解码后当前页面或表单内容流内的字节位置
 type Diagnostic struct {
 	Page    int

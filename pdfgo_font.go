@@ -22,22 +22,26 @@ import (
 
 // Font 保存PDF字体程序、字符映射及字宽，不依赖渲染后端
 type Font struct {
-	Name         string
-	Subtype      Name
-	Program      []byte
-	ProgramType  Name
-	Dictionary   Dictionary
-	Unicode      UnicodeMap
-	widths       map[uint32]float64
-	defaultWidth float64
-	composite    bool
-	encoding     Name
-	glyphMap     []byte
-	simpleCmap   []byte
-	symbolCmap   bool
-	symbolic     bool
-	cffGlyphs    map[uint32]uint16
-	cffNames     map[uint32]string
+	Name           string
+	Subtype        Name
+	Program        []byte
+	ProgramType    Name
+	Dictionary     Dictionary
+	Unicode        UnicodeMap
+	widths         map[uint32]float64
+	defaultWidth   float64
+	composite      bool
+	encoding       Name
+	glyphMap       []byte
+	simpleCmap     []byte
+	symbolCmap     bool
+	symbolic       bool
+	cffGlyphs      map[uint32]uint16
+	cffNames       map[uint32]string
+	differences    map[uint32]string
+	type3Matrix    Matrix
+	type3Procs     Dictionary
+	type3Resources Dictionary
 }
 
 // Glyph 保存原始字符码、Unicode文本、字形名称、编号和千分之一字宽
@@ -177,17 +181,53 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 				return nil, fmt.Errorf("invalid CIDToGIDMap length")
 			}
 		}
-	} else if subtype == Name("TrueType") || subtype == Name("Type1") {
+	} else if subtype == Name("TrueType") || subtype == Name("Type1") || subtype == Name("Type3") {
 		encoding, err := r.Resolve(dict["Encoding"])
 		if err != nil {
 			return nil, err
 		}
 		if encoding != nil {
-			name, ok := encoding.(Name)
-			if !ok {
-				return nil, &UnsupportedError{Feature: "font encoding differences"}
+			switch value := encoding.(type) {
+			case Name:
+				font.encoding = value
+			case Dictionary:
+				if value["BaseEncoding"] != nil {
+					name, ok := value["BaseEncoding"].(Name)
+					if !ok {
+						return nil, fmt.Errorf("invalid font base encoding")
+					}
+					font.encoding = name
+				}
+				array, err := r.Resolve(value["Differences"])
+				if err != nil {
+					return nil, err
+				}
+				entries, ok := array.(Array)
+				if !ok {
+					return nil, fmt.Errorf("invalid font encoding differences")
+				}
+				font.differences = map[uint32]string{}
+				code := 256
+				for _, entry := range entries {
+					switch v := entry.(type) {
+					case Integer:
+						if v < 0 || v > 255 {
+							return nil, fmt.Errorf("invalid font difference code")
+						}
+						code = int(v)
+					case Name:
+						if code > 255 {
+							return nil, fmt.Errorf("invalid font difference code")
+						}
+						font.differences[uint32(code)] = string(v)
+						code++
+					default:
+						return nil, fmt.Errorf("invalid font encoding differences")
+					}
+				}
+			default:
+				return nil, fmt.Errorf("invalid font encoding")
 			}
-			font.encoding = name
 		}
 		widths, err := r.Resolve(dict["Widths"])
 		if err != nil {
@@ -211,6 +251,39 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 					return nil, err
 				}
 				font.widths[uint32(first)+uint32(n)] = width
+			}
+		}
+		if subtype == Name("Type3") {
+			matrix, err := r.Resolve(dict["FontMatrix"])
+			if err != nil {
+				return nil, err
+			}
+			values, ok := matrix.(Array)
+			if !ok {
+				return nil, fmt.Errorf("invalid Type3 font matrix")
+			}
+			numbers, err := numbers(values, 6)
+			if err != nil {
+				return nil, err
+			}
+			font.type3Matrix = Matrix(numbers)
+			procs, err := r.Resolve(dict["CharProcs"])
+			if err != nil {
+				return nil, err
+			}
+			font.type3Procs, ok = procs.(Dictionary)
+			if !ok {
+				return nil, fmt.Errorf("invalid Type3 character procedures")
+			}
+			resources, err := r.Resolve(dict["Resources"])
+			if err != nil {
+				return nil, err
+			}
+			if resources != nil {
+				font.type3Resources, ok = resources.(Dictionary)
+				if !ok {
+					return nil, fmt.Errorf("invalid Type3 resources")
+				}
 			}
 		}
 	} else {
@@ -284,10 +357,10 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		}
 	}
 	if font.ProgramType == "Type1C" || font.ProgramType == "CIDFontType0C" {
-		if !font.composite && font.encoding != "" {
+		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "StandardEncoding" {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
-		font.cffGlyphs, font.cffNames, err = cffFontMapping(font.Program, font.composite)
+		font.cffGlyphs, font.cffNames, err = cffFontMapping(font.Program, font.composite, font.encoding, font.differences)
 		if err != nil {
 			return nil, err
 		}
@@ -327,7 +400,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			if f.composite {
 				return nil, &UnsupportedError{Feature: "CID without Unicode mapping"}
 			}
-			if f.encoding == Name("WinAnsiEncoding") {
+			if f.Subtype == Name("Type3") && f.differences[code] != "" {
+				text = ""
+			} else if f.encoding == Name("WinAnsiEncoding") {
 				text = string(charmap.Windows1252.DecodeByte(raw[0]))
 			} else if raw[0] >= 32 && raw[0] <= 126 && (f.encoding == "" || f.encoding == Name("StandardEncoding")) {
 				text = string(rune(raw[0]))
@@ -339,10 +414,19 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		if !ok {
 			width = f.defaultWidth
 		}
+		if f.Subtype == Name("Type3") {
+			width *= f.type3Matrix[0] * 1000
+		}
 		if width == 0 && len(f.widths) == 0 && !f.composite {
 			return nil, &UnsupportedError{Feature: "unembedded standard font metrics"}
 		}
 		glyph := Glyph{Code: code, Text: text, Width: width, WordSpace: step == 1 && code == 32}
+		if f.Subtype == Name("Type3") {
+			glyph.Name = f.differences[code]
+			if glyph.Name == "" {
+				return nil, &UnsupportedError{Feature: "Type3 character without glyph name"}
+			}
+		}
 		if f.simpleCmap != nil {
 			lookup := code
 			if !f.symbolic {

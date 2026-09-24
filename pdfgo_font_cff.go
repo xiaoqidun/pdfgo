@@ -154,9 +154,9 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 }
 
 // cffFontMapping 读取CID或内置字符编码到字形编号的映射，不重新解释轮廓
-// 入参: data CFF数据, composite 是否为CID字体
+// 入参: data CFF数据, composite 是否为CID字体, encoding PDF基础编码, differences PDF编码差异
 // 返回: map[uint32]uint16 字符码或CID到字形编号的映射, map[uint32]string 可用字形名称, error 错误信息
-func cffFontMapping(data []byte, composite bool) (map[uint32]uint16, map[uint32]string, error) {
+func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string) (map[uint32]uint16, map[uint32]string, error) {
 	if len(data) < 4 || data[0] != 1 || data[2] < 4 {
 		return nil, nil, fmt.Errorf("invalid CFF header")
 	}
@@ -273,63 +273,68 @@ func cffFontMapping(data []byte, composite bool) (map[uint32]uint16, map[uint32]
 	if err != nil {
 		return nil, nil, err
 	}
+	if encoding == "" && encodingOffset == 0 {
+		encoding = "StandardEncoding"
+	}
 	mapping := map[uint32]uint16{}
-	if encodingOffset <= 1 {
-		return nil, nil, &UnsupportedError{Feature: "predefined CFF encoding"}
-	}
-	if encodingOffset+2 > len(data) {
-		return nil, nil, fmt.Errorf("truncated CFF encoding")
-	}
-	format, pos := data[encodingOffset], encodingOffset+1
-	count := int(data[pos])
-	pos++
-	gid := 1
-	for n := 0; n < count; n++ {
-		if pos >= len(data) {
+	if encoding == "" {
+		if encodingOffset <= 1 {
+			return nil, nil, &UnsupportedError{Feature: "predefined CFF encoding"}
+		}
+		if encodingOffset+2 > len(data) {
 			return nil, nil, fmt.Errorf("truncated CFF encoding")
 		}
-		first, run := int(data[pos]), 1
+		format, pos := data[encodingOffset], encodingOffset+1
+		count := int(data[pos])
 		pos++
-		switch format & 127 {
-		case 0:
-		case 1:
-			if pos == len(data) {
-				return nil, nil, fmt.Errorf("truncated CFF encoding range")
-			}
-			run += int(data[pos])
-			pos++
-		default:
-			return nil, nil, fmt.Errorf("invalid CFF encoding format")
-		}
-		if first+run > 256 || gid+run > len(chars) {
-			return nil, nil, fmt.Errorf("invalid CFF encoding range")
-		}
-		for code := first; code < first+run; code++ {
-			if _, ok := mapping[uint32(code)]; ok {
-				return nil, nil, fmt.Errorf("duplicate CFF character code")
-			}
-			mapping[uint32(code)] = uint16(gid)
-			gid++
-		}
-	}
-	if format&128 != 0 {
-		if pos == len(data) {
-			return nil, nil, fmt.Errorf("truncated CFF supplement")
-		}
-		count = int(data[pos])
-		pos++
-		if count > (len(data)-pos)/3 {
-			return nil, nil, fmt.Errorf("truncated CFF supplements")
-		}
+		gid := 1
 		for n := 0; n < count; n++ {
-			code := uint32(data[pos])
-			sid := uint32(binary.BigEndian.Uint16(data[pos+1:]))
-			pos += 3
-			gid, ok := bySID[sid]
-			if !ok {
-				return nil, nil, fmt.Errorf("missing CFF supplement glyph")
+			if pos >= len(data) {
+				return nil, nil, fmt.Errorf("truncated CFF encoding")
 			}
-			mapping[code] = gid
+			first, run := int(data[pos]), 1
+			pos++
+			switch format & 127 {
+			case 0:
+			case 1:
+				if pos == len(data) {
+					return nil, nil, fmt.Errorf("truncated CFF encoding range")
+				}
+				run += int(data[pos])
+				pos++
+			default:
+				return nil, nil, fmt.Errorf("invalid CFF encoding format")
+			}
+			if first+run > 256 || gid+run > len(chars) {
+				return nil, nil, fmt.Errorf("invalid CFF encoding range")
+			}
+			for code := first; code < first+run; code++ {
+				if _, ok := mapping[uint32(code)]; ok {
+					return nil, nil, fmt.Errorf("duplicate CFF character code")
+				}
+				mapping[uint32(code)] = uint16(gid)
+				gid++
+			}
+		}
+		if format&128 != 0 {
+			if pos == len(data) {
+				return nil, nil, fmt.Errorf("truncated CFF supplement")
+			}
+			count = int(data[pos])
+			pos++
+			if count > (len(data)-pos)/3 {
+				return nil, nil, fmt.Errorf("truncated CFF supplements")
+			}
+			for n := 0; n < count; n++ {
+				code := uint32(data[pos])
+				sid := uint32(binary.BigEndian.Uint16(data[pos+1:]))
+				pos += 3
+				gid, ok := bySID[sid]
+				if !ok {
+					return nil, nil, fmt.Errorf("missing CFF supplement glyph")
+				}
+				mapping[code] = gid
+			}
 		}
 	}
 	glyphNames := map[uint32]string{}
@@ -340,6 +345,49 @@ func cffFontMapping(data []byte, composite bool) (map[uint32]uint16, map[uint32]
 				return nil, nil, fmt.Errorf("invalid CFF string identifier")
 			}
 			glyphNames[code] = string(stringsIndex[sid-391])
+		}
+	}
+	if encoding != "" || len(differences) > 0 {
+		byName := map[string]uint16{}
+		for gid, sid := range charset {
+			if int(sid) < len(cffStandardNames) {
+				byName[cffStandardNames[sid]] = uint16(gid)
+			} else if int(sid)-len(cffStandardNames) < len(stringsIndex) {
+				byName[string(stringsIndex[int(sid)-len(cffStandardNames)])] = uint16(gid)
+			} else {
+				return nil, nil, fmt.Errorf("invalid CFF string identifier")
+			}
+		}
+		if encoding != "" {
+			var base []string
+			switch encoding {
+			case "WinAnsiEncoding":
+				base = pdfWinAnsiNames
+			case "MacRomanEncoding":
+				base = pdfMacRomanNames
+			case "StandardEncoding":
+				base = pdfStandardNames
+			default:
+				return nil, nil, &UnsupportedError{Feature: "external CFF encoding"}
+			}
+			mapping = map[uint32]uint16{}
+			glyphNames = map[uint32]string{}
+			for code, name := range base {
+				if gid, ok := byName[name]; ok && name != ".notdef" {
+					mapping[uint32(code)] = gid
+					glyphNames[uint32(code)] = name
+				}
+			}
+		}
+		for code, name := range differences {
+			gid, ok := byName[name]
+			if !ok {
+				delete(mapping, code)
+				glyphNames[code] = name
+				continue
+			}
+			mapping[code] = gid
+			glyphNames[code] = name
 		}
 	}
 	return mapping, glyphNames, nil

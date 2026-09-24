@@ -409,6 +409,9 @@ func (r *Reader) classicXref(p *objectParser) (Dictionary, map[int64]xrefEntry, 
 			position, e1 := strconv.ParseInt(p.token(), 10, 64)
 			generation, e2 := strconv.ParseInt(p.token(), 10, 64)
 			state := p.token()
+			if first+i == 0 && state == "f" && generation == 65536 {
+				generation = 65535
+			}
 			if e1 != nil || e2 != nil || position < 0 || generation < 0 || generation > 65535 || (state != "f" && state != "n") {
 				return nil, nil, p.fail("invalid cross-reference entry")
 			}

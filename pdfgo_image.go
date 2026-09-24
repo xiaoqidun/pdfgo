@@ -25,6 +25,8 @@ import (
 	"github.com/xiaoqidun/jbig2"
 )
 
+var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
+
 // Image 保存图像原始属性，颜色空间和遮罩保持为PDF对象
 type Image struct {
 	Width            int
@@ -37,6 +39,59 @@ type Image struct {
 	SoftMask         Object
 	Stream           *Stream
 	reader           *Reader
+}
+
+// JBIG2File 无损封装可直接复用的单页JBIG2图像及全局段
+// 不适合直接复用的图像返回nil，调用DecodeImage可得到已应用颜色与遮罩的像素
+// 返回: []byte 完整JBIG2文件, error 解码参数或资源错误
+func (i *Image) JBIG2File() ([]byte, error) {
+	if i.ImageMask || i.BitsPerComponent != 1 || i.ColorSpace != Name("DeviceGray") || len(i.Decode) != 0 || i.Mask != nil || i.SoftMask != nil || i.Stream.Dictionary["SMaskInData"] != nil || i.Stream.Dictionary["Matte"] != nil {
+		return nil, nil
+	}
+	filter, err := i.reader.Resolve(i.Stream.Dictionary["Filter"])
+	if err != nil {
+		return nil, err
+	}
+	if filter != Name("JBIG2Decode") {
+		return nil, nil
+	}
+	var globals []byte
+	if i.Stream.Dictionary["DecodeParms"] != nil {
+		value, err := i.reader.Resolve(i.Stream.Dictionary["DecodeParms"])
+		if err != nil {
+			return nil, err
+		}
+		params, ok := value.(Dictionary)
+		if !ok {
+			return nil, fmt.Errorf("invalid JBIG2 decode parameters")
+		}
+		if params["JBIG2Globals"] != nil {
+			value, err := i.reader.Resolve(params["JBIG2Globals"])
+			if err != nil {
+				return nil, err
+			}
+			stream, ok := value.(*Stream)
+			if !ok {
+				return nil, fmt.Errorf("invalid JBIG2 globals")
+			}
+			globals, err = stream.Decode()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	data := make([]byte, 0, len(jbig2FileHeader)+len(globals)+len(i.Stream.Data))
+	data = append(data, jbig2FileHeader...)
+	data = append(data, globals...)
+	data = append(data, i.Stream.Data...)
+	config, err := jbig2.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	if config.Width != i.Width || config.Height != i.Height {
+		return nil, fmt.Errorf("JBIG2 dimensions differ from image dictionary")
+	}
+	return data, nil
 }
 
 // ReadImage 读取图像XObject描述，不隐式转换颜色或丢弃遮罩
@@ -114,7 +169,7 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Decode: decode, ImageMask: mask, Mask: dict["Mask"], SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
 }
 
-// DecodeImage 应用Decode映射、设备色彩或CalRGB索引色转换及同尺寸遮罩，返回非预乘透明图像
+// DecodeImage 应用Decode映射及颜色空间变换，合成同尺寸遮罩后返回非预乘透明图像
 // 模板图像返回映射后的灰度样本，当前填充色由页面使用方应用
 // 不支持的色彩管理、遮罩重采样和预混合底色返回明确错误
 // 返回: image.Image 解码图像, error 错误信息
@@ -127,6 +182,7 @@ func (i *Image) DecodeImage() (image.Image, error) {
 	var calibrated *calRGBSpace
 	var iccGray *iccGraySpace
 	var iccRGB *iccRGBSpace
+	var separation *separationSpace
 	switch i.ColorSpace {
 	case Name("DeviceGray"):
 		components = 1
@@ -164,6 +220,13 @@ func (i *Image) DecodeImage() (image.Image, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Separation") {
+		separation, err = i.reader.readSeparation(space)
+		if err != nil {
+			return nil, err
+		}
+		components = 1
 	}
 	if i.ImageMask {
 		components = 1
@@ -241,6 +304,20 @@ func (i *Image) DecodeImage() (image.Image, error) {
 			if palette != nil {
 				index := int(math.Max(0, math.Min(float64(len(palette)-1), math.Round(values[0]))))
 				pixel = palette[index]
+			} else if separation != nil {
+				paint, err := separation.paint(values[0])
+				if err != nil {
+					return nil, err
+				}
+				if paint.CMYK != nil {
+					v := paint.CMYK
+					pixel = color.NRGBA64Model.Convert(color.CMYK{C: uint8(math.Round(v[0] * 255)), M: uint8(math.Round(v[1] * 255)), Y: uint8(math.Round(v[2] * 255)), K: uint8(math.Round(v[3] * 255))}).(color.NRGBA64)
+				} else {
+					pixel = color.NRGBA64{R: uint16(math.Round(paint.RGB[0] * 65535)), G: uint16(math.Round(paint.RGB[1] * 65535)), B: uint16(math.Round(paint.RGB[2] * 65535)), A: 65535}
+				}
+				if separation.name == "None" {
+					pixel.A = 0
+				}
 			} else if iccGray != nil {
 				pixel = iccGray.color(values[0])
 			} else if iccRGB != nil {
@@ -280,7 +357,7 @@ func (i *Image) palette() ([]color.NRGBA64, error) {
 	if !ok {
 		return nil, nil
 	}
-	if len(array) == 2 && (array[0] == Name("CalRGB") || array[0] == Name("ICCBased")) {
+	if len(array) == 2 && (array[0] == Name("CalRGB") || array[0] == Name("ICCBased")) || len(array) == 4 && array[0] == Name("Separation") {
 		return nil, nil
 	}
 	if len(array) != 4 || array[0] != Name("Indexed") {
@@ -547,6 +624,9 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Indexed") {
+		components = 1
+	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Separation") {
 		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("CalRGB") {
