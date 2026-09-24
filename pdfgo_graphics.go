@@ -65,6 +65,7 @@ type Paint struct {
 	RGB   [3]float64
 	CMYK  *[4]float64
 	Alpha float64
+	Axial *AxialGradient
 }
 
 // Style 保存绘制状态及按顺序相交的裁剪路径
@@ -80,6 +81,8 @@ type Style struct {
 	FillOverprint   bool
 	StrokeOverprint bool
 	OverprintMode   int
+	RenderingIntent Name
+	SoftMask        *SoftMask
 }
 
 // PathMark 表示一次路径绘制
@@ -107,12 +110,20 @@ type ImageMark struct {
 	Style  Style
 }
 
+// GroupMark 保存透明度组的边界不透明度和隔离方式，组内绘制使用独立状态
+type GroupMark struct {
+	Alpha    float64
+	Isolated bool
+	SoftMask *SoftMask
+}
+
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
 // Warning非空时允许恢复缺失的ExtGState资源并报告诊断，其他解析错误仍返回错误
 type Visitor struct {
 	Path    func(PathMark) error
 	Text    func(TextMark) error
 	Image   func(ImageMark) error
+	Group   func(GroupMark, func(Visitor) error) error
 	Warning func(Diagnostic)
 }
 
@@ -124,6 +135,7 @@ type graphicsState struct {
 	fontSize, spacing, wordSpacing, hscale, leading, rise float64
 	mode                                                  int
 	fillSpace, strokeSpace                                Name
+	fillICC, strokeICC                                    *iccRGBSpace
 }
 
 // pageInterpreter 按内容顺序解释页面或表单
@@ -143,6 +155,8 @@ type pageInterpreter struct {
 	clipEvenOdd            bool
 	depth                  int
 	opaqueGroup            bool
+	maskGroup              bool
+	patternMatrix          Matrix
 }
 
 // WalkPage 解释页面内容并按绘制顺序访问可准确表达的图元，注解由Page.Annotations读取
@@ -172,8 +186,8 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 					return &UnsupportedError{Feature: "page group subtype"}
 				}
 			case "CS":
-				if value != Name("DeviceRGB") {
-					return &UnsupportedError{Feature: "page group color space"}
+				if err := r.validateRGBGroupSpace(value); err != nil {
+					return err
 				}
 			case "I":
 				if value != Boolean(true) {
@@ -196,6 +210,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 		return err
 	}
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx}
+	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
 	return interpreter.run(data)
 }
@@ -371,15 +386,15 @@ func (p *pageInterpreter) operation(op Operation) error {
 		stroke := op.Operator == "S" || op.Operator == "s" || op.Operator == "B" || op.Operator == "B*" || op.Operator == "b" || op.Operator == "b*"
 		p.path.EvenOdd = op.Operator == "f*" || op.Operator == "B*" || op.Operator == "b*"
 		if (fill || stroke) && len(p.path.Segments) > 0 {
+			if err := p.validatePaint(fill, stroke); err != nil {
+				return err
+			}
 			style := p.state.style
 			if stroke {
 				m := p.state.matrix
 				sx, sy := math.Hypot(m[0], m[1]), math.Hypot(m[2], m[3])
 				if math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy) {
 					return &UnsupportedError{Feature: "anisotropic path stroke"}
-				}
-				if style.LineWidth == 0 {
-					return &UnsupportedError{Feature: "device-dependent hairline stroke"}
 				}
 				style.LineWidth *= sx
 				style.Dash = append([]float64(nil), style.Dash...)
@@ -417,8 +432,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 			cmyk = &[4]float64{v[0], v[1], v[2], v[3]}
 		}
 		if op.Operator == "G" || op.Operator == "RG" || op.Operator == "K" {
+			p.state.strokeICC = nil
 			p.state.style.Stroke.RGB = rgb
 			p.state.style.Stroke.CMYK = cmyk
+			p.state.style.Stroke.Axial = nil
 			if len(v) == 1 {
 				p.state.strokeSpace = "DeviceGray"
 			} else if cmyk != nil {
@@ -428,7 +445,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 		} else {
 			p.state.style.Fill.RGB = rgb
+			p.state.fillICC = nil
 			p.state.style.Fill.CMYK = cmyk
+			p.state.style.Fill.Axial = nil
 			if len(v) == 1 {
 				p.state.fillSpace = "DeviceGray"
 			} else if cmyk != nil {
@@ -442,30 +461,95 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("invalid color space")
 		}
 		name, ok := a[0].(Name)
-		if !ok || (name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK") {
-			return &UnsupportedError{Feature: "non-device color space"}
+		if !ok {
+			return fmt.Errorf("invalid color space name")
+		}
+		var profile *iccRGBSpace
+		if name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK" && name != "Pattern" {
+			object, err := p.resource("ColorSpace", name)
+			if err != nil {
+				return err
+			}
+			object, err = p.reader.Resolve(object)
+			if err != nil {
+				return err
+			}
+			space, ok := object.(Array)
+			if !ok || len(space) == 0 {
+				return &UnsupportedError{Feature: "non-device color space"}
+			}
+			if len(space) == 1 && space[0] == Name("Pattern") {
+				name = "Pattern"
+			} else {
+				profile, err = p.reader.readICCRGB(space)
+				if err != nil {
+					return err
+				}
+				name = "ICCBased"
+			}
 		}
 		if op.Operator == "cs" {
 			p.state.fillSpace = name
+			p.state.fillICC = profile
 			p.state.style.Fill.RGB = [3]float64{}
 			p.state.style.Fill.CMYK = nil
+			p.state.style.Fill.Axial = nil
 			if name == "DeviceCMYK" {
 				p.state.style.Fill.CMYK = &[4]float64{0, 0, 0, 1}
 			}
 		} else {
 			p.state.strokeSpace = name
+			p.state.strokeICC = profile
 			p.state.style.Stroke.RGB = [3]float64{}
 			p.state.style.Stroke.CMYK = nil
+			p.state.style.Stroke.Axial = nil
 			if name == "DeviceCMYK" {
 				p.state.style.Stroke.CMYK = &[4]float64{0, 0, 0, 1}
 			}
 		}
 	case "sc", "scn", "SC", "SCN":
 		space := p.state.fillSpace
+		profile := p.state.fillICC
 		operator := "g"
 		if op.Operator == "SC" || op.Operator == "SCN" {
 			space = p.state.strokeSpace
+			profile = p.state.strokeICC
 			operator = "G"
+		}
+		if space == "ICCBased" {
+			values, err := numbers(a, 3)
+			if err != nil {
+				return err
+			}
+			rgb, err := profile.color(values, p.state.style.RenderingIntent)
+			if err != nil {
+				return err
+			}
+			if operator == "g" {
+				p.state.style.Fill.RGB, p.state.style.Fill.CMYK = rgb, nil
+			} else {
+				p.state.style.Stroke.RGB, p.state.style.Stroke.CMYK = rgb, nil
+			}
+			return nil
+		}
+		if space == "Pattern" {
+			if len(a) != 1 {
+				return fmt.Errorf("invalid colored pattern operands")
+			}
+			name, ok := a[0].(Name)
+			if !ok {
+				return fmt.Errorf("invalid pattern name")
+			}
+			gradient, err := p.axialPattern(name)
+			if err != nil {
+				return err
+			}
+			if operator == "g" {
+				p.state.style.Fill.Axial = gradient
+			} else {
+				p.state.style.Stroke.Axial = gradient
+			}
+			return nil
 		}
 		if space == "DeviceRGB" {
 			if operator == "g" {
@@ -601,9 +685,14 @@ func (p *pageInterpreter) operation(op Operation) error {
 	case "gs":
 		return p.extState(a, op.Offset)
 	case "ri":
-		if len(a) != 1 || a[0] != Name("RelativeColorimetric") {
-			return &UnsupportedError{Feature: "rendering intent"}
+		if len(a) != 1 {
+			return fmt.Errorf("invalid rendering intent operands")
 		}
+		intent, ok := a[0].(Name)
+		if !ok || intent != "RelativeColorimetric" && intent != "AbsoluteColorimetric" && intent != "Perceptual" && intent != "Saturation" {
+			return fmt.Errorf("invalid rendering intent")
+		}
+		p.state.style.RenderingIntent = intent
 	case "i":
 		n, err := numbers(a, 1)
 		if err != nil {
@@ -626,6 +715,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 func (p *pageInterpreter) showText(data []byte) error {
 	if !p.inText || p.state.font == nil {
 		return fmt.Errorf("text without active font")
+	}
+	if err := p.validatePaint(p.state.mode == 0 || p.state.mode == 2, p.state.mode == 1 || p.state.mode == 2); err != nil {
+		return err
 	}
 	if p.state.mode == 1 || p.state.mode == 2 {
 		m := p.textMatrix
@@ -706,6 +798,11 @@ func (p *pageInterpreter) xobject(a []Object) error {
 		if p.opaqueGroup && (image.Mask != nil || image.SoftMask != nil || image.ImageMask) {
 			return &UnsupportedError{Feature: "masked image in isolated group"}
 		}
+		if image.ImageMask {
+			if err := p.validatePaint(true, false); err != nil {
+				return err
+			}
+		}
 		if p.visitor.Image == nil {
 			return fmt.Errorf("image visitor missing")
 		}
@@ -714,6 +811,26 @@ func (p *pageInterpreter) xobject(a []Object) error {
 	if stream.Dictionary["Subtype"] != Name("Form") {
 		return &UnsupportedError{Feature: "XObject subtype"}
 	}
+	return p.form(stream)
+}
+
+// validatePaint 检查实际使用的颜色状态，避免未指定图案或未支持的色彩意图被静默替换
+// 入参: fill 是否填充, stroke 是否描边
+// 返回: error 颜色状态错误
+func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
+	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil {
+		return fmt.Errorf("missing pattern color")
+	}
+	if p.state.style.RenderingIntent == "AbsoluteColorimetric" && (fill && p.state.fillICC != nil || stroke && p.state.strokeICC != nil) {
+		return &UnsupportedError{Feature: "absolute colorimetric ICC transform"}
+	}
+	return nil
+}
+
+// form 在独立图形状态中解释表单内容及透明度组
+// 入参: stream 表单内容流
+// 返回: error 解析或访问错误
+func (p *pageInterpreter) form(stream *Stream) error {
 	if p.depth >= 32 {
 		return fmt.Errorf("form recursion limit exceeded")
 	}
@@ -723,18 +840,27 @@ func (p *pageInterpreter) xobject(a []Object) error {
 		}
 	}
 	child := *p
+	var groupMark *GroupMark
 	if stream.Dictionary["Group"] != nil {
 		value, err := p.reader.Resolve(stream.Dictionary["Group"])
 		if err != nil {
 			return err
 		}
 		group, ok := value.(Dictionary)
-		if !ok || group["S"] != Name("Transparency") || group["I"] != Boolean(true) || group["K"] != nil && group["K"] != Boolean(false) || group["CS"] != nil && group["CS"] != Name("DeviceRGB") {
+		if !ok || group["S"] != Name("Transparency") || group["I"] != nil && group["I"] != Boolean(true) && group["I"] != Boolean(false) || group["K"] != nil && group["K"] != Boolean(false) {
 			return &UnsupportedError{Feature: "form transparency group"}
 		}
-		if p.state.style.Fill.Alpha != 1 || p.state.style.Stroke.Alpha != 1 {
-			return &UnsupportedError{Feature: "transparent form group boundary"}
+		if group["CS"] != nil && !(p.maskGroup && group["CS"] == Name("DeviceGray")) {
+			if err := p.reader.validateRGBGroupSpace(group["CS"]); err != nil {
+				return err
+			}
 		}
+		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, Isolated: group["I"] == Boolean(true), SoftMask: p.state.style.SoftMask}
+		if p.visitor.Group == nil && (groupMark.Alpha != 1 || !groupMark.Isolated || groupMark.SoftMask != nil) {
+			return &UnsupportedError{Feature: "transparency group visitor missing"}
+		}
+		child.state.style.Fill.Alpha, child.state.style.Stroke.Alpha = 1, 1
+		child.state.style.SoftMask = nil
 		child.opaqueGroup = true
 	}
 	child.depth++
@@ -776,9 +902,17 @@ func (p *pageInterpreter) xobject(a []Object) error {
 	m := child.state.matrix
 	clip := Path{Segments: []Segment{{"M", []Point{m.Apply(Point{box.XMin, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMax})}}, {"L", []Point{m.Apply(Point{box.XMin, box.YMax})}}, {"C", nil}}}
 	child.state.style.Clips = append(append([]Path(nil), child.state.style.Clips...), clip)
+	child.patternMatrix = child.state.matrix
 	data, err := stream.Decode()
 	if err != nil {
 		return err
+	}
+	if groupMark != nil && p.visitor.Group != nil {
+		return p.visitor.Group(*groupMark, func(visitor Visitor) error {
+			group := child
+			group.visitor = visitor
+			return group.run(data)
+		})
 	}
 	return child.run(data)
 }
@@ -826,6 +960,10 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 		}
 		switch key {
 		case "Type":
+		case "RI":
+			if err := p.operation(Operation{Operator: "ri", Operands: []Object{value}}); err != nil {
+				return err
+			}
 		case "ca", "CA":
 			n, err := numbers([]Object{value}, 1)
 			if err != nil {
@@ -852,8 +990,14 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				return &UnsupportedError{Feature: "blend mode"}
 			}
 		case "SMask":
-			if value != Name("None") {
-				return &UnsupportedError{Feature: "soft mask graphics state"}
+			if value == Name("None") {
+				p.state.style.SoftMask = nil
+			} else {
+				mask, err := p.readSoftMask(value)
+				if err != nil {
+					return err
+				}
+				p.state.style.SoftMask = mask
 			}
 		case "AIS":
 			if value != Boolean(false) {
