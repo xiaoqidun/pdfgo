@@ -350,7 +350,13 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			break
 		}
 	}
-	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 {
+	if len(font.Program) >= 4 && font.Program[0] == 1 && font.Program[1] == 0 && font.Program[2] >= 4 && font.Program[3] >= 1 && font.Program[3] <= 4 {
+		font.ProgramType = "Type1C"
+		if font.composite {
+			font.ProgramType = "CIDFontType0C"
+		}
+	}
+	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && font.ProgramType != "Type1C" {
 		font.simpleCmap, font.symbolCmap, err = fontCmap(font.Program, font.symbolic)
 		if err != nil {
 			return nil, err
@@ -360,7 +366,8 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "StandardEncoding" {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
-		font.cffGlyphs, font.cffNames, err = cffFontMapping(font.Program, font.composite, font.encoding, font.differences)
+		identity := font.composite && metrics["Subtype"] == Name("CIDFontType2") && font.glyphMap == nil
+		font.cffGlyphs, font.cffNames, err = cffFontMapping(font.Program, font.composite, font.encoding, font.differences, identity)
 		if err != nil {
 			return nil, err
 		}

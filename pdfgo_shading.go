@@ -32,6 +32,14 @@ type AxialGradient struct {
 	Stops      []GradientStop
 }
 
+// RadialGradient 保存页面坐标中的双圆径向渐变及两端延伸方式
+type RadialGradient struct {
+	Start, End             Point
+	StartRadius, EndRadius float64
+	Extend                 [2]bool
+	Stops                  []GradientStop
+}
+
 // numberArray 解析指定长度的数值数组
 // 入参: object 数组或引用, count 数组长度
 // 返回: []float64 数值, error 解析错误
@@ -47,102 +55,129 @@ func (r *Reader) numberArray(object Object, count int) ([]float64, error) {
 	return numbers(a, count)
 }
 
-// axialPattern 解析着色图案中的轴向线性渐变
+// shadingPattern 解析着色图案中的轴向或径向渐变
 // 入参: name 图案资源名
-// 返回: *AxialGradient 渐变信息, error 不支持的图案或解析错误
-func (p *pageInterpreter) axialPattern(name Name) (*AxialGradient, error) {
+// 返回: Paint 渐变画刷, error 不支持的图案或解析错误
+func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	object, err := p.resource("Pattern", name)
 	if err != nil {
-		return nil, err
+		return Paint{}, err
 	}
 	v, err := p.reader.Resolve(object)
 	if err != nil {
-		return nil, err
+		return Paint{}, err
 	}
 	dict, ok := v.(Dictionary)
 	if !ok || dict["PatternType"] != Integer(2) || dict["ExtGState"] != nil {
-		return nil, &UnsupportedError{Feature: "shading pattern type or graphics state"}
+		return Paint{}, &UnsupportedError{Feature: "shading pattern type or graphics state"}
 	}
 	m := p.patternMatrix
 	if dict["Matrix"] != nil {
 		v, err := p.reader.numberArray(dict["Matrix"], 6)
 		if err != nil {
-			return nil, err
+			return Paint{}, err
 		}
 		m = m.Mul(Matrix(v))
 	}
 	sx, sy := math.Hypot(m[0], m[1]), math.Hypot(m[2], m[3])
 	if sx == 0 || math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy) {
-		return nil, &UnsupportedError{Feature: "anisotropic axial shading pattern"}
+		return Paint{}, &UnsupportedError{Feature: "anisotropic shading pattern"}
 	}
 	v, err = p.reader.Resolve(dict["Shading"])
 	if err != nil {
-		return nil, err
+		return Paint{}, err
 	}
 	shading, ok := v.(Dictionary)
-	if !ok || shading["ShadingType"] != Integer(2) || shading["Background"] != nil || shading["BBox"] != nil {
-		return nil, &UnsupportedError{Feature: "axial shading dictionary"}
+	if !ok || shading["Background"] != nil || shading["BBox"] != nil {
+		return Paint{}, &UnsupportedError{Feature: "shading dictionary"}
 	}
 	if shading["Domain"] != nil {
 		d, err := p.reader.numberArray(shading["Domain"], 2)
 		if err != nil {
-			return nil, err
+			return Paint{}, err
 		}
 		if d[0] != 0 || d[1] != 1 {
-			return nil, &UnsupportedError{Feature: "shading domain"}
+			return Paint{}, &UnsupportedError{Feature: "shading domain"}
 		}
 	}
-	coords, err := p.reader.numberArray(shading["Coords"], 4)
+	count := 4
+	if shading["ShadingType"] == Integer(3) {
+		count = 6
+	} else if shading["ShadingType"] != Integer(2) {
+		return Paint{}, &UnsupportedError{Feature: "shading type"}
+	}
+	coords, err := p.reader.numberArray(shading["Coords"], count)
 	if err != nil {
-		return nil, err
+		return Paint{}, err
 	}
-	start, end := Point{coords[0], coords[1]}, Point{coords[2], coords[3]}
-	if start == end {
-		return nil, fmt.Errorf("degenerate shading axis")
+	start := Point{coords[0], coords[1]}
+	if count == 6 {
+		if coords[2] < 0 || coords[5] <= 0 {
+			return Paint{}, &UnsupportedError{Feature: "radial shading radius"}
+		}
 	}
-	gradient := &AxialGradient{Start: m.Apply(start), End: m.Apply(end)}
+	paint := Paint{}
+	if count == 4 {
+		end := Point{coords[2], coords[3]}
+		if start == end {
+			return Paint{}, fmt.Errorf("degenerate shading axis")
+		}
+		paint.Axial = &AxialGradient{Start: m.Apply(start), End: m.Apply(end)}
+	} else {
+		end := Point{coords[3], coords[4]}
+		paint.Radial = &RadialGradient{Start: m.Apply(start), End: m.Apply(end), StartRadius: coords[2] * sx, EndRadius: coords[5] * sx}
+	}
 	if shading["Extend"] != nil {
 		v, err := p.reader.Resolve(shading["Extend"])
 		if err != nil {
-			return nil, err
+			return Paint{}, err
 		}
 		a, ok := v.(Array)
 		if !ok || len(a) != 2 {
-			return nil, fmt.Errorf("invalid shading extension")
+			return Paint{}, fmt.Errorf("invalid shading extension")
 		}
 		for i, v := range a {
 			b, ok := v.(Boolean)
 			if !ok {
-				return nil, fmt.Errorf("invalid shading extension")
+				return Paint{}, fmt.Errorf("invalid shading extension")
 			}
-			gradient.Extend[i] = bool(b)
+			if paint.Axial != nil {
+				paint.Axial.Extend[i] = bool(b)
+			} else {
+				paint.Radial.Extend[i] = bool(b)
+			}
 		}
 	}
-	gradient.Stops, err = p.reader.linearGradientStops(shading["Function"], 0)
+	stops, err := p.reader.linearGradientStops(shading["Function"], 0)
 	if err != nil {
-		return nil, err
+		return Paint{}, err
 	}
 	space, err := p.reader.Resolve(shading["ColorSpace"])
 	if err != nil {
-		return nil, err
+		return Paint{}, err
 	}
 	if space != Name("DeviceRGB") {
 		if err := p.reader.validateRGBGroupSpace(space); err != nil {
-			return nil, err
+			return Paint{}, err
 		}
 		profile, err := p.reader.readICCRGB(space.(Array))
 		if err != nil {
-			return nil, err
+			return Paint{}, err
 		}
-		for i := range gradient.Stops {
-			stop := &gradient.Stops[i]
+		for i := range stops {
+			stop := &stops[i]
 			stop.RGB, err = profile.color(stop.RGB[:], p.state.style.RenderingIntent)
 			if err != nil {
-				return nil, err
+				return Paint{}, err
 			}
 		}
 	}
-	return gradient, nil
+	if paint.Axial != nil {
+		paint.Axial.Stops = stops
+	} else {
+		paint.Radial.Stops = stops
+	}
+	return paint, nil
 }
 
 // linearGradientStops 解析线性指数函数及线性拼接函数
@@ -210,8 +245,11 @@ func (r *Reader) linearGradientStops(object Object, depth int) ([]GradientStop, 
 		points := append(append([]float64{0}, bounds...), 1)
 		var stops []GradientStop
 		for i, function := range functions {
-			if points[i] >= points[i+1] || encode[i*2] != 0 || encode[i*2+1] != 1 {
+			if points[i] > points[i+1] || encode[i*2] != 0 || encode[i*2+1] != 1 {
 				return nil, &UnsupportedError{Feature: "gradient stitching bounds or encoding"}
+			}
+			if points[i] == points[i+1] {
+				continue
 			}
 			part, err := r.linearGradientStops(function, depth+1)
 			if err != nil {

@@ -154,9 +154,9 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 }
 
 // cffFontMapping 读取CID或内置字符编码到字形编号的映射，不重新解释轮廓
-// 入参: data CFF数据, composite 是否为CID字体, encoding PDF基础编码, differences PDF编码差异
+// 入参: data CFF数据, composite 是否为复合字体, encoding PDF基础编码, differences PDF编码差异, identity 是否允许非CID字形身份映射
 // 返回: map[uint32]uint16 字符码或CID到字形编号的映射, map[uint32]string 可用字形名称, error 错误信息
-func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string) (map[uint32]uint16, map[uint32]string, error) {
+func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool) (map[uint32]uint16, map[uint32]string, error) {
 	if len(data) < 4 || data[0] != 1 || data[2] < 4 {
 		return nil, nil, fmt.Errorf("invalid CFF header")
 	}
@@ -202,6 +202,13 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 	}
 	if len(chars) == 0 {
 		return nil, nil, fmt.Errorf("empty CFF charstrings")
+	}
+	if composite && identity && len(dict[1230]) == 0 {
+		glyphs := make(map[uint32]uint16, len(chars))
+		for gid := range chars {
+			glyphs[uint32(gid)] = uint16(gid)
+		}
+		return glyphs, nil, nil
 	}
 	charsetOffset, err := offset(15, 0)
 	if err != nil {

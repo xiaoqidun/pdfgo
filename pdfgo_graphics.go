@@ -62,10 +62,11 @@ type Path struct {
 
 // Paint 保存设备颜色及不透明度，CMYK非空时保留原始四色分量
 type Paint struct {
-	RGB   [3]float64
-	CMYK  *[4]float64
-	Alpha float64
-	Axial *AxialGradient
+	RGB    [3]float64
+	CMYK   *[4]float64
+	Alpha  float64
+	Axial  *AxialGradient
+	Radial *RadialGradient
 }
 
 // Style 保存绘制状态及按顺序相交的裁剪路径
@@ -540,6 +541,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Stroke.RGB = rgb
 			p.state.style.Stroke.CMYK = cmyk
 			p.state.style.Stroke.Axial = nil
+			p.state.style.Stroke.Radial = nil
 			if len(v) == 1 {
 				p.state.strokeSpace = "DeviceGray"
 			} else if cmyk != nil {
@@ -553,6 +555,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.fillSeparation = nil
 			p.state.style.Fill.CMYK = cmyk
 			p.state.style.Fill.Axial = nil
+			p.state.style.Fill.Radial = nil
 			if len(v) == 1 {
 				p.state.fillSpace = "DeviceGray"
 			} else if cmyk != nil {
@@ -607,6 +610,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Fill.RGB = [3]float64{}
 			p.state.style.Fill.CMYK = nil
 			p.state.style.Fill.Axial = nil
+			p.state.style.Fill.Radial = nil
 			if name == "DeviceCMYK" {
 				p.state.style.Fill.CMYK = &[4]float64{0, 0, 0, 1}
 			}
@@ -617,6 +621,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Stroke.RGB = [3]float64{}
 			p.state.style.Stroke.CMYK = nil
 			p.state.style.Stroke.Axial = nil
+			p.state.style.Stroke.Radial = nil
 			if name == "DeviceCMYK" {
 				p.state.style.Stroke.CMYK = &[4]float64{0, 0, 0, 1}
 			}
@@ -678,14 +683,14 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if !ok {
 				return fmt.Errorf("invalid pattern name")
 			}
-			gradient, err := p.axialPattern(name)
+			gradient, err := p.shadingPattern(name)
 			if err != nil {
 				return err
 			}
 			if operator == "g" {
-				p.state.style.Fill.Axial = gradient
+				p.state.style.Fill.Axial, p.state.style.Fill.Radial = gradient.Axial, gradient.Radial
 			} else {
-				p.state.style.Stroke.Axial = gradient
+				p.state.style.Stroke.Axial, p.state.style.Stroke.Radial = gradient.Axial, gradient.Radial
 			}
 			return nil
 		}
@@ -950,7 +955,7 @@ func (p *pageInterpreter) xobject(a []Object) error {
 // 入参: fill 是否填充, stroke 是否描边
 // 返回: error 颜色状态错误
 func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
-	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil {
+	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil {
 		return fmt.Errorf("missing pattern color")
 	}
 	if p.state.style.RenderingIntent == "AbsoluteColorimetric" && (fill && p.state.fillICC != nil || stroke && p.state.strokeICC != nil) {
