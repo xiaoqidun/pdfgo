@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strconv"
 	"unicode/utf16"
@@ -23,6 +24,8 @@ import (
 
 // UnicodeMap 保存字符码到Unicode文本的映射，不将字符码等同于字形编号
 type UnicodeMap map[string]string
+
+var errInvalidUnicodeSurrogate = errors.New("invalid Unicode surrogate")
 
 // ParseUnicodeMap 读取ToUnicode映射中的字符与范围定义
 // 入参: data 已解码的CMap数据
@@ -128,6 +131,9 @@ func ParseUnicodeMap(data []byte) (UnicodeMap, error) {
 					}
 					value, err := unicodeBytes(target)
 					if err != nil {
+						if errors.Is(err, errInvalidUnicodeSurrogate) {
+							continue
+						}
 						return nil, err
 					}
 					key := make([]byte, len(first))
@@ -173,11 +179,11 @@ func unicodeBytes(data []byte) (string, error) {
 		v := values[n]
 		if v >= 0xD800 && v <= 0xDBFF {
 			if n+1 == len(values) || values[n+1] < 0xDC00 || values[n+1] > 0xDFFF {
-				return "", fmt.Errorf("invalid Unicode surrogate")
+				return "", errInvalidUnicodeSurrogate
 			}
 			n++
 		} else if v >= 0xDC00 && v <= 0xDFFF {
-			return "", fmt.Errorf("invalid Unicode surrogate")
+			return "", errInvalidUnicodeSurrogate
 		}
 	}
 	return string(utf16.Decode(values)), nil

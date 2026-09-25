@@ -32,6 +32,7 @@ type Font struct {
 	defaultWidth   float64
 	composite      bool
 	encoding       Name
+	cidMap         CIDMap
 	glyphMap       []byte
 	simpleCmap     []byte
 	symbolCmap     bool
@@ -87,10 +88,18 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		if err != nil {
 			return nil, err
 		}
-		if encoding != Name("Identity-H") {
-			return nil, &UnsupportedError{Feature: "composite font encoding other than Identity-H"}
+		switch encoding {
+		case Name("Identity-H"):
+			font.encoding = Name("Identity-H")
+		case Name("UniGB-UCS2-H"):
+			font.encoding = Name("UniGB-UCS2-H")
+			font.cidMap, err = loadUniGBUCS2H()
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, &UnsupportedError{Feature: fmt.Sprintf("composite font encoding %v", encoding)}
 		}
-		font.encoding = Name("Identity-H")
 		descendants, err := r.Resolve(dict["DescendantFonts"])
 		if err != nil {
 			return nil, err
@@ -109,6 +118,21 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		}
 		if metrics["Subtype"] != Name("CIDFontType2") && metrics["Subtype"] != Name("CIDFontType0") {
 			return nil, &UnsupportedError{Feature: "CID font subtype"}
+		}
+		if font.cidMap != nil {
+			value, err := r.Resolve(metrics["CIDSystemInfo"])
+			if err != nil {
+				return nil, err
+			}
+			system, ok := value.(Dictionary)
+			if !ok {
+				return nil, fmt.Errorf("invalid CID system information")
+			}
+			registry, registryOK := system["Registry"].(String)
+			ordering, orderingOK := system["Ordering"].(String)
+			if !registryOK || !orderingOK || string(registry) != "Adobe" || string(ordering) != "GB1" {
+				return nil, fmt.Errorf("UniGB-UCS2-H requires Adobe-GB1 CID collection")
+			}
 		}
 		font.defaultWidth = 1000
 		if metrics["DW"] != nil {
@@ -399,9 +423,25 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 	for n := 0; n < len(data); n += step {
 		raw := data[n : n+step]
 		code := uint32(codeNumber(raw))
+		cid := code
+		if f.cidMap != nil {
+			mapped, ok := f.cidMap[string(raw)]
+			if !ok {
+				return nil, &UnsupportedError{Feature: "character outside predefined CID mapping"}
+			}
+			cid = uint32(mapped)
+		}
 		text, ok := f.Unicode[string(raw)]
+		if !ok && f.encoding == Name("UniGB-UCS2-H") {
+			var err error
+			text, err = unicodeBytes(raw)
+			if err != nil {
+				return nil, err
+			}
+			ok = true
+		}
 		if !ok && f.cffGlyphs != nil {
-			_, ok = f.cffGlyphs[code]
+			_, ok = f.cffGlyphs[cid]
 		}
 		if !ok {
 			if f.composite {
@@ -417,9 +457,14 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 				return nil, &UnsupportedError{Feature: "unmapped simple font character"}
 			}
 		}
-		width, ok := f.widths[code]
+		width, ok := f.widths[cid]
 		if !ok {
 			width = f.defaultWidth
+			if len(f.widths) == 0 && len(f.Program) == 0 && f.Subtype == Name("Type1") {
+				if standardWidth, found := f.coreLatinWidth(code); found {
+					width = standardWidth
+				}
+			}
 		}
 		if f.Subtype == Name("Type3") {
 			width *= f.type3Matrix[0] * 1000
@@ -465,18 +510,18 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		}
 		if f.composite {
 			glyph.HasID = true
-			glyph.ID = uint16(code)
+			glyph.ID = uint16(cid)
 			if f.glyphMap != nil {
-				if int(code)*2+1 >= len(f.glyphMap) {
+				if int(cid)*2+1 >= len(f.glyphMap) {
 					glyph.ID = 0
 				} else {
-					glyph.ID = uint16(f.glyphMap[code*2])<<8 | uint16(f.glyphMap[code*2+1])
+					glyph.ID = uint16(f.glyphMap[cid*2])<<8 | uint16(f.glyphMap[cid*2+1])
 				}
 			}
 		}
 		if f.cffGlyphs != nil {
-			glyph.ID, glyph.HasID = f.cffGlyphs[code]
-			glyph.Name = f.cffNames[code]
+			glyph.ID, glyph.HasID = f.cffGlyphs[cid]
+			glyph.Name = f.cffNames[cid]
 			if !glyph.HasID {
 				return nil, fmt.Errorf("missing CFF glyph for code %d", code)
 			}
@@ -484,4 +529,28 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		glyphs = append(glyphs, glyph)
 	}
 	return glyphs, nil
+}
+
+// coreLatinWidth读取标准西文字体的内建宽度
+func (f *Font) coreLatinWidth(code uint32) (float64, bool) {
+	widths, ok := pdfCoreLatinWidths[f.Name]
+	if !ok || code > 255 {
+		return 0, false
+	}
+	name := f.differences[code]
+	if name == "" {
+		encoding := pdfStandardNames
+		switch f.encoding {
+		case Name("WinAnsiEncoding"):
+			encoding = pdfWinAnsiNames
+		case Name("MacRomanEncoding"):
+			encoding = pdfMacRomanNames
+		case "", Name("StandardEncoding"):
+		default:
+			return 0, false
+		}
+		name = encoding[code]
+	}
+	width, ok := widths[name]
+	return float64(width), ok
 }

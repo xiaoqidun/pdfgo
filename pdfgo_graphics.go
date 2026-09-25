@@ -67,6 +67,7 @@ type Paint struct {
 	Alpha  float64
 	Axial  *AxialGradient
 	Radial *RadialGradient
+	Tiling *TilingPattern
 }
 
 // Style 保存绘制状态及按顺序相交的裁剪路径
@@ -146,6 +147,7 @@ type graphicsState struct {
 	fontSize, spacing, wordSpacing, hscale, leading, rise float64
 	mode                                                  int
 	fillSpace, strokeSpace                                Name
+	fillPatternBase, strokePatternBase                    Name
 	fillICC, strokeICC                                    *iccRGBSpace
 	fillSeparation, strokeSeparation                      *separationSpace
 }
@@ -170,6 +172,7 @@ type pageInterpreter struct {
 	opaqueGroup            bool
 	maskGroup              bool
 	patternMatrix          Matrix
+	uncoloredPattern       bool
 	type3                  bool
 }
 
@@ -355,6 +358,12 @@ func numbers(operands []Object, count int) ([]float64, error) {
 // 返回: error 错误信息
 func (p *pageInterpreter) operation(op Operation) error {
 	a := op.Operands
+	if p.uncoloredPattern {
+		switch op.Operator {
+		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN":
+			return fmt.Errorf("color operator in uncolored pattern")
+		}
+	}
 	count := map[string]int{"q": 0, "Q": 0, "cm": 6, "w": 1, "J": 1, "j": 1, "M": 1, "m": 2, "l": 2, "c": 6, "v": 4, "y": 4, "h": 0, "re": 4, "S": 0, "s": 0, "f": 0, "F": 0, "f*": 0, "B": 0, "B*": 0, "b": 0, "b*": 0, "n": 0, "W": 0, "W*": 0, "g": 1, "G": 1, "rg": 3, "RG": 3, "k": 4, "K": 4, "BT": 0, "ET": 0, "Tc": 1, "Tw": 1, "Tz": 1, "TL": 1, "Tr": 1, "Ts": 1, "Td": 2, "TD": 2, "Tm": 6, "T*": 0, "d0": 2, "d1": 6}
 	var v []float64
 	if n, ok := count[op.Operator]; ok {
@@ -542,6 +551,8 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Stroke.CMYK = cmyk
 			p.state.style.Stroke.Axial = nil
 			p.state.style.Stroke.Radial = nil
+			p.state.style.Stroke.Tiling = nil
+			p.state.strokePatternBase = ""
 			if len(v) == 1 {
 				p.state.strokeSpace = "DeviceGray"
 			} else if cmyk != nil {
@@ -556,6 +567,8 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Fill.CMYK = cmyk
 			p.state.style.Fill.Axial = nil
 			p.state.style.Fill.Radial = nil
+			p.state.style.Fill.Tiling = nil
+			p.state.fillPatternBase = ""
 			if len(v) == 1 {
 				p.state.fillSpace = "DeviceGray"
 			} else if cmyk != nil {
@@ -574,6 +587,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 		var profile *iccRGBSpace
 		var separation *separationSpace
+		var patternBase Name
 		if name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK" && name != "Pattern" {
 			object, err := p.resource("ColorSpace", name)
 			if err != nil {
@@ -588,6 +602,12 @@ func (p *pageInterpreter) operation(op Operation) error {
 				return &UnsupportedError{Feature: "non-device color space"}
 			}
 			if len(space) == 1 && space[0] == Name("Pattern") {
+				name = "Pattern"
+			} else if len(space) == 2 && space[0] == Name("Pattern") {
+				patternBase, ok = space[1].(Name)
+				if !ok || patternBase != "DeviceGray" && patternBase != "DeviceRGB" && patternBase != "DeviceCMYK" {
+					return &UnsupportedError{Feature: "uncolored pattern base color space"}
+				}
 				name = "Pattern"
 			} else if space[0] == Name("Separation") {
 				separation, err = p.reader.readSeparation(space)
@@ -605,34 +625,40 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 		if op.Operator == "cs" {
 			p.state.fillSpace = name
+			p.state.fillPatternBase = patternBase
 			p.state.fillICC = profile
 			p.state.fillSeparation = separation
 			p.state.style.Fill.RGB = [3]float64{}
 			p.state.style.Fill.CMYK = nil
 			p.state.style.Fill.Axial = nil
 			p.state.style.Fill.Radial = nil
+			p.state.style.Fill.Tiling = nil
 			if name == "DeviceCMYK" {
 				p.state.style.Fill.CMYK = &[4]float64{0, 0, 0, 1}
 			}
 		} else {
 			p.state.strokeSpace = name
+			p.state.strokePatternBase = patternBase
 			p.state.strokeICC = profile
 			p.state.strokeSeparation = separation
 			p.state.style.Stroke.RGB = [3]float64{}
 			p.state.style.Stroke.CMYK = nil
 			p.state.style.Stroke.Axial = nil
 			p.state.style.Stroke.Radial = nil
+			p.state.style.Stroke.Tiling = nil
 			if name == "DeviceCMYK" {
 				p.state.style.Stroke.CMYK = &[4]float64{0, 0, 0, 1}
 			}
 		}
 	case "sc", "scn", "SC", "SCN":
 		space := p.state.fillSpace
+		patternBase := p.state.fillPatternBase
 		profile := p.state.fillICC
 		separation := p.state.fillSeparation
 		operator := "g"
 		if op.Operator == "SC" || op.Operator == "SCN" {
 			space = p.state.strokeSpace
+			patternBase = p.state.strokePatternBase
 			profile = p.state.strokeICC
 			separation = p.state.strokeSeparation
 			operator = "G"
@@ -676,12 +702,42 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return nil
 		}
 		if space == "Pattern" {
-			if len(a) != 1 {
-				return fmt.Errorf("invalid colored pattern operands")
+			if len(a) == 0 {
+				return fmt.Errorf("missing pattern name")
 			}
-			name, ok := a[0].(Name)
+			name, ok := a[len(a)-1].(Name)
 			if !ok {
 				return fmt.Errorf("invalid pattern name")
+			}
+			paint := p.state.style.Fill
+			if operator == "G" {
+				paint = p.state.style.Stroke
+			}
+			if patternBase != "" {
+				if err := patternBaseColor(&paint, patternBase, a[:len(a)-1]); err != nil {
+					return err
+				}
+			} else if len(a) != 1 {
+				return fmt.Errorf("invalid colored pattern operands")
+			}
+			pattern, err := p.tilingPattern(name)
+			if err != nil {
+				return err
+			}
+			if pattern != nil {
+				if pattern.PaintType == 2 && patternBase == "" || pattern.PaintType == 1 && patternBase != "" {
+					return fmt.Errorf("pattern paint type does not match color space")
+				}
+				paint.Tiling, paint.Axial, paint.Radial = pattern, nil, nil
+				if operator == "g" {
+					p.state.style.Fill = paint
+				} else {
+					p.state.style.Stroke = paint
+				}
+				return nil
+			}
+			if patternBase != "" {
+				return fmt.Errorf("shading pattern cannot use a base color space")
 			}
 			gradient, err := p.shadingPattern(name)
 			if err != nil {
@@ -689,8 +745,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 			if operator == "g" {
 				p.state.style.Fill.Axial, p.state.style.Fill.Radial = gradient.Axial, gradient.Radial
+				p.state.style.Fill.Tiling = nil
 			} else {
 				p.state.style.Stroke.Axial, p.state.style.Stroke.Radial = gradient.Axial, gradient.Radial
+				p.state.style.Stroke.Tiling = nil
 			}
 			return nil
 		}
@@ -955,7 +1013,7 @@ func (p *pageInterpreter) xobject(a []Object) error {
 // 入参: fill 是否填充, stroke 是否描边
 // 返回: error 颜色状态错误
 func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
-	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil {
+	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil && p.state.style.Fill.Tiling == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil && p.state.style.Stroke.Tiling == nil {
 		return fmt.Errorf("missing pattern color")
 	}
 	if p.state.style.RenderingIntent == "AbsoluteColorimetric" && (fill && p.state.fillICC != nil || stroke && p.state.strokeICC != nil) {
@@ -1124,7 +1182,7 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				return err
 			}
 		case "BM":
-			if value != Name("Normal") && value != Name("Compatible") && value != Name("Multiply") {
+			if value != Name("Normal") && value != Name("Compatible") && value != Name("Multiply") && value != Name("Darken") {
 				return &UnsupportedError{Feature: "blend mode"}
 			}
 			p.state.style.BlendMode = value.(Name)
