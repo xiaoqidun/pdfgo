@@ -14,7 +14,77 @@
 
 package pdfgo
 
-import "strings"
+import (
+	_ "embed"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+//go:embed assets/glyph/glyphlist.txt
+var adobeGlyphList []byte
+
+var adobeGlyphNames = sync.OnceValue(func() map[string]string {
+	names := make(map[string]string)
+	for _, line := range strings.Split(string(adobeGlyphList), "\n") {
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		name, codes, ok := strings.Cut(line, ";")
+		if !ok {
+			continue
+		}
+		var value strings.Builder
+		for _, code := range strings.Fields(codes) {
+			n, err := strconv.ParseUint(code, 16, 32)
+			if err != nil {
+				continue
+			}
+			value.WriteRune(rune(n))
+		}
+		names[name] = value.String()
+	}
+	return names
+})
+
+// glyphNameUnicode 按Adobe字形名称规则取得Unicode文本
+// 入参: name 字形名称
+// 返回: string Unicode文本, bool 是否有明确映射
+func glyphNameUnicode(name string) (string, bool) {
+	name, _, _ = strings.Cut(name, ".")
+	if value, ok := adobeGlyphNames()[name]; ok {
+		return value, true
+	}
+	if strings.Contains(name, "_") {
+		var value strings.Builder
+		for _, part := range strings.Split(name, "_") {
+			text, ok := glyphNameUnicode(part)
+			if !ok {
+				return "", false
+			}
+			value.WriteString(text)
+		}
+		return value.String(), true
+	}
+	if strings.HasPrefix(name, "uni") && len(name) > 3 && (len(name)-3)%4 == 0 {
+		var value strings.Builder
+		for i := 3; i < len(name); i += 4 {
+			n, err := strconv.ParseUint(name[i:i+4], 16, 16)
+			if err != nil || n >= 0xD800 && n <= 0xDFFF {
+				return "", false
+			}
+			value.WriteRune(rune(n))
+		}
+		return value.String(), true
+	}
+	if strings.HasPrefix(name, "u") && len(name) >= 5 && len(name) <= 7 {
+		n, err := strconv.ParseUint(name[1:], 16, 32)
+		if err == nil && n <= 0x10FFFF && (n < 0xD800 || n > 0xDFFF) {
+			return string(rune(n)), true
+		}
+	}
+	return "", false
+}
 
 // pdfWinAnsiNames 保存PDF标准简单字体编码的字形名称
 var pdfWinAnsiNames = strings.Fields(`

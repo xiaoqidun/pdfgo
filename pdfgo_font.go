@@ -440,6 +440,27 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			}
 			ok = true
 		}
+		if !ok && !f.composite {
+			name := f.differences[code]
+			if name == "" {
+				encoding := pdfStandardNames
+				switch f.encoding {
+				case Name("WinAnsiEncoding"):
+					encoding = pdfWinAnsiNames
+				case Name("MacRomanEncoding"):
+					encoding = pdfMacRomanNames
+				case "", Name("StandardEncoding"):
+				default:
+					encoding = nil
+				}
+				if int(code) < len(encoding) {
+					name = encoding[code]
+				}
+			}
+			if name != "" && name != ".notdef" {
+				text, ok = glyphNameUnicode(name)
+			}
+		}
 		if !ok && f.cffGlyphs != nil {
 			_, ok = f.cffGlyphs[cid]
 		}
