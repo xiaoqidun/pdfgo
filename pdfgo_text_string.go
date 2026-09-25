@@ -32,9 +32,9 @@ var pdfDocCharacters = map[byte]rune{
 	0x9e: 0x017e, 0x9f: 0, 0xa0: 0x20ac,
 }
 
-// DecodeTextString按照PDF文本串编码读取Unicode文字
+// DecodeTextString 按照PDF文本串编码读取Unicode文字
 // 入参: value PDF字符串
-// 返回: string Unicode文字, error无效编码
+// 返回: string Unicode文字, error 无效编码
 func DecodeTextString(value String) (string, error) {
 	data := []byte(value)
 	if bytes.HasPrefix(data, []byte{0xfe, 0xff}) {
