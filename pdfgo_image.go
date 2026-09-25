@@ -171,7 +171,7 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 
 // DecodeImage 应用Decode映射及颜色空间变换，合成同尺寸遮罩后返回非预乘透明图像
 // 模板图像返回映射后的灰度样本，当前填充色由页面使用方应用
-// 不支持的色彩管理、遮罩重采样和预混合底色返回明确错误
+// 不支持的色彩管理和遮罩重采样返回明确错误
 // 返回: image.Image 解码图像, error 错误信息
 func (i *Image) DecodeImage() (image.Image, error) {
 	palette, err := i.palette()
@@ -237,10 +237,8 @@ func (i *Image) DecodeImage() (image.Image, error) {
 	if components == 0 {
 		return nil, &UnsupportedError{Feature: "image color space"}
 	}
-	for _, key := range []Name{"SMaskInData", "Matte"} {
-		if i.Stream.Dictionary[key] != nil {
-			return nil, &UnsupportedError{Feature: fmt.Sprintf("image field %q", key)}
-		}
+	if i.Stream.Dictionary["SMaskInData"] != nil {
+		return nil, &UnsupportedError{Feature: "image field SMaskInData"}
 	}
 	if intent := i.Stream.Dictionary["Intent"]; intent != nil && intent != Name("Perceptual") && intent != Name("RelativeColorimetric") {
 		return nil, &UnsupportedError{Feature: "image rendering intent"}
@@ -268,7 +266,7 @@ func (i *Image) DecodeImage() (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	mask, keys, inverted, err := i.decodeMask(components)
+	mask, keys, inverted, matte, err := i.decodeMask(components)
 	if err != nil {
 		return nil, err
 	}
@@ -277,6 +275,14 @@ func (i *Image) DecodeImage() (image.Image, error) {
 	maximum := float64((uint32(1) << i.BitsPerComponent) - 1)
 	for y := 0; y < i.Height; y++ {
 		for x := 0; x < i.Width; x++ {
+			alpha := uint16(65535)
+			if mask != nil {
+				value, _, _, _ := mask.At(x, y).RGBA()
+				if inverted {
+					value = 65535 - value
+				}
+				alpha = uint16(value)
+			}
 			r, g, b, _ := samples.At(x, y).RGBA()
 			values := [4]float64{float64(r) / 65535, float64(g) / 65535, float64(b) / 65535}
 			if components == 4 {
@@ -295,6 +301,13 @@ func (i *Image) DecodeImage() (image.Image, error) {
 				values[c] = ranges[c*2] + values[c]*(ranges[c*2+1]-ranges[c*2])
 				if palette == nil {
 					values[c] = math.Max(0, math.Min(1, values[c]))
+				}
+				if len(matte) != 0 {
+					if alpha == 0 {
+						values[c] = matte[c]
+					} else {
+						values[c] = math.Max(0, math.Min(1, matte[c]+(values[c]-matte[c])*65535/float64(alpha)))
+					}
 				}
 			}
 			if components == 1 {
@@ -338,11 +351,7 @@ func (i *Image) DecodeImage() (image.Image, error) {
 				pixel.A = 0
 			}
 			if mask != nil {
-				alpha, _, _, _ := mask.At(x, y).RGBA()
-				if inverted {
-					alpha = 65535 - alpha
-				}
-				pixel.A = uint16(alpha)
+				pixel.A = alpha
 			}
 			out.SetNRGBA64(x, y, pixel)
 		}
@@ -430,56 +439,77 @@ func (i *Image) palette() ([]color.NRGBA64, error) {
 
 // decodeMask 读取有效遮罩，软遮罩优先于显式遮罩和色键遮罩
 // 入参: components 原始图像分量数
-// 返回: image.Image 遮罩图像, []float64 色键范围, bool 是否反转遮罩灰度, error 错误信息
-func (i *Image) decodeMask(components int) (image.Image, []float64, bool, error) {
+// 返回: image.Image 遮罩图像, []float64 色键范围, bool 是否反转遮罩灰度, []float64 预混合底色, error 错误信息
+func (i *Image) decodeMask(components int) (image.Image, []float64, bool, []float64, error) {
 	object, err := i.reader.Resolve(i.SoftMask)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, false, nil, err
 	}
 	soft := object != nil && object != Name("None")
 	if !soft {
 		object, err = i.reader.Resolve(i.Mask)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, false, nil, err
 		}
 	}
 	if object == nil {
-		return nil, nil, false, nil
+		return nil, nil, false, nil, nil
 	}
 	if i.ImageMask {
-		return nil, nil, false, fmt.Errorf("stencil image cannot have a mask")
+		return nil, nil, false, nil, fmt.Errorf("stencil image cannot have a mask")
 	}
 	if keys, ok := object.(Array); ok && !soft {
 		if len(keys) != components*2 {
-			return nil, nil, false, fmt.Errorf("invalid color key mask")
+			return nil, nil, false, nil, fmt.Errorf("invalid color key mask")
 		}
 		values := make([]float64, len(keys))
 		maximum := (int64(1) << i.BitsPerComponent) - 1
 		for n, key := range keys {
 			value, err := i.reader.Resolve(key)
 			if err != nil {
-				return nil, nil, false, err
+				return nil, nil, false, nil, err
 			}
 			v, ok := value.(Integer)
 			if !ok || v < 0 || int64(v) > maximum || n%2 == 1 && float64(v) < values[n-1] {
-				return nil, nil, false, fmt.Errorf("invalid color key range")
+				return nil, nil, false, nil, fmt.Errorf("invalid color key range")
 			}
 			values[n] = float64(v)
 		}
-		return nil, values, false, nil
+		return nil, values, false, nil, nil
 	}
 	mask, err := i.reader.ReadImage(object)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, false, nil, err
 	}
 	if mask.Mask != nil || mask.SoftMask != nil || soft && (mask.ImageMask || mask.ColorSpace != Name("DeviceGray")) || !soft && !mask.ImageMask {
-		return nil, nil, false, fmt.Errorf("invalid image mask dictionary")
+		return nil, nil, false, nil, fmt.Errorf("invalid image mask dictionary")
 	}
 	if mask.Width != i.Width || mask.Height != i.Height {
-		return nil, nil, false, &UnsupportedError{Feature: "image mask resampling"}
+		return nil, nil, false, nil, &UnsupportedError{Feature: "image mask resampling"}
+	}
+	var matte []float64
+	if value := mask.Stream.Dictionary["Matte"]; value != nil {
+		if !soft {
+			return nil, nil, false, nil, fmt.Errorf("invalid image Matte array")
+		}
+		resolved, err := i.reader.Resolve(value)
+		if err != nil {
+			return nil, nil, false, nil, err
+		}
+		array, ok := resolved.(Array)
+		if !ok || len(array) != components {
+			return nil, nil, false, nil, fmt.Errorf("invalid image Matte array")
+		}
+		matte = make([]float64, len(array))
+		for index, component := range array {
+			matte[index], err = i.reader.number(component)
+			if err != nil || math.IsNaN(matte[index]) || math.IsInf(matte[index], 0) {
+				return nil, nil, false, nil, fmt.Errorf("invalid image Matte value")
+			}
+		}
 	}
 	decoded, err := mask.DecodeImage()
-	return decoded, nil, !soft, err
+	return decoded, nil, !soft, matte, err
 }
 
 // DecodeSamples 解码原始图像样本，不应用Decode数组、遮罩或色彩管理
