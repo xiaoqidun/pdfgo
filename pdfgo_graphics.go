@@ -48,6 +48,22 @@ func (m Matrix) Apply(p Point) Point {
 	return Point{m[0]*p.X + m[2]*p.Y + m[4], m[1]*p.X + m[3]*p.Y + m[5]}
 }
 
+// Inverse 返回可逆仿射矩阵的逆变换
+// 返回: Matrix 逆矩阵, bool 是否存在有限逆矩阵
+func (m Matrix) Inverse() (Matrix, bool) {
+	d := m[0]*m[3] - m[1]*m[2]
+	if d == 0 {
+		return Matrix{}, false
+	}
+	n := Matrix{m[3] / d, -m[1] / d, -m[2] / d, m[0] / d, (m[2]*m[5] - m[3]*m[4]) / d, (m[1]*m[4] - m[0]*m[5]) / d}
+	for _, v := range n {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return Matrix{}, false
+		}
+	}
+	return n, true
+}
+
 // Segment 保存直线、三次曲线或闭合路径，坐标已变换到页面用户空间
 type Segment struct {
 	Operator string
@@ -99,11 +115,13 @@ type Style struct {
 	Smoothness      *float64
 }
 
-// PathMark 表示一次路径绘制
+// PathMark 表示一次路径绘制，路径及裁剪坐标始终位于页面用户空间
+// StrokeMatrix非零时保留非等比描边变换，线宽及虚线参数属于其逆变换后的坐标空间
 type PathMark struct {
 	Path         Path
 	Style        Style
 	Fill, Stroke bool
+	StrokeMatrix Matrix
 }
 
 // TextMark 保存文字字形及其相对于文字矩阵的基线位置
@@ -525,23 +543,28 @@ func (p *pageInterpreter) operation(op Operation) error {
 				return err
 			}
 			style := p.state.style
+			var strokeMatrix Matrix
 			if stroke {
 				m := p.state.matrix
 				sx, sy := math.Hypot(m[0], m[1]), math.Hypot(m[2], m[3])
 				if math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy) {
-					return &UnsupportedError{Feature: "anisotropic path stroke"}
+					strokeMatrix = Matrix{m[0], m[1], m[2], m[3], 0, 0}
+					if _, ok := strokeMatrix.Inverse(); !ok {
+						return &UnsupportedError{Feature: "singular path stroke"}
+					}
+				} else {
+					style.LineWidth *= sx
+					style.Dash = append([]float64(nil), style.Dash...)
+					for n := range style.Dash {
+						style.Dash[n] *= sx
+					}
+					style.DashPhase *= sx
 				}
-				style.LineWidth *= sx
-				style.Dash = append([]float64(nil), style.Dash...)
-				for n := range style.Dash {
-					style.Dash[n] *= sx
-				}
-				style.DashPhase *= sx
 			}
 			if p.visitor.Path == nil {
 				return fmt.Errorf("path visitor missing")
 			}
-			if err := p.visitor.Path(PathMark{p.path, style, fill, stroke}); err != nil {
+			if err := p.visitor.Path(PathMark{Path: p.path, Style: style, Fill: fill, Stroke: stroke, StrokeMatrix: strokeMatrix}); err != nil {
 				return err
 			}
 		}
@@ -690,7 +713,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if err != nil {
 				return err
 			}
-			paint, err := separation.paint(values[0])
+			paint, err := separation.paint(values[0], p.state.style.RenderingIntent)
 			if err != nil {
 				return err
 			}

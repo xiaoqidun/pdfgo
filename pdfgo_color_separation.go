@@ -24,6 +24,8 @@ type separationSpace struct {
 	name      Name
 	alternate Name
 	lab       *labSpace
+	icc       *iccRGBSpace
+	calRGB    *calRGBSpace
 	transform *tintFunction
 }
 
@@ -54,16 +56,29 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	}
 	alternate, ok := object.(Name)
 	var lab *labSpace
+	var icc *iccRGBSpace
+	var calibrated *calRGBSpace
 	if !ok {
 		array, arrayOK := object.(Array)
-		if !arrayOK || len(array) != 2 || array[0] != Name("Lab") {
+		if !arrayOK || len(array) != 2 {
 			return nil, &UnsupportedError{Feature: "Separation alternate color space"}
 		}
-		lab, err = r.readLab(array)
+		switch array[0] {
+		case Name("Lab"):
+			lab, err = r.readLab(array)
+			alternate = "Lab"
+		case Name("ICCBased"):
+			icc, err = r.readICCRGB(array)
+			alternate = "ICCBased"
+		case Name("CalRGB"):
+			calibrated, err = r.readCalRGB(array)
+			alternate = "CalRGB"
+		default:
+			return nil, &UnsupportedError{Feature: "Separation alternate color space"}
+		}
 		if err != nil {
 			return nil, err
 		}
-		alternate = "Lab"
 	}
 	channels := 0
 	switch alternate {
@@ -71,7 +86,7 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 		channels = 1
 	case "DeviceRGB":
 		channels = 3
-	case "Lab":
+	case "Lab", "ICCBased", "CalRGB":
 		channels = 3
 	case "DeviceCMYK":
 		channels = 4
@@ -82,7 +97,7 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &separationSpace{name: name, alternate: alternate, lab: lab, transform: transform}, nil
+	return &separationSpace{name: name, alternate: alternate, lab: lab, icc: icc, calRGB: calibrated, transform: transform}, nil
 }
 
 // readTintFunction 读取一维采样或指数着色函数
@@ -240,10 +255,10 @@ func (f *tintFunction) sample(index int) float64 {
 	return float64(value)
 }
 
-// paint 将分色浓度映射到备用设备颜色空间
-// 入参: tint 分色浓度
+// paint 将分色浓度映射到替代颜色空间
+// 入参: tint 分色浓度, intent 渲染意图
 // 返回: Paint 备用空间颜色, error 错误信息
-func (s *separationSpace) paint(tint float64) (Paint, error) {
+func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 	if math.IsNaN(tint) || math.IsInf(tint, 0) {
 		return Paint{}, fmt.Errorf("invalid Separation tint")
 	}
@@ -265,6 +280,15 @@ func (s *separationSpace) paint(tint float64) (Paint, error) {
 		paint.CMYK = &[4]float64{values[0], values[1], values[2], values[3]}
 	case "Lab":
 		color := s.lab.color(values[0], values[1], values[2])
+		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}
+	case "ICCBased":
+		var err error
+		paint.RGB, err = s.icc.color(values, intent)
+		if err != nil {
+			return Paint{}, err
+		}
+	case "CalRGB":
+		color := s.calRGB.color(values[0], values[1], values[2])
 		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}
 	}
 	return paint, nil

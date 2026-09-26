@@ -37,6 +37,7 @@ type Reader struct {
 	legacyDestinations Dictionary
 	fonts              map[Reference]*Font
 	objectStream       *objectStream
+	security           *standardSecurity
 }
 
 // objectStream 保留最近访问的对象流索引和解码数据，避免逐对象重复解压
@@ -58,6 +59,13 @@ type xrefEntry struct {
 // 入参: path 文件路径
 // 返回: *Reader 阅读器, error 错误信息
 func Open(path string) (*Reader, error) {
+	return OpenWithPassword(path, nil)
+}
+
+// OpenWithPassword 使用密码打开PDF文件，密码按PDFDocEncoding字节传入
+// 入参: path 文件路径, password 用户或所有者密码，nil表示空密码
+// 返回: *Reader 阅读器, error 错误信息
+func OpenWithPassword(path string, password []byte) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -67,7 +75,7 @@ func Open(path string) (*Reader, error) {
 		f.Close()
 		return nil, err
 	}
-	r, err := NewReader(f, info.Size())
+	r, err := NewReaderWithPassword(f, info.Size(), password)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -81,6 +89,14 @@ func Open(path string) (*Reader, error) {
 // 入参: source 随机读取器, size 文件字节数
 // 返回: *Reader 阅读器, error 错误信息
 func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
+	return NewReaderWithPassword(source, size, nil)
+}
+
+// NewReaderWithPassword 使用密码读取PDF，源读取器仍由调用方管理
+// 支持标准安全处理器的RC4及AES-128，密码按PDFDocEncoding字节传入
+// 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码
+// 返回: *Reader 阅读器, error 错误信息
+func NewReaderWithPassword(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
 	if size < 8 {
 		return nil, fmt.Errorf("invalid file size")
 	}
@@ -165,9 +181,6 @@ func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
 		}
 		offset = int64(prev)
 	}
-	if r.Trailer["Encrypt"] != nil {
-		return nil, &UnsupportedError{Feature: "encrypted PDF"}
-	}
 	sizeObject, ok := r.Trailer["Size"].(Integer)
 	if !ok || sizeObject <= 0 {
 		return nil, fmt.Errorf("invalid trailer size")
@@ -176,6 +189,9 @@ func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
 		if id >= int64(sizeObject) {
 			delete(r.xref, id)
 		}
+	}
+	if err := r.openSecurity(password); err != nil {
+		return nil, err
 	}
 	root, err := r.Resolve(r.Trailer["Root"])
 	if err != nil {
@@ -284,6 +300,9 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 		actual, value, err = r.indirect(entry.position)
 		if err == nil && actual != ref {
 			err = fmt.Errorf("cross-reference object mismatch")
+		}
+		if err == nil && r.security != nil {
+			value, err = r.security.decryptObject(value, ref)
 		}
 	}
 	if err != nil {
@@ -431,13 +450,19 @@ func (r *Reader) classicXref(p *objectParser) (Dictionary, map[int64]xrefEntry, 
 
 // readXrefStream 读取交叉引用流并检查字段边界
 func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, error) {
-	_, object, err := r.indirect(offset)
+	ref, object, err := r.indirect(offset)
 	if err != nil {
 		return nil, nil, err
 	}
 	stream, ok := object.(*Stream)
-	if !ok || stream.Dictionary["Type"] != Name("XRef") {
-		return nil, nil, fmt.Errorf("invalid cross-reference stream")
+	if !ok {
+		return nil, nil, &SyntaxError{Offset: offset, Message: fmt.Sprintf("invalid cross-reference stream: object %d %d is not a stream", ref.Number, ref.Generation)}
+	}
+	if stream.Dictionary["Type"] == nil {
+		return nil, nil, &SyntaxError{Offset: offset, Message: fmt.Sprintf("invalid cross-reference stream: object %d %d is missing /Type /XRef", ref.Number, ref.Generation)}
+	}
+	if stream.Dictionary["Type"] != Name("XRef") {
+		return nil, nil, &SyntaxError{Offset: offset, Message: fmt.Sprintf("invalid cross-reference stream: object %d %d requires /Type /XRef", ref.Number, ref.Generation)}
 	}
 	dict := stream.Dictionary
 	widths, ok := dict["W"].(Array)

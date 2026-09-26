@@ -47,10 +47,12 @@ type Font struct {
 
 // Glyph 保存原始字符码、Unicode文本、字形名称、编号和千分之一字宽
 // 缺少Unicode映射但具有字形编号时，Text为空，不推测字符含义
+// CID保留复合字体字符标识，只有可确定内嵌字形编号时HasID才为true
 type Glyph struct {
 	Name      string
 	Code      uint32
 	Text      string
+	CID       uint16
 	ID        uint16
 	HasID     bool
 	Width     float64
@@ -402,7 +404,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, err
 		}
 	}
-	if font.composite && metrics["Subtype"] == Name("CIDFontType0") && font.cffGlyphs == nil {
+	if font.composite && len(font.Program) != 0 && metrics["Subtype"] == Name("CIDFontType0") && font.cffGlyphs == nil {
 		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without bare CFF program"}
 	}
 	if indirect {
@@ -509,6 +511,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			return nil, &UnsupportedError{Feature: "unembedded standard font metrics"}
 		}
 		glyph := Glyph{Code: code, Text: text, Width: width, WordSpace: step == 1 && code == 32}
+		if f.composite {
+			glyph.CID = uint16(cid)
+		}
 		if f.Subtype == Name("Type1") {
 			glyph.Name = name
 		}
@@ -547,7 +552,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			glyph.ID = id
 			glyph.HasID = true
 		}
-		if f.composite {
+		if f.composite && len(f.Program) != 0 {
 			glyph.HasID = true
 			glyph.ID = uint16(cid)
 			if f.glyphMap != nil {

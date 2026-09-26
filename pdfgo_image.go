@@ -20,11 +20,13 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"math"
 
 	_ "github.com/mububoki/jpeg2000/j2k"
 	_ "github.com/mububoki/jpeg2000/jp2"
 	"github.com/xiaoqidun/jbig2"
+	"golang.org/x/image/ccitt"
 )
 
 var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
@@ -320,7 +322,7 @@ func (i *Image) DecodeImage() (image.Image, error) {
 				index := int(math.Max(0, math.Min(float64(len(palette)-1), math.Round(values[0]))))
 				pixel = palette[index]
 			} else if separation != nil {
-				paint, err := separation.paint(values[0])
+				paint, err := separation.paint(values[0], intent)
 				if err != nil {
 					return nil, err
 				}
@@ -527,7 +529,7 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 	var terminalParams Dictionary
 	if len(filters) > 0 {
 		last := filters[len(filters)-1]
-		if last == Name("DCTDecode") || last == Name("JBIG2Decode") || last == Name("JPXDecode") {
+		if last == Name("DCTDecode") || last == Name("JBIG2Decode") || last == Name("JPXDecode") || last == Name("CCITTFaxDecode") {
 			terminal = last.(Name)
 			if parameters[len(filters)-1] != nil {
 				var ok bool
@@ -546,6 +548,8 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 	}
 	var result image.Image
 	switch terminal {
+	case "CCITTFaxDecode":
+		return i.ccittSamples(data, terminalParams)
 	case "DCTDecode":
 		if terminalParams["ColorTransform"] != nil {
 			return nil, &UnsupportedError{Feature: "explicit JPEG ColorTransform"}
@@ -605,6 +609,76 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 		return nil, fmt.Errorf("decoded image dimensions differ from dictionary")
 	}
 	return result, nil
+}
+
+// ccittSamples 按PDF参数解码CCITT Group4样本，保留黑白映射及行边界
+// 入参: data 编码数据, params 解码参数
+// 返回: image.Image 样本图像, error 错误信息
+func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error) {
+	if i.BitsPerComponent != 1 {
+		return nil, fmt.Errorf("invalid CCITT component depth")
+	}
+	k, err := integerDefault(params, "K", 0)
+	if err != nil {
+		return nil, err
+	}
+	if k >= 0 {
+		return nil, &UnsupportedError{Feature: "CCITT Group 3"}
+	}
+	columns, err := integerDefault(params, "Columns", 1728)
+	if err != nil {
+		return nil, err
+	}
+	if columns != int64(i.Width) || columns <= 0 || i.Height <= 0 {
+		return nil, fmt.Errorf("CCITT dimensions differ from image dictionary")
+	}
+	rows, err := integerDefault(params, "Rows", 0)
+	if err != nil || rows < 0 {
+		return nil, fmt.Errorf("invalid CCITT Rows")
+	}
+	endOfBlock, align, invert, endOfLine := true, false, false, false
+	for _, flag := range []struct {
+		name  Name
+		value *bool
+	}{{"EndOfBlock", &endOfBlock}, {"EncodedByteAlign", &align}, {"BlackIs1", &invert}, {"EndOfLine", &endOfLine}} {
+		if value := params[flag.name]; value != nil {
+			boolean, ok := value.(Boolean)
+			if !ok {
+				return nil, fmt.Errorf("invalid CCITT %s", flag.name)
+			}
+			*flag.value = bool(boolean)
+		}
+	}
+	if endOfLine {
+		return nil, &UnsupportedError{Feature: "CCITT Group 4 end-of-line markers"}
+	}
+	if !endOfBlock && rows != 0 && rows != int64(i.Height) {
+		return nil, &UnsupportedError{Feature: "CCITT Rows differing from image height"}
+	}
+	height := i.Height
+	if endOfBlock {
+		height = ccitt.AutoDetectHeight
+	}
+	stride := (uint64(i.Width) + 7) / 8
+	if stride > uint64(^uint(0)>>1)/uint64(i.Height) {
+		return nil, fmt.Errorf("CCITT sample size exceeds platform integer range")
+	}
+	reader := ccitt.NewReader(bytes.NewReader(data), ccitt.MSB, ccitt.Group4, i.Width, height, &ccitt.Options{Align: align, Invert: invert})
+	samples := make([]byte, int(stride)*i.Height)
+	if _, err := io.ReadFull(reader, samples); err != nil {
+		return nil, err
+	}
+	if endOfBlock {
+		var extra [1]byte
+		n, err := io.ReadFull(reader, extra[:])
+		if n != 0 {
+			return nil, fmt.Errorf("CCITT dimensions differ from image dictionary")
+		}
+		if err != io.EOF {
+			return nil, err
+		}
+	}
+	return i.rawSamples(samples)
 }
 
 // rawSamples 将已解压的设备色彩样本或颜色索引展开为图像

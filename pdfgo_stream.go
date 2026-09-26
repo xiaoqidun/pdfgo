@@ -30,6 +30,7 @@ type Stream struct {
 	Dictionary Dictionary
 	Data       []byte
 	reader     *Reader
+	decrypted  bool
 }
 
 func (*Stream) pdfObject() {}
@@ -107,6 +108,9 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 			}
 		}
 	}
+	if s.decrypted && len(filters) > 0 && filters[0] == Name("Crypt") {
+		return filters[1:], params[1:], nil
+	}
 	return filters, params, nil
 }
 
@@ -124,6 +128,10 @@ func (s *Stream) Decode() ([]byte, error) {
 		dict, _ := params[i].(Dictionary)
 		var err error
 		switch name {
+		case "Crypt":
+			if i != 0 || dict["Name"] != nil && dict["Name"] != Name("Identity") {
+				return nil, &UnsupportedError{Feature: "stream crypt filter"}
+			}
 		case "FlateDecode":
 			var reader io.ReadCloser
 			reader, err = zlib.NewReader(bytes.NewReader(data))
