@@ -22,6 +22,8 @@ import (
 	"image/jpeg"
 	"math"
 
+	_ "github.com/mububoki/jpeg2000/j2k"
+	_ "github.com/mububoki/jpeg2000/jp2"
 	"github.com/xiaoqidun/jbig2"
 )
 
@@ -562,7 +564,7 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 	var terminalParams Dictionary
 	if len(filters) > 0 {
 		last := filters[len(filters)-1]
-		if last == Name("DCTDecode") || last == Name("JBIG2Decode") {
+		if last == Name("DCTDecode") || last == Name("JBIG2Decode") || last == Name("JPXDecode") {
 			terminal = last.(Name)
 			if parameters[len(filters)-1] != nil {
 				var ok bool
@@ -628,6 +630,11 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 		if err != nil {
 			return nil, err
 		}
+	case "JPXDecode":
+		result, _, err = image.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
 	default:
 		return i.rawSamples(data)
 	}
@@ -686,8 +693,17 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	}
 	rowBits := uint64(i.Width) * uint64(components) * uint64(i.BitsPerComponent)
 	rowBytes := (rowBits + 7) / 8
-	if rowBytes > uint64(len(data))/uint64(i.Height) || rowBytes*uint64(i.Height) != uint64(len(data)) {
+	expected := rowBytes * uint64(i.Height)
+	if rowBytes > uint64(len(data))/uint64(i.Height) || expected > uint64(len(data)) {
 		return nil, fmt.Errorf("image sample size mismatch")
+	}
+	if expected < uint64(len(data)) {
+		for _, value := range data[expected:] {
+			if value != 0 {
+				return nil, fmt.Errorf("image sample size mismatch")
+			}
+		}
+		data = data[:expected]
 	}
 	stride := int(rowBytes)
 	if components == 4 {

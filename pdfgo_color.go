@@ -27,6 +27,101 @@ type calRGBSpace struct {
 	adapt  [3]float64
 }
 
+// labSpace 保存Lab白点和分量范围
+type labSpace struct {
+	white   [3]float64
+	rangeAB [4]float64
+	adapt   [3]float64
+}
+
+// readLab 读取Lab颜色空间定义
+// 入参: object Lab颜色空间数组
+// 返回: *labSpace 颜色变换参数, error 错误信息
+func (r *Reader) readLab(object Object) (*labSpace, error) {
+	a, ok := object.(Array)
+	if !ok || len(a) != 2 || a[0] != Name("Lab") {
+		return nil, fmt.Errorf("invalid Lab color space")
+	}
+	resolved, err := r.Resolve(a[1])
+	if err != nil {
+		return nil, err
+	}
+	dict, ok := resolved.(Dictionary)
+	if !ok {
+		return nil, fmt.Errorf("invalid Lab dictionary")
+	}
+	s := &labSpace{rangeAB: [4]float64{-100, 100, -100, 100}}
+	for _, field := range []struct {
+		key    Name
+		values []float64
+	}{{"WhitePoint", s.white[:]}, {"Range", s.rangeAB[:]}} {
+		value, err := r.Resolve(dict[field.key])
+		if err != nil {
+			return nil, err
+		}
+		if value == nil && field.key == "Range" {
+			continue
+		}
+		values, ok := value.(Array)
+		if !ok || len(values) != len(field.values) {
+			return nil, fmt.Errorf("invalid Lab %s", field.key)
+		}
+		for n, item := range values {
+			field.values[n], err = r.number(item)
+			if err != nil || math.IsNaN(field.values[n]) || math.IsInf(field.values[n], 0) {
+				return nil, fmt.Errorf("invalid Lab %s", field.key)
+			}
+		}
+	}
+	if s.white[0] <= 0 || s.white[1] != 1 || s.white[2] <= 0 || s.rangeAB[0] > s.rangeAB[1] || s.rangeAB[2] > s.rangeAB[3] {
+		return nil, fmt.Errorf("invalid Lab white point or range")
+	}
+	black, err := r.Resolve(dict["BlackPoint"])
+	if err != nil {
+		return nil, err
+	}
+	if black != nil {
+		values, err := r.numberArray(black, 3)
+		if err != nil || values[0] != 0 || values[1] != 0 || values[2] != 0 {
+			return nil, &UnsupportedError{Feature: "Lab nonzero black point"}
+		}
+	}
+	source := bradford(s.white)
+	target := bradford([3]float64{0.95047, 1, 1.08883})
+	for n := range s.adapt {
+		if source[n] <= 0 {
+			return nil, fmt.Errorf("invalid Lab white point")
+		}
+		s.adapt[n] = target[n] / source[n]
+	}
+	return s, nil
+}
+
+// color 将Lab分量转换为sRGB颜色
+// 入参: lightness 亮度, a 红绿分量, b 黄蓝分量
+// 返回: color.NRGBA64 非预乘sRGB颜色
+func (s *labSpace) color(lightness, a, b float64) color.NRGBA64 {
+	lightness = math.Max(0, math.Min(100, lightness))
+	a = math.Max(s.rangeAB[0], math.Min(s.rangeAB[1], a))
+	b = math.Max(s.rangeAB[2], math.Min(s.rangeAB[3], b))
+	fy := (lightness + 16) / 116
+	fx, fz := fy+a/500, fy-b/200
+	inverse := func(v float64) float64 {
+		if v > 6.0/29 {
+			return v * v * v
+		}
+		return 3 * (6.0 / 29) * (6.0 / 29) * (v - 4.0/29)
+	}
+	cone := bradford([3]float64{s.white[0] * inverse(fx), s.white[1] * inverse(fy), s.white[2] * inverse(fz)})
+	for n := range cone {
+		cone[n] *= s.adapt[n]
+	}
+	x := 0.9869929*cone[0] - 0.1470543*cone[1] + 0.1599627*cone[2]
+	y := 0.4323053*cone[0] + 0.5183603*cone[1] + 0.0492912*cone[2]
+	z := -0.0085287*cone[0] + 0.0400428*cone[1] + 0.9684867*cone[2]
+	return color.NRGBA64{R: srgbComponent(3.2404542*x - 1.5371385*y - 0.4985314*z), G: srgbComponent(-0.969266*x + 1.8760108*y + 0.041556*z), B: srgbComponent(0.0556434*x - 0.2040259*y + 1.0572252*z), A: 65535}
+}
+
 // readCalRGB 读取校准RGB参数，未支持的非零黑点不作近似处理
 // 入参: object CalRGB颜色空间数组
 // 返回: *calRGBSpace 颜色变换参数, error 错误信息

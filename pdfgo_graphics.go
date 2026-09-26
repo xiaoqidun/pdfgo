@@ -58,6 +58,16 @@ type Segment struct {
 type Path struct {
 	Segments []Segment
 	EvenOdd  bool
+	Text     []*TextClip
+}
+
+// TextClip 保存参与裁剪的字形及页面定位
+type TextClip struct {
+	Font                  *Font
+	Glyphs                []Glyph
+	Positions             []Point
+	Matrix                Matrix
+	Size, HorizontalScale float64
 }
 
 // Paint 保存设备颜色及不透明度，CMYK非空时保留原始四色分量
@@ -105,6 +115,7 @@ type TextMark struct {
 	Size, HorizontalScale float64
 	Style                 Style
 	Mode                  int
+	Clip                  *TextClip
 }
 
 // ImageMark 保存图像资源及单位方形到页面坐标的变换
@@ -161,6 +172,7 @@ type pageInterpreter struct {
 	state                  graphicsState
 	stack                  []graphicsState
 	marked                 []Name
+	textClips              []*TextClip
 	textMatrix, lineMatrix Matrix
 	inText                 bool
 	path                   Path
@@ -772,6 +784,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("nested text object")
 		}
 		p.inText = true
+		p.textClips = nil
 		p.textMatrix = Identity()
 		p.lineMatrix = Identity()
 	case "ET":
@@ -779,6 +792,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("unmatched operator %q", "ET")
 		}
 		p.inText = false
+		if len(p.textClips) != 0 {
+			p.state.style.Clips = append(append([]Path(nil), p.state.style.Clips...), Path{Text: p.textClips})
+			p.textClips = nil
+		}
 	case "Tf":
 		if len(a) != 2 {
 			return fmt.Errorf("invalid font operands")
@@ -816,8 +833,8 @@ func (p *pageInterpreter) operation(op Operation) error {
 	case "TL":
 		p.state.leading = v[0]
 	case "Tr":
-		if v[0] < 0 || v[0] > 3 || v[0] != math.Trunc(v[0]) {
-			return &UnsupportedError{Feature: "text clipping mode"}
+		if v[0] < 0 || v[0] > 7 || v[0] != math.Trunc(v[0]) {
+			return fmt.Errorf("invalid text rendering mode")
 		}
 		p.state.mode = int(v[0])
 	case "Ts":
@@ -917,7 +934,8 @@ func (p *pageInterpreter) showText(data []byte) error {
 	if !p.inText || p.state.font == nil {
 		return fmt.Errorf("text without active font")
 	}
-	if err := p.validatePaint(p.state.mode == 0 || p.state.mode == 2, p.state.mode == 1 || p.state.mode == 2); err != nil {
+	paintMode := p.state.mode % 4
+	if err := p.validatePaint(paintMode == 0 || paintMode == 2, paintMode == 1 || paintMode == 2); err != nil {
 		return err
 	}
 	glyphs, err := p.state.font.Decode(data)
@@ -939,6 +957,10 @@ func (p *pageInterpreter) showText(data []byte) error {
 			return fmt.Errorf("text visitor missing")
 		}
 		mark := TextMark{Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: p.state.mode}
+		if mark.Mode >= 4 {
+			mark.Clip = &TextClip{Font: mark.Font, Glyphs: glyphs, Positions: positions, Matrix: mark.Matrix, Size: mark.Size, HorizontalScale: mark.HorizontalScale}
+			p.textClips = append(p.textClips, mark.Clip)
+		}
 		if err := p.visitor.Text(mark); err != nil {
 			return err
 		}

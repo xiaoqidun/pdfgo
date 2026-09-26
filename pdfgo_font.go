@@ -380,6 +380,12 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			font.ProgramType = "CIDFontType0C"
 		}
 	}
+	if subtype == Name("Type1") && font.ProgramType == "FontFile" && dict["Encoding"] == nil {
+		font.differences, err = type1BuiltInEncoding(font.Program)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && font.ProgramType != "Type1C" {
 		font.simpleCmap, font.symbolCmap, err = fontCmap(font.Program, font.symbolic)
 		if err != nil {
@@ -432,16 +438,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			cid = uint32(mapped)
 		}
 		text, ok := f.Unicode[string(raw)]
-		if !ok && f.encoding == Name("UniGB-UCS2-H") {
-			var err error
-			text, err = unicodeBytes(raw)
-			if err != nil {
-				return nil, err
-			}
-			ok = true
-		}
-		if !ok && !f.composite {
-			name := f.differences[code]
+		name := ""
+		if !f.composite {
+			name = f.differences[code]
 			if name == "" {
 				encoding := pdfStandardNames
 				switch f.encoding {
@@ -457,8 +456,21 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 					name = encoding[code]
 				}
 			}
+		}
+		if !ok && f.encoding == Name("UniGB-UCS2-H") {
+			var err error
+			text, err = unicodeBytes(raw)
+			if err != nil {
+				return nil, err
+			}
+			ok = true
+		}
+		if !ok && !f.composite {
 			if name != "" && name != ".notdef" {
 				text, ok = glyphNameUnicode(name)
+				if !ok && f.Subtype == Name("Type1") && len(f.Program) != 0 {
+					ok = true
+				}
 			}
 		}
 		if !ok && f.cffGlyphs != nil {
@@ -467,6 +479,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		if !ok {
 			if f.composite {
 				return nil, &UnsupportedError{Feature: "CID without Unicode mapping"}
+			}
+			if f.Subtype == Name("Type1") && len(f.Program) != 0 && name == ".notdef" {
+				return nil, &UnsupportedError{Feature: "undefined Type1 glyph"}
 			}
 			if f.Subtype == Name("Type3") && f.differences[code] != "" {
 				text = ""
@@ -494,6 +509,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			return nil, &UnsupportedError{Feature: "unembedded standard font metrics"}
 		}
 		glyph := Glyph{Code: code, Text: text, Width: width, WordSpace: step == 1 && code == 32}
+		if f.Subtype == Name("Type1") {
+			glyph.Name = name
+		}
 		if f.Subtype == Name("Type3") {
 			glyph.Name = f.differences[code]
 			if glyph.Name == "" {

@@ -15,11 +15,109 @@
 package pdfgo
 
 import (
+	"bytes"
 	_ "embed"
+	"encoding/binary"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 )
+
+// type1BuiltInEncoding 读取嵌入Type1字体明文段中的内建编码表
+// 入参: program PFA或PFB字体数据
+// 返回: map[uint32]string 字码与字形名称, error 错误信息
+func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
+	if len(program) >= 6 && program[0] == 0x80 && program[1] == 1 {
+		length := binary.LittleEndian.Uint32(program[2:6])
+		if uint64(length) > uint64(len(program)-6) {
+			return nil, fmt.Errorf("truncated PFB header")
+		}
+		program = program[6 : 6+length]
+	}
+	if at := bytes.Index(program, []byte("eexec")); at >= 0 {
+		program = program[:at]
+	}
+	scanner := type1EncodingScanner{data: program}
+	for token := scanner.next(); token != ""; token = scanner.next() {
+		if token != "/Encoding" {
+			continue
+		}
+		switch scanner.next() {
+		case "StandardEncoding":
+			names := make(map[uint32]string, 256)
+			for code, name := range pdfStandardNames {
+				names[uint32(code)] = name
+			}
+			return names, nil
+		case "256":
+			if scanner.next() != "array" {
+				return nil, fmt.Errorf("invalid Type1 encoding array")
+			}
+			names := make(map[uint32]string, 256)
+			for code := 0; code < 256; code++ {
+				names[uint32(code)] = ".notdef"
+			}
+			for token := scanner.next(); token != ""; token = scanner.next() {
+				if token == "def" {
+					return names, nil
+				}
+				if token != "dup" {
+					continue
+				}
+				code, err := strconv.Atoi(scanner.next())
+				if err != nil || code < 0 || code > 255 {
+					return nil, fmt.Errorf("invalid Type1 encoding code")
+				}
+				name := scanner.next()
+				if len(name) < 2 || name[0] != '/' || scanner.next() != "put" {
+					return nil, fmt.Errorf("invalid Type1 encoding entry")
+				}
+				names[uint32(code)] = name[1:]
+			}
+			return nil, fmt.Errorf("incomplete Type1 encoding")
+		default:
+			return nil, &UnsupportedError{Feature: "Type1 built-in encoding"}
+		}
+	}
+	return nil, fmt.Errorf("Type1 font has no built-in encoding")
+}
+
+type type1EncodingScanner struct {
+	data []byte
+	pos  int
+}
+
+// next 读取Type1明文段的下一个PostScript词项
+// 返回: string 词项
+func (s *type1EncodingScanner) next() string {
+	for s.pos < len(s.data) {
+		c := s.data[s.pos]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' {
+			s.pos++
+			continue
+		}
+		if c == '%' {
+			for s.pos < len(s.data) && s.data[s.pos] != '\r' && s.data[s.pos] != '\n' {
+				s.pos++
+			}
+			continue
+		}
+		break
+	}
+	if s.pos == len(s.data) {
+		return ""
+	}
+	start := s.pos
+	if bytes.IndexByte([]byte("[]{}"), s.data[s.pos]) >= 0 {
+		s.pos++
+		return string(s.data[start:s.pos])
+	}
+	for s.pos < len(s.data) && s.data[s.pos] != ' ' && s.data[s.pos] != '\t' && s.data[s.pos] != '\r' && s.data[s.pos] != '\n' && bytes.IndexByte([]byte("[]{}%"), s.data[s.pos]) < 0 {
+		s.pos++
+	}
+	return string(s.data[start:s.pos])
+}
 
 //go:embed assets/glyph/glyphlist.txt
 var adobeGlyphList []byte

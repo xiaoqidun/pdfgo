@@ -1,3 +1,5 @@
+github.com/mububoki/jpeg2000 v1.0.0 h1:1ha5mqCg0DMK6zbbBp9bkUjEds4HYwQqmU3ItF3k9qs=
+github.com/mububoki/jpeg2000 v1.0.0/go.mod h1:q+kfbMgsqawC9I10Zk+goSZ8+ac4cOzcWdIL1vpsDLs=
 github.com/xiaoqidun/jbig2 v1.1.1 h1:SjliS9ZO0e9HX5oYUfBuXrfFsXhWricrSz+XY4zORDI=
 github.com/xiaoqidun/jbig2 v1.1.1/go.mod h1:8QonVWtENmh2kc6l+leqeGl7psb79DWlHDkCpdChjfQ=
 golang.org/x/image v0.46.0 h1:b1+oYj0Jbp6K5MDT4i4/eZpYlk3V8SJhhDKh6LBHAyQ=

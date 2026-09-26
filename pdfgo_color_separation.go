@@ -23,6 +23,7 @@ import (
 type separationSpace struct {
 	name      Name
 	alternate Name
+	lab       *labSpace
 	transform *tintFunction
 }
 
@@ -52,14 +53,25 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 		return nil, err
 	}
 	alternate, ok := object.(Name)
+	var lab *labSpace
 	if !ok {
-		return nil, &UnsupportedError{Feature: "Separation alternate color space"}
+		array, arrayOK := object.(Array)
+		if !arrayOK || len(array) != 2 || array[0] != Name("Lab") {
+			return nil, &UnsupportedError{Feature: "Separation alternate color space"}
+		}
+		lab, err = r.readLab(array)
+		if err != nil {
+			return nil, err
+		}
+		alternate = "Lab"
 	}
 	channels := 0
 	switch alternate {
 	case "DeviceGray":
 		channels = 1
 	case "DeviceRGB":
+		channels = 3
+	case "Lab":
 		channels = 3
 	case "DeviceCMYK":
 		channels = 4
@@ -70,7 +82,7 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &separationSpace{name: name, alternate: alternate, transform: transform}, nil
+	return &separationSpace{name: name, alternate: alternate, lab: lab, transform: transform}, nil
 }
 
 // readTintFunction 读取一维采样或指数着色函数
@@ -251,6 +263,9 @@ func (s *separationSpace) paint(tint float64) (Paint, error) {
 		copy(paint.RGB[:], values)
 	case "DeviceCMYK":
 		paint.CMYK = &[4]float64{values[0], values[1], values[2], values[3]}
+	case "Lab":
+		color := s.lab.color(values[0], values[1], values[2])
+		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}
 	}
 	return paint, nil
 }
