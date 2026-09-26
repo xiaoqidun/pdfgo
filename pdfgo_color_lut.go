@@ -250,6 +250,44 @@ func (s *iccLUTSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 	return [3]float64{0.9642 * inverse(y+a/500), inverse(y), 0.8249 * inverse(y-b/200)}, nil
 }
 
+// fromXYZ 按目标渲染意图将D50色度编码为PCS并执行逆向查找表
+// 入参: xyz D50色度, intent 渲染意图
+// 返回: [4]float64 设备分量, error 缺失或未支持的变换
+func (s *iccLUTSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
+	i, err := iccIntentIndex(intent)
+	if err != nil {
+		return [4]float64{}, err
+	}
+	lut := s.fromPCS[i]
+	if lut == nil {
+		lut = s.fromPCS[0]
+	}
+	if lut == nil {
+		return [4]float64{}, fmt.Errorf("missing ICC B2A0 transform")
+	}
+	var pcs [3]float64
+	if s.pcs == "XYZ " {
+		for i := range pcs {
+			pcs[i] = xyz[i] * 32768 / 65535
+		}
+	} else {
+		f := func(v float64) float64 {
+			if v > (6.0/29)*(6.0/29)*(6.0/29) {
+				return math.Cbrt(v)
+			}
+			return v/(3*(6.0/29)*(6.0/29)) + 4.0/29
+		}
+		x, y, z := f(xyz[0]/.9642), f(xyz[1]), f(xyz[2]/.8249)
+		pcs = [3]float64{(116*y - 16) / 100, (500*(x-y) + 128) / 255, (200*(y-z) + 128) / 255}
+		if lut.precision == 16 {
+			for i := range pcs {
+				pcs[i] *= 65280.0 / 65535
+			}
+		}
+	}
+	return lut.evaluate(pcs[:]), nil
+}
+
 // iccXYZRGB 将D50色度适应到D65并编码为sRGB
 // 入参: xyz D50色度
 // 返回: [3]float64 单位sRGB分量

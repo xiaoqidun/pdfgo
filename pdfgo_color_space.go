@@ -35,7 +35,7 @@ func (s *ColorSpace) Calibrated() bool { return s.profile != nil }
 // 入参: other 待比较空间
 // 返回: bool 是否相同
 func (s *ColorSpace) Equal(other *ColorSpace) bool {
-	return s != nil && other != nil && s.Model == other.Model && reflect.DeepEqual(s.profile, other.profile)
+	return s != nil && other != nil && s.Model == other.Model && (s.profile == other.profile || reflect.DeepEqual(s.profile, other.profile))
 }
 
 // SRGBEquivalent 检查混合空间与sRGB的偏差是否在8位量化精度内
@@ -118,7 +118,7 @@ func (s *ColorSpace) RGB(values []float64, intent Name) ([3]float64, error) {
 	return [3]float64{}, &UnsupportedError{Feature: "blending color space " + string(s.Model)}
 }
 
-// Convert 将源空间分量转换到当前设备空间，相同校准空间保留原值
+// Convert 将源空间分量转换到当前颜色空间，相同校准空间保留原值
 // DeviceRGB转DeviceCMYK采用恒等黑版生成及底色去除函数
 // 入参: values 源分量, source 源空间, intent 渲染意图
 // 返回: [4]float64 目标分量, error 无效分量或未支持的目标变换
@@ -132,7 +132,11 @@ func (s *ColorSpace) Convert(values []float64, source *ColorSpace, intent Name) 
 		return result, nil
 	}
 	if s.Calibrated() {
-		return result, &UnsupportedError{Feature: "ICC destination color transform"}
+		xyz, err := source.xyz(values, intent)
+		if err != nil {
+			return result, err
+		}
+		return s.profile.fromXYZ(xyz, intent)
 	}
 	rgb, err := source.RGB(values, intent)
 	if err != nil {

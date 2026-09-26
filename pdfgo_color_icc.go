@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"image/color"
@@ -75,6 +76,10 @@ func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
 	if err != nil {
 		return nil, err
 	}
+	key := sha256.Sum256(data)
+	if cached := r.colorProfiles[key]; cached != nil {
+		return cached, nil
+	}
 	space := &iccColorSpace{}
 	if tags["A2B0"] != nil {
 		space.lut, err = parseICCLUTSpace(data, tags)
@@ -85,7 +90,14 @@ func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
 	} else {
 		err = fmt.Errorf("missing ICC A2B0 transform")
 	}
-	return space, err
+	if err != nil {
+		return nil, err
+	}
+	if r.colorProfiles == nil {
+		r.colorProfiles = make(map[[32]byte]*iccColorSpace)
+	}
+	r.colorProfiles[key] = space
+	return space, nil
 }
 
 // components 返回配置文件的颜色分量数
