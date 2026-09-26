@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"fmt"
 	"math"
+	"slices"
 )
 
 // GradientStop 保存轴向渐变的归一化位置与sRGB颜色
@@ -79,10 +80,6 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		}
 		m = m.Mul(Matrix(v))
 	}
-	sx, sy := math.Hypot(m[0], m[1]), math.Hypot(m[2], m[3])
-	if sx == 0 || math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy) {
-		return Paint{}, &UnsupportedError{Feature: "anisotropic shading pattern"}
-	}
 	v, err = p.reader.Resolve(dict["Shading"])
 	if err != nil {
 		return Paint{}, err
@@ -91,14 +88,87 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if !ok || shading["Background"] != nil || shading["BBox"] != nil {
 		return Paint{}, &UnsupportedError{Feature: "shading dictionary"}
 	}
+	return p.shadingPaint(shading, m)
+}
+
+// shadingFill 按当前裁剪和图形状态直接绘制着色资源，不改变当前路径
+// 入参: operands 着色资源名
+// 返回: error 解析或绘制错误
+func (p *pageInterpreter) shadingFill(operands []Object) error {
+	if len(operands) != 1 {
+		return fmt.Errorf("invalid shading operands")
+	}
+	name, ok := operands[0].(Name)
+	if !ok {
+		return fmt.Errorf("invalid shading name")
+	}
+	object, err := p.resource("Shading", name)
+	if err != nil {
+		return err
+	}
+	value, err := p.reader.Resolve(object)
+	if err != nil {
+		return err
+	}
+	dict, ok := value.(Dictionary)
+	if !ok {
+		return &UnsupportedError{Feature: "shading dictionary"}
+	}
+	paint, err := p.shadingPaint(dict, p.state.matrix)
+	if err != nil {
+		return err
+	}
+	style := p.state.style
+	paint.Alpha = style.Fill.Alpha
+	style.Fill = paint
+	if dict["BBox"] != nil {
+		box, err := p.reader.rectangle(dict["BBox"])
+		if err != nil {
+			return err
+		}
+		clip := shadingRectangle(box, p.state.matrix)
+		style.Clips = append(append([]Path(nil), style.Clips...), clip)
+	}
+	if p.visitor.Path == nil {
+		return fmt.Errorf("path visitor missing")
+	}
+	if p.bounds.XMax <= p.bounds.XMin || p.bounds.YMax <= p.bounds.YMin {
+		return fmt.Errorf("missing shading bounds")
+	}
+	return p.visitor.Path(PathMark{Path: shadingRectangle(p.bounds, Identity()), Style: style, Fill: true})
+}
+
+// shadingRectangle 将着色边界转换为页面坐标的闭合路径
+// 入参: box 矩形边界, matrix 坐标变换
+// 返回: Path 矩形路径
+func shadingRectangle(box Rectangle, matrix Matrix) Path {
+	return Path{Segments: []Segment{
+		{"M", []Point{matrix.Apply(Point{box.XMin, box.YMin})}},
+		{"L", []Point{matrix.Apply(Point{box.XMax, box.YMin})}},
+		{"L", []Point{matrix.Apply(Point{box.XMax, box.YMax})}},
+		{"L", []Point{matrix.Apply(Point{box.XMin, box.YMax})}},
+		{"C", nil},
+	}}
+}
+
+// shadingPaint 解析轴向或径向着色的坐标及颜色函数
+// 入参: shading 着色字典, m 着色坐标到页面的变换
+// 返回: Paint 渐变画刷, error 解析错误
+func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, error) {
+	sx, sy := math.Hypot(m[0], m[1]), math.Hypot(m[2], m[3])
+	if shading["ShadingType"] == Integer(3) && (sx == 0 || math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy)) {
+		return Paint{}, &UnsupportedError{Feature: "anisotropic shading pattern"}
+	}
+	domain := [2]float64{0, 1}
 	if shading["Domain"] != nil {
 		d, err := p.reader.numberArray(shading["Domain"], 2)
 		if err != nil {
 			return Paint{}, err
 		}
-		if d[0] != 0 || d[1] != 1 {
-			return Paint{}, &UnsupportedError{Feature: "shading domain"}
+		if d[0] >= d[1] {
+			return Paint{}, fmt.Errorf("invalid shading domain")
 		}
+		domain = [2]float64(d)
 	}
 	count := 4
 	if shading["ShadingType"] == Integer(3) {
@@ -122,7 +192,15 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		if start == end {
 			return Paint{}, fmt.Errorf("degenerate shading axis")
 		}
-		paint.Axial = &AxialGradient{Start: m.Apply(start), End: m.Apply(end)}
+		inverse, ok := m.Inverse()
+		if !ok {
+			return Paint{}, fmt.Errorf("singular shading transform")
+		}
+		dx, dy := end.X-start.X, end.Y-start.Y
+		gx, gy := inverse[0]*dx+inverse[1]*dy, inverse[2]*dx+inverse[3]*dy
+		factor := (dx*dx + dy*dy) / (gx*gx + gy*gy)
+		start = m.Apply(start)
+		paint.Axial = &AxialGradient{Start: start, End: Point{start.X + gx*factor, start.Y + gy*factor}}
 	} else {
 		end := Point{coords[3], coords[4]}
 		paint.Radial = &RadialGradient{Start: m.Apply(start), End: m.Apply(end), StartRadius: coords[2] * sx, EndRadius: coords[5] * sx}
@@ -148,7 +226,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 			}
 		}
 	}
-	stops, err := p.reader.linearGradientStops(shading["Function"], 0)
+	stops, err := p.reader.linearGradientStops(shading["Function"], domain, 0)
 	if err != nil {
 		return Paint{}, err
 	}
@@ -181,9 +259,9 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 }
 
 // linearGradientStops 解析线性指数函数及线性拼接函数
-// 入参: object 函数字典或引用, depth 当前嵌套深度
+// 入参: object 函数字典或引用, interval 实际输入区间, depth 当前嵌套深度
 // 返回: []GradientStop 渐变分段, error 解析错误
-func (r *Reader) linearGradientStops(object Object, depth int) ([]GradientStop, error) {
+func (r *Reader) linearGradientStops(object Object, interval [2]float64, depth int) ([]GradientStop, error) {
 	if depth >= 32 {
 		return nil, fmt.Errorf("gradient function recursion limit exceeded")
 	}
@@ -199,9 +277,13 @@ func (r *Reader) linearGradientStops(object Object, depth int) ([]GradientStop, 
 	if err != nil {
 		return nil, err
 	}
-	if domain[0] != 0 || domain[1] != 1 || dict["Range"] != nil {
-		return nil, &UnsupportedError{Feature: "gradient function domain or range"}
+	if domain[0] >= domain[1] {
+		return nil, fmt.Errorf("invalid gradient function domain")
 	}
+	if dict["Range"] != nil {
+		return nil, &UnsupportedError{Feature: "gradient function range"}
+	}
+	var stops []GradientStop
 	switch dict["FunctionType"] {
 	case Integer(2):
 		n, err := r.number(dict["N"])
@@ -211,7 +293,7 @@ func (r *Reader) linearGradientStops(object Object, depth int) ([]GradientStop, 
 		if n != 1 {
 			return nil, &UnsupportedError{Feature: "nonlinear gradient function"}
 		}
-		stops := make([]GradientStop, 2)
+		var colors [2][3]float64
 		for i, key := range []Name{"C0", "C1"} {
 			color, err := r.numberArray(dict[key], 3)
 			if err != nil {
@@ -222,9 +304,29 @@ func (r *Reader) linearGradientStops(object Object, depth int) ([]GradientStop, 
 					return nil, fmt.Errorf("invalid gradient color")
 				}
 			}
-			stops[i] = GradientStop{Position: float64(i), RGB: [3]float64(color)}
+			colors[i] = [3]float64(color)
 		}
-		return stops, nil
+		positions := []float64{domain[0], domain[1]}
+		for c, start := range colors[0] {
+			change := colors[1][c] - start
+			if change == 0 {
+				continue
+			}
+			for _, limit := range []float64{0, 1} {
+				x := (limit - start) / change
+				if x > domain[0] && x < domain[1] {
+					positions = append(positions, x)
+				}
+			}
+		}
+		slices.Sort(positions)
+		for _, x := range slices.Compact(positions) {
+			stop := GradientStop{Position: (x - domain[0]) / (domain[1] - domain[0])}
+			for c, start := range colors[0] {
+				stop.RGB[c] = math.Max(0, math.Min(1, start+x*(colors[1][c]-start)))
+			}
+			stops = append(stops, stop)
+		}
 	case Integer(3):
 		v, err := r.Resolve(dict["Functions"])
 		if err != nil {
@@ -242,26 +344,70 @@ func (r *Reader) linearGradientStops(object Object, depth int) ([]GradientStop, 
 		if err != nil {
 			return nil, err
 		}
-		points := append(append([]float64{0}, bounds...), 1)
-		var stops []GradientStop
+		points := append(append([]float64{domain[0]}, bounds...), domain[1])
 		for i, function := range functions {
-			if points[i] > points[i+1] || encode[i*2] != 0 || encode[i*2+1] != 1 {
-				return nil, &UnsupportedError{Feature: "gradient stitching bounds or encoding"}
+			if points[i] > points[i+1] {
+				return nil, fmt.Errorf("invalid gradient stitching bounds")
 			}
 			if points[i] == points[i+1] {
 				continue
 			}
-			part, err := r.linearGradientStops(function, depth+1)
+			part, err := r.linearGradientStops(function, [2]float64{encode[i*2], encode[i*2+1]}, depth+1)
 			if err != nil {
 				return nil, err
 			}
 			for _, stop := range part {
-				stop.Position = points[i] + stop.Position*(points[i+1]-points[i])
+				stop.Position = (points[i] + stop.Position*(points[i+1]-points[i]) - domain[0]) / (domain[1] - domain[0])
 				stops = append(stops, stop)
 			}
 		}
-		return stops, nil
 	default:
 		return nil, &UnsupportedError{Feature: "gradient function type"}
 	}
+	return gradientInterval(stops, (interval[0]-domain[0])/(domain[1]-domain[0]), (interval[1]-domain[0])/(domain[1]-domain[0])), nil
+}
+
+// gradientInterval 截取或反向映射线性分段，保留定义域外常量和不连续边界
+// 入参: stops 原分段, start 起始参数, end 终止参数
+// 返回: []GradientStop 归一化分段
+func gradientInterval(stops []GradientStop, start, end float64) []GradientStop {
+	if start > end {
+		result := gradientInterval(stops, end, start)
+		slices.Reverse(result)
+		for i := range result {
+			result[i].Position = 1 - result[i].Position
+		}
+		return result
+	}
+	result := []GradientStop{{Position: 0, RGB: gradientValue(stops, start)}}
+	if start != end {
+		for _, stop := range stops {
+			if stop.Position > start && stop.Position <= end {
+				stop.Position = (stop.Position - start) / (end - start)
+				result = append(result, stop)
+			}
+		}
+	}
+	return slices.Compact(append(result, GradientStop{Position: 1, RGB: gradientValue(stops, end)}))
+}
+
+// gradientValue 计算线性分段在给定位置的颜色，重复位置使用右侧分段
+// 入参: stops 原分段, position 归一化位置
+// 返回: [3]float64 颜色分量
+func gradientValue(stops []GradientStop, position float64) [3]float64 {
+	if position < stops[0].Position {
+		return stops[0].RGB
+	}
+	for i := 1; i < len(stops); i++ {
+		if position < stops[i].Position {
+			a, b := stops[i-1], stops[i]
+			t := (position - a.Position) / (b.Position - a.Position)
+			var value [3]float64
+			for c := range value {
+				value[c] = a.RGB[c] + t*(b.RGB[c]-a.RGB[c])
+			}
+			return value
+		}
+	}
+	return stops[len(stops)-1].RGB
 }

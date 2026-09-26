@@ -39,6 +39,7 @@ type Image struct {
 	ColorSpace       Object
 	Decode           Array
 	ImageMask        bool
+	Interpolate      bool
 	Mask             Object
 	SoftMask         Object
 	Stream           *Stream
@@ -170,12 +171,19 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	if decodeObject != nil && !ok {
 		return nil, fmt.Errorf("invalid image decode array")
 	}
-	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Decode: decode, ImageMask: mask, Mask: dict["Mask"], SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
+	interpolate, err := r.Resolve(dict["Interpolate"])
+	if err != nil {
+		return nil, err
+	}
+	if interpolate != nil && interpolate != Boolean(true) && interpolate != Boolean(false) {
+		return nil, fmt.Errorf("invalid image interpolation flag")
+	}
+	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Decode: decode, ImageMask: mask, Interpolate: interpolate == Boolean(true), Mask: dict["Mask"], SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
 }
 
-// DecodeImage 应用Decode映射及颜色空间变换，合成同尺寸遮罩后返回非预乘透明图像
+// DecodeImage 应用Decode映射及颜色空间变换，合成遮罩后返回非预乘透明图像
 // 模板图像返回映射后的灰度样本，当前填充色由页面使用方应用
-// 不支持的色彩管理和遮罩重采样返回明确错误
+// 异尺寸遮罩按单位方形对齐，输出尺寸取各轴较大的采样数以保留边缘精度
 // 返回: image.Image 解码图像, error 错误信息
 func (i *Image) DecodeImage() (image.Image, error) {
 	palette, err := i.palette()
@@ -274,11 +282,24 @@ func (i *Image) DecodeImage() (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := image.NewNRGBA64(samples.Bounds())
+	bounds := samples.Bounds()
+	if mask != nil {
+		bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
+	}
+	if uint64(bounds.Dx()) > uint64(^uint(0)>>1)/8/uint64(bounds.Dy()) {
+		return nil, fmt.Errorf("masked image dimensions exceed platform integer range")
+	}
+	if samples.Bounds() != bounds {
+		samples = &imageResample{source: samples, bounds: bounds, interpolate: i.Interpolate && palette == nil}
+	}
+	if mask != nil {
+		mask.bounds = bounds
+	}
+	out := image.NewNRGBA64(bounds)
 	intent, _ := i.Stream.Dictionary["Intent"].(Name)
 	maximum := float64((uint32(1) << i.BitsPerComponent) - 1)
-	for y := 0; y < i.Height; y++ {
-		for x := 0; x < i.Width; x++ {
+	for y := 0; y < bounds.Dy(); y++ {
+		for x := 0; x < bounds.Dx(); x++ {
 			alpha := uint16(65535)
 			if mask != nil {
 				value, _, _, _ := mask.At(x, y).RGBA()
@@ -382,6 +403,7 @@ func (i *Image) palette() ([]color.NRGBA64, error) {
 	}
 	components := 0
 	var calibrated *calRGBSpace
+	var profile *iccColorSpace
 	switch base {
 	case Name("DeviceGray"):
 		components = 1
@@ -390,11 +412,19 @@ func (i *Image) palette() ([]color.NRGBA64, error) {
 	case Name("DeviceCMYK"):
 		components = 4
 	default:
-		calibrated, err = i.reader.readCalRGB(base)
-		if err != nil {
-			return nil, err
+		if space, ok := base.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
+			profile, err = i.reader.readICCColorSpace(space)
+			if err != nil {
+				return nil, err
+			}
+			components = profile.components()
+		} else {
+			calibrated, err = i.reader.readCalRGB(base)
+			if err != nil {
+				return nil, err
+			}
+			components = 3
 		}
-		components = 3
 	}
 	high, err := i.reader.Resolve(array[2])
 	if err != nil {
@@ -424,8 +454,21 @@ func (i *Image) palette() ([]color.NRGBA64, error) {
 		return nil, fmt.Errorf("invalid Indexed lookup length")
 	}
 	palette := make([]color.NRGBA64, int(n+1))
+	intent, _ := i.Stream.Dictionary["Intent"].(Name)
 	for index := range palette {
 		v := data[index*components:]
+		if profile != nil {
+			var values [3]float64
+			for c := 0; c < components; c++ {
+				values[c] = float64(v[c]) / 255
+			}
+			rgb, err := profile.color(values[:components], intent)
+			if err != nil {
+				return nil, err
+			}
+			palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
+			continue
+		}
 		switch components {
 		case 1:
 			palette[index] = color.NRGBA64{R: uint16(v[0]) * 257, G: uint16(v[0]) * 257, B: uint16(v[0]) * 257, A: 65535}
@@ -443,8 +486,8 @@ func (i *Image) palette() ([]color.NRGBA64, error) {
 
 // decodeMask 读取有效遮罩，软遮罩优先于显式遮罩和色键遮罩
 // 入参: components 原始图像分量数
-// 返回: image.Image 遮罩图像, []float64 色键范围, bool 是否反转遮罩灰度, []float64 预混合底色, error 错误信息
-func (i *Image) decodeMask(components int) (image.Image, []float64, bool, []float64, error) {
+// 返回: *imageResample 遮罩图像, []float64 色键范围, bool 是否反转遮罩灰度, []float64 预混合底色, error 错误信息
+func (i *Image) decodeMask(components int) (*imageResample, []float64, bool, []float64, error) {
 	object, err := i.reader.Resolve(i.SoftMask)
 	if err != nil {
 		return nil, nil, false, nil, err
@@ -488,9 +531,6 @@ func (i *Image) decodeMask(components int) (image.Image, []float64, bool, []floa
 	if mask.Mask != nil || mask.SoftMask != nil || soft && (mask.ImageMask || mask.ColorSpace != Name("DeviceGray")) || !soft && !mask.ImageMask {
 		return nil, nil, false, nil, fmt.Errorf("invalid image mask dictionary")
 	}
-	if mask.Width != i.Width || mask.Height != i.Height {
-		return nil, nil, false, nil, &UnsupportedError{Feature: "image mask resampling"}
-	}
 	var matte []float64
 	if value := mask.Stream.Dictionary["Matte"]; value != nil {
 		if !soft {
@@ -513,7 +553,68 @@ func (i *Image) decodeMask(components int) (image.Image, []float64, bool, []floa
 		}
 	}
 	decoded, err := mask.DecodeImage()
-	return decoded, nil, !soft, matte, err
+	if err != nil {
+		return nil, nil, false, nil, err
+	}
+	return &imageResample{source: decoded, bounds: decoded.Bounds(), interpolate: mask.Interpolate}, nil, !soft, matte, nil
+}
+
+// imageResample 在统一图像坐标中采样，不缩减任一轴的原始采样数
+type imageResample struct {
+	source      image.Image
+	bounds      image.Rectangle
+	interpolate bool
+}
+
+// ColorModel 返回原始图像的颜色模型
+// 返回: color.Model 颜色模型
+func (s *imageResample) ColorModel() color.Model { return s.source.ColorModel() }
+
+// Bounds 返回合成图像的采样边界
+// 返回: image.Rectangle 采样边界
+func (s *imageResample) Bounds() image.Rectangle { return s.bounds }
+
+// At 按像素中心执行最近邻或双线性采样，保留原始CMYK分量
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 采样颜色
+func (s *imageResample) At(x, y int) color.Color {
+	b := s.source.Bounds()
+	if b == s.bounds {
+		return s.source.At(x, y)
+	}
+	sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
+	sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
+	if !s.interpolate {
+		return s.source.At(b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
+	}
+	x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
+	fx, fy := sx-float64(x0), sy-float64(y0)
+	var values [4]float64
+	_, cmyk := s.source.At(b.Min.X, b.Min.Y).(color.CMYK)
+	for dy := 0; dy < 2; dy++ {
+		for dx := 0; dx < 2; dx++ {
+			weightX, weightY := 1-fx, 1-fy
+			if dx == 1 {
+				weightX = fx
+			}
+			if dy == 1 {
+				weightY = fy
+			}
+			pixel := s.source.At(b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy)))
+			r, g, b, a := pixel.RGBA()
+			if cmyk {
+				c := pixel.(color.CMYK)
+				r, g, b, a = uint32(c.C), uint32(c.M), uint32(c.Y), uint32(c.K)
+			}
+			for i, v := range [4]uint32{r, g, b, a} {
+				values[i] += float64(v) * weightX * weightY
+			}
+		}
+	}
+	if cmyk {
+		return color.CMYK{C: uint8(math.Round(values[0])), M: uint8(math.Round(values[1])), Y: uint8(math.Round(values[2])), K: uint8(math.Round(values[3]))}
+	}
+	return color.RGBA64{R: uint16(math.Round(values[0])), G: uint16(math.Round(values[1])), B: uint16(math.Round(values[2])), A: uint16(math.Round(values[3]))}
 }
 
 // DecodeSamples 解码原始图像样本，不应用Decode数组、遮罩或色彩管理
@@ -598,6 +699,9 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 			return nil, err
 		}
 	case "JPXDecode":
+		if i.ColorSpace == Name("DeviceCMYK") {
+			return i.jpxCMYKSamples(data)
+		}
 		result, _, err = image.Decode(bytes.NewReader(data))
 		if err != nil {
 			return nil, err

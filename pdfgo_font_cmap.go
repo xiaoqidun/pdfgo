@@ -20,13 +20,15 @@ import (
 )
 
 // fontCmap 读取指定TrueType字符表，不把ToUnicode当作字形索引
-func fontCmap(data []byte, symbolic bool) ([]byte, bool, error) {
+// 入参: data 字体数据, symbolic 是否为符号字体
+// 返回: []byte 字符映射表, Name 映射编码, error 解析错误
+func fontCmap(data []byte, symbolic bool) ([]byte, Name, error) {
 	if len(data) < 12 {
-		return nil, false, fmt.Errorf("truncated TrueType font")
+		return nil, "", fmt.Errorf("truncated TrueType font")
 	}
 	count := int(binary.BigEndian.Uint16(data[4:6]))
 	if count > (len(data)-12)/16 {
-		return nil, false, fmt.Errorf("invalid TrueType directory")
+		return nil, "", fmt.Errorf("invalid TrueType directory")
 	}
 	var cmap []byte
 	for n := 0; n < count; n++ {
@@ -36,18 +38,19 @@ func fontCmap(data []byte, symbolic bool) ([]byte, bool, error) {
 		}
 		offset, length := uint64(binary.BigEndian.Uint32(record[8:])), uint64(binary.BigEndian.Uint32(record[12:]))
 		if offset+length > uint64(len(data)) {
-			return nil, false, fmt.Errorf("invalid TrueType cmap")
+			return nil, "", fmt.Errorf("invalid TrueType cmap")
 		}
 		cmap = data[offset : offset+length]
 	}
 	if len(cmap) < 4 {
-		return nil, false, fmt.Errorf("missing TrueType cmap")
+		return nil, "", fmt.Errorf("missing TrueType cmap")
 	}
 	entries := int(binary.BigEndian.Uint16(cmap[2:]))
 	if entries > (len(cmap)-4)/8 {
-		return nil, false, fmt.Errorf("invalid cmap directory")
+		return nil, "", fmt.Errorf("invalid cmap directory")
 	}
-	selected, score, symbol := -1, -1, false
+	selected, score := -1, -1
+	var encodingName Name
 	for n := 0; n < entries; n++ {
 		record := cmap[4+n*8:]
 		platform, encoding := binary.BigEndian.Uint16(record), binary.BigEndian.Uint16(record[2:])
@@ -63,7 +66,10 @@ func fontCmap(data []byte, symbolic bool) ([]byte, bool, error) {
 				priority = 3
 			}
 		} else {
-			if platform == 0 {
+			if platform == 1 && encoding == 0 {
+				priority = 0
+			}
+			if platform == 0 && encoding != 5 {
 				priority = 1
 			}
 			if platform == 3 && encoding == 1 {
@@ -76,15 +82,20 @@ func fontCmap(data []byte, symbolic bool) ([]byte, bool, error) {
 		if priority > score {
 			selected = n
 			score = priority
-			symbol = platform == 3 && encoding == 0
+			encodingName = "Unicode"
+			if platform == 3 && encoding == 0 {
+				encodingName = "Symbol"
+			} else if platform == 1 && encoding == 0 {
+				encodingName = "MacRomanEncoding"
+			}
 		}
 	}
 	if selected < 0 {
-		return nil, false, &UnsupportedError{Feature: "TrueType cmap selection"}
+		return nil, "", &UnsupportedError{Feature: "TrueType cmap selection"}
 	}
 	offset := uint64(binary.BigEndian.Uint32(cmap[4+selected*8+4:]))
 	if offset+2 > uint64(len(cmap)) {
-		return nil, false, fmt.Errorf("invalid cmap offset")
+		return nil, "", fmt.Errorf("invalid cmap offset")
 	}
 	table := cmap[offset:]
 	format := binary.BigEndian.Uint16(table)
@@ -92,24 +103,26 @@ func fontCmap(data []byte, symbolic bool) ([]byte, bool, error) {
 	switch format {
 	case 0, 4, 6:
 		if len(table) < 4 {
-			return nil, false, fmt.Errorf("truncated cmap")
+			return nil, "", fmt.Errorf("truncated cmap")
 		}
 		length = uint64(binary.BigEndian.Uint16(table[2:]))
 	case 12:
 		if len(table) < 8 {
-			return nil, false, fmt.Errorf("truncated cmap")
+			return nil, "", fmt.Errorf("truncated cmap")
 		}
 		length = uint64(binary.BigEndian.Uint32(table[4:]))
 	default:
-		return nil, false, &UnsupportedError{Feature: fmt.Sprintf("TrueType cmap format %d", format)}
+		return nil, "", &UnsupportedError{Feature: fmt.Sprintf("TrueType cmap format %d", format)}
 	}
 	if length < 4 || length > uint64(len(table)) {
-		return nil, false, fmt.Errorf("invalid cmap length")
+		return nil, "", fmt.Errorf("invalid cmap length")
 	}
-	return table[:length], symbol, nil
+	return table[:length], encodingName, nil
 }
 
 // cmapGlyph 从已选定的字符表查询字形编号
+// 入参: table 字符映射表, code 字符编码
+// 返回: uint16 字形编号, error 解析错误
 func cmapGlyph(table []byte, code uint32) (uint16, error) {
 	if len(table) < 4 {
 		return 0, fmt.Errorf("truncated cmap")

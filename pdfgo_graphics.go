@@ -111,6 +111,7 @@ type Style struct {
 	OverprintMode   int
 	RenderingIntent Name
 	BlendMode       Name
+	AlphaIsShape    bool
 	SoftMask        *SoftMask
 	Smoothness      *float64
 }
@@ -125,11 +126,13 @@ type PathMark struct {
 }
 
 // TextMark 保存文字字形及其相对于文字矩阵的基线位置
+// StrokeMatrix保留图形状态坐标变换，描边参数不受文字矩阵和字号影响
 type TextMark struct {
 	Font                  *Font
 	Glyphs                []Glyph
 	Positions             []Point
 	Matrix                Matrix
+	StrokeMatrix          Matrix
 	Size, HorizontalScale float64
 	Style                 Style
 	Mode                  int
@@ -145,9 +148,11 @@ type ImageMark struct {
 
 // GroupMark 保存透明度组的边界不透明度和隔离方式，组内绘制使用独立状态
 type GroupMark struct {
-	Alpha    float64
-	Isolated bool
-	SoftMask *SoftMask
+	Alpha        float64
+	AlphaIsShape bool
+	Isolated     bool
+	BlendMode    Name
+	SoftMask     *SoftMask
 }
 
 // MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标记的标签
@@ -177,7 +182,7 @@ type graphicsState struct {
 	mode                                                  int
 	fillSpace, strokeSpace                                Name
 	fillPatternBase, strokePatternBase                    Name
-	fillICC, strokeICC                                    *iccRGBSpace
+	fillICC, strokeICC                                    *iccColorSpace
 	fillSeparation, strokeSeparation                      *separationSpace
 }
 
@@ -202,6 +207,7 @@ type pageInterpreter struct {
 	opaqueGroup            bool
 	maskGroup              bool
 	patternMatrix          Matrix
+	bounds                 Rectangle
 	uncoloredPattern       bool
 	type3                  bool
 }
@@ -256,7 +262,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	if err != nil {
 		return err
 	}
-	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx}
+	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
 	return interpreter.run(data)
@@ -401,7 +407,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 	a := op.Operands
 	if p.uncoloredPattern {
 		switch op.Operator {
-		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN":
+		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN", "sh":
 			return fmt.Errorf("color operator in uncolored pattern")
 		}
 	}
@@ -630,7 +636,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if !ok {
 			return fmt.Errorf("invalid color space name")
 		}
-		var profile *iccRGBSpace
+		var profile *iccColorSpace
 		var separation *separationSpace
 		var patternBase Name
 		if name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK" && name != "Pattern" {
@@ -661,7 +667,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 				}
 				name = "Separation"
 			} else {
-				profile, err = p.reader.readICCRGB(space)
+				profile, err = p.reader.readICCColorSpace(space)
 				if err != nil {
 					return err
 				}
@@ -731,7 +737,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return nil
 		}
 		if space == "ICCBased" {
-			values, err := numbers(a, 3)
+			values, err := numbers(a, profile.components())
 			if err != nil {
 				return err
 			}
@@ -931,6 +937,8 @@ func (p *pageInterpreter) operation(op Operation) error {
 				p.textMatrix = p.textMatrix.Mul(Matrix{1, 0, 0, 1, -adjustment[0] / 1000 * p.state.fontSize * p.state.hscale, 0})
 			}
 		}
+	case "sh":
+		return p.shadingFill(a)
 	case "Do":
 		return p.xobject(a)
 	case "gs":
@@ -1011,7 +1019,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 		if p.visitor.Text == nil {
 			return fmt.Errorf("text visitor missing")
 		}
-		mark := TextMark{Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: p.state.mode}
+		mark := TextMark{Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: p.state.mode}
 		if mark.Mode >= 4 {
 			mark.Clip = &TextClip{Font: mark.Font, Glyphs: glyphs, Positions: positions, Matrix: mark.Matrix, Size: mark.Size, HorizontalScale: mark.HorizontalScale}
 			p.textClips = append(p.textClips, mark.Clip)
@@ -1127,13 +1135,15 @@ func (p *pageInterpreter) form(stream *Stream) error {
 				return err
 			}
 		}
-		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, Isolated: group["I"] == Boolean(true), SoftMask: p.state.style.SoftMask}
-		if p.visitor.Group == nil && (groupMark.Alpha != 1 || !groupMark.Isolated || groupMark.SoftMask != nil) {
+		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, AlphaIsShape: p.state.style.AlphaIsShape, Isolated: group["I"] == Boolean(true), BlendMode: p.state.style.BlendMode, SoftMask: p.state.style.SoftMask}
+		if p.visitor.Group == nil && (groupMark.Alpha != 1 || !groupMark.Isolated || groupMark.SoftMask != nil || groupMark.BlendMode != "" && groupMark.BlendMode != "Normal" && groupMark.BlendMode != "Compatible") {
 			return &UnsupportedError{Feature: "transparency group visitor missing"}
 		}
 		child.state.style.Fill.Alpha, child.state.style.Stroke.Alpha = 1, 1
 		child.state.style.SoftMask = nil
-		child.opaqueGroup = true
+		child.state.style.AlphaIsShape = false
+		child.state.style.BlendMode = "Normal"
+		child.opaqueGroup = p.visitor.Group == nil
 	}
 	child.depth++
 	child.stack = nil
@@ -1274,9 +1284,11 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				p.state.style.SoftMask = mask
 			}
 		case "AIS":
-			if value != Boolean(false) {
-				return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
+			flag, ok := value.(Boolean)
+			if !ok {
+				return fmt.Errorf("invalid graphics state flag %q", key)
 			}
+			p.state.style.AlphaIsShape = bool(flag)
 		case "SA", "OP", "op":
 			flag, ok := value.(Boolean)
 			if !ok {

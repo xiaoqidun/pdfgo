@@ -35,7 +35,7 @@ type Font struct {
 	cidMap         CIDMap
 	glyphMap       []byte
 	simpleCmap     []byte
-	symbolCmap     bool
+	cmapEncoding   Name
 	symbolic       bool
 	cffGlyphs      map[uint32]uint16
 	cffNames       map[uint32]string
@@ -389,7 +389,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		}
 	}
 	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && font.ProgramType != "Type1C" {
-		font.simpleCmap, font.symbolCmap, err = fontCmap(font.Program, font.symbolic)
+		font.simpleCmap, font.cmapEncoding, err = fontCmap(font.Program, font.symbolic)
 		if err != nil {
 			return nil, err
 		}
@@ -525,17 +525,35 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		}
 		if f.simpleCmap != nil {
 			lookup := code
+			mapped := true
 			if !f.symbolic {
-				if f.encoding != Name("WinAnsiEncoding") {
-					return nil, &UnsupportedError{Feature: "simple TrueType encoding without explicit WinAnsi mapping"}
+				if f.cmapEncoding == "MacRomanEncoding" {
+					mapped = false
+					for index, glyphName := range pdfMacRomanNames {
+						if name != "" && glyphName == name {
+							lookup = uint32(index)
+							mapped = true
+							break
+						}
+					}
+				} else {
+					mapped, ok := glyphNameUnicode(name)
+					characters := []rune(mapped)
+					if !ok || len(characters) != 1 {
+						return nil, &UnsupportedError{Feature: "TrueType character without Unicode glyph name"}
+					}
+					lookup = uint32(characters[0])
 				}
-				lookup = uint32(charmap.Windows1252.DecodeByte(byte(code)))
 			}
-			id, err := cmapGlyph(f.simpleCmap, lookup)
-			if err != nil {
-				return nil, err
+			var id uint16
+			if mapped {
+				var err error
+				id, err = cmapGlyph(f.simpleCmap, lookup)
+				if err != nil {
+					return nil, err
+				}
 			}
-			if f.symbolCmap && id == 0 {
+			if f.cmapEncoding == "Symbol" && id == 0 {
 				for _, base := range []uint32{0xF000, 0xF100, 0xF200} {
 					candidate, err := cmapGlyph(f.simpleCmap, base+code)
 					if err != nil {

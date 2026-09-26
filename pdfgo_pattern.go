@@ -120,7 +120,7 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	box := p.BBox
 	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
 	style := Style{Fill: base, Stroke: base, LineWidth: 1, MiterLimit: 10, Clips: []Path{clip}}
-	child := pageInterpreter{reader: p.reader, resources: p.resources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity()}
+	child := pageInterpreter{reader: p.reader, resources: p.resources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
 	child.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: style}
 	return child.run(p.data)
 }

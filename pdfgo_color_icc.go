@@ -24,13 +24,73 @@ import (
 // iccRGBSpace 保存RGB矩阵曲线配置文件到sRGB的变换
 type iccRGBSpace struct {
 	matrix calRGBSpace
-	curves [3][]uint16
+	curves [3]iccToneCurve
 }
 
 // iccGraySpace 保存灰度曲线及D50连接空间到sRGB的变换
 type iccGraySpace struct {
 	matrix calRGBSpace
-	curve  []uint16
+	curve  iccToneCurve
+}
+
+// iccToneCurve 保存ICC采样曲线或参数曲线
+type iccToneCurve struct {
+	samples    []uint16
+	parameters []float64
+	function   uint16
+}
+
+// iccColorSpace 统一灰度与RGB配置文件的绘制颜色变换
+type iccColorSpace struct {
+	rgb  *iccRGBSpace
+	gray *iccGraySpace
+}
+
+// readICCColorSpace 读取内容流使用的ICC颜色空间
+// 入参: object ICCBased颜色空间数组
+// 返回: *iccColorSpace 颜色变换, error 解析错误
+func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
+	if len(object) != 2 || object[0] != Name("ICCBased") {
+		return nil, fmt.Errorf("invalid ICCBased color space")
+	}
+	value, err := r.Resolve(object[1])
+	if err != nil {
+		return nil, err
+	}
+	stream, ok := value.(*Stream)
+	if !ok {
+		return nil, fmt.Errorf("invalid ICC profile stream")
+	}
+	space := &iccColorSpace{}
+	if stream.Dictionary["N"] == Integer(1) {
+		space.gray, err = r.readICCGray(object)
+	} else {
+		space.rgb, err = r.readICCRGB(object)
+	}
+	return space, err
+}
+
+// components 返回配置文件的颜色分量数
+// 返回: int 分量数
+func (s *iccColorSpace) components() int {
+	if s.gray != nil {
+		return 1
+	}
+	return 3
+}
+
+// color 将内容流ICC颜色转换为sRGB
+// 入参: values 编码分量, intent 渲染意图
+// 返回: [3]float64 sRGB分量, error 不支持的变换
+func (s *iccColorSpace) color(values []float64, intent Name) ([3]float64, error) {
+	if s.gray == nil {
+		return s.rgb.color(values, intent)
+	}
+	if intent == "AbsoluteColorimetric" {
+		return [3]float64{}, &UnsupportedError{Feature: "ICC absolute colorimetric conversion"}
+	}
+	c := s.gray.color(values[0])
+	return [3]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}, nil
 }
 
 // validateRGBGroupSpace 检查混合空间与sRGB的偏差是否在8位量化精度内
@@ -238,42 +298,120 @@ func iccTags(data []byte, model string) (map[string][]byte, error) {
 	return tags, nil
 }
 
-// iccCurve 读取ICC曲线标签并检查单调性
+// iccCurve 读取ICC采样曲线或参数曲线并校验定义域
 // 入参: data 色调曲线标签数据
-// 返回: []uint16 曲线采样或指数, error 错误信息
-func iccCurve(data []byte) ([]uint16, error) {
-	if len(data) < 12 || string(data[:4]) != "curv" {
-		return nil, &UnsupportedError{Feature: "ICC tone curve type"}
+// 返回: iccToneCurve 色调曲线, error 错误信息
+func iccCurve(data []byte) (iccToneCurve, error) {
+	if len(data) < 12 {
+		return iccToneCurve{}, fmt.Errorf("invalid ICC tone curve length")
+	}
+	if string(data[:4]) == "para" {
+		curve := iccToneCurve{function: binary.BigEndian.Uint16(data[8:])}
+		counts := [...]int{1, 3, 4, 5, 7}
+		if int(curve.function) >= len(counts) {
+			return iccToneCurve{}, &UnsupportedError{Feature: "ICC parametric curve function"}
+		}
+		n := counts[curve.function]
+		if len(data) < 12+4*n {
+			return iccToneCurve{}, fmt.Errorf("invalid ICC parametric curve length")
+		}
+		curve.parameters = make([]float64, n)
+		for i := range curve.parameters {
+			curve.parameters[i] = float64(int32(binary.BigEndian.Uint32(data[12+4*i:]))) / 65536
+		}
+		if curve.parameters[0] <= 0 || (curve.function == 1 || curve.function == 2) && curve.parameters[1] <= 0 {
+			return iccToneCurve{}, fmt.Errorf("invalid ICC parametric curve parameters")
+		}
+		points := []float64{0, 1}
+		if curve.function >= 3 {
+			d := curve.parameters[4]
+			if d >= 0 && d <= 1 {
+				points = append(points, d)
+			}
+		}
+		for _, x := range points {
+			if y := curve.parametric(x); math.IsNaN(y) || math.IsInf(y, 0) {
+				return iccToneCurve{}, fmt.Errorf("undefined ICC parametric curve")
+			}
+		}
+		return curve, nil
+	}
+	if string(data[:4]) != "curv" {
+		return iccToneCurve{}, &UnsupportedError{Feature: "ICC tone curve type"}
 	}
 	n := uint64(binary.BigEndian.Uint32(data[8:]))
 	if n > uint64(len(data)-12)/2 {
-		return nil, fmt.Errorf("invalid ICC tone curve length")
+		return iccToneCurve{}, fmt.Errorf("invalid ICC tone curve length")
 	}
 	curve := make([]uint16, int(n))
 	for j := range curve {
 		curve[j] = binary.BigEndian.Uint16(data[12+2*j:])
 		if j > 0 && curve[j] < curve[j-1] {
-			return nil, fmt.Errorf("nonmonotonic ICC tone curve")
+			return iccToneCurve{}, fmt.Errorf("nonmonotonic ICC tone curve")
 		}
 	}
 	if n == 1 && curve[0] == 0 {
-		return nil, fmt.Errorf("invalid ICC curve gamma")
+		return iccToneCurve{}, fmt.Errorf("invalid ICC curve gamma")
 	}
-	return curve, nil
+	if n == 1 {
+		return iccToneCurve{parameters: []float64{float64(curve[0]) / 256}}, nil
+	}
+	return iccToneCurve{samples: curve}, nil
+}
+
+// parametric 按ICC函数类型求出未截断的曲线值
+// 入参: x 归一化输入
+// 返回: float64 曲线值
+func (c iccToneCurve) parametric(x float64) float64 {
+	p := c.parameters
+	if c.function == 0 {
+		return math.Pow(x, p[0])
+	}
+	if c.function <= 2 {
+		y := 0.0
+		if x >= -p[2]/p[1] {
+			y = math.Pow(p[1]*x+p[2], p[0])
+		}
+		if c.function == 2 {
+			y += p[3]
+		}
+		return y
+	}
+	if x < p[4] {
+		y := p[3] * x
+		if c.function == 4 {
+			y += p[6]
+		}
+		return y
+	}
+	y := math.Pow(p[1]*x+p[2], p[0])
+	if c.function == 4 {
+		y += p[5]
+	}
+	return y
+}
+
+// evaluate 计算ICC曲线并将输入输出限制在标准单位区间
+// 入参: value 编码分量
+// 返回: float64 线性分量
+func (c iccToneCurve) evaluate(value float64) float64 {
+	v := math.Max(0, math.Min(1, value))
+	if len(c.parameters) > 0 {
+		return math.Max(0, math.Min(1, c.parametric(v)))
+	}
+	if len(c.samples) > 1 {
+		position := v * float64(len(c.samples)-1)
+		index := min(int(position), len(c.samples)-2)
+		return (float64(c.samples[index]) + (position-float64(index))*float64(c.samples[index+1]-c.samples[index])) / 65535
+	}
+	return v
 }
 
 // color 将ICC灰度样本转换为sRGB颜色
 // 入参: value 灰度编码分量
 // 返回: color.NRGBA64 非预乘sRGB颜色
 func (s *iccGraySpace) color(value float64) color.NRGBA64 {
-	v := math.Max(0, math.Min(1, value))
-	if len(s.curve) == 1 {
-		v = math.Pow(v, float64(s.curve[0])/256)
-	} else if len(s.curve) > 1 {
-		position := v * float64(len(s.curve)-1)
-		index := min(int(position), len(s.curve)-2)
-		v = (float64(s.curve[index]) + (position-float64(index))*float64(s.curve[index+1]-s.curve[index])) / 65535
-	}
+	v := s.curve.evaluate(value)
 	return s.matrix.color(v, v, v)
 }
 
@@ -286,17 +424,7 @@ func (s *iccRGBSpace) color(values []float64, intent Name) ([3]float64, error) {
 	}
 	linear := [3]float64{}
 	for i, curve := range s.curves {
-		v := math.Max(0, math.Min(1, values[i]))
-		switch len(curve) {
-		case 0:
-			linear[i] = v
-		case 1:
-			linear[i] = math.Pow(v, float64(curve[0])/256)
-		default:
-			position := v * float64(len(curve)-1)
-			index := min(int(position), len(curve)-2)
-			linear[i] = (float64(curve[index]) + (position-float64(index))*float64(curve[index+1]-curve[index])) / 65535
-		}
+		linear[i] = curve.evaluate(values[i])
 	}
 	c := s.matrix.color(linear[0], linear[1], linear[2])
 	return [3]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}, nil

@@ -144,7 +144,7 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 	}
 	rect := annotation.Rect
 	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
-	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx}
+	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
 	return interpreter.form(stream)
