@@ -29,15 +29,19 @@ type GradientStop struct {
 }
 
 // AxialGradient 保存页面坐标中的渐变轴及两端延伸方式
+// Stops仅在函数可精确展开为线性分段时提供，否则通过ValuesAt或ColorAt求值
 type AxialGradient struct {
 	Start, End Point
 	Extend     [2]bool
 	Stops      []GradientStop
 	Space      *ColorSpace
 	Intent     Name
+	function   *gradientFunction
+	domain     [2]float64
 }
 
 // RadialGradient 保存页面坐标中的双圆径向渐变及两端延伸方式
+// Stops仅在函数可精确展开为线性分段时提供，否则通过ValuesAt或ColorAt求值
 type RadialGradient struct {
 	Start, End             Point
 	StartRadius, EndRadius float64
@@ -45,30 +49,71 @@ type RadialGradient struct {
 	Stops                  []GradientStop
 	Space                  *ColorSpace
 	Intent                 Name
+	function               *gradientFunction
+	domain                 [2]float64
 }
 
 // ColorAt 在源颜色空间内插值，再按渲染意图转换为sRGB
 // 入参: position 归一化轴位置，范围外使用端点颜色
 // 返回: [3]float64 sRGB颜色, error 无效渐变或颜色变换错误
 func (g *AxialGradient) ColorAt(position float64) ([3]float64, error) {
-	return gradientRGB(g.Stops, g.Space, g.Intent, position)
+	values, err := g.ValuesAt(position)
+	return gradientRGB(values, err, g.Space, g.Intent)
 }
 
 // ColorAt 在源颜色空间内插值，再按渲染意图转换为sRGB
 // 入参: position 归一化双圆插值位置，范围外使用端点颜色
 // 返回: [3]float64 sRGB颜色, error 无效渐变或颜色变换错误
 func (g *RadialGradient) ColorAt(position float64) ([3]float64, error) {
-	return gradientRGB(g.Stops, g.Space, g.Intent, position)
+	values, err := g.ValuesAt(position)
+	return gradientRGB(values, err, g.Space, g.Intent)
+}
+
+// ValuesAt 按原始函数计算轴向渐变的源颜色分量
+// 入参: position 归一化轴位置，范围外使用端点
+// 返回: [4]float64 源空间分量, error 无效求值
+func (g *AxialGradient) ValuesAt(position float64) ([4]float64, error) {
+	return gradientValues(g.Stops, g.function, g.domain, position)
+}
+
+// ValuesAt 按原始函数计算径向渐变的源颜色分量
+// 入参: position 归一化双圆插值位置，范围外使用端点
+// 返回: [4]float64 源空间分量, error 无效求值
+func (g *RadialGradient) ValuesAt(position float64) ([4]float64, error) {
+	return gradientValues(g.Stops, g.function, g.domain, position)
+}
+
+// gradientValues 优先计算原始函数，保留非线性、定义域和边界语义
+// 入参: stops 线性分段, function 原始函数, domain 着色定义域, position 归一化位置
+// 返回: [4]float64 源空间分量, error 无效参数或结果
+func gradientValues(stops []GradientStop, function *gradientFunction, domain [2]float64, position float64) ([4]float64, error) {
+	if math.IsNaN(position) || math.IsInf(position, 0) || function == nil && len(stops) == 0 {
+		return [4]float64{}, fmt.Errorf("invalid gradient evaluation")
+	}
+	if function == nil {
+		return gradientValue(stops, position), nil
+	}
+	position = math.Max(0, math.Min(1, position))
+	values := function.value(domain[0] + position*(domain[1]-domain[0]))
+	for i, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return [4]float64{}, fmt.Errorf("nonfinite gradient color")
+		}
+		values[i] = math.Max(0, math.Min(1, value))
+	}
+	return values, nil
 }
 
 // gradientRGB 保留源空间的插值语义，不在显示颜色之间近似
-// 入参: stops 颜色分段, space 源空间, intent 渲染意图, position 归一化位置
+// 入参: values 源分量, err 分量求值错误, space 源空间, intent 渲染意图
 // 返回: [3]float64 sRGB颜色, error 参数或变换错误
-func gradientRGB(stops []GradientStop, space *ColorSpace, intent Name, position float64) ([3]float64, error) {
-	if len(stops) == 0 || space == nil || math.IsNaN(position) || math.IsInf(position, 0) {
+func gradientRGB(values [4]float64, err error, space *ColorSpace, intent Name) ([3]float64, error) {
+	if err != nil {
+		return [3]float64{}, err
+	}
+	if space == nil {
 		return [3]float64{}, fmt.Errorf("invalid gradient evaluation")
 	}
-	values := gradientValue(stops, position)
 	return space.RGB(values[:space.Components()], intent)
 }
 
@@ -257,7 +302,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 			}
 		}
 	}
-	stops, space, err := p.shadingStops(shading["ColorSpace"], shading["Function"], domain)
+	stops, space, function, err := p.shadingStops(shading["ColorSpace"], shading["Function"], domain)
 	if err != nil {
 		return Paint{}, err
 	}
@@ -271,29 +316,31 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	if paint.Axial != nil {
 		paint.Axial.Stops, paint.Axial.Space = stops, space
 		paint.Axial.Intent = p.state.style.RenderingIntent
+		paint.Axial.function, paint.Axial.domain = function, domain
 	} else {
 		paint.Radial.Stops, paint.Radial.Space = stops, space
 		paint.Radial.Intent = p.state.style.RenderingIntent
+		paint.Radial.function, paint.Radial.domain = function, domain
 	}
 	return paint, nil
 }
 
 // shadingStops 解析渐变源空间，DeviceN按仿射着色函数精确映射到备用空间
 // 入参: object 颜色空间, function 渐变函数, domain 输入区间
-// 返回: []GradientStop 分段, *ColorSpace 插值空间, error 解析错误
-func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, error) {
+// 返回: []GradientStop 分段, *ColorSpace 插值空间, *gradientFunction 原始函数, error 解析错误
+func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
 	object, err := p.reader.Resolve(object)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if name, ok := object.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
 		object, err = p.resource("ColorSpace", name)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		object, err = p.reader.Resolve(object)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	array, ok := object.(Array)
@@ -302,99 +349,93 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 	}
 	space, err := p.reader.readColorSpace(object)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	stops, err := p.reader.linearGradientStops(function, domain, space.Components(), 0)
-	return stops, space, err
+	f, err := p.reader.readGradientFunction(function, space.Components(), 0)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var stops []GradientStop
+	if f.linear != nil {
+		stops = clipGradientValues(f.linear(domain), gradientUnitBounds(space.Components()))
+	}
+	return stops, space, f, nil
 }
 
 // deviceNGradient 精确展开多色渐变的仿射着色与范围截断
 // 入参: space 多色定义, function 渐变函数, domain 输入区间
-// 返回: []GradientStop 备用空间分段, *ColorSpace 备用空间, error 能力或格式错误
-func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, error) {
+// 返回: []GradientStop 备用空间分段, *ColorSpace 备用空间, *gradientFunction 颜色函数, error 能力或格式错误
+func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
 	if len(space) != 4 && len(space) != 5 {
-		return nil, nil, fmt.Errorf("invalid DeviceN color space")
+		return nil, nil, nil, fmt.Errorf("invalid DeviceN color space")
 	}
 	value, err := r.Resolve(space[1])
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	names, ok := value.(Array)
 	if !ok || len(names) == 0 {
-		return nil, nil, fmt.Errorf("invalid DeviceN colorants")
+		return nil, nil, nil, fmt.Errorf("invalid DeviceN colorants")
 	}
 	if len(names) > 4 {
-		return nil, nil, &UnsupportedError{Feature: "DeviceN gradient component count"}
+		return nil, nil, nil, &UnsupportedError{Feature: "DeviceN gradient component count"}
 	}
 	seen := map[Name]bool{}
 	for _, value := range names {
 		name, ok := value.(Name)
 		if !ok || seen[name] || name == "All" {
-			return nil, nil, fmt.Errorf("invalid DeviceN colorant")
+			return nil, nil, nil, fmt.Errorf("invalid DeviceN colorant")
 		}
 		if name == "None" {
-			return nil, nil, &UnsupportedError{Feature: "DeviceN gradient None colorant"}
+			return nil, nil, nil, &UnsupportedError{Feature: "DeviceN gradient None colorant"}
 		}
 		seen[name] = true
 	}
 	alternate, err := r.readColorSpace(space[2])
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	value, err = r.Resolve(space[3])
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	stream, ok := value.(*Stream)
 	if !ok || stream.Dictionary["FunctionType"] != Integer(4) {
-		return nil, nil, &UnsupportedError{Feature: "DeviceN gradient tint function"}
+		return nil, nil, nil, &UnsupportedError{Feature: "DeviceN gradient tint function"}
 	}
 	input, err := r.numberArray(stream.Dictionary["Domain"], 2*len(names))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	output, err := r.numberArray(stream.Dictionary["Range"], 2*alternate.Components())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for index, bounds := range [][]float64{input, output} {
 		for i := 0; i < len(bounds); i += 2 {
 			if bounds[i] > bounds[i+1] || index == 0 && bounds[i] == bounds[i+1] {
-				return nil, nil, fmt.Errorf("invalid DeviceN tint bounds")
+				return nil, nil, nil, fmt.Errorf("invalid DeviceN tint bounds")
 			}
 		}
 	}
 	data, err := stream.Decode()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	expressions, err := affineCalculator(data, len(names), alternate.Components())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	stops, err := r.linearGradientStops(function, domain, len(names), 0)
+	source, err := r.readGradientFunction(function, len(names), 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	stops = clipGradientValues(stops, input)
-	for i := range stops {
-		values := stops[i].Values
-		stops[i].Values = [4]float64{}
-		for c, expression := range expressions {
-			v := expression[0]
-			for j, coefficient := range expression[1:] {
-				v += coefficient * values[j]
-			}
-			if math.IsNaN(v) || math.IsInf(v, 0) {
-				return nil, nil, fmt.Errorf("nonfinite DeviceN tint result")
-			}
-			stops[i].Values[c] = v
-		}
+	mapped := deviceNGradientFunction(source, input, output, expressions)
+	var stops []GradientStop
+	if mapped.linear != nil {
+		stops = clipGradientValues(mapped.linear(domain), gradientUnitBounds(alternate.Components()))
 	}
-	for i := range output {
-		output[i] = math.Max(0, math.Min(1, output[i]))
-	}
-	return clipGradientValues(stops, output), alternate, nil
+	return stops, alternate, mapped, nil
 }
 
 // clipGradientValues 在截断位置增加精确断点，不改变其余分段或跳变
@@ -436,122 +477,29 @@ func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
 	return slices.Compact(result)
 }
 
-// linearGradientStops 解析线性指数函数及线性拼接函数
-// 入参: object 函数字典或引用, interval 实际输入区间, channels 分量数, depth 当前嵌套深度
-// 返回: []GradientStop 渐变分段, error 解析错误
+// linearGradientStops 返回可精确展开的函数分段，不近似非线性函数
+// 入参: object 函数对象, interval 输入区间, channels 分量数, depth 嵌套深度
+// 返回: []GradientStop 精确分段, error 解析或非线性错误
 func (r *Reader) linearGradientStops(object Object, interval [2]float64, channels, depth int) ([]GradientStop, error) {
-	if depth >= 32 {
-		return nil, fmt.Errorf("gradient function recursion limit exceeded")
-	}
-	v, err := r.Resolve(object)
+	f, err := r.readGradientFunction(object, channels, depth)
 	if err != nil {
 		return nil, err
 	}
-	if array, ok := v.(Array); ok {
-		return r.gradientFunctionArray(array, interval, channels, depth)
+	if f.linear == nil {
+		return nil, &UnsupportedError{Feature: "nonlinear gradient function"}
 	}
-	dict, ok := v.(Dictionary)
-	if stream, streamOK := v.(*Stream); streamOK {
-		dict, ok = stream.Dictionary, true
+	return clipGradientValues(f.linear(interval), gradientUnitBounds(channels)), nil
+}
+
+// gradientUnitBounds 返回设备或ICC分量的单位区间
+// 入参: channels 分量数
+// 返回: []float64 分量上下界
+func gradientUnitBounds(channels int) []float64 {
+	bounds := make([]float64, channels*2)
+	for i := 0; i < channels; i++ {
+		bounds[i*2+1] = 1
 	}
-	if !ok {
-		return nil, &UnsupportedError{Feature: "gradient function type"}
-	}
-	if dict["FunctionType"] == Integer(0) {
-		return r.sampledGradientStops(v, interval, channels)
-	}
-	domain, err := r.numberArray(dict["Domain"], 2)
-	if err != nil {
-		return nil, err
-	}
-	if domain[0] >= domain[1] {
-		return nil, fmt.Errorf("invalid gradient function domain")
-	}
-	if dict["Range"] != nil {
-		return nil, &UnsupportedError{Feature: "gradient function range"}
-	}
-	var stops []GradientStop
-	switch dict["FunctionType"] {
-	case Integer(2):
-		n, err := r.number(dict["N"])
-		if err != nil {
-			return nil, err
-		}
-		if n != 1 {
-			return nil, &UnsupportedError{Feature: "nonlinear gradient function"}
-		}
-		var colors [2][4]float64
-		for i, key := range []Name{"C0", "C1"} {
-			color, err := r.numberArray(dict[key], channels)
-			if err != nil {
-				return nil, err
-			}
-			for _, c := range color {
-				if c < 0 || c > 1 {
-					return nil, fmt.Errorf("invalid gradient color")
-				}
-			}
-			copy(colors[i][:], color)
-		}
-		positions := []float64{domain[0], domain[1]}
-		for c, start := range colors[0] {
-			change := colors[1][c] - start
-			if change == 0 {
-				continue
-			}
-			for _, limit := range []float64{0, 1} {
-				x := (limit - start) / change
-				if x > domain[0] && x < domain[1] {
-					positions = append(positions, x)
-				}
-			}
-		}
-		slices.Sort(positions)
-		for _, x := range slices.Compact(positions) {
-			stop := GradientStop{Position: (x - domain[0]) / (domain[1] - domain[0])}
-			for c, start := range colors[0] {
-				stop.Values[c] = math.Max(0, math.Min(1, start+x*(colors[1][c]-start)))
-			}
-			stops = append(stops, stop)
-		}
-	case Integer(3):
-		v, err := r.Resolve(dict["Functions"])
-		if err != nil {
-			return nil, err
-		}
-		functions, ok := v.(Array)
-		if !ok || len(functions) == 0 {
-			return nil, fmt.Errorf("invalid stitching functions")
-		}
-		bounds, err := r.numberArray(dict["Bounds"], len(functions)-1)
-		if err != nil {
-			return nil, err
-		}
-		encode, err := r.numberArray(dict["Encode"], len(functions)*2)
-		if err != nil {
-			return nil, err
-		}
-		points := append(append([]float64{domain[0]}, bounds...), domain[1])
-		for i, function := range functions {
-			if points[i] > points[i+1] {
-				return nil, fmt.Errorf("invalid gradient stitching bounds")
-			}
-			if points[i] == points[i+1] {
-				continue
-			}
-			part, err := r.linearGradientStops(function, [2]float64{encode[i*2], encode[i*2+1]}, channels, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			for _, stop := range part {
-				stop.Position = (points[i] + stop.Position*(points[i+1]-points[i]) - domain[0]) / (domain[1] - domain[0])
-				stops = append(stops, stop)
-			}
-		}
-	default:
-		return nil, &UnsupportedError{Feature: "gradient function type"}
-	}
-	return gradientInterval(stops, (interval[0]-domain[0])/(domain[1]-domain[0]), (interval[1]-domain[0])/(domain[1]-domain[0])), nil
+	return bounds
 }
 
 // gradientInterval 截取或反向映射线性分段，保留定义域外常量和不连续边界
@@ -604,88 +552,4 @@ func gradientValueSide(stops []GradientStop, position float64, left bool) [4]flo
 		}
 	}
 	return stops[len(stops)-1].Values
-}
-
-// gradientFunctionArray 合并独立分量函数的断点，保留各分量的不连续边界
-// 入参: functions 分量函数, interval 输入区间, channels 分量数, depth 嵌套深度
-// 返回: []GradientStop 合并分段, error 函数错误
-func (r *Reader) gradientFunctionArray(functions Array, interval [2]float64, channels, depth int) ([]GradientStop, error) {
-	if len(functions) != channels {
-		return nil, fmt.Errorf("invalid gradient function count")
-	}
-	parts := make([][]GradientStop, channels)
-	positions := []float64{0, 1}
-	for i, function := range functions {
-		var err error
-		parts[i], err = r.linearGradientStops(function, interval, 1, depth+1)
-		if err != nil {
-			return nil, err
-		}
-		for _, stop := range parts[i] {
-			positions = append(positions, stop.Position)
-		}
-	}
-	slices.Sort(positions)
-	var stops []GradientStop
-	for _, position := range slices.Compact(positions) {
-		for _, left := range []bool{true, false} {
-			stop := GradientStop{Position: position}
-			for c, part := range parts {
-				stop.Values[c] = gradientValueSide(part, position, left)[0]
-			}
-			stops = append(stops, stop)
-		}
-	}
-	return slices.Compact(stops), nil
-}
-
-// sampledGradientStops 精确展开一维线性采样与范围截断，不以固定步长近似
-// 入参: object 采样函数, interval 输入区间, channels 分量数
-// 返回: []GradientStop 线性分段, error 函数错误
-func (r *Reader) sampledGradientStops(object Object, interval [2]float64, channels int) ([]GradientStop, error) {
-	f, err := r.readTintFunction(object, channels)
-	if err != nil {
-		return nil, err
-	}
-	positions := []float64{f.domain[0], f.domain[1]}
-	if f.encoded[0] != f.encoded[1] {
-		for i := 0; i < f.size; i++ {
-			x := f.domain[0] + (float64(i)-f.encoded[0])/(f.encoded[1]-f.encoded[0])*(f.domain[1]-f.domain[0])
-			if x > f.domain[0] && x < f.domain[1] {
-				positions = append(positions, x)
-			}
-		}
-	}
-	slices.Sort(positions)
-	positions = slices.Compact(positions)
-	raw := *f
-	raw.values = make([]float64, channels*2)
-	for i := 0; i < channels; i++ {
-		raw.values[2*i], raw.values[2*i+1] = math.Inf(-1), math.Inf(1)
-	}
-	knots := append([]float64(nil), positions...)
-	for i := 1; i < len(positions); i++ {
-		a, b := raw.color(positions[i-1]), raw.color(positions[i])
-		for c := range a {
-			if a[c] == b[c] {
-				continue
-			}
-			for _, limit := range []float64{0, 1, f.values[2*c], f.values[2*c+1]} {
-				t := (limit - a[c]) / (b[c] - a[c])
-				if t > 0 && t < 1 {
-					knots = append(knots, positions[i-1]+t*(positions[i]-positions[i-1]))
-				}
-			}
-		}
-	}
-	slices.Sort(knots)
-	stops := make([]GradientStop, 0, len(knots))
-	for _, x := range slices.Compact(knots) {
-		stop := GradientStop{Position: (x - f.domain[0]) / (f.domain[1] - f.domain[0])}
-		for i, value := range f.color(x) {
-			stop.Values[i] = math.Max(0, math.Min(1, value))
-		}
-		stops = append(stops, stop)
-	}
-	return gradientInterval(stops, (interval[0]-f.domain[0])/(f.domain[1]-f.domain[0]), (interval[1]-f.domain[0])/(f.domain[1]-f.domain[0])), nil
 }

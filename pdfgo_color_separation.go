@@ -173,8 +173,11 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 		}
 	case Integer(2):
 		f.exponent, err = r.number(dict["N"])
-		if err != nil || f.exponent <= 0 || math.IsNaN(f.exponent) || math.IsInf(f.exponent, 0) {
+		if err != nil || math.IsNaN(f.exponent) || math.IsInf(f.exponent, 0) {
 			return nil, fmt.Errorf("invalid tint exponent")
+		}
+		if math.Trunc(f.exponent) != f.exponent && domain[0] < 0 || f.exponent < 0 && domain[0] <= 0 && domain[1] >= 0 {
+			return nil, fmt.Errorf("undefined tint function domain")
 		}
 		f.values = make([]float64, channels*2)
 		for n := 0; n < channels; n++ {
@@ -185,6 +188,9 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 			index int
 		}{{"C0", 0}, {"C1", 1}} {
 			if dict[entry.key] == nil {
+				if channels != 1 {
+					return nil, fmt.Errorf("invalid default tint component count")
+				}
 				continue
 			}
 			values, err := r.numberArray(dict[entry.key], channels)
@@ -216,8 +222,15 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 // 入参: tint 分色浓度
 // 返回: []float64 备用空间分量
 func (f *tintFunction) color(tint float64) []float64 {
-	tint = math.Max(f.domain[0], math.Min(f.domain[1], tint))
 	out := make([]float64, f.channels)
+	f.colorInto(tint, out)
+	return out
+}
+
+// colorInto 将着色函数结果写入已有分量缓冲区
+// 入参: tint 输入浓度, out 输出分量缓冲区
+func (f *tintFunction) colorInto(tint float64, out []float64) {
+	tint = math.Max(f.domain[0], math.Min(f.domain[1], tint))
 	if !f.sampled {
 		t := math.Pow(tint, f.exponent)
 		for n := range out {
@@ -226,7 +239,7 @@ func (f *tintFunction) color(tint float64) []float64 {
 				out[n] = math.Max(f.outputRange[2*n], math.Min(f.outputRange[2*n+1], out[n]))
 			}
 		}
-		return out
+		return
 	}
 	position := f.encoded[0] + (tint-f.domain[0])/(f.domain[1]-f.domain[0])*(f.encoded[1]-f.encoded[0])
 	position = math.Max(0, math.Min(float64(f.size-1), position))
@@ -240,7 +253,6 @@ func (f *tintFunction) color(tint float64) []float64 {
 		v = f.decode[2*n] + v/(math.Exp2(float64(f.bits))-1)*(f.decode[2*n+1]-f.decode[2*n])
 		out[n] = math.Max(f.values[2*n], math.Min(f.values[2*n+1], v))
 	}
-	return out
 }
 
 // sample 读取采样表中的单个高位优先分量

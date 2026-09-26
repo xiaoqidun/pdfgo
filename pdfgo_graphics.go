@@ -129,6 +129,7 @@ type PathMark struct {
 }
 
 // TextMark 保存文字字形及其相对于文字矩阵的基线位置
+// Positions始终使用字形横排原点，竖排位置已扣除竖排原点向量
 // StrokeMatrix保留图形状态坐标变换，描边参数不受文字矩阵和字号影响
 type TextMark struct {
 	Font                  *Font
@@ -979,7 +980,16 @@ func (p *pageInterpreter) operation(op Operation) error {
 				if err != nil {
 					return err
 				}
-				p.textMatrix = p.textMatrix.Mul(Matrix{1, 0, 0, 1, -adjustment[0] / 1000 * p.state.fontSize * p.state.hscale, 0})
+				if !p.inText || p.state.font == nil {
+					return fmt.Errorf("text without active font")
+				}
+				shift := Matrix{1, 0, 0, 1, 0, 0}
+				if p.state.font.Vertical {
+					shift[5] = -adjustment[0] / 1000 * p.state.fontSize
+				} else {
+					shift[4] = -adjustment[0] / 1000 * p.state.fontSize * p.state.hscale
+				}
+				p.textMatrix = p.textMatrix.Mul(shift)
 			}
 		}
 	case "sh":
@@ -1054,14 +1064,19 @@ func (p *pageInterpreter) showText(data []byte) error {
 		return err
 	}
 	positions := make([]Point, len(glyphs))
-	advance := 0.0
+	advance := Point{}
 	for n, glyph := range glyphs {
-		positions[n] = Point{advance, p.state.rise}
-		width := glyph.Width/1000*p.state.fontSize + p.state.spacing
+		spacing := p.state.spacing
 		if glyph.WordSpace {
-			width += p.state.wordSpacing
+			spacing += p.state.wordSpacing
 		}
-		advance += width * p.state.hscale
+		if p.state.font.Vertical {
+			positions[n] = Point{-glyph.Vertical.Origin.X / 1000 * p.state.fontSize * p.state.hscale, advance.Y - glyph.Vertical.Origin.Y/1000*p.state.fontSize + p.state.rise}
+			advance.Y += glyph.Vertical.Advance/1000*p.state.fontSize + spacing
+		} else {
+			positions[n] = Point{advance.X, p.state.rise}
+			advance.X += (glyph.Width/1000*p.state.fontSize + spacing) * p.state.hscale
+		}
 	}
 	if len(glyphs) > 0 {
 		if p.visitor.Text == nil {
@@ -1076,7 +1091,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 			return err
 		}
 	}
-	p.textMatrix = p.textMatrix.Mul(Matrix{1, 0, 0, 1, advance, 0})
+	p.textMatrix = p.textMatrix.Mul(Matrix{1, 0, 0, 1, advance.X, advance.Y})
 	return nil
 }
 

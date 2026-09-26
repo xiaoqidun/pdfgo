@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/jpeg"
 	"io"
 	"math"
 
@@ -633,24 +632,9 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 	case "CCITTFaxDecode":
 		return i.ccittSamples(data, terminalParams)
 	case "DCTDecode":
-		if terminalParams["ColorTransform"] != nil {
-			return nil, &UnsupportedError{Feature: "explicit JPEG ColorTransform"}
-		}
-		config, err := jpeg.DecodeConfig(bytes.NewReader(data))
+		result, err = i.jpegSamples(data, terminalParams)
 		if err != nil {
 			return nil, err
-		}
-		if config.Width != i.Width || config.Height != i.Height {
-			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
-		}
-		result, err = jpeg.Decode(bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-		if cmyk, ok := result.(*image.CMYK); ok {
-			for n := range cmyk.Pix {
-				cmyk.Pix[n] = 255 - cmyk.Pix[n]
-			}
 		}
 	case "JBIG2Decode":
 		if i.BitsPerComponent != 1 {

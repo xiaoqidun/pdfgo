@@ -21,33 +21,38 @@ import (
 )
 
 // Font 保存PDF字体程序、字符映射及字宽，不依赖渲染后端
+// Vertical为true时使用竖排度量，字形本身仍以横排原点描述
 type Font struct {
-	Name           string
-	Subtype        Name
-	Program        []byte
-	ProgramType    Name
-	Dictionary     Dictionary
-	Unicode        UnicodeMap
-	widths         map[uint32]float64
-	defaultWidth   float64
-	composite      bool
-	encoding       Name
-	cidMap         CIDMap
-	glyphMap       []byte
-	simpleCmap     []byte
-	cmapEncoding   Name
-	symbolic       bool
-	cffGlyphs      map[uint32]uint16
-	cffNames       map[uint32]string
-	differences    map[uint32]string
-	type3Matrix    Matrix
-	type3Procs     Dictionary
-	type3Resources Dictionary
+	Name            string
+	Subtype         Name
+	Program         []byte
+	ProgramType     Name
+	Dictionary      Dictionary
+	Unicode         UnicodeMap
+	Vertical        bool
+	widths          map[uint32]float64
+	defaultWidth    float64
+	verticals       map[uint32]VerticalMetrics
+	defaultVertical [2]float64
+	composite       bool
+	encoding        Name
+	cidMap          CIDMap
+	glyphMap        []byte
+	simpleCmap      []byte
+	cmapEncoding    Name
+	symbolic        bool
+	cffGlyphs       map[uint32]uint16
+	cffNames        map[uint32]string
+	differences     map[uint32]string
+	type3Matrix     Matrix
+	type3Procs      Dictionary
+	type3Resources  Dictionary
 }
 
 // Glyph 保存原始字符码、Unicode文本、字形名称、编号和千分之一字宽
 // 缺少Unicode映射但具有字形编号时，Text为空，不推测字符含义
 // CID保留复合字体字符标识，只有可确定内嵌字形编号时HasID才为true
+// Vertical仅在竖排字体中有效，Width始终保留横排字宽
 type Glyph struct {
 	Name      string
 	Code      uint32
@@ -56,6 +61,7 @@ type Glyph struct {
 	ID        uint16
 	HasID     bool
 	Width     float64
+	Vertical  VerticalMetrics
 	WordSpace bool
 }
 
@@ -91,8 +97,9 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, err
 		}
 		switch encoding {
-		case Name("Identity-H"):
-			font.encoding = Name("Identity-H")
+		case Name("Identity-H"), Name("Identity-V"):
+			font.encoding = encoding.(Name)
+			font.Vertical = font.encoding == "Identity-V"
 		case Name("UniGB-UCS2-H"):
 			font.encoding = Name("UniGB-UCS2-H")
 			font.cidMap, err = loadUniGBUCS2H()
@@ -188,6 +195,11 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 						font.widths[uint32(code)] = width
 					}
 				}
+			}
+		}
+		if font.Vertical {
+			if err := r.readVerticalMetrics(font, metrics); err != nil {
+				return nil, err
 			}
 		}
 		gidMap, err := r.Resolve(metrics["CIDToGIDMap"])
@@ -511,6 +523,13 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			return nil, &UnsupportedError{Feature: "unembedded standard font metrics"}
 		}
 		glyph := Glyph{Code: code, Text: text, Width: width, WordSpace: step == 1 && code == 32}
+		if f.Vertical {
+			var ok bool
+			glyph.Vertical, ok = f.verticals[cid]
+			if !ok {
+				glyph.Vertical = VerticalMetrics{Advance: f.defaultVertical[1], Origin: Point{width / 2, f.defaultVertical[0]}}
+			}
+		}
 		if f.composite {
 			glyph.CID = uint16(cid)
 		}
