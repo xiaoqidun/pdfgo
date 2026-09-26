@@ -519,46 +519,9 @@ func (i *Image) decodeMask(components int) (image.Image, []float64, bool, []floa
 // CMYK图像还原DCT分量，取消通用JPEG解码器的Adobe反相处理
 // 返回: image.Image 样本图像, error 错误信息
 func (i *Image) DecodeSamples() (image.Image, error) {
-	dict := i.Stream.Dictionary
-	filter, err := i.reader.Resolve(dict["Filter"])
+	filters, parameters, err := i.Stream.filterChain(i.reader)
 	if err != nil {
 		return nil, err
-	}
-	params, err := i.reader.Resolve(dict["DecodeParms"])
-	if err != nil {
-		return nil, err
-	}
-	filters := Array{}
-	if filter != nil {
-		if a, ok := filter.(Array); ok {
-			filters = append(Array(nil), a...)
-		} else {
-			filters = Array{filter}
-		}
-	}
-	parameters := make(Array, len(filters))
-	if params != nil {
-		if a, ok := params.(Array); ok {
-			if len(a) != len(filters) {
-				return nil, fmt.Errorf("image filter parameter count mismatch")
-			}
-			copy(parameters, a)
-		} else {
-			if len(filters) != 1 {
-				return nil, fmt.Errorf("invalid image filter parameters")
-			}
-			parameters[0] = params
-		}
-	}
-	for n := range filters {
-		filters[n], err = i.reader.Resolve(filters[n])
-		if err != nil {
-			return nil, err
-		}
-		parameters[n], err = i.reader.Resolve(parameters[n])
-		if err != nil {
-			return nil, err
-		}
 	}
 	terminal := Name("")
 	var terminalParams Dictionary

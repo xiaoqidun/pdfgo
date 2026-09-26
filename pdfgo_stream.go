@@ -25,55 +25,103 @@ import (
 )
 
 // Stream 保存流字典及未经解码的数据
+// 阅读器返回的流解码需与所属Reader串行调用，并保持数据源可读
 type Stream struct {
 	Dictionary Dictionary
 	Data       []byte
+	reader     *Reader
 }
 
 func (*Stream) pdfObject() {}
 
-// Decode 解码通用流过滤器，图像专用过滤器由图像接口处理
-// 返回: []byte 解码数据, error 错误信息
-func (s *Stream) Decode() ([]byte, error) {
+// filterChain 解析过滤器及解码参数的间接引用，不修改源字典
+// 入参: reader 关联阅读器，nil表示不解析间接引用
+// 返回: Array 过滤器, Array 对应参数, error 错误信息
+func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
+	resolve := func(value Object) (Object, error) {
+		if reader != nil {
+			return reader.Resolve(value)
+		}
+		return value, nil
+	}
+	filter, err := resolve(s.Dictionary["Filter"])
+	if err != nil {
+		return nil, nil, err
+	}
+	parameters, err := resolve(s.Dictionary["DecodeParms"])
+	if err != nil {
+		return nil, nil, err
+	}
 	var filters Array
-	switch v := s.Dictionary["Filter"].(type) {
+	switch v := filter.(type) {
 	case nil:
 	case Name:
 		filters = Array{v}
 	case Array:
-		filters = v
+		filters = append(Array(nil), v...)
 	default:
-		return nil, fmt.Errorf("invalid stream filter")
+		return nil, nil, fmt.Errorf("invalid stream filter")
 	}
 	params := make(Array, len(filters))
-	switch v := s.Dictionary["DecodeParms"].(type) {
+	switch v := parameters.(type) {
 	case nil:
 	case Dictionary:
 		if len(filters) != 1 {
-			return nil, fmt.Errorf("invalid filter parameters")
+			return nil, nil, fmt.Errorf("invalid filter parameters")
 		}
 		params[0] = v
 	case Array:
 		if len(v) != len(filters) {
-			return nil, fmt.Errorf("filter parameter count mismatch")
+			return nil, nil, fmt.Errorf("filter parameter count mismatch")
 		}
 		copy(params, v)
 	default:
-		return nil, fmt.Errorf("invalid filter parameters")
+		return nil, nil, fmt.Errorf("invalid filter parameters")
+	}
+	for i, filter := range filters {
+		filters[i], err = resolve(filter)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, ok := filters[i].(Name); !ok {
+			return nil, nil, fmt.Errorf("filter is not a name")
+		}
+		params[i], err = resolve(params[i])
+		if err != nil {
+			return nil, nil, err
+		}
+		if params[i] != nil {
+			dict, ok := params[i].(Dictionary)
+			if !ok {
+				return nil, nil, fmt.Errorf("invalid decode parameters")
+			}
+			if reader != nil {
+				resolved := make(Dictionary, len(dict))
+				for key, value := range dict {
+					resolved[key], err = resolve(value)
+					if err != nil {
+						return nil, nil, err
+					}
+				}
+				params[i] = resolved
+			}
+		}
+	}
+	return filters, params, nil
+}
+
+// Decode 解码通用流过滤器，图像专用过滤器由图像接口处理
+// 阅读器返回的流按需解析参数引用，手工构造的流需提供直接参数
+// 返回: []byte 解码数据, error 错误信息
+func (s *Stream) Decode() ([]byte, error) {
+	filters, params, err := s.filterChain(s.reader)
+	if err != nil {
+		return nil, err
 	}
 	data := s.Data
 	for i, filter := range filters {
-		name, ok := filter.(Name)
-		if !ok {
-			return nil, fmt.Errorf("filter is not a name")
-		}
-		var dict Dictionary
-		if params[i] != nil {
-			dict, ok = params[i].(Dictionary)
-			if !ok {
-				return nil, fmt.Errorf("invalid decode parameters")
-			}
-		}
+		name := filter.(Name)
+		dict, _ := params[i].(Dictionary)
 		var err error
 		switch name {
 		case "FlateDecode":

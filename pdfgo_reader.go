@@ -296,16 +296,24 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 // indirect 从文件偏移读取完整间接对象
 func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 	var p objectParser
+	var ref Reference
+	var value Object
+	var keyword string
 	err := r.parseAt(offset, func(input *objectParser) error {
 		p = *input
 		defer func() { input.pos = p.pos }()
-		for range 3 {
-			p.token()
+		number, e1 := strconv.ParseInt(p.token(), 10, 64)
+		generation, e2 := strconv.ParseInt(p.token(), 10, 64)
+		if e1 != nil || e2 != nil || number <= 0 || generation < 0 || generation > 65535 || p.token() != "obj" {
+			return p.fail("invalid indirect object header")
 		}
-		if _, err := p.object(); err != nil {
+		ref = Reference{number, generation}
+		var err error
+		value, err = p.object()
+		if err != nil {
 			return err
 		}
-		p.token()
+		keyword = p.token()
 		if p.pos < len(p.data) && p.data[p.pos] == '\r' {
 			p.pos++
 		}
@@ -314,25 +322,10 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 	if err != nil {
 		return Reference{}, nil, err
 	}
-	p.pos = 0
-	number, e1 := strconv.ParseInt(p.token(), 10, 64)
-	generation, e2 := strconv.ParseInt(p.token(), 10, 64)
-	if e1 != nil || e2 != nil || number <= 0 || generation < 0 || generation > 65535 || p.token() != "obj" {
-		return Reference{}, nil, p.fail("invalid indirect object header")
-	}
-	ref := Reference{number, generation}
-	value, err := p.object()
-	if err != nil {
-		return ref, nil, err
-	}
-	keyword := p.token()
 	if keyword == "stream" {
 		dict, ok := value.(Dictionary)
 		if !ok {
 			return ref, nil, p.fail("stream requires dictionary")
-		}
-		if p.pos < len(p.data) && p.data[p.pos] == '\r' {
-			p.pos++
 		}
 		if p.pos >= len(p.data) || p.data[p.pos] != '\n' {
 			return ref, nil, p.fail("missing stream line ending")
@@ -351,7 +344,7 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 		if err != nil {
 			return ref, nil, err
 		}
-		value = &Stream{Dictionary: dict, Data: data}
+		value = &Stream{Dictionary: dict, Data: data, reader: r}
 		err = r.parseAt(start+int64(length), func(tail *objectParser) error {
 			if tail.token() != "endstream" {
 				return tail.fail("missing endstream")
@@ -475,7 +468,9 @@ func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, 
 			return nil, nil, fmt.Errorf("invalid cross-reference index")
 		}
 	}
-	data, err := stream.Decode()
+	direct := *stream
+	direct.reader = nil
+	data, err := direct.Decode()
 	if err != nil {
 		return nil, nil, err
 	}
