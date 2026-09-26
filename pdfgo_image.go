@@ -192,8 +192,7 @@ func (i *Image) DecodeImage() (image.Image, error) {
 	}
 	components := 0
 	var calibrated *calRGBSpace
-	var iccGray *iccGraySpace
-	var iccRGB *iccRGBSpace
+	var profile *iccColorSpace
 	var separation *separationSpace
 	switch i.ColorSpace {
 	case Name("DeviceGray"):
@@ -211,27 +210,11 @@ func (i *Image) DecodeImage() (image.Image, error) {
 		components = 3
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-		profile, err := i.reader.Resolve(space[1])
+		profile, err = i.reader.readICCColorSpace(space)
 		if err != nil {
 			return nil, err
 		}
-		stream, ok := profile.(*Stream)
-		if !ok {
-			return nil, fmt.Errorf("invalid ICC profile stream")
-		}
-		switch stream.Dictionary["N"] {
-		case Integer(1):
-			iccGray, err = i.reader.readICCGray(space)
-			components = 1
-		case Integer(3):
-			iccRGB, err = i.reader.readICCRGB(space)
-			components = 3
-		default:
-			return nil, &UnsupportedError{Feature: "image ICC component count"}
-		}
-		if err != nil {
-			return nil, err
-		}
+		components = profile.components()
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Separation") {
 		separation, err = i.reader.readSeparation(space)
@@ -356,10 +339,8 @@ func (i *Image) DecodeImage() (image.Image, error) {
 				if separation.name == "None" {
 					pixel.A = 0
 				}
-			} else if iccGray != nil {
-				pixel = iccGray.color(values[0])
-			} else if iccRGB != nil {
-				converted, err := iccRGB.color(values[:3], intent)
+			} else if profile != nil {
+				converted, err := profile.color(values[:components], intent)
 				if err != nil {
 					return nil, err
 				}
@@ -820,7 +801,7 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 			return nil, fmt.Errorf("invalid ICC profile stream")
 		}
 		switch stream.Dictionary["N"] {
-		case Integer(1), Integer(3):
+		case Integer(1), Integer(3), Integer(4):
 			components = int(stream.Dictionary["N"].(Integer))
 		default:
 			return nil, &UnsupportedError{Feature: "image ICC component count"}

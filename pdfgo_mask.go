@@ -17,12 +17,13 @@ package pdfgo
 import (
 	"fmt"
 	"math"
-	"strconv"
 )
 
-// SoftMask 保存灰度亮度蒙版及线性传递函数，Transfer为零值和单位值的输出
+// SoftMask 保存透明度或亮度蒙版及线性传递函数，Transfer为零值和单位值的输出
 type SoftMask struct {
-	Background  float64
+	Subtype     Name
+	ColorSpace  *ColorSpace
+	Backdrop    []float64
 	Transfer    [2]float64
 	interpreter pageInterpreter
 	stream      *Stream
@@ -37,12 +38,12 @@ func (m *SoftMask) Walk(visitor Visitor) error {
 	return p.form(m.stream)
 }
 
-// readSoftMask 读取灰度亮度蒙版，保留图形与线性传递关系
+// readSoftMask 读取蒙版颜色空间、背景及图形，不执行页面合成
 // 入参: value 蒙版字典
 // 返回: *SoftMask 蒙版信息, error 错误信息
 func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 	dict, ok := value.(Dictionary)
-	if !ok || dict["S"] != Name("Luminosity") {
+	if !ok || dict["S"] != Name("Luminosity") && dict["S"] != Name("Alpha") {
 		return nil, &UnsupportedError{Feature: "soft mask subtype"}
 	}
 	v, err := p.reader.Resolve(dict["G"])
@@ -58,15 +59,28 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		return nil, err
 	}
 	group, ok := v.(Dictionary)
-	if !ok || group["CS"] != Name("DeviceGray") {
-		return nil, &UnsupportedError{Feature: "soft mask blending color space"}
+	if !ok || group["S"] != Name("Transparency") {
+		return nil, fmt.Errorf("invalid soft mask transparency group")
 	}
-	m := &SoftMask{Transfer: [2]float64{0, 1}, interpreter: *p, stream: stream}
-	m.interpreter.maskGroup = true
+	m := &SoftMask{Subtype: dict["S"].(Name), Transfer: [2]float64{0, 1}, interpreter: *p, stream: stream}
+	if group["CS"] != nil {
+		m.ColorSpace, err = p.reader.readBlendingSpace(group["CS"])
+		if err != nil {
+			return nil, err
+		}
+	} else if m.Subtype == "Luminosity" {
+		return nil, fmt.Errorf("missing luminosity mask color space")
+	}
+	if m.ColorSpace != nil {
+		m.Backdrop = make([]float64, m.ColorSpace.Components())
+		if m.ColorSpace.Model == "DeviceCMYK" {
+			m.Backdrop[3] = 1
+		}
+	}
 	m.interpreter.state.style.SoftMask = nil
 	m.interpreter.state.style.Clips = nil
 	m.interpreter.state.style.Fill.Alpha, m.interpreter.state.style.Stroke.Alpha = 1, 1
-	if dict["BC"] != nil {
+	if dict["BC"] != nil && m.Subtype == "Luminosity" {
 		v, err := p.reader.Resolve(dict["BC"])
 		if err != nil {
 			return nil, err
@@ -75,11 +89,11 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid soft mask backdrop")
 		}
-		n, err := numbers(a, 1)
-		if err != nil || n[0] < 0 || n[0] > 1 {
+		n, err := numbers(a, m.ColorSpace.Components())
+		if err != nil || m.ColorSpace.validate(n) != nil {
 			return nil, fmt.Errorf("invalid soft mask backdrop")
 		}
-		m.Background = n[0]
+		m.Backdrop = n
 	}
 	if dict["TR"] != nil && dict["TR"] != Name("Identity") {
 		v, err := p.reader.Resolve(dict["TR"])
@@ -120,75 +134,13 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 // 入参: data 计算器函数内容
 // 返回: [2]float64 函数端点值, error 非线性或语法错误
 func linearCalculator(data []byte) ([2]float64, error) {
-	p := objectParser{data: data}
-	p.skipSpace()
-	if p.pos == len(data) || data[p.pos] != '{' {
-		return [2]float64{}, fmt.Errorf("invalid calculator procedure")
+	values, err := affineCalculator(data, 1, 1)
+	if err != nil {
+		return [2]float64{}, err
 	}
-	p.pos++
-	stack := [][2]float64{{0, 1}}
-	for {
-		p.skipSpace()
-		if p.pos == len(data) {
-			return [2]float64{}, fmt.Errorf("unterminated calculator procedure")
-		}
-		if data[p.pos] == '}' {
-			p.pos++
-			break
-		}
-		token := p.token()
-		if v, err := strconv.ParseFloat(token, 64); err == nil && !math.IsNaN(v) && !math.IsInf(v, 0) {
-			stack = append(stack, [2]float64{v, v})
-			continue
-		}
-		n := len(stack)
-		required := 2
-		if token == "dup" || token == "pop" || token == "neg" {
-			required = 1
-		}
-		if n < required {
-			return [2]float64{}, fmt.Errorf("calculator stack underflow")
-		}
-		switch token {
-		case "dup":
-			stack = append(stack, stack[n-1])
-		case "pop":
-			stack = stack[:n-1]
-		case "exch":
-			stack[n-1], stack[n-2] = stack[n-2], stack[n-1]
-		case "neg":
-			stack[n-1] = [2]float64{-stack[n-1][0], -stack[n-1][1]}
-		case "add", "sub", "mul", "div":
-			a, b := stack[n-2], stack[n-1]
-			if token == "mul" && a[0] != a[1] && b[0] != b[1] || token == "div" && (b[0] != b[1] || b[0] == 0) {
-				return [2]float64{}, &UnsupportedError{Feature: "nonlinear calculator function"}
-			}
-			for i := range a {
-				switch token {
-				case "add":
-					a[i] += b[i]
-				case "sub":
-					a[i] -= b[i]
-				case "mul":
-					a[i] *= b[i]
-				case "div":
-					a[i] /= b[i]
-				}
-			}
-			stack[n-2] = a
-			stack = stack[:n-1]
-		default:
-			return [2]float64{}, &UnsupportedError{Feature: "calculator operator " + token}
-		}
+	end := values[0][0] + values[0][1]
+	if math.IsNaN(end) || math.IsInf(end, 0) {
+		return [2]float64{}, fmt.Errorf("nonfinite calculator result")
 	}
-	p.skipSpace()
-	if p.pos != len(data) || len(stack) != 1 {
-		return [2]float64{}, fmt.Errorf("invalid calculator result")
-	}
-	for _, v := range stack[0] {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return [2]float64{}, fmt.Errorf("nonfinite calculator result")
-		}
-	}
-	return stack[0], nil
+	return [2]float64{values[0][0], end}, nil
 }

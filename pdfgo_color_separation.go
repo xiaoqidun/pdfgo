@@ -282,11 +282,7 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 		color := s.lab.color(values[0], values[1], values[2])
 		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}
 	case "ICCBased":
-		var err error
-		paint.RGB, err = s.icc.color(values, intent)
-		if err != nil {
-			return Paint{}, err
-		}
+		return (&iccColorSpace{rgb: s.icc}).paint(values, intent)
 	case "CalRGB":
 		color := s.calRGB.color(values[0], values[1], values[2])
 		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}

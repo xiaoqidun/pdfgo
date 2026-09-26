@@ -86,10 +86,12 @@ type TextClip struct {
 	Size, HorizontalScale float64
 }
 
-// Paint 保存设备颜色及不透明度，CMYK非空时保留原始四色分量
+// Paint 保存颜色及不透明度，CMYK保留设备四色，Space与Values保留ICC源分量
 type Paint struct {
 	RGB    [3]float64
 	CMYK   *[4]float64
+	Space  *ColorSpace
+	Values [4]float64
 	Alpha  float64
 	Axial  *AxialGradient
 	Radial *RadialGradient
@@ -114,6 +116,7 @@ type Style struct {
 	AlphaIsShape    bool
 	SoftMask        *SoftMask
 	Smoothness      *float64
+	Antialias       *bool
 }
 
 // PathMark 表示一次路径绘制，路径及裁剪坐标始终位于页面用户空间
@@ -153,6 +156,7 @@ type GroupMark struct {
 	Isolated     bool
 	BlendMode    Name
 	SoftMask     *SoftMask
+	ColorSpace   *ColorSpace
 }
 
 // MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标记的标签
@@ -204,8 +208,8 @@ type pageInterpreter struct {
 	pendingClip            bool
 	clipEvenOdd            bool
 	depth                  int
+	compatibility          int
 	opaqueGroup            bool
-	maskGroup              bool
 	patternMatrix          Matrix
 	bounds                 Rectangle
 	uncoloredPattern       bool
@@ -219,6 +223,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	if page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
 	}
+	var groupSpace *ColorSpace
 	if page.Dictionary["Group"] != nil {
 		value, err := r.Resolve(page.Dictionary["Group"])
 		if err != nil {
@@ -239,12 +244,16 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 					return &UnsupportedError{Feature: "page group subtype"}
 				}
 			case "CS":
-				if err := r.validateRGBGroupSpace(value); err != nil {
+				groupSpace, err = r.readBlendingSpace(value)
+				if err != nil {
 					return err
 				}
+				if visitor.Group == nil && !groupSpace.SRGBEquivalent() {
+					return &UnsupportedError{Feature: "page blending space visitor missing"}
+				}
 			case "I":
-				if value != Boolean(true) {
-					return &UnsupportedError{Feature: "non-isolated page group"}
+				if _, ok := value.(Boolean); !ok {
+					return fmt.Errorf("invalid page isolation flag")
 				}
 			case "K":
 				if value != Boolean(false) {
@@ -265,6 +274,13 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
+	if groupSpace != nil && visitor.Group != nil {
+		return visitor.Group(GroupMark{Alpha: 1, Isolated: true, ColorSpace: groupSpace}, func(v Visitor) error {
+			child := interpreter
+			child.visitor = v
+			return child.run(data)
+		})
+	}
 	return interpreter.run(data)
 }
 
@@ -317,6 +333,9 @@ func (p *pageInterpreter) run(data []byte) error {
 	}
 	if len(p.stack) != 0 || p.inText || len(p.marked) != 0 {
 		return fmt.Errorf("unbalanced graphics, text or marked content state")
+	}
+	if p.compatibility != 0 {
+		return fmt.Errorf("unbalanced compatibility section")
 	}
 	return nil
 }
@@ -422,6 +441,13 @@ func (p *pageInterpreter) operation(op Operation) error {
 	point := func(x, y float64) Point { return p.state.matrix.Apply(Point{x, y}) }
 	add := func(name string, points ...Point) { p.path.Segments = append(p.path.Segments, Segment{name, points}) }
 	switch op.Operator {
+	case "BX":
+		p.compatibility++
+	case "EX":
+		if p.compatibility == 0 {
+			return fmt.Errorf("unmatched operator %q", "EX")
+		}
+		p.compatibility--
 	case "d0", "d1":
 		if !p.type3 {
 			return &UnsupportedError{Feature: "Type3 glyph metrics outside character procedure"}
@@ -600,6 +626,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.strokeSeparation = nil
 			p.state.style.Stroke.RGB = rgb
 			p.state.style.Stroke.CMYK = cmyk
+			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
 			p.state.style.Stroke.Axial = nil
 			p.state.style.Stroke.Radial = nil
 			p.state.style.Stroke.Tiling = nil
@@ -616,6 +643,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.fillICC = nil
 			p.state.fillSeparation = nil
 			p.state.style.Fill.CMYK = cmyk
+			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
 			p.state.style.Fill.Axial = nil
 			p.state.style.Fill.Radial = nil
 			p.state.style.Fill.Tiling = nil
@@ -681,6 +709,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.fillSeparation = separation
 			p.state.style.Fill.RGB = [3]float64{}
 			p.state.style.Fill.CMYK = nil
+			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
 			p.state.style.Fill.Axial = nil
 			p.state.style.Fill.Radial = nil
 			p.state.style.Fill.Tiling = nil
@@ -694,11 +723,25 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.strokeSeparation = separation
 			p.state.style.Stroke.RGB = [3]float64{}
 			p.state.style.Stroke.CMYK = nil
+			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
 			p.state.style.Stroke.Axial = nil
 			p.state.style.Stroke.Radial = nil
 			p.state.style.Stroke.Tiling = nil
 			if name == "DeviceCMYK" {
 				p.state.style.Stroke.CMYK = &[4]float64{0, 0, 0, 1}
+			}
+		}
+		if profile != nil {
+			paint, err := profile.paint(make([]float64, profile.components()), p.state.style.RenderingIntent)
+			if err != nil {
+				return err
+			}
+			if op.Operator == "cs" {
+				paint.Alpha = p.state.style.Fill.Alpha
+				p.state.style.Fill = paint
+			} else {
+				paint.Alpha = p.state.style.Stroke.Alpha
+				p.state.style.Stroke = paint
 			}
 		}
 	case "sc", "scn", "SC", "SCN":
@@ -741,14 +784,16 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if err != nil {
 				return err
 			}
-			rgb, err := profile.color(values, p.state.style.RenderingIntent)
+			paint, err := profile.paint(values, p.state.style.RenderingIntent)
 			if err != nil {
 				return err
 			}
 			if operator == "g" {
-				p.state.style.Fill.RGB, p.state.style.Fill.CMYK = rgb, nil
+				paint.Alpha = p.state.style.Fill.Alpha
+				p.state.style.Fill = paint
 			} else {
-				p.state.style.Stroke.RGB, p.state.style.Stroke.CMYK = rgb, nil
+				paint.Alpha = p.state.style.Stroke.Alpha
+				p.state.style.Stroke = paint
 			}
 			return nil
 		}
@@ -963,6 +1008,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 	case "BMC", "BDC", "EMC", "MP", "DP":
 		return p.markedContent(op)
 	default:
+		if p.compatibility != 0 {
+			return nil
+		}
 		return &UnsupportedError{Feature: "content operator " + op.Operator}
 	}
 	return nil
@@ -973,7 +1021,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 // 返回: int 参数数量
 func graphicsOperandCount(operator string) int {
 	switch operator {
-	case "q", "Q", "h", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n", "W", "W*", "BT", "ET", "T*":
+	case "q", "Q", "h", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n", "W", "W*", "BT", "ET", "T*", "BX", "EX":
 		return 0
 	case "w", "J", "j", "M", "g", "G", "Tc", "Tw", "Tz", "TL", "Tr", "Ts":
 		return 1
@@ -1130,12 +1178,18 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		if !ok || group["S"] != Name("Transparency") || group["I"] != nil && group["I"] != Boolean(true) && group["I"] != Boolean(false) || group["K"] != nil && group["K"] != Boolean(false) {
 			return &UnsupportedError{Feature: "form transparency group"}
 		}
-		if group["CS"] != nil && !(p.maskGroup && group["CS"] == Name("DeviceGray")) {
+		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, AlphaIsShape: p.state.style.AlphaIsShape, Isolated: group["I"] == Boolean(true), BlendMode: p.state.style.BlendMode, SoftMask: p.state.style.SoftMask}
+		if group["CS"] != nil {
+			groupMark.ColorSpace, err = p.reader.readBlendingSpace(group["CS"])
+			if err != nil {
+				return err
+			}
+		}
+		if p.visitor.Group == nil && groupMark.ColorSpace != nil {
 			if err := p.reader.validateRGBGroupSpace(group["CS"]); err != nil {
 				return err
 			}
 		}
-		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, AlphaIsShape: p.state.style.AlphaIsShape, Isolated: group["I"] == Boolean(true), BlendMode: p.state.style.BlendMode, SoftMask: p.state.style.SoftMask}
 		if p.visitor.Group == nil && (groupMark.Alpha != 1 || !groupMark.Isolated || groupMark.SoftMask != nil || groupMark.BlendMode != "" && groupMark.BlendMode != "Normal" && groupMark.BlendMode != "Compatible") {
 			return &UnsupportedError{Feature: "transparency group visitor missing"}
 		}
@@ -1147,6 +1201,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	}
 	child.depth++
 	child.stack = nil
+	child.compatibility = 0
 	child.marked = nil
 	child.path = Path{}
 	child.hasPoint = false
@@ -1269,10 +1324,11 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				return err
 			}
 		case "BM":
-			if value != Name("Normal") && value != Name("Compatible") && value != Name("Multiply") && value != Name("Darken") {
-				return &UnsupportedError{Feature: "blend mode"}
+			mode, err := p.reader.readBlendMode(value)
+			if err != nil {
+				return err
 			}
-			p.state.style.BlendMode = value.(Name)
+			p.state.style.BlendMode = mode
 		case "SMask":
 			if value == Name("None") {
 				p.state.style.SoftMask = nil
@@ -1316,6 +1372,13 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				return fmt.Errorf("invalid smoothness tolerance")
 			}
 			p.state.style.Smoothness = &n[0]
+		case "AAPL:AA":
+			flag, ok := value.(Boolean)
+			if !ok {
+				return fmt.Errorf("invalid antialias flag")
+			}
+			v := bool(flag)
+			p.state.style.Antialias = &v
 		case "BG2", "UCR2":
 			if value != Name("Default") {
 				return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
@@ -1325,4 +1388,29 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 		}
 	}
 	return nil
+}
+
+// readBlendMode 读取标准混合模式，数组按优先顺序选择支持的名称
+// 入参: value 名称或名称数组
+// 返回: Name 标准模式, error 无效类型
+func (r *Reader) readBlendMode(value Object) (Name, error) {
+	values, array := value.(Array)
+	if !array {
+		values = Array{value}
+	}
+	for _, item := range values {
+		item, err := r.Resolve(item)
+		if err != nil {
+			return "", err
+		}
+		mode, ok := item.(Name)
+		if !ok {
+			return "", fmt.Errorf("invalid blend mode")
+		}
+		switch mode {
+		case "Normal", "Compatible", "Multiply", "Screen", "Overlay", "Darken", "Lighten", "ColorDodge", "ColorBurn", "HardLight", "SoftLight", "Difference", "Exclusion", "Hue", "Saturation", "Color", "Luminosity":
+			return mode, nil
+		}
+	}
+	return "Normal", nil
 }
