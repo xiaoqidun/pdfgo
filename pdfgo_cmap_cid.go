@@ -20,19 +20,22 @@ import (
 	"sync"
 )
 
-// CIDMap保存字符码到CID的映射
+// CIDMap 保存字符码到CID的映射
 type CIDMap map[string]uint16
 
+// uniGBUCS2H 保存Adobe字符码到CID的映射资源
+//
 //go:embed assets/cmap/UniGB-UCS2-H
 var uniGBUCS2H []byte
 
+// loadUniGBUCS2H 按需读取内嵌CMap并复用解析结果
 var loadUniGBUCS2H = sync.OnceValues(func() (CIDMap, error) {
 	return ParseCIDMap(uniGBUCS2H)
 })
 
-// ParseCIDMap读取CMap中的字符码到CID的直接映射及连续范围
+// ParseCIDMap 读取CMap中的字符码到CID的直接映射及连续范围
 // 入参: data CMap数据
-// 返回: CIDMap字符映射, error错误信息
+// 返回: CIDMap 字符映射, error 错误信息
 func ParseCIDMap(data []byte) (CIDMap, error) {
 	p := objectParser{data: data}
 	result := CIDMap{}

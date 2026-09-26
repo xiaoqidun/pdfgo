@@ -570,7 +570,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 	return glyphs, nil
 }
 
-// coreLatinWidth读取标准西文字体的内建宽度
+// coreLatinWidth 读取标准西文字体的内建宽度
 func (f *Font) coreLatinWidth(code uint32) (float64, bool) {
 	widths, ok := pdfCoreLatinWidths[f.Name]
 	if !ok || code > 255 {
