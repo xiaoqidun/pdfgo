@@ -257,7 +257,18 @@ func (r *Reader) parseAt(offset int64, parse func(*objectParser) error) error {
 // 入参: object 待解析对象
 // 返回: Object 解析后的对象, error 错误信息
 func (r *Reader) Resolve(object Object) (Object, error) {
-	seen := map[Reference]bool{}
+	ref, ok := object.(Reference)
+	if !ok {
+		return object, nil
+	}
+	object, err := r.Object(ref)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := object.(Reference); !ok {
+		return object, nil
+	}
+	seen := map[Reference]bool{ref: true}
 	for {
 		ref, ok := object.(Reference)
 		if !ok {

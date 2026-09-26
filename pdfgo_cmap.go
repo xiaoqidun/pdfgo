@@ -31,18 +31,34 @@ var errInvalidUnicodeSurrogate = errors.New("invalid Unicode surrogate")
 // 入参: data 已解码的CMap数据
 // 返回: UnicodeMap 字符映射, error 错误信息
 func ParseUnicodeMap(data []byte) (UnicodeMap, error) {
+	return parseUnicodeMap(data, nil)
+}
+
+// parseUnicodeMap 读取Unicode映射并展开命名基础资源
+// 入参: data 映射数据, active 当前命名继承链
+// 返回: UnicodeMap 独立映射, error 解析错误
+func parseUnicodeMap(data []byte, active map[Name]bool) (UnicodeMap, error) {
 	p := objectParser{data: data}
 	result := UnicodeMap{}
+	var inherited UnicodeMap
 	previous := ""
+	var name Name
 	for {
 		p.skipSpace()
 		if p.pos == len(data) {
+			for code, text := range inherited {
+				if _, exists := result[code]; !exists {
+					result[code] = text
+				}
+			}
 			return result, nil
 		}
 		if b := p.data[p.pos]; b == '/' || b == '(' || b == '<' || b == '[' {
-			if _, err := p.object(); err != nil {
+			object, err := p.object()
+			if err != nil {
 				return nil, err
 			}
+			name, _ = object.(Name)
 			previous = ""
 			continue
 		}
@@ -53,10 +69,20 @@ func ParseUnicodeMap(data []byte) (UnicodeMap, error) {
 			continue
 		}
 		if token == "usecmap" {
-			return nil, &UnsupportedError{Feature: "inherited ToUnicode CMap"}
+			if name == "" || inherited != nil {
+				return nil, p.fail("invalid ToUnicode CMap inheritance")
+			}
+			var err error
+			inherited, err = loadUnicodeCMap(name, active)
+			if err != nil {
+				return nil, err
+			}
+			name = ""
+			continue
 		}
 		if token != "beginbfchar" && token != "beginbfrange" {
 			previous = token
+			name = ""
 			continue
 		}
 		count, err := strconv.Atoi(previous)

@@ -16,6 +16,8 @@ package pdfgo
 
 import (
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/text/encoding/charmap"
 )
@@ -38,7 +40,8 @@ type Font struct {
 	defaultVertical [2]float64
 	composite       bool
 	encoding        Name
-	cidMap          CIDMap
+	cidMap          *cidCMap
+	cidUnicode      UnicodeMap
 	glyphMap        []byte
 	simpleCmap      []byte
 	cmapEncoding    Name
@@ -98,19 +101,12 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		if err != nil {
 			return nil, err
 		}
-		switch encoding {
-		case Name("Identity-H"), Name("Identity-V"):
-			font.encoding = encoding.(Name)
-			font.Vertical = font.encoding == "Identity-V"
-		case Name("UniGB-UCS2-H"):
-			font.encoding = Name("UniGB-UCS2-H")
-			font.cidMap, err = loadUniGBUCS2H()
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, &UnsupportedError{Feature: fmt.Sprintf("composite font encoding %v", encoding)}
+		font.encoding, _ = encoding.(Name)
+		font.cidMap, err = r.readCIDCMap(encoding, nil)
+		if err != nil {
+			return nil, err
 		}
+		font.Vertical = font.cidMap.vertical
 		descendants, err := r.Resolve(dict["DescendantFonts"])
 		if err != nil {
 			return nil, err
@@ -129,21 +125,6 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		}
 		if metrics["Subtype"] != Name("CIDFontType2") && metrics["Subtype"] != Name("CIDFontType0") {
 			return nil, &UnsupportedError{Feature: "CID font subtype"}
-		}
-		if font.cidMap != nil {
-			value, err := r.Resolve(metrics["CIDSystemInfo"])
-			if err != nil {
-				return nil, err
-			}
-			system, ok := value.(Dictionary)
-			if !ok {
-				return nil, fmt.Errorf("invalid CID system information")
-			}
-			registry, registryOK := system["Registry"].(String)
-			ordering, orderingOK := system["Ordering"].(String)
-			if !registryOK || !orderingOK || string(registry) != "Adobe" || string(ordering) != "GB1" {
-				return nil, fmt.Errorf("UniGB-UCS2-H requires Adobe-GB1 CID collection")
-			}
 		}
 		font.defaultWidth = 1000
 		if metrics["DW"] != nil {
@@ -330,19 +311,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		return nil, &UnsupportedError{Feature: "font subtype " + string(subtype)}
 	}
 	if dict["ToUnicode"] != nil {
-		value, err := r.Resolve(dict["ToUnicode"])
-		if err != nil {
-			return nil, err
-		}
-		stream, ok := value.(*Stream)
-		if !ok {
-			return nil, fmt.Errorf("invalid ToUnicode")
-		}
-		data, err := stream.Decode()
-		if err != nil {
-			return nil, err
-		}
-		font.Unicode, err = ParseUnicodeMap(data)
+		font.Unicode, err = r.readUnicodeCMap(dict["ToUnicode"], nil)
 		if err != nil {
 			return nil, err
 		}
@@ -442,6 +411,45 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 	if font.composite && len(font.Program) != 0 && metrics["Subtype"] == Name("CIDFontType0") && font.cffGlyphs == nil {
 		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without bare CFF program"}
 	}
+	if font.composite && metrics["CIDSystemInfo"] != nil {
+		value, err := r.Resolve(metrics["CIDSystemInfo"])
+		if err != nil {
+			return nil, err
+		}
+		info, ok := value.(Dictionary)
+		if !ok {
+			return nil, fmt.Errorf("invalid CID system information")
+		}
+		registry, err := r.Resolve(info["Registry"])
+		if err != nil {
+			return nil, err
+		}
+		ordering, err := r.Resolve(info["Ordering"])
+		if err != nil {
+			return nil, err
+		}
+		reg, regOK := registry.(String)
+		ord, ordOK := ordering.(String)
+		if !regOK || !ordOK {
+			return nil, fmt.Errorf("invalid CID character collection")
+		}
+		if font.cidMap.ordering != "" && font.cidMap.ordering != "Identity" && (font.cidMap.ordering != string(ord) || font.cidMap.registry != string(reg)) {
+			return nil, fmt.Errorf("CMap and font character collections differ")
+		}
+		if string(reg) == "Adobe" {
+			index, err := cmapResourceIndex()
+			if err != nil {
+				return nil, err
+			}
+			name := Name("Adobe-" + string(ord) + "-UCS2")
+			if _, exists := index[name]; exists {
+				font.cidUnicode, err = loadUnicodeCMap(name, nil)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
 	if indirect {
 		if r.fonts == nil {
 			r.fonts = map[Reference]*Font{}
@@ -459,22 +467,31 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 	if f.composite {
 		step = 2
 	}
-	if len(data)%step != 0 {
+	if f.cidMap == nil && len(data)%step != 0 {
 		return nil, fmt.Errorf("incomplete font character code")
 	}
 	glyphs := make([]Glyph, 0, len(data)/step)
 	for n := 0; n < len(data); n += step {
+		valid := true
+		if f.cidMap != nil {
+			step, valid = f.cidMap.next(data[n:])
+		}
 		raw := data[n : n+step]
 		code := uint32(codeNumber(raw))
 		cid := code
 		if f.cidMap != nil {
-			mapped, ok := f.cidMap[string(raw)]
-			if !ok {
-				return nil, &UnsupportedError{Feature: "character outside predefined CID mapping"}
+			cid = uint32(f.cidMap.lookup(raw, valid))
+			if len(f.Program) != 0 && !f.hasCIDGlyph(cid) {
+				cid = uint32(f.cidMap.undefined(raw))
+				if !f.hasCIDGlyph(cid) {
+					cid = 0
+				}
 			}
-			cid = uint32(mapped)
 		}
 		text, ok := f.Unicode[string(raw)]
+		if !ok && f.cidUnicode != nil {
+			text, ok = f.cidUnicode[string([]byte{byte(cid >> 8), byte(cid)})]
+		}
 		name := ""
 		if !f.composite {
 			name = f.differences[code]
@@ -494,13 +511,8 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 				}
 			}
 		}
-		if !ok && f.encoding == Name("UniGB-UCS2-H") {
-			var err error
-			text, err = unicodeBytes(raw)
-			if err != nil {
-				return nil, err
-			}
-			ok = true
+		if !ok && valid && f.cidMap != nil {
+			text, ok = predefinedCodeUnicode(f.encoding, raw)
 		}
 		if !ok && !f.composite {
 			if name != "" && name != ".notdef" {
@@ -512,6 +524,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		}
 		if !ok && f.cffGlyphs != nil {
 			_, ok = f.cffGlyphs[cid]
+		}
+		if !ok && f.composite && len(f.Program) != 0 && f.cffGlyphs == nil {
+			ok = true
 		}
 		if !ok {
 			if f.composite {
@@ -633,6 +648,42 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		glyphs = append(glyphs, glyph)
 	}
 	return glyphs, nil
+}
+
+// hasCIDGlyph 检查内嵌字体是否提供指定CID的字形映射
+// 入参: cid 字符标识
+// 返回: bool 是否提供字形
+func (f *Font) hasCIDGlyph(cid uint32) bool {
+	if f.cffGlyphs != nil {
+		_, ok := f.cffGlyphs[cid]
+		return ok
+	}
+	if f.glyphMap != nil {
+		return int(cid)*2+1 < len(f.glyphMap) && (f.glyphMap[cid*2] != 0 || f.glyphMap[cid*2+1] != 0)
+	}
+	return true
+}
+
+// predefinedCodeUnicode 还原以Unicode编码命名的官方CMap字符，不推测其他编码
+// 入参: name 官方编码名称, raw 字符码
+// 返回: string Unicode文本, bool 是否为有效Unicode编码
+func predefinedCodeUnicode(name Name, raw []byte) (string, bool) {
+	encoding := string(name)
+	if !strings.HasPrefix(encoding, "Uni") {
+		return "", false
+	}
+	if strings.Contains(encoding, "-UCS2-") || strings.Contains(encoding, "-UTF16-") {
+		value, err := unicodeBytes(raw)
+		return value, err == nil
+	}
+	if strings.Contains(encoding, "-UTF8-") {
+		return string(raw), utf8.Valid(raw)
+	}
+	if strings.Contains(encoding, "-UTF32-") && len(raw) == 4 {
+		value := rune(codeNumber(raw))
+		return string(value), utf8.ValidRune(value)
+	}
+	return "", false
 }
 
 // coreLatinWidth 读取标准西文字体的内建宽度

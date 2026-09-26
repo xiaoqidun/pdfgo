@@ -37,6 +37,14 @@ type Page struct {
 	reader     *Reader
 }
 
+// pageAttributes 保存页面树可继承的四项属性
+type pageAttributes struct {
+	resources Object
+	mediaBox  Object
+	cropBox   Object
+	rotation  Object
+}
+
 // WalkPages 按页面顺序访问页面，不执行动作或访问外部资源
 // 入参: ctx 取消上下文, visit 页面访问函数
 // 返回: error 错误信息
@@ -51,8 +59,8 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 	}
 	seen := map[Reference]bool{}
 	index := 0
-	var walk func(Object, Dictionary, int) error
-	walk = func(object Object, inherited Dictionary, depth int) error {
+	var walk func(Object, pageAttributes, int) error
+	walk = func(object Object, inherited pageAttributes, depth int) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -75,11 +83,17 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 		if !ok {
 			return fmt.Errorf("invalid page tree node")
 		}
-		attrs := Dictionary{}
-		for _, key := range []Name{"Resources", "MediaBox", "CropBox", "Rotate"} {
-			attrs[key] = inherited[key]
-			if dict[key] != nil {
-				attrs[key] = dict[key]
+		attrs := inherited
+		for _, attr := range [...]struct {
+			key   Name
+			value *Object
+		}{{"Resources", &attrs.resources}, {"MediaBox", &attrs.mediaBox}, {"CropBox", &attrs.cropBox}, {"Rotate", &attrs.rotation}} {
+			value, err := r.Resolve(dict[attr.key])
+			if err != nil {
+				return err
+			}
+			if value != nil {
+				*attr.value = value
 			}
 		}
 		switch dict["Type"] {
@@ -112,18 +126,18 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 			return fmt.Errorf("invalid page tree type")
 		}
 	}
-	return walk(catalog["Pages"], Dictionary{}, 0)
+	return walk(catalog["Pages"], pageAttributes{}, 0)
 }
 
 // readPage 解析继承属性并检查页面尺寸
-func (r *Reader) readPage(ref Reference, dict, attrs Dictionary) (*Page, error) {
-	media, err := r.rectangle(attrs["MediaBox"])
+func (r *Reader) readPage(ref Reference, dict Dictionary, attrs pageAttributes) (*Page, error) {
+	media, err := r.rectangle(attrs.mediaBox)
 	if err != nil {
 		return nil, err
 	}
 	crop := media
-	if attrs["CropBox"] != nil {
-		crop, err = r.rectangle(attrs["CropBox"])
+	if attrs.cropBox != nil {
+		crop, err = r.rectangle(attrs.cropBox)
 		if err != nil {
 			return nil, err
 		}
@@ -132,21 +146,13 @@ func (r *Reader) readPage(ref Reference, dict, attrs Dictionary) (*Page, error) 
 			return nil, fmt.Errorf("empty crop box")
 		}
 	}
-	resources, err := r.Resolve(attrs["Resources"])
-	if err != nil {
-		return nil, err
-	}
-	resourceDict, ok := resources.(Dictionary)
-	if !ok && resources != nil {
+	resourceDict, ok := attrs.resources.(Dictionary)
+	if !ok && attrs.resources != nil {
 		return nil, fmt.Errorf("invalid page resources")
 	}
-	rotationObject, err := r.Resolve(attrs["Rotate"])
-	if err != nil {
-		return nil, err
-	}
 	rotation := Integer(0)
-	if rotationObject != nil {
-		rotation, ok = rotationObject.(Integer)
+	if attrs.rotation != nil {
+		rotation, ok = attrs.rotation.(Integer)
 		if !ok || rotation%90 != 0 {
 			return nil, fmt.Errorf("invalid page rotation")
 		}

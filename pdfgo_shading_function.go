@@ -219,7 +219,11 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 				continue
 			}
 			for _, stop := range part.linear([2]float64{encode[2*i], encode[2*i+1]}) {
-				stop.Position = (points[i] + stop.Position*(points[i+1]-points[i]) - domain[0]) / (domain[1] - domain[0])
+				position := points[i] + stop.Position*(points[i+1]-points[i])
+				if stop.Position == 1 {
+					position = points[i+1]
+				}
+				stop.Position = (position - domain[0]) / (domain[1] - domain[0])
 				stops = append(stops, stop)
 			}
 		}

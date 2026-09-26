@@ -40,9 +40,11 @@ type AxialGradient struct {
 	domain     [2]float64
 }
 
-// RadialGradient 保存页面坐标中的双圆径向渐变及两端延伸方式
+// RadialGradient 保存双圆径向渐变及两端延伸方式，Matrix将渐变坐标映射到页面
+// Matrix为零值时使用单位矩阵
 // Stops仅在函数可精确展开为线性分段时提供，否则通过ValuesAt或ColorAt求值
 type RadialGradient struct {
+	Matrix                 Matrix
 	Start, End             Point
 	StartRadius, EndRadius float64
 	Extend                 [2]bool
@@ -160,6 +162,12 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if err != nil {
 		return Paint{}, err
 	}
+	if stream, ok := v.(*Stream); ok {
+		if stream.Dictionary["BBox"] != nil {
+			return Paint{}, &UnsupportedError{Feature: "bounded mesh shading pattern"}
+		}
+		return p.meshPaint(stream, m)
+	}
 	shading, ok := v.(Dictionary)
 	if !ok || shading["Background"] != nil || shading["BBox"] != nil {
 		return Paint{}, &UnsupportedError{Feature: "shading dictionary"}
@@ -187,10 +195,15 @@ func (p *pageInterpreter) shadingFill(operands []Object) error {
 		return err
 	}
 	dict, ok := value.(Dictionary)
-	if !ok {
+	var paint Paint
+	if stream, streamOK := value.(*Stream); streamOK {
+		dict = stream.Dictionary
+		paint, err = p.meshPaint(stream, p.state.matrix)
+	} else if ok {
+		paint, err = p.shadingPaint(dict, p.state.matrix)
+	} else {
 		return &UnsupportedError{Feature: "shading dictionary"}
 	}
-	paint, err := p.shadingPaint(dict, p.state.matrix)
 	if err != nil {
 		return err
 	}
@@ -231,9 +244,8 @@ func shadingRectangle(box Rectangle, matrix Matrix) Path {
 // 入参: shading 着色字典, m 着色坐标到页面的变换
 // 返回: Paint 渐变画刷, error 解析错误
 func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, error) {
-	sx, sy := math.Hypot(m[0], m[1]), math.Hypot(m[2], m[3])
-	if shading["ShadingType"] == Integer(3) && (sx == 0 || math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy)) {
-		return Paint{}, &UnsupportedError{Feature: "anisotropic shading pattern"}
+	if _, ok := m.Inverse(); !ok {
+		return Paint{}, fmt.Errorf("singular shading transform")
 	}
 	domain := [2]float64{0, 1}
 	if shading["Domain"] != nil {
@@ -279,7 +291,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		paint.Axial = &AxialGradient{Start: start, End: Point{start.X + gx*factor, start.Y + gy*factor}}
 	} else {
 		end := Point{coords[3], coords[4]}
-		paint.Radial = &RadialGradient{Start: m.Apply(start), End: m.Apply(end), StartRadius: coords[2] * sx, EndRadius: coords[5] * sx}
+		paint.Radial = &RadialGradient{Matrix: m, Start: start, End: end, StartRadius: coords[2], EndRadius: coords[5]}
 	}
 	if shading["Extend"] != nil {
 		v, err := p.reader.Resolve(shading["Extend"])

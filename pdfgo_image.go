@@ -278,6 +278,11 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if uint64(bounds.Dx()) > uint64(^uint(0)>>1)/8/uint64(bounds.Dy()) {
 		return nil, fmt.Errorf("masked image dimensions exceed platform integer range")
 	}
+	if target == nil && palette == nil && calibrated == nil && profile == nil && separation == nil && components != 4 && mask == nil && len(keys) == 0 && len(i.Decode) == 0 {
+		if output := deviceImage(samples); output != nil {
+			return output, nil
+		}
+	}
 	if samples.Bounds() != bounds {
 		samples = &imageResample{source: samples, bounds: bounds, interpolate: i.Interpolate && palette == nil}
 	}
@@ -408,6 +413,34 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		return nil, nil
 	}
 	return out, nil
+}
+
+// deviceImage 直接展开无颜色变换的灰度及RGB样本，避免逐像素接口装箱和浮点映射
+// 入参: source 原始样本
+// 返回: *image.NRGBA64 显示图像，其他样本类型返回空值
+func deviceImage(source image.Image) *image.NRGBA64 {
+	var sample func(int, int) (uint32, uint32, uint32, uint32)
+	switch source := source.(type) {
+	case *image.NRGBA:
+		sample = func(x, y int) (uint32, uint32, uint32, uint32) { return source.NRGBAAt(x, y).RGBA() }
+	case *image.NRGBA64:
+		sample = func(x, y int) (uint32, uint32, uint32, uint32) { return source.NRGBA64At(x, y).RGBA() }
+	case *image.Gray:
+		sample = func(x, y int) (uint32, uint32, uint32, uint32) { return source.GrayAt(x, y).RGBA() }
+	case *image.Gray16:
+		sample = func(x, y int) (uint32, uint32, uint32, uint32) { return source.Gray16At(x, y).RGBA() }
+	default:
+		return nil
+	}
+	bounds := source.Bounds()
+	output := image.NewNRGBA64(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, _ := sample(x, y)
+			output.SetNRGBA64(x, y, color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: 65535})
+		}
+	}
+	return output
 }
 
 // imagePalette 保存索引色的原始分量和显示颜色

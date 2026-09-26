@@ -95,6 +95,7 @@ type Paint struct {
 	Alpha  float64
 	Axial  *AxialGradient
 	Radial *RadialGradient
+	Mesh   *MeshGradient
 	Tiling *TilingPattern
 }
 
@@ -157,6 +158,7 @@ type GroupMark struct {
 	Alpha        float64
 	AlphaIsShape bool
 	Isolated     bool
+	Knockout     bool
 	BlendMode    Name
 	SoftMask     *SoftMask
 	ColorSpace   *ColorSpace
@@ -227,6 +229,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 		return fmt.Errorf("page belongs to another reader")
 	}
 	var groupSpace *ColorSpace
+	var knockout bool
 	if page.Dictionary["Group"] != nil {
 		value, err := r.Resolve(page.Dictionary["Group"])
 		if err != nil {
@@ -237,6 +240,10 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			return fmt.Errorf("invalid page group")
 		}
 		for key, value := range group {
+			value, err = r.Resolve(value)
+			if err != nil {
+				return err
+			}
 			switch key {
 			case "Type":
 				if value != Name("Group") {
@@ -259,9 +266,11 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 					return fmt.Errorf("invalid page isolation flag")
 				}
 			case "K":
-				if value != Boolean(false) {
-					return &UnsupportedError{Feature: "knockout page group"}
+				flag, ok := value.(Boolean)
+				if !ok {
+					return fmt.Errorf("invalid page knockout flag")
 				}
+				knockout = bool(flag)
 			default:
 				return &UnsupportedError{Feature: fmt.Sprintf("page group field %q", key)}
 			}
@@ -277,8 +286,11 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
-	if groupSpace != nil && visitor.Group != nil {
-		return visitor.Group(GroupMark{Page: true, Alpha: 1, Isolated: true, ColorSpace: groupSpace}, func(v Visitor) error {
+	if knockout && visitor.Group == nil {
+		return &UnsupportedError{Feature: "page knockout visitor missing"}
+	}
+	if (groupSpace != nil || knockout) && visitor.Group != nil {
+		return visitor.Group(GroupMark{Page: true, Alpha: 1, Isolated: true, Knockout: knockout, ColorSpace: groupSpace}, func(v Visitor) error {
 			child := interpreter
 			child.visitor = v
 			return child.run(data)
@@ -1192,10 +1204,27 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			return err
 		}
 		group, ok := value.(Dictionary)
-		if !ok || group["S"] != Name("Transparency") || group["I"] != nil && group["I"] != Boolean(true) && group["I"] != Boolean(false) || group["K"] != nil && group["K"] != Boolean(false) {
+		if !ok || group["S"] != Name("Transparency") {
 			return &UnsupportedError{Feature: "form transparency group"}
 		}
-		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, AlphaIsShape: p.state.style.AlphaIsShape, Isolated: group["I"] == Boolean(true), BlendMode: p.state.style.BlendMode, SoftMask: p.state.style.SoftMask}
+		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, AlphaIsShape: p.state.style.AlphaIsShape, BlendMode: p.state.style.BlendMode, SoftMask: p.state.style.SoftMask}
+		for _, flag := range []struct {
+			name   Name
+			target *bool
+		}{{"I", &groupMark.Isolated}, {"K", &groupMark.Knockout}} {
+			value, err := p.reader.Resolve(group[flag.name])
+			if err != nil {
+				return err
+			}
+			if value == nil {
+				continue
+			}
+			boolean, ok := value.(Boolean)
+			if !ok {
+				return fmt.Errorf("invalid form group flag %q", flag.name)
+			}
+			*flag.target = bool(boolean)
+		}
 		if group["CS"] != nil {
 			groupMark.ColorSpace, err = p.reader.readBlendingSpace(group["CS"])
 			if err != nil {
@@ -1207,7 +1236,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 				return err
 			}
 		}
-		if p.visitor.Group == nil && (groupMark.Alpha != 1 || !groupMark.Isolated || groupMark.SoftMask != nil || groupMark.BlendMode != "" && groupMark.BlendMode != "Normal" && groupMark.BlendMode != "Compatible") {
+		if p.visitor.Group == nil && (groupMark.Knockout || groupMark.Alpha != 1 || !groupMark.Isolated || groupMark.SoftMask != nil || groupMark.BlendMode != "" && groupMark.BlendMode != "Normal" && groupMark.BlendMode != "Compatible") {
 			return &UnsupportedError{Feature: "transparency group visitor missing"}
 		}
 		child.state.style.Fill.Alpha, child.state.style.Stroke.Alpha = 1, 1
