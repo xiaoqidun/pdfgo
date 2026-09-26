@@ -151,7 +151,9 @@ type ImageMark struct {
 }
 
 // GroupMark 保存透明度组的边界不透明度和隔离方式，组内绘制使用独立状态
+// Page区分页面初始组与内容流中的表单组
 type GroupMark struct {
+	Page         bool
 	Alpha        float64
 	AlphaIsShape bool
 	Isolated     bool
@@ -276,7 +278,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
 	if groupSpace != nil && visitor.Group != nil {
-		return visitor.Group(GroupMark{Alpha: 1, Isolated: true, ColorSpace: groupSpace}, func(v Visitor) error {
+		return visitor.Group(GroupMark{Page: true, Alpha: 1, Isolated: true, ColorSpace: groupSpace}, func(v Visitor) error {
 			child := interpreter
 			child.visitor = v
 			return child.run(data)

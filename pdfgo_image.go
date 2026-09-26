@@ -185,6 +185,13 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 // 异尺寸遮罩按单位方形对齐，输出尺寸取各轴较大的采样数以保留边缘精度
 // 返回: image.Image 解码图像, error 错误信息
 func (i *Image) DecodeImage() (image.Image, error) {
+	return i.decodeImage(nil)
+}
+
+// decodeImage 共用解码、遮罩和预混合恢复流程，按需保留颜色分量
+// 入参: target 可选分量输出
+// 返回: image.Image 显示图像，分量模式下为空, error 解码错误
+func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	palette, err := i.palette()
 	if err != nil {
 		return nil, err
@@ -277,7 +284,27 @@ func (i *Image) DecodeImage() (image.Image, error) {
 	if mask != nil {
 		mask.bounds = bounds
 	}
-	out := image.NewNRGBA64(bounds)
+	var out *image.NRGBA64
+	if target == nil {
+		out = image.NewNRGBA64(bounds)
+	} else {
+		if palette != nil {
+			target.Space = palette.space
+		} else if profile != nil {
+			target.Space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
+		} else if calibrated == nil && separation == nil {
+			target.Space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components]}
+		}
+		if target.Space == nil {
+			return nil, &UnsupportedError{Feature: "image source color components"}
+		}
+		target.Rect = bounds
+		stride := target.Space.Components() + 1
+		if uint64(bounds.Dx()) > uint64(^uint(0)>>1)/uint64(2*stride)/uint64(bounds.Dy()) {
+			return nil, fmt.Errorf("image component dimensions exceed platform integer range")
+		}
+		target.Pix = make([]uint16, bounds.Dx()*bounds.Dy()*stride)
+	}
 	intent, _ := i.Stream.Dictionary["Intent"].(Name)
 	maximum := float64((uint32(1) << i.BitsPerComponent) - 1)
 	for y := 0; y < bounds.Dy(); y++ {
@@ -320,18 +347,34 @@ func (i *Image) DecodeImage() (image.Image, error) {
 			if components == 1 {
 				values[1], values[2] = values[0], values[0]
 			}
+			if target != nil {
+				if palette != nil {
+					index := int(math.Max(0, math.Min(float64(len(palette.values)-1), math.Round(values[0]))))
+					values = palette.values[index]
+				}
+				channels := target.Space.Components()
+				offset := (y*bounds.Dx() + x) * (channels + 1)
+				for c := 0; c < channels; c++ {
+					target.Pix[offset+c] = uint16(math.Round(values[c] * 65535))
+				}
+				if transparent {
+					alpha = 0
+				}
+				target.Pix[offset+channels] = alpha
+				continue
+			}
 			var pixel color.NRGBA64
 			if palette != nil {
-				index := int(math.Max(0, math.Min(float64(len(palette)-1), math.Round(values[0]))))
-				pixel = palette[index]
+				index := int(math.Max(0, math.Min(float64(len(palette.colors)-1), math.Round(values[0]))))
+				pixel = palette.colors[index]
 			} else if separation != nil {
 				paint, err := separation.paint(values[0], intent)
 				if err != nil {
 					return nil, err
 				}
 				if paint.CMYK != nil {
-					v := paint.CMYK
-					pixel = color.NRGBA64Model.Convert(color.CMYK{C: uint8(math.Round(v[0] * 255)), M: uint8(math.Round(v[1] * 255)), Y: uint8(math.Round(v[2] * 255)), K: uint8(math.Round(v[3] * 255))}).(color.NRGBA64)
+					rgb := deviceCMYKRGB(paint.CMYK[:])
+					pixel = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
 				} else {
 					pixel = color.NRGBA64{R: uint16(math.Round(paint.RGB[0] * 65535)), G: uint16(math.Round(paint.RGB[1] * 65535)), B: uint16(math.Round(paint.RGB[2] * 65535)), A: 65535}
 				}
@@ -347,8 +390,8 @@ func (i *Image) DecodeImage() (image.Image, error) {
 			} else if calibrated != nil {
 				pixel = calibrated.color(values[0], values[1], values[2])
 			} else if components == 4 {
-				cmyk := color.CMYK{C: uint8(math.Round(values[0] * 255)), M: uint8(math.Round(values[1] * 255)), Y: uint8(math.Round(values[2] * 255)), K: uint8(math.Round(values[3] * 255))}
-				pixel = color.NRGBA64Model.Convert(cmyk).(color.NRGBA64)
+				rgb := deviceCMYKRGB(values[:])
+				pixel = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
 			} else {
 				pixel = color.NRGBA64{R: uint16(math.Round(values[0] * 65535)), G: uint16(math.Round(values[1] * 65535)), B: uint16(math.Round(values[2] * 65535)), A: 65535}
 			}
@@ -361,12 +404,22 @@ func (i *Image) DecodeImage() (image.Image, error) {
 			out.SetNRGBA64(x, y, pixel)
 		}
 	}
+	if out == nil {
+		return nil, nil
+	}
 	return out, nil
 }
 
+// imagePalette 保存索引色的原始分量和显示颜色
+type imagePalette struct {
+	space  *ColorSpace
+	values [][4]float64
+	colors []color.NRGBA64
+}
+
 // palette 解析索引色查找表，保留原始索引样本供Decode和色键遮罩使用
-// 返回: []color.NRGBA64 调色板，非索引色时为空, error 错误信息
-func (i *Image) palette() ([]color.NRGBA64, error) {
+// 返回: *imagePalette 调色板，非索引色时为空, error 错误信息
+func (i *Image) palette() (*imagePalette, error) {
 	array, ok := i.ColorSpace.(Array)
 	if !ok {
 		return nil, nil
@@ -434,14 +487,18 @@ func (i *Image) palette() ([]color.NRGBA64, error) {
 		return nil, fmt.Errorf("invalid Indexed lookup length")
 	}
 	palette := make([]color.NRGBA64, int(n+1))
+	result := &imagePalette{colors: palette, values: make([][4]float64, len(palette))}
+	if calibrated == nil {
+		result.space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
+	}
 	intent, _ := i.Stream.Dictionary["Intent"].(Name)
 	for index := range palette {
 		v := data[index*components:]
+		for c := 0; c < components; c++ {
+			result.values[index][c] = float64(v[c]) / 255
+		}
 		if profile != nil {
-			var values [3]float64
-			for c := 0; c < components; c++ {
-				values[c] = float64(v[c]) / 255
-			}
+			values := result.values[index]
 			rgb, err := profile.color(values[:components], intent)
 			if err != nil {
 				return nil, err
@@ -458,10 +515,11 @@ func (i *Image) palette() ([]color.NRGBA64, error) {
 				palette[index] = calibrated.color(float64(v[0])/255, float64(v[1])/255, float64(v[2])/255)
 			}
 		case 4:
-			palette[index] = color.NRGBA64Model.Convert(color.CMYK{C: v[0], M: v[1], Y: v[2], K: v[3]}).(color.NRGBA64)
+			rgb := deviceCMYKRGB(result.values[index][:])
+			palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
 		}
 	}
-	return palette, nil
+	return result, nil
 }
 
 // decodeMask 读取有效遮罩，软遮罩优先于显式遮罩和色键遮罩

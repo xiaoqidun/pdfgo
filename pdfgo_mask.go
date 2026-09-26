@@ -78,6 +78,7 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		}
 	}
 	m.interpreter.state.style.SoftMask = nil
+	m.interpreter.state.style.BlendMode = "Normal"
 	m.interpreter.state.style.Clips = nil
 	m.interpreter.state.style.Fill.Alpha, m.interpreter.state.style.Stroke.Alpha = 1, 1
 	if dict["BC"] != nil && m.Subtype == "Luminosity" {

@@ -24,29 +24,75 @@ import (
 	"io"
 )
 
-// jpegSamples 按PDF的DCT颜色规则解码，Adobe标记优先于解码字典
-// 入参: data JPEG数据, params DCT解码参数
-// 返回: image.Image 原始颜色样本, error 参数或解码错误
-func (i *Image) jpegSamples(data []byte, params Dictionary) (image.Image, error) {
-	components, adobe, tagged, err := jpegColorInfo(data)
+// JPEGFile 返回可脱离PDF字典直接显示的原始JPEG，需颜色映射或遮罩时返回空值
+// 返回: []byte 原始JPEG数据或空值, error 解码参数错误
+func (i *Image) JPEGFile() ([]byte, error) {
+	filter, err := i.reader.Resolve(i.Stream.Dictionary["Filter"])
 	if err != nil {
 		return nil, err
+	}
+	if filter != Name("DCTDecode") || i.ImageMask || len(i.Decode) != 0 || i.Mask != nil || i.SoftMask != nil || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB") {
+		return nil, nil
+	}
+	value, err := i.reader.Resolve(i.Stream.Dictionary["DecodeParms"])
+	if err != nil {
+		return nil, err
+	}
+	params, ok := value.(Dictionary)
+	if value != nil && !ok {
+		return nil, fmt.Errorf("invalid JPEG decode parameters")
+	}
+	components, transform, _, err := i.jpegTransform(i.Stream.Data, params)
+	if err != nil {
+		return nil, err
+	}
+	config, err := jpeg.DecodeConfig(bytes.NewReader(i.Stream.Data))
+	if err != nil {
+		return nil, err
+	}
+	if config.Width != i.Width || config.Height != i.Height {
+		return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
+	}
+	if components == 1 && i.ColorSpace == Name("DeviceGray") || components == 3 && i.ColorSpace == Name("DeviceRGB") && transform == (config.ColorModel == color.YCbCrModel) {
+		return i.Stream.Data, nil
+	}
+	return nil, nil
+}
+
+// jpegTransform 解析PDF的DCT颜色规则，Adobe标记优先于解码字典
+// 入参: data JPEG数据, params DCT参数
+// 返回: int 分量数, bool 是否进行颜色变换, bool 是否有Adobe标记, error 参数错误
+func (i *Image) jpegTransform(data []byte, params Dictionary) (int, bool, bool, error) {
+	components, adobe, tagged, err := jpegColorInfo(data)
+	if err != nil {
+		return 0, false, false, err
 	}
 	transform := components == 3
 	if tagged {
 		if components == 3 && adobe != 0 && adobe != 1 || components == 4 && adobe != 0 && adobe != 2 {
-			return nil, fmt.Errorf("invalid Adobe JPEG color transform")
+			return 0, false, false, fmt.Errorf("invalid Adobe JPEG color transform")
 		}
 		transform = adobe != 0
 	} else if (components == 3 || components == 4) && params["ColorTransform"] != nil {
 		value, err := i.reader.Resolve(params["ColorTransform"])
 		if err != nil {
-			return nil, err
+			return 0, false, false, err
 		}
 		if value != Integer(0) && value != Integer(1) {
-			return nil, fmt.Errorf("invalid JPEG ColorTransform")
+			return 0, false, false, fmt.Errorf("invalid JPEG ColorTransform")
 		}
 		transform = value == Integer(1)
+	}
+	return components, transform, tagged, nil
+}
+
+// jpegSamples 按PDF的DCT颜色规则解码，Adobe标记优先于解码字典
+// 入参: data JPEG数据, params DCT解码参数
+// 返回: image.Image 原始颜色样本, error 参数或解码错误
+func (i *Image) jpegSamples(data []byte, params Dictionary) (image.Image, error) {
+	components, transform, tagged, err := i.jpegTransform(data, params)
+	if err != nil {
+		return nil, err
 	}
 	reader := func() io.Reader { return bytes.NewReader(data) }
 	if components == 4 && !tagged {

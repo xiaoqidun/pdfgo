@@ -113,9 +113,53 @@ func (s *ColorSpace) RGB(values []float64, intent Name) ([3]float64, error) {
 	case "DeviceRGB":
 		return [3]float64(values), nil
 	case "DeviceCMYK":
-		return [3]float64{(1 - values[0]) * (1 - values[3]), (1 - values[1]) * (1 - values[3]), (1 - values[2]) * (1 - values[3])}, nil
+		return deviceCMYKRGB(values), nil
 	}
 	return [3]float64{}, &UnsupportedError{Feature: "blending color space " + string(s.Model)}
+}
+
+// Convert 将源空间分量转换到当前设备空间，相同校准空间保留原值
+// DeviceRGB转DeviceCMYK采用恒等黑版生成及底色去除函数
+// 入参: values 源分量, source 源空间, intent 渲染意图
+// 返回: [4]float64 目标分量, error 无效分量或未支持的目标变换
+func (s *ColorSpace) Convert(values []float64, source *ColorSpace, intent Name) ([4]float64, error) {
+	var result [4]float64
+	if err := source.validate(values); err != nil {
+		return result, err
+	}
+	if s.Equal(source) {
+		copy(result[:], values)
+		return result, nil
+	}
+	if s.Calibrated() {
+		return result, &UnsupportedError{Feature: "ICC destination color transform"}
+	}
+	rgb, err := source.RGB(values, intent)
+	if err != nil {
+		return result, err
+	}
+	switch s.Model {
+	case "DeviceGray":
+		result[0] = .3*rgb[0] + .59*rgb[1] + .11*rgb[2]
+	case "DeviceRGB":
+		copy(result[:], rgb[:])
+	case "DeviceCMYK":
+		black := 1 - math.Max(rgb[0], math.Max(rgb[1], rgb[2]))
+		for c := range rgb {
+			result[c] = math.Max(0, 1-rgb[c]-black)
+		}
+		result[3] = black
+	default:
+		return result, &UnsupportedError{Feature: "destination color space " + string(s.Model)}
+	}
+	return result, nil
+}
+
+// deviceCMYKRGB 按PDF设备颜色转换规则叠加黑色分量后取补色
+// 入参: values CMYK单位分量
+// 返回: [3]float64 RGB单位分量
+func deviceCMYKRGB(values []float64) [3]float64 {
+	return [3]float64{1 - math.Min(1, values[0]+values[3]), 1 - math.Min(1, values[1]+values[3]), 1 - math.Min(1, values[2]+values[3])}
 }
 
 // Luminosity 按PDF蒙版规则计算亮度，ICC使用连接空间的Y分量
@@ -138,6 +182,9 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 			y += p.rgb.matrix.matrix[3*i+1] * curve.evaluate(values[i])
 		}
 		return math.Max(0, math.Min(1, y)), nil
+	}
+	if s.Model == "DeviceCMYK" {
+		return (.3*(1-values[0]) + .59*(1-values[1]) + .11*(1-values[2])) * (1 - values[3]), nil
 	}
 	rgb, err := s.RGB(values, intent)
 	return .3*rgb[0] + .59*rgb[1] + .11*rgb[2], err
