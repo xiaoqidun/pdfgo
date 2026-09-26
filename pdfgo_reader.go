@@ -36,6 +36,15 @@ type Reader struct {
 	destinations       map[string]Object
 	legacyDestinations Dictionary
 	fonts              map[Reference]*Font
+	objectStream       *objectStream
+}
+
+// objectStream 保留最近访问的对象流索引和解码数据，避免逐对象重复解压
+type objectStream struct {
+	reference Reference
+	data      []byte
+	ids       []int64
+	offsets   []int64
 }
 
 // xrefEntry 保存交叉引用类型、文件偏移或对象流索引
@@ -517,7 +526,37 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 	if !ok || containerEntry.kind != 1 {
 		return nil, fmt.Errorf("invalid object stream reference")
 	}
-	object, err := r.Object(Reference{entry.position, containerEntry.generation})
+	container := Reference{entry.position, containerEntry.generation}
+	stream := r.objectStream
+	if stream == nil || stream.reference != container {
+		var err error
+		stream, err = r.readObjectStream(container)
+		if err != nil {
+			return nil, err
+		}
+		r.objectStream = stream
+	}
+	index := entry.generation
+	if index < 0 || index >= int64(len(stream.ids)) || stream.ids[index] != ref.Number {
+		return nil, fmt.Errorf("object stream index mismatch")
+	}
+	p := objectParser{data: stream.data[stream.offsets[index]:stream.offsets[index+1]]}
+	value, err := p.object()
+	if err != nil {
+		return nil, err
+	}
+	p.skipSpace()
+	if p.pos != len(p.data) {
+		return nil, fmt.Errorf("excess compressed object data")
+	}
+	return value, nil
+}
+
+// readObjectStream 解码对象流并校验全部索引，内容仍按引用逐项解析
+// 入参: ref 对象流引用
+// 返回: *objectStream 对象流数据, error 错误信息
+func (r *Reader) readObjectStream(ref Reference) (*objectStream, error) {
+	object, err := r.Object(ref)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +566,7 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 	}
 	count, e1 := integerDefault(stream.Dictionary, "N", -1)
 	first, e2 := integerDefault(stream.Dictionary, "First", -1)
-	if e1 != nil || e2 != nil || count <= 0 || first < 0 || entry.generation >= count {
+	if e1 != nil || e2 != nil || count <= 0 || first < 0 {
 		return nil, fmt.Errorf("invalid object stream header")
 	}
 	data, err := stream.Decode()
@@ -538,7 +577,7 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 		return nil, fmt.Errorf("invalid object stream dimensions")
 	}
 	p := objectParser{data: data[:first]}
-	ids, offsets := make([]int64, count), make([]int64, count)
+	ids, offsets := make([]int64, count), make([]int64, count+1)
 	for i := int64(0); i < count; i++ {
 		ids[i], e1 = strconv.ParseInt(p.token(), 10, 64)
 		offsets[i], e2 = strconv.ParseInt(p.token(), 10, 64)
@@ -547,22 +586,9 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 		}
 	}
 	p.skipSpace()
-	if p.pos != len(p.data) || ids[entry.generation] != ref.Number {
+	if p.pos != len(p.data) {
 		return nil, fmt.Errorf("object stream index mismatch")
 	}
-	start := first + offsets[entry.generation]
-	end := int64(len(data))
-	if entry.generation+1 < count {
-		end = first + offsets[entry.generation+1]
-	}
-	p = objectParser{data: data[start:end]}
-	value, err := p.object()
-	if err != nil {
-		return nil, err
-	}
-	p.skipSpace()
-	if p.pos != len(p.data) {
-		return nil, fmt.Errorf("excess compressed object data")
-	}
-	return value, nil
+	offsets[count] = int64(len(data)) - first
+	return &objectStream{reference: ref, data: data[first:], ids: ids, offsets: offsets}, nil
 }

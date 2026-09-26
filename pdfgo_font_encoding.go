@@ -83,6 +83,7 @@ func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
 	return nil, fmt.Errorf("Type1 font has no built-in encoding")
 }
 
+// type1EncodingScanner 按词项读取Type1字体明文段
 type type1EncodingScanner struct {
 	data []byte
 	pos  int
@@ -119,9 +120,12 @@ func (s *type1EncodingScanner) next() string {
 	return string(s.data[start:s.pos])
 }
 
+// adobeGlyphList 保存Adobe字形名称映射资源
+//
 //go:embed assets/glyph/glyphlist.txt
 var adobeGlyphList []byte
 
+// adobeGlyphNames 按需构建字形名称与Unicode映射
 var adobeGlyphNames = sync.OnceValue(func() map[string]string {
 	names := make(map[string]string)
 	for _, line := range strings.Split(string(adobeGlyphList), "\n") {

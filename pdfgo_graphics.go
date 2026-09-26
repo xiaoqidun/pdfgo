@@ -140,7 +140,7 @@ type MarkedContentMark struct {
 }
 
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
-// Warning非空时报告缺失的ExtGState资源及未保留的内容语义，其他解析错误仍返回错误
+// Warning非空时报告空Type3字形、缺失的ExtGState资源及未保留的内容语义，其他解析错误仍返回错误
 type Visitor struct {
 	Path          func(PathMark) error
 	Text          func(TextMark) error
@@ -248,8 +248,11 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 // 入参: ctx 取消上下文, mark 文字绘制信息, index 字形下标, visitor 图元访问器
 // 返回: error 解析或访问错误
 func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, visitor Visitor) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	font := mark.Font
-	if font == nil || font.Subtype != Name("Type3") || index < 0 || index >= len(mark.Glyphs) {
+	if font == nil || font.Subtype != Name("Type3") || index < 0 || index >= len(mark.Glyphs) || index >= len(mark.Positions) {
 		return fmt.Errorf("invalid Type3 glyph")
 	}
 	object, err := r.Resolve(font.type3Procs[Name(mark.Glyphs[index].Name)])
@@ -259,6 +262,14 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	stream, ok := object.(*Stream)
 	if !ok {
 		return fmt.Errorf("missing Type3 character procedure")
+	}
+	if len(stream.Data) == 0 {
+		message := fmt.Sprintf("empty Type3 character procedure %q", mark.Glyphs[index].Name)
+		if visitor.Warning == nil {
+			return fmt.Errorf("%s", message)
+		}
+		visitor.Warning(Diagnostic{Message: message})
+		return nil
 	}
 	data, err := stream.Decode()
 	if err != nil {
@@ -376,9 +387,8 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("color operator in uncolored pattern")
 		}
 	}
-	count := map[string]int{"q": 0, "Q": 0, "cm": 6, "w": 1, "J": 1, "j": 1, "M": 1, "m": 2, "l": 2, "c": 6, "v": 4, "y": 4, "h": 0, "re": 4, "S": 0, "s": 0, "f": 0, "F": 0, "f*": 0, "B": 0, "B*": 0, "b": 0, "b*": 0, "n": 0, "W": 0, "W*": 0, "g": 1, "G": 1, "rg": 3, "RG": 3, "k": 4, "K": 4, "BT": 0, "ET": 0, "Tc": 1, "Tw": 1, "Tz": 1, "TL": 1, "Tr": 1, "Ts": 1, "Td": 2, "TD": 2, "Tm": 6, "T*": 0, "d0": 2, "d1": 6}
 	var v []float64
-	if n, ok := count[op.Operator]; ok {
+	if n := graphicsOperandCount(op.Operator); n >= 0 {
 		var err error
 		v, err = numbers(a, n)
 		if err != nil {
@@ -925,6 +935,28 @@ func (p *pageInterpreter) operation(op Operation) error {
 		return &UnsupportedError{Feature: "content operator " + op.Operator}
 	}
 	return nil
+}
+
+// graphicsOperandCount 获取固定数值操作符的参数数量，其他操作返回负数
+// 入参: operator 操作符
+// 返回: int 参数数量
+func graphicsOperandCount(operator string) int {
+	switch operator {
+	case "q", "Q", "h", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n", "W", "W*", "BT", "ET", "T*":
+		return 0
+	case "w", "J", "j", "M", "g", "G", "Tc", "Tw", "Tz", "TL", "Tr", "Ts":
+		return 1
+	case "m", "l", "Td", "TD", "d0":
+		return 2
+	case "rg", "RG":
+		return 3
+	case "v", "y", "re", "k", "K":
+		return 4
+	case "cm", "c", "Tm", "d1":
+		return 6
+	default:
+		return -1
+	}
 }
 
 // showText 保留逐字定位并更新文字矩阵

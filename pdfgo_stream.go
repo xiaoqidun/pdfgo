@@ -67,6 +67,13 @@ func (s *Stream) Decode() ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("filter is not a name")
 		}
+		var dict Dictionary
+		if params[i] != nil {
+			dict, ok = params[i].(Dictionary)
+			if !ok {
+				return nil, fmt.Errorf("invalid decode parameters")
+			}
+		}
 		var err error
 		switch name {
 		case "FlateDecode":
@@ -78,6 +85,12 @@ func (s *Stream) Decode() ([]byte, error) {
 				if err == nil {
 					err = closeErr
 				}
+			}
+		case "LZWDecode":
+			var early int64
+			early, err = integerDefault(dict, "EarlyChange", 1)
+			if err == nil {
+				data, err = decodeLZW(data, early)
 			}
 		case "ASCIIHexDecode":
 			end := bytes.IndexByte(data, '>')
@@ -113,20 +126,77 @@ func (s *Stream) Decode() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if params[i] != nil {
-			dict, ok := params[i].(Dictionary)
-			if !ok {
-				return nil, fmt.Errorf("invalid decode parameters")
-			}
-			if name == "FlateDecode" {
-				data, err = decodePredictor(data, dict)
-				if err != nil {
-					return nil, err
-				}
+		if name == "FlateDecode" || name == "LZWDecode" {
+			data, err = decodePredictor(data, dict)
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
-	return bytes.Clone(data), nil
+	if len(filters) == 0 {
+		return bytes.Clone(data), nil
+	}
+	return data, nil
+}
+
+// decodeLZW 解码高位优先的PDF变长字典编码，支持两种码宽增长规则
+// 入参: data 压缩数据, early 提前增长标志
+// 返回: []byte 解码数据, error 错误信息
+func decodeLZW(data []byte, early int64) ([]byte, error) {
+	if early != 0 && early != 1 {
+		return nil, fmt.Errorf("invalid LZW EarlyChange")
+	}
+	var prefixes [4096]uint16
+	var suffixes, stack [4096]byte
+	var out []byte
+	var bits uint32
+	available, position := uint(0), 0
+	width, next, previous := uint(9), 258, -1
+	for {
+		for available < width {
+			if position == len(data) {
+				return nil, io.ErrUnexpectedEOF
+			}
+			bits = bits<<8 | uint32(data[position])
+			available += 8
+			position++
+		}
+		available -= width
+		code := int(bits >> available & (1<<width - 1))
+		if code == 256 {
+			width, next, previous = 9, 258, -1
+			continue
+		}
+		if code == 257 {
+			return out, nil
+		}
+		if code > next || code >= 4096 || previous < 0 && code >= 256 {
+			return nil, fmt.Errorf("invalid LZW code %d", code)
+		}
+		current, start := code, len(stack)
+		if code == next {
+			current = previous
+		}
+		for current >= 258 {
+			start--
+			stack[start] = suffixes[current]
+			current = int(prefixes[current])
+		}
+		start--
+		stack[start] = byte(current)
+		out = append(out, stack[start:]...)
+		if code == next {
+			out = append(out, byte(current))
+		}
+		if previous >= 0 && next < 4096 {
+			prefixes[next], suffixes[next] = uint16(previous), byte(current)
+			next++
+			if width < 12 && next+int(early) == 1<<width {
+				width++
+			}
+		}
+		previous = code
+	}
 }
 
 // validateASCII85 检查编码分组溢出并移除PDF空白
