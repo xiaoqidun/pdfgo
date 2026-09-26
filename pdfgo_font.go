@@ -22,12 +22,14 @@ import (
 
 // Font 保存PDF字体程序、字符映射及字宽，不依赖渲染后端
 // Vertical为true时使用竖排度量，字形本身仍以横排原点描述
+// BoundingBox保留非Type3字体描述符的千分之一文字空间边界，未提供有效边界时为空
 type Font struct {
 	Name            string
 	Subtype         Name
 	Program         []byte
 	ProgramType     Name
 	Dictionary      Dictionary
+	BoundingBox     *Rectangle
 	Unicode         UnicodeMap
 	Vertical        bool
 	widths          map[uint32]float64
@@ -359,6 +361,27 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, err
 		}
 		font.symbolic = flags&4 != 0
+		if subtype != "Type3" && d["FontBBox"] != nil {
+			value, err := r.Resolve(d["FontBBox"])
+			if err != nil {
+				return nil, err
+			}
+			array, ok := value.(Array)
+			if !ok || len(array) != 4 {
+				return nil, fmt.Errorf("invalid font bounding box")
+			}
+			var values [4]float64
+			for i, value := range array {
+				values[i], err = r.number(value)
+				if err != nil {
+					return nil, fmt.Errorf("font bounding box: %w", err)
+				}
+			}
+			bounds := Rectangle{min(values[0], values[2]), min(values[1], values[3]), max(values[0], values[2]), max(values[1], values[3])}
+			if bounds.XMin < bounds.XMax && bounds.YMin < bounds.YMax {
+				font.BoundingBox = &bounds
+			}
+		}
 		if !font.composite && d["MissingWidth"] != nil {
 			font.defaultWidth, err = r.number(d["MissingWidth"])
 			if err != nil {
