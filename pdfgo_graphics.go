@@ -193,6 +193,7 @@ type graphicsState struct {
 	fillPatternBase, strokePatternBase                    Name
 	fillICC, strokeICC                                    *iccColorSpace
 	fillSeparation, strokeSeparation                      *separationSpace
+	fillDeviceN, strokeDeviceN                            *singleDeviceNSpace
 }
 
 // pageInterpreter 按内容顺序解释页面或表单
@@ -639,6 +640,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if op.Operator == "G" || op.Operator == "RG" || op.Operator == "K" {
 			p.state.strokeICC = nil
 			p.state.strokeSeparation = nil
+			p.state.strokeDeviceN = nil
 			p.state.style.Stroke.RGB = rgb
 			p.state.style.Stroke.CMYK = cmyk
 			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
@@ -657,6 +659,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Fill.RGB = rgb
 			p.state.fillICC = nil
 			p.state.fillSeparation = nil
+			p.state.fillDeviceN = nil
 			p.state.style.Fill.CMYK = cmyk
 			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
 			p.state.style.Fill.Axial = nil
@@ -681,6 +684,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 		var profile *iccColorSpace
 		var separation *separationSpace
+		var deviceN *singleDeviceNSpace
 		var patternBase Name
 		if name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK" && name != "Pattern" {
 			object, err := p.resource("ColorSpace", name)
@@ -703,18 +707,26 @@ func (p *pageInterpreter) operation(op Operation) error {
 					return &UnsupportedError{Feature: "uncolored pattern base color space"}
 				}
 				name = "Pattern"
+			} else if space[0] == Name("DeviceN") {
+				deviceN, err = p.reader.readSingleDeviceN(space)
+				if err != nil {
+					return err
+				}
+				name = "DeviceN"
 			} else if space[0] == Name("Separation") {
 				separation, err = p.reader.readSeparation(space)
 				if err != nil {
 					return err
 				}
 				name = "Separation"
-			} else {
+			} else if space[0] == Name("ICCBased") {
 				profile, err = p.reader.readICCColorSpace(space)
 				if err != nil {
 					return err
 				}
 				name = "ICCBased"
+			} else {
+				return &UnsupportedError{Feature: "color space " + fmt.Sprint(space[0])}
 			}
 		}
 		if op.Operator == "cs" {
@@ -722,6 +734,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.fillPatternBase = patternBase
 			p.state.fillICC = profile
 			p.state.fillSeparation = separation
+			p.state.fillDeviceN = deviceN
 			p.state.style.Fill.RGB = [3]float64{}
 			p.state.style.Fill.CMYK = nil
 			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
@@ -736,6 +749,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.strokePatternBase = patternBase
 			p.state.strokeICC = profile
 			p.state.strokeSeparation = separation
+			p.state.strokeDeviceN = deviceN
 			p.state.style.Stroke.RGB = [3]float64{}
 			p.state.style.Stroke.CMYK = nil
 			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
@@ -759,18 +773,51 @@ func (p *pageInterpreter) operation(op Operation) error {
 				p.state.style.Stroke = paint
 			}
 		}
+		if deviceN != nil {
+			paint, err := deviceN.paint(1, p.state.style.RenderingIntent)
+			if err != nil {
+				return err
+			}
+			if op.Operator == "cs" {
+				paint.Alpha = p.state.style.Fill.Alpha
+				p.state.style.Fill = paint
+			} else {
+				paint.Alpha = p.state.style.Stroke.Alpha
+				p.state.style.Stroke = paint
+			}
+		}
 	case "sc", "scn", "SC", "SCN":
 		space := p.state.fillSpace
 		patternBase := p.state.fillPatternBase
 		profile := p.state.fillICC
 		separation := p.state.fillSeparation
+		deviceN := p.state.fillDeviceN
 		operator := "g"
 		if op.Operator == "SC" || op.Operator == "SCN" {
 			space = p.state.strokeSpace
 			patternBase = p.state.strokePatternBase
 			profile = p.state.strokeICC
 			separation = p.state.strokeSeparation
+			deviceN = p.state.strokeDeviceN
 			operator = "G"
+		}
+		if space == "DeviceN" {
+			values, err := numbers(a, 1)
+			if err != nil {
+				return err
+			}
+			paint, err := deviceN.paint(values[0], p.state.style.RenderingIntent)
+			if err != nil {
+				return err
+			}
+			if operator == "g" {
+				paint.Alpha = p.state.style.Fill.Alpha
+				p.state.style.Fill = paint
+			} else {
+				paint.Alpha = p.state.style.Stroke.Alpha
+				p.state.style.Stroke = paint
+			}
+			return nil
 		}
 		if space == "Separation" {
 			values, err := numbers(a, 1)

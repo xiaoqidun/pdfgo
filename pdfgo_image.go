@@ -200,6 +200,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	var calibrated *calRGBSpace
 	var profile *iccColorSpace
 	var separation *separationSpace
+	var deviceN *singleDeviceNSpace
 	switch i.ColorSpace {
 	case Name("DeviceGray"):
 		components = 1
@@ -230,6 +231,13 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		components = 1
 	}
 	if i.ImageMask {
+		components = 1
+	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
+		deviceN, err = i.reader.readSingleDeviceN(space)
+		if err != nil {
+			return nil, err
+		}
 		components = 1
 	}
 	if palette != nil {
@@ -278,7 +286,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if uint64(bounds.Dx()) > uint64(^uint(0)>>1)/8/uint64(bounds.Dy()) {
 		return nil, fmt.Errorf("masked image dimensions exceed platform integer range")
 	}
-	if target == nil && palette == nil && calibrated == nil && profile == nil && separation == nil && components != 4 && mask == nil && len(keys) == 0 && len(i.Decode) == 0 {
+	if target == nil && palette == nil && calibrated == nil && profile == nil && separation == nil && deviceN == nil && components != 4 && mask == nil && len(keys) == 0 && len(i.Decode) == 0 {
 		if output := deviceImage(samples); output != nil {
 			return output, nil
 		}
@@ -295,6 +303,8 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	} else {
 		if palette != nil {
 			target.Space = palette.space
+		} else if deviceN != nil {
+			target.Space = deviceN.alternate
 		} else if profile != nil {
 			target.Space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
 		} else if calibrated == nil && separation == nil {
@@ -352,6 +362,9 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 			if components == 1 {
 				values[1], values[2] = values[0], values[0]
 			}
+			if deviceN != nil {
+				values = deviceN.values(values[0])
+			}
 			if target != nil {
 				if palette != nil {
 					index := int(math.Max(0, math.Min(float64(len(palette.values)-1), math.Round(values[0]))))
@@ -372,6 +385,12 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 			if palette != nil {
 				index := int(math.Max(0, math.Min(float64(len(palette.colors)-1), math.Round(values[0]))))
 				pixel = palette.colors[index]
+			} else if deviceN != nil {
+				rgb, err := deviceN.alternate.RGB(values[:deviceN.alternate.Components()], intent)
+				if err != nil {
+					return nil, err
+				}
+				pixel = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
 			} else if separation != nil {
 				paint, err := separation.paint(values[0], intent)
 				if err != nil {
@@ -455,6 +474,9 @@ type imagePalette struct {
 func (i *Image) palette() (*imagePalette, error) {
 	array, ok := i.ColorSpace.(Array)
 	if !ok {
+		return nil, nil
+	}
+	if len(array) > 0 && array[0] == Name("DeviceN") {
 		return nil, nil
 	}
 	if len(array) == 2 && (array[0] == Name("CalRGB") || array[0] == Name("ICCBased")) || len(array) == 4 && array[0] == Name("Separation") {
@@ -846,6 +868,12 @@ func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error
 // 返回: image.Image 样本图像, error 错误信息
 func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	components := 0
+	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
+		if _, err := i.reader.readSingleDeviceN(space); err != nil {
+			return nil, err
+		}
+		components = 1
+	}
 	switch i.ColorSpace {
 	case Name("DeviceGray"):
 		components = 1
