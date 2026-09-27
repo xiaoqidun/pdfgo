@@ -79,6 +79,9 @@ func (r *Reader) openSecurity(password []byte) error {
 	}
 	v, vok := dict["V"].(Integer)
 	revision, rok := dict["R"].(Integer)
+	if vok && rok && v == 5 && (revision == 5 || revision == 6) {
+		return r.openAES256Security(dict, password, int(revision))
+	}
 	if !vok || !rok || !(v == 1 && (revision == 2 || revision == 3) || v == 2 && revision == 3 || v == 4 && revision == 4) {
 		return &UnsupportedError{Feature: "PDF encryption revision"}
 	}
@@ -238,11 +241,14 @@ func (s *standardSecurity) cryptMethod(name Name) (Name, error) {
 	if dict["CFM"] == nil || method == "None" {
 		return "Identity", nil
 	}
-	if !ok || method != "V2" && method != "AESV2" {
+	if !ok || method != "V2" && method != "AESV2" && method != "AESV3" {
 		return "", &UnsupportedError{Feature: "crypt filter method"}
 	}
+	if (s.info.Revision >= 5) != (method == "AESV3") {
+		return "", fmt.Errorf("crypt filter does not match encryption revision")
+	}
 	length, err := integerDefault(dict, "Length", int64(len(s.key)))
-	if err != nil || length != int64(len(s.key)) || method == "AESV2" && length != 16 {
+	if err != nil || length != int64(len(s.key)) || method == "AESV2" && length != 16 || method == "AESV3" && length != 32 {
 		return "", fmt.Errorf("invalid crypt filter key length")
 	}
 	return method, nil
@@ -256,12 +262,16 @@ func (s *standardSecurity) decryptBytes(data []byte, ref Reference, name Name) (
 	if err != nil || method == "Identity" {
 		return data, err
 	}
-	seed := append(bytes.Clone(s.key), byte(ref.Number), byte(ref.Number>>8), byte(ref.Number>>16), byte(ref.Generation), byte(ref.Generation>>8))
-	if method == "AESV2" {
-		seed = append(seed, 's', 'A', 'l', 'T')
+	key := s.key
+	if method != "AESV3" {
+		seed := append(bytes.Clone(s.key), byte(ref.Number), byte(ref.Number>>8), byte(ref.Number>>16), byte(ref.Generation), byte(ref.Generation>>8))
+		if method == "AESV2" {
+			seed = append(seed, 's', 'A', 'l', 'T')
+		}
+		digest := md5.Sum(seed)
+		clear(seed)
+		key = digest[:min(len(s.key)+5, 16)]
 	}
-	digest := md5.Sum(seed)
-	key := digest[:min(len(s.key)+5, 16)]
 	if method == "V2" {
 		c, err := rc4.NewCipher(key)
 		if err != nil {

@@ -63,7 +63,7 @@ func Open(path string) (*Reader, error) {
 	return OpenWithPassword(path, nil)
 }
 
-// OpenWithPassword 使用密码打开PDF文件，密码按PDFDocEncoding字节传入
+// OpenWithPassword 使用已编码密码打开PDF，编码规则见NewReaderWithPassword
 // 入参: path 文件路径, password 用户或所有者密码，nil表示空密码
 // 返回: *Reader 阅读器, error 错误信息
 func OpenWithPassword(path string, password []byte) (*Reader, error) {
@@ -94,10 +94,24 @@ func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
 }
 
 // NewReaderWithPassword 使用密码读取PDF，源读取器仍由调用方管理
-// 支持标准安全处理器的RC4及AES-128，密码按PDFDocEncoding字节传入
+// 支持RC4、AES-128和AES-256；R2至R4使用PDFDocEncoding，R5/R6使用经SASLprep处理的UTF-8
 // 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码
 // 返回: *Reader 阅读器, error 错误信息
 func NewReaderWithPassword(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
+	return newReaderWithPassword(source, size, password, false)
+}
+
+// NewReaderWithUTF8Password 自动按安全处理器版本转换UTF-8密码并读取PDF
+// 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码的UTF-8字节
+// 返回: *Reader 阅读器, error 错误信息
+func NewReaderWithUTF8Password(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
+	return newReaderWithPassword(source, size, password, true)
+}
+
+// newReaderWithPassword 读取交叉引用并按调用方的密码编码约定认证
+// 入参: source 随机读取器, size 文件字节数, password 密码, utf8Password 是否转换UTF-8输入
+// 返回: *Reader 阅读器, error 错误信息
+func newReaderWithPassword(source io.ReaderAt, size int64, password []byte, utf8Password bool) (*Reader, error) {
 	if size < 8 {
 		return nil, fmt.Errorf("invalid file size")
 	}
@@ -190,6 +204,13 @@ func NewReaderWithPassword(source io.ReaderAt, size int64, password []byte) (*Re
 		if id >= int64(sizeObject) {
 			delete(r.xref, id)
 		}
+	}
+	if utf8Password {
+		password, err = r.encodePassword(password)
+		if err != nil {
+			return nil, err
+		}
+		defer clear(password)
 	}
 	if err := r.openSecurity(password); err != nil {
 		return nil, err
