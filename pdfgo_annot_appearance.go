@@ -287,25 +287,6 @@ func (r *Reader) lineAppearance(annotation Annotation) (*Stream, error) {
 	if border.style == "B" || border.style == "I" || border.style == "U" {
 		return nil, &UnsupportedError{Feature: "line border style " + string(border.style)}
 	}
-	value, err := r.Resolve(annotation.Dictionary["LE"])
-	if err != nil {
-		return nil, err
-	}
-	if value != nil {
-		endings, ok := value.(Array)
-		if !ok || len(endings) != 2 {
-			return nil, fmt.Errorf("invalid annotation line endings")
-		}
-		for _, ending := range endings {
-			value, err := r.Resolve(ending)
-			if err != nil {
-				return nil, err
-			}
-			if value != Name("None") {
-				return nil, &UnsupportedError{Feature: "annotation line ending"}
-			}
-		}
-	}
 	for _, key := range []Name{"LL", "LLE", "LLO"} {
 		if annotation.Dictionary[key] == nil {
 			continue
@@ -318,7 +299,7 @@ func (r *Reader) lineAppearance(annotation Annotation) (*Stream, error) {
 			return nil, &UnsupportedError{Feature: "annotation leader line"}
 		}
 	}
-	value, err = r.Resolve(annotation.Dictionary["Cap"])
+	value, err := r.Resolve(annotation.Dictionary["Cap"])
 	if err != nil {
 		return nil, err
 	}
@@ -331,27 +312,21 @@ func (r *Reader) lineAppearance(annotation Annotation) (*Stream, error) {
 			return nil, &UnsupportedError{Feature: "annotation line caption"}
 		}
 	}
-	alpha := 1.0
-	if annotation.Dictionary["CA"] != nil {
-		alpha, err = r.number(annotation.Dictionary["CA"])
-		if err != nil || alpha < 0 || alpha > 1 || math.IsNaN(alpha) {
-			return nil, fmt.Errorf("invalid annotation opacity")
-		}
-	}
 	var content strings.Builder
 	stroke, err := r.writeAnnotationStroke(&content, border)
 	if err != nil {
 		return nil, err
 	}
 	if stroke {
-		fmt.Fprintf(&content, "/Opacity gs %g %g m %g %g l S\n", points[0], points[1], points[2], points[3])
+		fmt.Fprintf(&content, "%g %g m %g %g l S\n", points[0], points[1], points[2], points[3])
 	}
-	box := annotation.Rect
-	resources := Dictionary{"ExtGState": Dictionary{"Opacity": Dictionary{"CA": Real(alpha), "ca": Real(alpha)}}}
-	return &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}, "Resources": resources}, Data: []byte(content.String()), reader: r}, nil
+	if err := r.writeAnnotationEndings(&content, annotation, border, points, stroke); err != nil {
+		return nil, err
+	}
+	return r.annotationAppearance(annotation, content.String())
 }
 
-// shapeAppearance 按矩形或椭圆的边界、内缩量和颜色生成外观
+// shapeAppearance 按图形边界或顶点、笔画和内部颜色生成外观
 // 入参: annotation 图形注解
 // 返回: *Stream 外观流, error 属性错误或不支持的边框效果
 func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
@@ -381,7 +356,7 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 	}
 	box := annotation.Rect
 	inner := box
-	if annotation.Dictionary["RD"] != nil {
+	if (annotation.Subtype == "Square" || annotation.Subtype == "Circle") && annotation.Dictionary["RD"] != nil {
 		inset, err := r.numberArray(annotation.Dictionary["RD"], 4)
 		if err != nil {
 			return nil, err
@@ -427,7 +402,37 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 		inner.YMax -= dy
 	}
 	x0, y0, x1, y1 := inner.XMin, inner.YMin, inner.XMax, inner.YMax
-	if annotation.Subtype == "Square" {
+	var vertices []float64
+	if annotation.Subtype == "Polygon" || annotation.Subtype == "PolyLine" {
+		value, err := r.Resolve(annotation.Dictionary["Vertices"])
+		if err != nil {
+			return nil, err
+		}
+		points, ok := value.(Array)
+		minimum := 4
+		if annotation.Subtype == "Polygon" {
+			minimum = 6
+		}
+		if !ok || len(points) < minimum || len(points)%2 != 0 {
+			return nil, fmt.Errorf("invalid annotation vertices")
+		}
+		vertices, err = r.numberArray(points, len(points))
+		if err != nil {
+			return nil, err
+		}
+		if annotation.Dictionary["Path"] != nil {
+			return nil, &UnsupportedError{Feature: "annotation curved path"}
+		}
+		fmt.Fprintf(&content, "%g %g m\n", vertices[0], vertices[1])
+		for j := 2; j < len(vertices); j += 2 {
+			fmt.Fprintf(&content, "%g %g l\n", vertices[j], vertices[j+1])
+		}
+		if annotation.Subtype == "Polygon" {
+			content.WriteString("h\n")
+		} else {
+			fill = false
+		}
+	} else if annotation.Subtype == "Square" {
 		fmt.Fprintf(&content, "%g %g %g %g re\n", x0, y0, x1-x0, y1-y0)
 	} else {
 		cx, cy, rx, ry := (x0+x1)/2, (y0+y1)/2, (x1-x0)/2, (y1-y0)/2
@@ -448,8 +453,125 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 	default:
 		content.WriteString("n\n")
 	}
+	if annotation.Subtype == "PolyLine" {
+		if err := r.writeAnnotationEndings(&content, annotation, border, vertices, stroke); err != nil {
+			return nil, err
+		}
+	}
+	return r.annotationAppearance(annotation, content.String())
+}
+
+// writeAnnotationEndings 按端点切线方向绘制标准线端样式，闭合样式使用IC内部颜色
+// 入参: content 外观内容, annotation 注解, border 笔画样式, points 顶点坐标, stroke 是否可见
+// 返回: error 样式或端点错误
+func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Annotation, border *annotationBorder, points []float64, stroke bool) error {
+	value, err := r.Resolve(annotation.Dictionary["LE"])
+	if err != nil {
+		return err
+	}
+	if value == nil {
+		return nil
+	}
+	endings, ok := value.(Array)
+	if !ok || len(endings) != 2 {
+		return fmt.Errorf("invalid annotation line endings")
+	}
+	for index, item := range endings {
+		value, err := r.Resolve(item)
+		if err != nil {
+			return err
+		}
+		style, ok := value.(Name)
+		if !ok {
+			return fmt.Errorf("invalid annotation line ending")
+		}
+		switch style {
+		case "None":
+			continue
+		case "Square", "Circle", "Diamond", "OpenArrow", "ClosedArrow", "Butt", "ROpenArrow", "RClosedArrow", "Slash":
+		default:
+			return &UnsupportedError{Feature: "annotation line ending " + string(style)}
+		}
+		if !stroke {
+			continue
+		}
+		start, step := 0, 2
+		if index == 1 {
+			start, step = len(points)-2, -2
+		}
+		x, y := points[start], points[start+1]
+		dx, dy := 0.0, 0.0
+		for j := start + step; j >= 0 && j < len(points); j += step {
+			dx, dy = points[j]-x, points[j+1]-y
+			if dx != 0 || dy != 0 {
+				break
+			}
+		}
+		length := math.Hypot(dx, dy)
+		if length == 0 {
+			return fmt.Errorf("annotation line ending has no direction")
+		}
+		dx, dy = dx/length, dy/length
+		fmt.Fprintf(content, "q [] 0 d %g %g %g %g %g %g cm\n", dx, dy, -dy, dx, x, y)
+		fill := false
+		value, err = r.Resolve(annotation.Dictionary["IC"])
+		if err != nil {
+			return err
+		}
+		if value != nil {
+			components, ok := value.(Array)
+			if !ok {
+				return fmt.Errorf("invalid annotation interior color")
+			}
+			fill, err = r.writeAnnotationColor(content, components, false)
+			if err != nil {
+				return err
+			}
+		}
+		size, closed := 3*border.width, false
+		switch style {
+		case "Square":
+			fmt.Fprintf(content, "%g %g %g %g re\n", -size/2, -size/2, size, size)
+			closed = true
+		case "Diamond":
+			fmt.Fprintf(content, "%g 0 m 0 %g l %g 0 l 0 %g l h\n", -size/2, size/2, size/2, -size/2)
+			closed = true
+		case "Circle":
+			radius := size / 2
+			k := 4 * (math.Sqrt2 - 1) / 3 * radius
+			fmt.Fprintf(content, "%g 0 m %g %g %g %g 0 %g c %g %g %g %g %g 0 c %g %g %g %g 0 %g c %g %g %g %g %g 0 c h\n", radius, radius, k, k, radius, radius, -k, radius, -radius, k, -radius, -radius, -k, -k, -radius, -radius, k, -radius, radius, -k, radius)
+			closed = true
+		case "OpenArrow", "ClosedArrow", "ROpenArrow", "RClosedArrow":
+			x := size
+			if style == "ROpenArrow" || style == "RClosedArrow" {
+				x = -x
+			}
+			fmt.Fprintf(content, "%g %g m 0 0 l %g %g l\n", x, size/2, x, -size/2)
+			closed = style == "ClosedArrow" || style == "RClosedArrow"
+			if closed {
+				content.WriteString("h\n")
+			}
+		case "Butt":
+			fmt.Fprintf(content, "0 %g m 0 %g l\n", -size/2, size/2)
+		case "Slash":
+			fmt.Fprintf(content, "%g %g m %g %g l\n", -size/4, -size*math.Sqrt(3)/4, size/4, size*math.Sqrt(3)/4)
+		}
+		if closed && fill {
+			content.WriteString("B Q\n")
+		} else {
+			content.WriteString("S Q\n")
+		}
+	}
+	return nil
+}
+
+// annotationAppearance 将组合图形的不透明度应用一次，避免填充和描边重叠变暗
+// 入参: annotation 注解, content 外观绘制内容
+// 返回: *Stream 外观流, error 不透明度错误
+func (r *Reader) annotationAppearance(annotation Annotation, content string) (*Stream, error) {
+	box := annotation.Rect
 	bbox := Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}
-	body := &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox}, Data: []byte(content.String()), reader: r}
+	body := &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox}, Data: []byte(content), reader: r}
 	if annotation.Dictionary["CA"] == nil {
 		return body, nil
 	}

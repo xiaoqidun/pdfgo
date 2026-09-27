@@ -38,6 +38,7 @@ type labSpace struct {
 type graphicsColorSpace struct {
 	lab     *labSpace
 	calRGB  *calRGBSpace
+	gray    bool
 	palette *imagePalette
 }
 
@@ -46,7 +47,7 @@ type graphicsColorSpace struct {
 // 返回: Paint 画刷, error 无效分量
 func (s *graphicsColorSpace) paint(values []float64) (Paint, error) {
 	count := 3
-	if s.palette != nil {
+	if s.palette != nil || s.gray {
 		count = 1
 	}
 	if len(values) != count {
@@ -65,6 +66,9 @@ func (s *graphicsColorSpace) paint(values []float64) (Paint, error) {
 		paint.Space, paint.Values = s.palette.space, s.palette.values[index]
 	} else if s.lab != nil {
 		c = s.lab.color(values[0], values[1], values[2])
+	} else if s.gray {
+		v := math.Max(0, math.Min(1, values[0]))
+		c = s.calRGB.color(v, v, v)
 	} else {
 		c = s.calRGB.color(math.Max(0, math.Min(1, values[0])), math.Max(0, math.Min(1, values[1])), math.Max(0, math.Min(1, values[2])))
 	}
@@ -158,6 +162,62 @@ func (s *labSpace) color(lightness, a, b float64) color.NRGBA64 {
 	y := 0.4323053*cone[0] + 0.5183603*cone[1] + 0.0492912*cone[2]
 	z := -0.0085287*cone[0] + 0.0400428*cone[1] + 0.9684867*cone[2]
 	return color.NRGBA64{R: srgbComponent(3.2404542*x - 1.5371385*y - 0.4985314*z), G: srgbComponent(-0.969266*x + 1.8760108*y + 0.041556*z), B: srgbComponent(0.0556434*x - 0.2040259*y + 1.0572252*z), A: 65535}
+}
+
+// readCalGray 将单分量校准灰度展开为等价的三轴颜色变换
+// 入参: object CalGray颜色空间数组
+// 返回: *calRGBSpace 颜色变换参数, error 错误信息
+func (r *Reader) readCalGray(object Object) (*calRGBSpace, error) {
+	a, ok := object.(Array)
+	if !ok || len(a) != 2 || a[0] != Name("CalGray") {
+		return nil, fmt.Errorf("invalid CalGray color space")
+	}
+	resolved, err := r.Resolve(a[1])
+	if err != nil {
+		return nil, err
+	}
+	dict, ok := resolved.(Dictionary)
+	if !ok {
+		return nil, fmt.Errorf("invalid CalGray dictionary")
+	}
+	white, err := r.numberArray(dict["WhitePoint"], 3)
+	if err != nil || white[0] <= 0 || white[1] != 1 || white[2] <= 0 {
+		return nil, fmt.Errorf("invalid CalGray white point")
+	}
+	gamma := 1.0
+	value, err := r.Resolve(dict["Gamma"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		gamma, err = r.number(value)
+		if err != nil || gamma <= 0 || math.IsNaN(gamma) || math.IsInf(gamma, 0) {
+			return nil, fmt.Errorf("invalid CalGray gamma")
+		}
+	}
+	black, err := r.Resolve(dict["BlackPoint"])
+	if err != nil {
+		return nil, err
+	}
+	if black != nil {
+		values, err := r.numberArray(black, 3)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CalGray black point")
+		}
+		for _, v := range values {
+			if v < 0 {
+				return nil, fmt.Errorf("invalid CalGray black point")
+			}
+			if v != 0 {
+				return nil, &UnsupportedError{Feature: "CalGray nonzero black point"}
+			}
+		}
+	}
+	return r.readCalRGB(Array{Name("CalRGB"), Dictionary{
+		"WhitePoint": Array{Real(white[0]), Real(white[1]), Real(white[2])},
+		"Gamma":      Array{Real(gamma), Real(gamma), Real(gamma)},
+		"Matrix":     Array{Real(white[0]), Integer(0), Integer(0), Integer(0), Real(white[1]), Integer(0), Integer(0), Integer(0), Real(white[2])},
+	}})
 }
 
 // readCalRGB 读取校准RGB参数，未支持的非零黑点不作近似处理

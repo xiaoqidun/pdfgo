@@ -736,7 +736,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 					return &UnsupportedError{Feature: "uncolored pattern base color space"}
 				}
 				name = "Pattern"
-			} else if space[0] == Name("Lab") || space[0] == Name("CalRGB") || space[0] == Name("Indexed") {
+			} else if space[0] == Name("Lab") || space[0] == Name("CalRGB") || space[0] == Name("CalGray") || space[0] == Name("Indexed") {
 				calibrated = &graphicsColorSpace{}
 				name = space[0].(Name)
 				switch name {
@@ -744,6 +744,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 					calibrated.lab, err = p.reader.readLab(space)
 				case "CalRGB":
 					calibrated.calRGB, err = p.reader.readCalRGB(space)
+				case "CalGray":
+					calibrated.gray = true
+					calibrated.calRGB, err = p.reader.readCalGray(space)
 				case "Indexed":
 					image := &Image{reader: p.reader, ColorSpace: space, Stream: &Stream{Dictionary: Dictionary{"Intent": p.state.style.RenderingIntent}}}
 					calibrated.palette, err = image.palette()
@@ -808,7 +811,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 		if calibrated != nil {
 			values := []float64{0, 0, 0}
-			if calibrated.palette != nil {
+			if calibrated.palette != nil || calibrated.gray {
 				values = values[:1]
 			}
 			paint, err := calibrated.paint(values)

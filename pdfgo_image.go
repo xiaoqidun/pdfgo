@@ -226,6 +226,13 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		}
 		components = 3
 	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("CalGray") {
+		calibrated, err = i.reader.readCalGray(space)
+		if err != nil {
+			return nil, err
+		}
+		components = 1
+	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
 		profile, err = i.reader.readICCColorSpace(space)
 		if err != nil {
@@ -573,7 +580,7 @@ func (i *Image) palette() (*imagePalette, error) {
 	if len(array) > 0 && array[0] == Name("DeviceN") {
 		return nil, nil
 	}
-	if len(array) == 2 && (array[0] == Name("CalRGB") || array[0] == Name("Lab") || array[0] == Name("ICCBased")) || len(array) == 4 && array[0] == Name("Separation") {
+	if len(array) == 2 && (array[0] == Name("CalRGB") || array[0] == Name("CalGray") || array[0] == Name("Lab") || array[0] == Name("ICCBased")) || len(array) == 4 && array[0] == Name("Separation") {
 		return nil, nil
 	}
 	if len(array) != 4 || array[0] != Name("Indexed") {
@@ -614,6 +621,12 @@ func (i *Image) palette() (*imagePalette, error) {
 				return nil, err
 			}
 			components = 3
+		} else if space, ok := base.(Array); ok && len(space) == 2 && space[0] == Name("CalGray") {
+			calibrated, err = i.reader.readCalGray(space)
+			if err != nil {
+				return nil, err
+			}
+			components = 1
 		} else {
 			calibrated, err = i.reader.readCalRGB(base)
 			if err != nil {
@@ -694,6 +707,9 @@ func (i *Image) palette() (*imagePalette, error) {
 		switch components {
 		case 1:
 			palette[index] = color.NRGBA64{R: uint16(v[0]) * 257, G: uint16(v[0]) * 257, B: uint16(v[0]) * 257, A: 65535}
+			if calibrated != nil {
+				palette[index] = calibrated.color(float64(v[0])/255, float64(v[0])/255, float64(v[0])/255)
+			}
 		case 3:
 			palette[index] = color.NRGBA64{R: uint16(v[0]) * 257, G: uint16(v[1]) * 257, B: uint16(v[2]) * 257, A: 65535}
 			if calibrated != nil {
@@ -1036,6 +1052,9 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && (space[0] == Name("CalRGB") || space[0] == Name("Lab")) {
 		components = 3
+	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("CalGray") {
+		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
 		profile, err := i.reader.Resolve(space[1])
