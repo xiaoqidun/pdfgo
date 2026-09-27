@@ -410,7 +410,11 @@ func (r *Reader) ReadDestination(object Object) (Destination, error) {
 	if !ok {
 		return Destination{}, fmt.Errorf("invalid destination page")
 	}
-	mode, ok := array[1].(Name)
+	modeValue, err := r.Resolve(array[1])
+	if err != nil {
+		return Destination{}, err
+	}
+	mode, ok := modeValue.(Name)
 	counts := map[Name]int{"XYZ": 3, "Fit": 0, "FitH": 1, "FitV": 1, "FitR": 4, "FitB": 0, "FitBH": 1, "FitBV": 1}
 	count, known := counts[mode]
 	if !ok || !known || len(array) != count+2 {
@@ -422,9 +426,16 @@ func (r *Reader) ReadDestination(object Object) (Destination, error) {
 		if err != nil {
 			return Destination{}, err
 		}
+		if parameters[n] == nil && mode == "FitR" {
+			return Destination{}, fmt.Errorf("null rectangle destination parameter")
+		}
 		if parameters[n] != nil {
-			if _, err := r.number(parameters[n]); err != nil {
+			value, err := r.number(parameters[n])
+			if err != nil {
 				return Destination{}, err
+			}
+			if math.IsNaN(value) || math.IsInf(value, 0) || mode == "XYZ" && n == 2 && value < 0 {
+				return Destination{}, fmt.Errorf("invalid destination parameter")
 			}
 		}
 	}
@@ -467,67 +478,10 @@ func (r *Reader) readDestinations() error {
 		if !ok {
 			return fmt.Errorf("invalid names dictionary")
 		}
-		seen := map[Reference]bool{}
-		var walk func(Object, int) error
-		walk = func(object Object, depth int) error {
-			if object == nil {
-				return nil
-			}
-			if depth > 256 {
-				return fmt.Errorf("destination name tree depth exceeded")
-			}
-			if ref, ok := object.(Reference); ok {
-				if seen[ref] {
-					return fmt.Errorf("repeated destination name tree node")
-				}
-				seen[ref] = true
-			}
-			value, err := r.Resolve(object)
-			if err != nil {
-				return err
-			}
-			node, ok := value.(Dictionary)
-			if !ok {
-				return fmt.Errorf("invalid destination name tree node")
-			}
-			value, err = r.Resolve(node["Names"])
-			if err != nil {
-				return err
-			}
-			if value != nil {
-				items, ok := value.(Array)
-				if !ok || len(items)%2 != 0 {
-					return fmt.Errorf("invalid destination name pairs")
-				}
-				for n := 0; n < len(items); n += 2 {
-					name, ok := items[n].(String)
-					if !ok {
-						return fmt.Errorf("invalid destination name")
-					}
-					if _, exists := result[string(name)]; exists {
-						return fmt.Errorf("duplicate destination name")
-					}
-					result[string(name)] = items[n+1]
-				}
-			}
-			value, err = r.Resolve(node["Kids"])
-			if err != nil {
-				return err
-			}
-			if value != nil {
-				kids, ok := value.(Array)
-				if !ok {
-					return fmt.Errorf("invalid destination name tree children")
-				}
-				for _, kid := range kids {
-					if err := walk(kid, depth+1); err != nil {
-						return err
-					}
-				}
-			}
+		if err := r.WalkNameTree(context.Background(), dict["Dests"], func(name string, value Object) error {
+			result[name] = value
 			return nil
-		}
-		if err := walk(dict["Dests"], 0); err != nil {
+		}); err != nil {
 			return err
 		}
 	}
