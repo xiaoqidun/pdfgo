@@ -86,9 +86,15 @@ func (r *Reader) ReadPopupAnnotation(object Object) (PopupAnnotation, error) {
 		if err != nil {
 			return popup, err
 		}
+		if value == nil {
+			return popup, nil
+		}
 		parentDict, ok := value.(Dictionary)
 		if !ok || parentDict["Subtype"] == Name("Popup") {
 			return popup, fmt.Errorf("invalid popup parent annotation")
+		}
+		if _, ok := parentDict["Subtype"].(Name); !ok {
+			return popup, fmt.Errorf("invalid popup parent subtype")
 		}
 		popup.Parent = parent
 		for _, key := range []Name{"Contents", "M", "C", "T"} {
