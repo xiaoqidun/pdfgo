@@ -20,6 +20,7 @@ import (
 )
 
 // Operation 保存内容流操作符及其操作数，不解释或执行操作
+// BI操作将完整内联图像作为唯一的Stream操作数交付，字典缩写已展开
 type Operation struct {
 	Operator string
 	Operands []Object
@@ -30,6 +31,13 @@ type Operation struct {
 // 入参: ctx 取消上下文, data 内容流, visit 操作访问函数
 // 返回: error 错误信息
 func WalkOperations(ctx context.Context, data []byte, visit func(Operation) error) error {
+	return walkOperations(ctx, data, visit, nil)
+}
+
+// walkOperations 解析内容流，并在内联图像引用命名颜色空间时使用当前资源作用域
+// 入参: ctx 取消上下文, data 内容流, visit 操作访问函数, resolve 颜色空间解析器
+// 返回: error 解析或访问错误
+func walkOperations(ctx context.Context, data []byte, visit func(Operation) error, resolve func(Object) (Object, error)) error {
 	p := objectParser{data: data}
 	var operands []Object
 	for {
@@ -69,7 +77,14 @@ func WalkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 			return p.fail("invalid content operator")
 		}
 		if op == "BI" {
-			return &UnsupportedError{Feature: "inline image content parsing"}
+			if len(operands) != 0 {
+				return p.fail("inline image has operands")
+			}
+			stream, err := p.inlineImage(resolve)
+			if err != nil {
+				return err
+			}
+			operands = []Object{stream}
 		}
 		if err := visit(Operation{Operator: op, Operands: operands, Offset: int64(start)}); err != nil {
 			return fmt.Errorf("content offset %d: %w", start, err)

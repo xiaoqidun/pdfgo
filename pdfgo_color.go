@@ -34,6 +34,44 @@ type labSpace struct {
 	adapt   [3]float64
 }
 
+// graphicsColorSpace 保存页面着色使用的校准色或索引色参数
+type graphicsColorSpace struct {
+	lab     *labSpace
+	calRGB  *calRGBSpace
+	palette *imagePalette
+}
+
+// paint 将页面颜色操作数转换为画刷，索引色保留基色空间分量
+// 入参: values 颜色分量
+// 返回: Paint 画刷, error 无效分量
+func (s *graphicsColorSpace) paint(values []float64) (Paint, error) {
+	count := 3
+	if s.palette != nil {
+		count = 1
+	}
+	if len(values) != count {
+		return Paint{}, fmt.Errorf("invalid color component count")
+	}
+	for _, v := range values {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return Paint{}, fmt.Errorf("invalid color component")
+		}
+	}
+	var c color.NRGBA64
+	paint := Paint{}
+	if s.palette != nil {
+		index := int(math.Round(math.Max(0, math.Min(float64(len(s.palette.colors)-1), values[0]))))
+		c = s.palette.colors[index]
+		paint.Space, paint.Values = s.palette.space, s.palette.values[index]
+	} else if s.lab != nil {
+		c = s.lab.color(values[0], values[1], values[2])
+	} else {
+		c = s.calRGB.color(math.Max(0, math.Min(1, values[0])), math.Max(0, math.Min(1, values[1])), math.Max(0, math.Min(1, values[2])))
+	}
+	paint.RGB = [3]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
+	return paint, nil
+}
+
 // readLab 读取Lab颜色空间定义
 // 入参: object Lab颜色空间数组
 // 返回: *labSpace 颜色变换参数, error 错误信息

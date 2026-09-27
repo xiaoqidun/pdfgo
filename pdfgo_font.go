@@ -224,7 +224,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 					return nil, err
 				}
 				entries, ok := array.(Array)
-				if !ok {
+				if array != nil && !ok {
 					return nil, fmt.Errorf("invalid font encoding differences")
 				}
 				font.differences = map[uint32]string{}

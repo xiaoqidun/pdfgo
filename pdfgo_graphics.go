@@ -196,6 +196,7 @@ type graphicsState struct {
 	fillICC, strokeICC                                    *iccColorSpace
 	fillSeparation, strokeSeparation                      *separationSpace
 	fillDeviceN, strokeDeviceN                            *deviceNSpace
+	fillColor, strokeColor                                *graphicsColorSpace
 }
 
 // pageInterpreter 按内容顺序解释页面或表单
@@ -345,7 +346,16 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 // 入参: data 解码后的内容流
 // 返回: error 错误信息
 func (p *pageInterpreter) run(data []byte) error {
-	err := WalkOperations(p.ctx, data, p.operation)
+	err := walkOperations(p.ctx, data, p.operation, func(value Object) (Object, error) {
+		if name, ok := value.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
+			var err error
+			value, err = p.resource("ColorSpace", name)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return p.reader.Resolve(value)
+	})
 	if err != nil {
 		return err
 	}
@@ -689,6 +699,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		var separation *separationSpace
 		var deviceN *deviceNSpace
 		var patternBase Name
+		var calibrated *graphicsColorSpace
 		if name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK" && name != "Pattern" {
 			object, err := p.resource("ColorSpace", name)
 			if err != nil {
@@ -710,6 +721,21 @@ func (p *pageInterpreter) operation(op Operation) error {
 					return &UnsupportedError{Feature: "uncolored pattern base color space"}
 				}
 				name = "Pattern"
+			} else if space[0] == Name("Lab") || space[0] == Name("CalRGB") || space[0] == Name("Indexed") {
+				calibrated = &graphicsColorSpace{}
+				name = space[0].(Name)
+				switch name {
+				case "Lab":
+					calibrated.lab, err = p.reader.readLab(space)
+				case "CalRGB":
+					calibrated.calRGB, err = p.reader.readCalRGB(space)
+				case "Indexed":
+					image := &Image{reader: p.reader, ColorSpace: space, Stream: &Stream{Dictionary: Dictionary{"Intent": p.state.style.RenderingIntent}}}
+					calibrated.palette, err = image.palette()
+				}
+				if err != nil {
+					return err
+				}
 			} else if space[0] == Name("DeviceN") {
 				deviceN, err = p.reader.readDeviceN(space)
 				if err != nil {
@@ -738,6 +764,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.fillICC = profile
 			p.state.fillSeparation = separation
 			p.state.fillDeviceN = deviceN
+			p.state.fillColor = calibrated
 			p.state.style.Fill.RGB = [3]float64{}
 			p.state.style.Fill.CMYK = nil
 			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
@@ -753,6 +780,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.strokeICC = profile
 			p.state.strokeSeparation = separation
 			p.state.strokeDeviceN = deviceN
+			p.state.strokeColor = calibrated
 			p.state.style.Stroke.RGB = [3]float64{}
 			p.state.style.Stroke.CMYK = nil
 			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
@@ -761,6 +789,23 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Stroke.Tiling = nil
 			if name == "DeviceCMYK" {
 				p.state.style.Stroke.CMYK = &[4]float64{0, 0, 0, 1}
+			}
+		}
+		if calibrated != nil {
+			values := []float64{0, 0, 0}
+			if calibrated.palette != nil {
+				values = values[:1]
+			}
+			paint, err := calibrated.paint(values)
+			if err != nil {
+				return err
+			}
+			if op.Operator == "cs" {
+				paint.Alpha = p.state.style.Fill.Alpha
+				p.state.style.Fill = paint
+			} else {
+				paint.Alpha = p.state.style.Stroke.Alpha
+				p.state.style.Stroke = paint
 			}
 		}
 		if profile != nil {
@@ -799,6 +844,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		profile := p.state.fillICC
 		separation := p.state.fillSeparation
 		deviceN := p.state.fillDeviceN
+		calibrated := p.state.fillColor
 		operator := "g"
 		if op.Operator == "SC" || op.Operator == "SCN" {
 			space = p.state.strokeSpace
@@ -806,7 +852,30 @@ func (p *pageInterpreter) operation(op Operation) error {
 			profile = p.state.strokeICC
 			separation = p.state.strokeSeparation
 			deviceN = p.state.strokeDeviceN
+			calibrated = p.state.strokeColor
 			operator = "G"
+		}
+		if space == "Lab" || space == "CalRGB" || space == "Indexed" {
+			count := 3
+			if space == "Indexed" {
+				count = 1
+			}
+			values, err := numbers(a, count)
+			if err != nil {
+				return err
+			}
+			paint, err := calibrated.paint(values)
+			if err != nil {
+				return err
+			}
+			if operator == "g" {
+				paint.Alpha = p.state.style.Fill.Alpha
+				p.state.style.Fill = paint
+			} else {
+				paint.Alpha = p.state.style.Stroke.Alpha
+				p.state.style.Stroke = paint
+			}
+			return nil
 		}
 		if space == "DeviceN" {
 			values, err := numbers(a, deviceN.components)
@@ -1060,6 +1129,15 @@ func (p *pageInterpreter) operation(op Operation) error {
 		return p.shadingFill(a)
 	case "Do":
 		return p.xobject(a)
+	case "BI":
+		if len(a) != 1 {
+			return fmt.Errorf("invalid inline image operands")
+		}
+		stream, ok := a[0].(*Stream)
+		if !ok {
+			return fmt.Errorf("invalid inline image stream")
+		}
+		return p.image(stream)
 	case "gs":
 		return p.extState(a, op.Offset)
 	case "ri":
@@ -1222,35 +1300,42 @@ func (p *pageInterpreter) xobject(a []Object) error {
 		return fmt.Errorf("invalid XObject stream")
 	}
 	if stream.Dictionary["Subtype"] == Name("Image") {
-		visible, err := p.optionalVisible(stream.Dictionary["OC"])
-		if err != nil || !visible {
-			return err
-		}
-		image, err := p.reader.ReadImage(stream)
-		if err != nil {
-			return err
-		}
-		if p.opaqueGroup && (image.Mask != nil || image.SoftMask != nil || image.ImageMask) {
-			return &UnsupportedError{Feature: "masked image in isolated group"}
-		}
-		if image.ImageMask {
-			if fill, _ := p.visiblePaint(true, false); !fill {
-				return nil
-			}
-			if err := p.validatePaint(true, false); err != nil {
-				return err
-			}
-		}
-		if p.visitor.Image == nil {
-			return fmt.Errorf("image visitor missing")
-		}
-		image.Warning = p.visitor.Warning
-		return p.visitor.Image(ImageMark{image, p.state.matrix, p.state.style})
+		return p.image(stream)
 	}
 	if stream.Dictionary["Subtype"] != Name("Form") {
 		return &UnsupportedError{Feature: "XObject subtype"}
 	}
 	return p.form(stream)
+}
+
+// image 解释外部或内联图像，统一遮罩、可见性和诊断处理
+// 入参: stream 图像数据流
+// 返回: error 解析或访问错误
+func (p *pageInterpreter) image(stream *Stream) error {
+	visible, err := p.optionalVisible(stream.Dictionary["OC"])
+	if err != nil || !visible {
+		return err
+	}
+	image, err := p.reader.ReadImage(stream)
+	if err != nil {
+		return err
+	}
+	if p.opaqueGroup && (image.Mask != nil || image.SoftMask != nil || image.ImageMask) {
+		return &UnsupportedError{Feature: "masked image in isolated group"}
+	}
+	if image.ImageMask {
+		if fill, _ := p.visiblePaint(true, false); !fill {
+			return nil
+		}
+		if err := p.validatePaint(true, false); err != nil {
+			return err
+		}
+	}
+	if p.visitor.Image == nil {
+		return fmt.Errorf("image visitor missing")
+	}
+	image.Warning = p.visitor.Warning
+	return p.visitor.Image(ImageMark{image, p.state.matrix, p.state.style})
 }
 
 // validatePaint 检查实际使用的颜色状态，避免未指定图案或未支持的色彩意图被静默替换
@@ -1421,13 +1506,66 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 	if !ok {
 		return fmt.Errorf("invalid external graphics state")
 	}
+	transfer, err := p.reader.Resolve(dict["TR2"])
+	if err != nil {
+		return err
+	}
 	for key, value := range dict {
+		if key == "TR" && transfer != nil {
+			continue
+		}
 		value, err = p.reader.Resolve(value)
 		if err != nil {
 			return err
 		}
+		if value == nil {
+			continue
+		}
 		switch key {
 		case "Type":
+		case "D":
+			values, ok := value.(Array)
+			if !ok || len(values) != 2 {
+				return fmt.Errorf("invalid graphics state dash pattern")
+			}
+			values = append(Array(nil), values...)
+			for i := range values {
+				values[i], err = p.reader.Resolve(values[i])
+				if err != nil {
+					return err
+				}
+			}
+			if err := p.operation(Operation{Operator: "d", Operands: values}); err != nil {
+				return err
+			}
+		case "FL":
+			if err := p.operation(Operation{Operator: "i", Operands: []Object{value}}); err != nil {
+				return err
+			}
+		case "TR", "TR2":
+			if value != Name("Identity") && !(key == "TR2" && value == Name("Default")) {
+				return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
+			}
+		case "Font":
+			array, ok := value.(Array)
+			if !ok || len(array) != 2 {
+				return fmt.Errorf("invalid graphics state font")
+			}
+			size, err := p.reader.number(array[1])
+			if err != nil {
+				return err
+			}
+			if math.IsNaN(size) || math.IsInf(size, 0) {
+				return fmt.Errorf("invalid font size")
+			}
+			if size <= 0 {
+				return &UnsupportedError{Feature: "nonpositive text font size"}
+			}
+			font, err := p.reader.ReadFont(array[0])
+			if err != nil {
+				return err
+			}
+			p.state.font, p.state.fontSize = font, size
 		case "RI":
 			if err := p.operation(Operation{Operator: "ri", Operands: []Object{value}}); err != nil {
 				return err

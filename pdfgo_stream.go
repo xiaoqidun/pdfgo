@@ -199,8 +199,16 @@ func (s *Stream) Decode() ([]byte, error) {
 // 入参: data 压缩数据, early 提前增长标志
 // 返回: []byte 解码数据, error 错误信息
 func decodeLZW(data []byte, early int64) ([]byte, error) {
+	out, _, err := decodeLZWBytes(data, early)
+	return out, err
+}
+
+// decodeLZWBytes 解码LZW并返回结束码占用的字节数，供内联图像界定数据边界
+// 入参: data 压缩数据, early 提前增长标志
+// 返回: []byte 解码数据, int 已消费字节数, error 编码错误
+func decodeLZWBytes(data []byte, early int64) ([]byte, int, error) {
 	if early != 0 && early != 1 {
-		return nil, fmt.Errorf("invalid LZW EarlyChange")
+		return nil, 0, fmt.Errorf("invalid LZW EarlyChange")
 	}
 	var prefixes [4096]uint16
 	var suffixes, stack [4096]byte
@@ -211,7 +219,7 @@ func decodeLZW(data []byte, early int64) ([]byte, error) {
 	for {
 		for available < width {
 			if position == len(data) {
-				return nil, io.ErrUnexpectedEOF
+				return nil, 0, io.ErrUnexpectedEOF
 			}
 			bits = bits<<8 | uint32(data[position])
 			available += 8
@@ -224,10 +232,10 @@ func decodeLZW(data []byte, early int64) ([]byte, error) {
 			continue
 		}
 		if code == 257 {
-			return out, nil
+			return out, position, nil
 		}
 		if code > next || code >= 4096 || previous < 0 && code >= 256 {
-			return nil, fmt.Errorf("invalid LZW code %d", code)
+			return nil, 0, fmt.Errorf("invalid LZW code %d", code)
 		}
 		current, start := code, len(stack)
 		if code == next {

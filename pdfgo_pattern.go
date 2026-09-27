@@ -79,7 +79,7 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	if xstep <= 0 || ystep <= 0 || math.IsNaN(xstep) || math.IsNaN(ystep) {
+	if xstep == 0 || ystep == 0 || math.IsNaN(xstep) || math.IsNaN(ystep) || math.IsInf(xstep, 0) || math.IsInf(ystep, 0) {
 		return nil, fmt.Errorf("invalid tiling pattern step")
 	}
 	matrix := Identity()
