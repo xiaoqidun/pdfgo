@@ -131,7 +131,17 @@ func (r *Reader) numberArray(object Object, count int) ([]float64, error) {
 	if !ok {
 		return nil, fmt.Errorf("expected numeric array")
 	}
-	return numbers(a, count)
+	if len(a) != count {
+		return nil, fmt.Errorf("expected %d numbers, got %d", count, len(a))
+	}
+	values := make([]float64, count)
+	for i, item := range a {
+		values[i], err = r.number(item)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return values, nil
 }
 
 // shadingPattern 解析着色图案中的轴向或径向渐变

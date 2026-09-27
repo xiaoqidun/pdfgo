@@ -15,8 +15,10 @@
 package pdfgo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math"
 )
 
@@ -59,14 +61,22 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 	}
 	seen := map[Reference]bool{}
 	index := 0
-	var walk func(Object, pageAttributes, int) error
-	walk = func(object Object, inherited pageAttributes, depth int) error {
+	type frame struct {
+		kids  Array
+		attrs pageAttributes
+	}
+	stack := []frame{{kids: Array{catalog["Pages"]}}}
+	for len(stack) != 0 {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if depth > 256 {
-			return fmt.Errorf("page tree depth exceeded")
+		current := &stack[len(stack)-1]
+		if len(current.kids) == 0 {
+			stack = stack[:len(stack)-1]
+			continue
 		}
+		object, inherited := current.kids[0], current.attrs
+		current.kids = current.kids[1:]
 		ref, ok := object.(Reference)
 		if !ok {
 			return fmt.Errorf("page tree node is not indirect")
@@ -106,12 +116,7 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 			if !ok {
 				return fmt.Errorf("invalid page tree kids")
 			}
-			for _, child := range array {
-				if err := walk(child, attrs, depth+1); err != nil {
-					return err
-				}
-			}
-			return nil
+			stack = append(stack, frame{kids: array, attrs: attrs})
 		case Name("Page"):
 			page, err := r.readPage(ref, dict, attrs)
 			if err != nil {
@@ -121,12 +126,11 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 				return err
 			}
 			index++
-			return nil
 		default:
 			return fmt.Errorf("invalid page tree type")
 		}
 	}
-	return walk(catalog["Pages"], pageAttributes{}, 0)
+	return nil
 }
 
 // readPage 解析继承属性并检查页面尺寸
@@ -213,33 +217,67 @@ func (r *Reader) rectangle(object Object) (Rectangle, error) {
 // Content 读取并依次连接页面内容流，保留流间的图形状态语义
 // 返回: []byte 内容操作符数据, error 错误信息
 func (p *Page) Content() ([]byte, error) {
-	value, err := p.reader.Resolve(p.Dictionary["Contents"])
-	if err != nil {
+	var out bytes.Buffer
+	if _, err := p.WriteContent(context.Background(), &out); err != nil {
 		return nil, err
 	}
+	return out.Bytes(), nil
+}
+
+// WriteContent 逐个解码并输出页面内容流，以换行分隔，不拼接整页内容；单个流仍完整解码
+// 入参: ctx 取消上下文，在流之间检查, writer 输出流
+// 返回: int64 已写字节数, error 解码或写入错误，出错时可能已有部分输出
+func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	value, err := p.reader.Resolve(p.Dictionary["Contents"])
+	if err != nil {
+		return 0, err
+	}
 	if value == nil {
-		return nil, nil
+		return 0, nil
 	}
 	objects := Array{value}
 	if array, ok := value.(Array); ok {
 		objects = array
 	}
-	var out []byte
+	var written int64
 	for _, object := range objects {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
 		resolved, err := p.reader.Resolve(object)
 		if err != nil {
-			return nil, err
+			return written, err
 		}
 		stream, ok := resolved.(*Stream)
 		if !ok {
-			return nil, fmt.Errorf("page content is not a stream")
+			return written, fmt.Errorf("page content is not a stream")
 		}
 		data, err := stream.Decode()
 		if err != nil {
-			return nil, err
+			return written, err
 		}
-		out = append(out, data...)
-		out = append(out, '\n')
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, err := writer.Write(data)
+		written += int64(n)
+		if err != nil {
+			return written, err
+		}
+		if n != len(data) {
+			return written, io.ErrShortWrite
+		}
+		n, err = io.WriteString(writer, "\n")
+		written += int64(n)
+		if err != nil {
+			return written, err
+		}
+		if n != 1 {
+			return written, io.ErrShortWrite
+		}
 	}
-	return out, nil
+	return written, nil
 }
