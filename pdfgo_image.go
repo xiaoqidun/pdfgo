@@ -288,16 +288,26 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if uint64(bounds.Dx()) > uint64(^uint(0)>>1)/8/uint64(bounds.Dy()) {
 		return nil, fmt.Errorf("masked image dimensions exceed platform integer range")
 	}
-	if target == nil && palette == nil && calibrated == nil && profile == nil && separation == nil && deviceN == nil && components != 4 && mask == nil && len(keys) == 0 && len(i.Decode) == 0 {
-		if output := deviceImage(samples); output != nil {
-			return output, nil
-		}
-	}
 	if samples.Bounds() != bounds {
 		samples = &imageResample{source: samples, bounds: bounds, interpolate: i.Interpolate && palette == nil}
 	}
 	if mask != nil {
 		mask.bounds = bounds
+	}
+	if target == nil && calibrated == nil && profile == nil && separation == nil && deviceN == nil && components != 4 && len(keys) == 0 && len(matte) == 0 && len(i.Decode) == 0 {
+		byteExact := imageByteExact(samples)
+		if mask != nil {
+			byteExact = byteExact && imageByteExact(mask)
+		}
+		if palette != nil {
+			for _, c := range palette.colors {
+				if c.R%257 != 0 || c.G%257 != 0 || c.B%257 != 0 || c.A%257 != 0 {
+					byteExact = false
+					break
+				}
+			}
+		}
+		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: float64((uint32(1) << i.BitsPerComponent) - 1), byteExact: byteExact}, nil
 	}
 	var out *image.NRGBA64
 	if target == nil {
@@ -344,14 +354,19 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				}
 				alpha = uint16(value)
 			}
-			r, g, b, _ := samples.At(x, y).RGBA()
-			values := [4]float64{float64(r) / 65535, float64(g) / 65535, float64(b) / 65535}
+			sampleColor := samples.At(x, y)
+			var values [4]float64
 			if components == 4 {
-				cmyk, ok := samples.At(x, y).(color.CMYK)
+				cmyk, ok := imageCMYKSample(sampleColor)
 				if !ok {
 					return nil, fmt.Errorf("invalid CMYK image samples")
 				}
-				values = [4]float64{float64(cmyk.C) / 255, float64(cmyk.M) / 255, float64(cmyk.Y) / 255, float64(cmyk.K) / 255}
+				for c := range cmyk {
+					values[c] = float64(cmyk[c]) / 65535
+				}
+			} else {
+				r, g, b, _ := sampleColor.RGBA()
+				values = [4]float64{float64(r) / 65535, float64(g) / 65535, float64(b) / 65535}
 			}
 			transparent := len(keys) != 0
 			for c := 0; c < components; c++ {
@@ -457,32 +472,72 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	return out, nil
 }
 
-// deviceImage 直接展开无颜色变换的灰度及RGB样本，避免逐像素接口装箱和浮点映射
-// 入参: source 原始样本
-// 返回: *image.NRGBA64 显示图像，其他样本类型返回空值
-func deviceImage(source image.Image) *image.NRGBA64 {
-	var sample func(int, int) (uint32, uint32, uint32, uint32)
-	switch source := source.(type) {
-	case *image.NRGBA:
-		sample = func(x, y int) (uint32, uint32, uint32, uint32) { return source.NRGBAAt(x, y).RGBA() }
-	case *image.NRGBA64:
-		sample = func(x, y int) (uint32, uint32, uint32, uint32) { return source.NRGBA64At(x, y).RGBA() }
-	case *image.Gray:
-		sample = func(x, y int) (uint32, uint32, uint32, uint32) { return source.GrayAt(x, y).RGBA() }
-	case *image.Gray16:
-		sample = func(x, y int) (uint32, uint32, uint32, uint32) { return source.Gray16At(x, y).RGBA() }
-	default:
-		return nil
+// deviceSampleImage 按需组合设备色或索引色样本与遮罩，不重复展开像素缓冲
+type deviceSampleImage struct {
+	source    image.Image
+	mask      *imageResample
+	inverted  bool
+	palette   *imagePalette
+	maximum   float64
+	byteExact bool
+}
+
+// ColorModel 返回可无损表达原始采样精度的非预乘颜色模型
+// 返回: color.Model 颜色模型
+func (s *deviceSampleImage) ColorModel() color.Model {
+	if s.byteExact {
+		return color.NRGBAModel
 	}
-	bounds := source.Bounds()
-	output := image.NewNRGBA64(bounds)
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			r, g, b, _ := sample(x, y)
-			output.SetNRGBA64(x, y, color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: 65535})
+	return color.NRGBA64Model
+}
+
+// imageByteExact 判断样本及重采样结果是否可由八位分量无损表达
+// 入参: source 样本图像
+// 返回: bool 是否可无损表达
+func imageByteExact(source image.Image) bool {
+	switch s := source.(type) {
+	case *image.NRGBA:
+		return s.Opaque()
+	case *image.RGBA, *image.Gray, *image.YCbCr, *packedGrayImage:
+		return true
+	case *deviceSampleImage:
+		return s.byteExact
+	case *imageResample:
+		return (!s.interpolate || s.source.Bounds() == s.bounds) && imageByteExact(s.source)
+	default:
+		return false
+	}
+}
+
+// Bounds 返回对齐后的图像边界
+// 返回: image.Rectangle 图像边界
+func (s *deviceSampleImage) Bounds() image.Rectangle { return s.source.Bounds() }
+
+// At 按原始采样精度返回非预乘颜色，边界外透明
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 像素颜色
+func (s *deviceSampleImage) At(x, y int) color.Color {
+	if !image.Pt(x, y).In(s.Bounds()) {
+		return color.NRGBA64{}
+	}
+	r, g, b, _ := s.source.At(x, y).RGBA()
+	pixel := color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: 65535}
+	if s.palette != nil {
+		index := int(math.Max(0, math.Min(float64(len(s.palette.colors)-1), math.Round(float64(r)/65535*s.maximum))))
+		pixel = s.palette.colors[index]
+	}
+	alpha := uint32(65535)
+	if s.mask != nil {
+		alpha, _, _, _ = s.mask.At(x, y).RGBA()
+		if s.inverted {
+			alpha = 65535 - alpha
 		}
 	}
-	return output
+	pixel.A = uint16(uint32(pixel.A) * alpha / 65535)
+	if s.byteExact {
+		return color.NRGBA{R: uint8(pixel.R >> 8), G: uint8(pixel.G >> 8), B: uint8(pixel.B >> 8), A: uint8(pixel.A >> 8)}
+	}
+	return pixel
 }
 
 // imagePalette 保存索引色的原始分量和显示颜色
@@ -668,6 +723,7 @@ func (i *Image) decodeMask(components int) (*imageResample, []float64, bool, []f
 	if err != nil {
 		return nil, nil, false, nil, err
 	}
+	mask.Warning = i.Warning
 	if mask.Mask != nil || mask.SoftMask != nil || soft && (mask.ImageMask || mask.ColorSpace != Name("DeviceGray")) || !soft && !mask.ImageMask {
 		return nil, nil, false, nil, fmt.Errorf("invalid image mask dictionary")
 	}
@@ -730,7 +786,7 @@ func (s *imageResample) At(x, y int) color.Color {
 	x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
 	fx, fy := sx-float64(x0), sy-float64(y0)
 	var values [4]float64
-	_, cmyk := s.source.At(b.Min.X, b.Min.Y).(color.CMYK)
+	_, cmyk := imageCMYKSample(s.source.At(b.Min.X, b.Min.Y))
 	for dy := 0; dy < 2; dy++ {
 		for dx := 0; dx < 2; dx++ {
 			weightX, weightY := 1-fx, 1-fy
@@ -743,8 +799,8 @@ func (s *imageResample) At(x, y int) color.Color {
 			pixel := s.source.At(b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy)))
 			r, g, b, a := pixel.RGBA()
 			if cmyk {
-				c := pixel.(color.CMYK)
-				r, g, b, a = uint32(c.C), uint32(c.M), uint32(c.Y), uint32(c.K)
+				c, _ := imageCMYKSample(pixel)
+				r, g, b, a = uint32(c[0]), uint32(c[1]), uint32(c[2]), uint32(c[3])
 			}
 			for i, v := range [4]uint32{r, g, b, a} {
 				values[i] += float64(v) * weightX * weightY
@@ -752,7 +808,7 @@ func (s *imageResample) At(x, y int) color.Color {
 		}
 	}
 	if cmyk {
-		return color.CMYK{C: uint8(math.Round(values[0])), M: uint8(math.Round(values[1])), Y: uint8(math.Round(values[2])), K: uint8(math.Round(values[3]))}
+		return cmykSample{uint16(math.Round(values[0])), uint16(math.Round(values[1])), uint16(math.Round(values[2])), uint16(math.Round(values[3]))}
 	}
 	return color.RGBA64{R: uint16(math.Round(values[0])), G: uint16(math.Round(values[1])), B: uint16(math.Round(values[2])), A: uint16(math.Round(values[3]))}
 }
@@ -972,9 +1028,6 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	if components == 0 {
 		return nil, &UnsupportedError{Feature: "raw image color space"}
 	}
-	if i.BitsPerComponent != 8 && components == 4 {
-		return nil, &UnsupportedError{Feature: "non-8-bit CMYK image samples"}
-	}
 	rowBits := uint64(i.Width) * uint64(components) * uint64(i.BitsPerComponent)
 	rowBytes := (rowBits + 7) / 8
 	expected := rowBytes * uint64(i.Height)
@@ -995,6 +1048,9 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	}
 	stride := int(rowBytes)
 	if components == 4 {
+		if i.BitsPerComponent != 8 {
+			return &packedCMYKImage{data: bytes.Clone(data), rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
+		}
 		return &image.CMYK{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 	}
 	if components == 3 && i.BitsPerComponent == 8 {
@@ -1020,13 +1076,105 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 		}
 		return out, nil
 	}
-	out := image.NewGray16(image.Rect(0, 0, i.Width, i.Height))
-	for y := 0; y < i.Height; y++ {
-		line := data[y*stride : (y+1)*stride]
-		for x := 0; x < i.Width; x++ {
-			sample := uint32(packedSample(line, x, i.BitsPerComponent))
-			out.SetGray16(x, y, color.Gray16{Y: uint16(sample * 65535 / maximum)})
-		}
+	if i.BitsPerComponent < 8 {
+		return &packedGrayImage{data: bytes.Clone(data), rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
 	}
-	return out, nil
+	if i.BitsPerComponent == 16 {
+		return &image.Gray16{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
+	}
+	return &image.Gray{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
+}
+
+// cmykSample 保存未经过色彩管理的十六位四色分量
+type cmykSample [4]uint16
+
+// RGBA 返回不透明的设备色预览，原始分量由图像解码流程解释
+// 返回: uint32 红、绿、蓝及透明度
+func (c cmykSample) RGBA() (uint32, uint32, uint32, uint32) {
+	k := uint64(65535 - c[3])
+	return uint32(uint64(65535-c[0]) * k / 65535), uint32(uint64(65535-c[1]) * k / 65535), uint32(uint64(65535-c[2]) * k / 65535), 65535
+}
+
+// imageCMYKSample 统一取得八位或十六位四色样本，保留黑色分量
+// 入参: pixel 样本颜色
+// 返回: cmykSample 四色分量, bool 是否为四色样本
+func imageCMYKSample(pixel color.Color) (cmykSample, bool) {
+	switch c := pixel.(type) {
+	case color.CMYK:
+		return cmykSample{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}, true
+	case cmykSample:
+		return c, true
+	}
+	return cmykSample{}, false
+}
+
+// packedCMYKImage 保留逐行对齐的四色样本，按需无损展开分量
+type packedCMYKImage struct {
+	data          []byte
+	rect          image.Rectangle
+	stride, depth int
+}
+
+// ColorModel 返回保留十六位四色样本的颜色模型
+// 返回: color.Model 颜色模型
+func (s *packedCMYKImage) ColorModel() color.Model {
+	return color.ModelFunc(func(c color.Color) color.Color {
+		if sample, ok := imageCMYKSample(c); ok {
+			return sample
+		}
+		r, g, b, _ := c.RGBA()
+		white := max(r, g, b)
+		if white == 0 {
+			return cmykSample{0, 0, 0, 65535}
+		}
+		return cmykSample{uint16((white - r) * 65535 / white), uint16((white - g) * 65535 / white), uint16((white - b) * 65535 / white), uint16(65535 - white)}
+	})
+}
+
+// Bounds 返回原始样本边界
+// 返回: image.Rectangle 图像边界
+func (s *packedCMYKImage) Bounds() image.Rectangle { return s.rect }
+
+// At 读取逐行打包的四色分量，边界外返回零透明度
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 样本颜色
+func (s *packedCMYKImage) At(x, y int) color.Color {
+	if !image.Pt(x, y).In(s.rect) {
+		return color.RGBA64{}
+	}
+	line := s.data[(y-s.rect.Min.Y)*s.stride:]
+	var sample cmykSample
+	for c := range sample {
+		value := uint32(packedSample(line, (x-s.rect.Min.X)*4+c, s.depth))
+		sample[c] = uint16(value * 65535 / ((uint32(1) << s.depth) - 1))
+	}
+	return sample
+}
+
+// packedGrayImage 保留低位深灰度或索引样本的逐行紧凑布局
+type packedGrayImage struct {
+	data   []byte
+	rect   image.Rectangle
+	stride int
+	depth  int
+}
+
+// ColorModel 返回十六位灰度模型
+// 返回: color.Model 颜色模型
+func (s *packedGrayImage) ColorModel() color.Model { return color.Gray16Model }
+
+// Bounds 返回原始采样边界
+// 返回: image.Rectangle 图像边界
+func (s *packedGrayImage) Bounds() image.Rectangle { return s.rect }
+
+// At 将单个紧凑样本无损展开为十六位灰度，边界外返回零值
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 灰度样本
+func (s *packedGrayImage) At(x, y int) color.Color {
+	if !image.Pt(x, y).In(s.rect) {
+		return color.Gray16{}
+	}
+	line := s.data[(y-s.rect.Min.Y)*s.stride:]
+	value := uint32(packedSample(line, x-s.rect.Min.X, s.depth))
+	return color.Gray16{Y: uint16(value * 65535 / ((uint32(1) << s.depth) - 1))}
 }

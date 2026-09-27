@@ -27,14 +27,25 @@ type MeshPatch struct {
 	Colors [4][4]float64
 }
 
-// MeshGradient 保存按绘制顺序排列的曲面网格，Matrix将网格坐标映射到页面
-type MeshGradient struct {
-	Patches  []MeshPatch
-	Matrix   Matrix
-	Space    *ColorSpace
-	Intent   Name
-	function *gradientFunction
+// MeshTriangle 保存Gouraud三角形顶点及对应颜色分量
+type MeshTriangle struct {
+	Points [3]Point
+	Colors [3][4]float64
 }
+
+// MeshGradient 保存曲面或三角网格，各切片保持绘制顺序，Matrix将网格坐标映射到页面
+type MeshGradient struct {
+	Patches   []MeshPatch
+	Triangles []MeshTriangle
+	Matrix    Matrix
+	Space     *ColorSpace
+	Intent    Name
+	function  *gradientFunction
+}
+
+// UsesFunction 判断颜色分量是否需在插值后经过函数变换
+// 返回: bool 是否使用颜色函数
+func (g *MeshGradient) UsesFunction() bool { return g.function != nil }
 
 // PointAt 计算单位参数域内的双三次曲面坐标
 // 入参: u 横向参数, v 纵向参数
@@ -51,17 +62,27 @@ func (p MeshPatch) PointAt(u, v float64) Point {
 	return point
 }
 
-// ValuesAt 在参数域中双线性插值，再执行可选颜色函数
-// 入参: patch 曲面序号, u 横向参数, v 纵向参数
+// ValuesAt 插值源分量后执行颜色函数，三角形编号接在曲面之后
+// 入参: patch 网格序号, u 横向参数或第二顶点权重, v 纵向参数或第三顶点权重
 // 返回: [4]float64 源颜色分量, error 参数或颜色错误
 func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
-	if patch < 0 || patch >= len(g.Patches) || math.IsNaN(u) || math.IsNaN(v) || u < 0 || u > 1 || v < 0 || v > 1 {
+	if patch < 0 || patch >= len(g.Patches)+len(g.Triangles) || math.IsNaN(u) || math.IsNaN(v) || u < 0 || u > 1 || v < 0 || v > 1 {
 		return [4]float64{}, fmt.Errorf("invalid mesh evaluation")
 	}
 	weights := [4]float64{(1 - u) * (1 - v), (1 - u) * v, u * v, u * (1 - v)}
+	var colors [4][4]float64
+	if patch < len(g.Patches) {
+		colors = g.Patches[patch].Colors
+	} else {
+		if u+v > 1+1e-12 {
+			return [4]float64{}, fmt.Errorf("invalid triangle evaluation")
+		}
+		weights = [4]float64{math.Max(0, 1-u-v), u, v, 0}
+		copy(colors[:], g.Triangles[patch-len(g.Patches)].Colors[:])
+	}
 	var values [4]float64
 	for i, weight := range weights {
-		for c, value := range g.Patches[patch].Colors[i] {
+		for c, value := range colors[i] {
 			values[c] += value * weight
 		}
 	}
@@ -106,13 +127,13 @@ func (b *meshBits) read(count int) (uint32, error) {
 	return value, nil
 }
 
-// meshPaint 解码Coons及张量积曲面，保留源颜色分量和共享边
+// meshPaint 解码三角形、Coons及张量积网格，保留源颜色分量和共享边
 // 入参: stream 着色流, matrix 网格到页面的变换
 // 返回: Paint 曲面画刷, error 格式或能力错误
 func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error) {
 	d := stream.Dictionary
 	kind, ok := d["ShadingType"].(Integer)
-	if !ok || kind != 6 && kind != 7 {
+	if !ok || kind < 4 || kind > 7 {
 		return Paint{}, &UnsupportedError{Feature: "mesh shading type"}
 	}
 	if d["Background"] != nil {
@@ -120,6 +141,9 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	}
 	depths := [3]int{}
 	for i, key := range []Name{"BitsPerCoordinate", "BitsPerComponent", "BitsPerFlag"} {
+		if kind == 5 && i == 2 {
+			continue
+		}
 		v, err := p.reader.Resolve(d[key])
 		if err != nil {
 			return Paint{}, err
@@ -140,6 +164,9 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	}
 	g := &MeshGradient{Space: space, Intent: p.state.style.RenderingIntent, Matrix: matrix}
 	components := space.Components()
+	if components > 4 {
+		return Paint{}, &UnsupportedError{Feature: "mesh color component count"}
+	}
 	if d["Function"] != nil {
 		g.function, err = p.reader.readGradientFunction(d["Function"], components, 0)
 		if err != nil {
@@ -154,6 +181,13 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	data, err := stream.Decode()
 	if err != nil {
 		return Paint{}, err
+	}
+	if kind == 4 || kind == 5 {
+		g.Triangles, err = p.meshTriangleData(d, data, depths, ranges, components, kind == 5)
+		if err != nil {
+			return Paint{}, err
+		}
+		return Paint{Mesh: g}, nil
 	}
 	bits := meshBits{data: data}
 	pointCount := 12
@@ -223,6 +257,118 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		return Paint{}, fmt.Errorf("empty mesh shading")
 	}
 	return Paint{Mesh: g}, nil
+}
+
+// meshTriangleData 按边标志或格点行顺序解码三角网格，保留绘制顺序
+// 入参: dict 着色字典, data 解码数据, depths 数值位宽, ranges 解码区间, components 分量数, lattice 是否为格点网格
+// 返回: []MeshTriangle 三角形, error 结构或取消错误
+func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths [3]int, ranges []float64, components int, lattice bool) ([]MeshTriangle, error) {
+	type vertex struct {
+		point Point
+		color [4]float64
+	}
+	stride := (depths[2] + depths[0]*2 + depths[1]*components + 7) / 8
+	if len(data)%stride != 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	count := len(data) / stride
+	bits := meshBits{data: data}
+	read := func() (vertex, uint32, error) {
+		var v vertex
+		flag, err := bits.read(depths[2])
+		if err != nil {
+			return v, 0, err
+		}
+		for index := 0; index < 2+components; index++ {
+			depth := depths[1]
+			if index < 2 {
+				depth = depths[0]
+			}
+			n, err := bits.read(depth)
+			if err != nil {
+				return v, 0, err
+			}
+			value := ranges[index*2] + float64(n)/float64(uint64(1)<<uint(depth)-1)*(ranges[index*2+1]-ranges[index*2])
+			switch index {
+			case 0:
+				v.point.X = value
+			case 1:
+				v.point.Y = value
+			default:
+				v.color[index-2] = value
+			}
+		}
+		bits.pos = (bits.pos + 7) / 8 * 8
+		return v, flag & 3, nil
+	}
+	var result []MeshTriangle
+	appendTriangle := func(a, b, c vertex) {
+		result = append(result, MeshTriangle{Points: [3]Point{a.point, b.point, c.point}, Colors: [3][4]float64{a.color, b.color, c.color}})
+	}
+	if lattice {
+		value, err := p.reader.Resolve(dict["VerticesPerRow"])
+		if err != nil {
+			return nil, err
+		}
+		columns, ok := value.(Integer)
+		if !ok || columns < 2 || columns > Integer(count/2) || Integer(count)%columns != 0 {
+			return nil, fmt.Errorf("invalid mesh lattice dimensions")
+		}
+		row := make([]vertex, int(columns))
+		var aboveLeft, left vertex
+		for index := 0; index < count; index++ {
+			if err := p.ctx.Err(); err != nil {
+				return nil, err
+			}
+			v, _, err := read()
+			if err != nil {
+				return nil, err
+			}
+			column := index % len(row)
+			above := row[column]
+			if index >= len(row) && column != 0 {
+				appendTriangle(aboveLeft, above, left)
+				appendTriangle(above, left, v)
+			}
+			row[column], aboveLeft, left = v, above, v
+		}
+	} else {
+		var previous [3]vertex
+		for bits.pos < len(data)*8 {
+			if err := p.ctx.Err(); err != nil {
+				return nil, err
+			}
+			v, flag, err := read()
+			if err != nil {
+				return nil, err
+			}
+			switch flag {
+			case 0:
+				previous[0] = v
+				for i := 1; i < 3; i++ {
+					previous[i], _, err = read()
+					if err != nil {
+						return nil, err
+					}
+				}
+			case 1, 2:
+				if len(result) == 0 {
+					return nil, fmt.Errorf("mesh shared edge without previous triangle")
+				}
+				if flag == 1 {
+					previous[0] = previous[1]
+				}
+				previous[1], previous[2] = previous[2], v
+			default:
+				return nil, fmt.Errorf("invalid mesh triangle edge flag")
+			}
+			appendTriangle(previous[0], previous[1], previous[2])
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("empty mesh shading")
+	}
+	return result, nil
 }
 
 // completeCoons 按双线性边界混合补齐Coons曲面的内部控制点

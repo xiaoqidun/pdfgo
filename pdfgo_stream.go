@@ -49,6 +49,9 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if filter == nil {
+		return nil, nil, nil
+	}
 	parameters, err := resolve(s.Dictionary["DecodeParms"])
 	if err != nil {
 		return nil, nil, err

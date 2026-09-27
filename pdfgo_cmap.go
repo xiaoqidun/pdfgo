@@ -194,7 +194,7 @@ func codeNumber(code []byte) uint64 {
 
 // unicodeBytes 严格解析CMap使用的UTF-16BE文本
 func unicodeBytes(data []byte) (string, error) {
-	if len(data) == 0 || len(data)%2 != 0 {
+	if len(data)%2 != 0 {
 		return "", fmt.Errorf("invalid UTF-16BE mapping")
 	}
 	values := make([]uint16, len(data)/2)

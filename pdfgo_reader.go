@@ -114,7 +114,7 @@ func NewReaderWithPassword(source io.ReaderAt, size int64, password []byte) (*Re
 	if end < 0 {
 		return nil, fmt.Errorf("invalid PDF header")
 	}
-	version := string(bytes.TrimSpace(data[5:end]))
+	version := string(bytes.Trim(data[5:end], "\x00\t\n\f\r "))
 	if version != "2.0" && (len(version) != 3 || version[0:2] != "1." || version[2] < '0' || version[2] > '7') {
 		return nil, &UnsupportedError{Feature: "PDF version " + version}
 	}
@@ -138,7 +138,7 @@ func NewReaderWithPassword(source io.ReaderAt, size int64, password []byte) (*Re
 	if err != nil {
 		return nil, p.fail("invalid startxref offset")
 	}
-	if !bytes.Equal(bytes.TrimSpace(data[p.pos:]), []byte("%%EOF")) {
+	if !bytes.Equal(bytes.Trim(data[p.pos:], "\x00\t\n\f\r "), []byte("%%EOF")) {
 		return nil, p.fail("missing final EOF marker")
 	}
 	visited := map[int64]bool{}

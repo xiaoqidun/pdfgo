@@ -91,6 +91,52 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		value = Dictionary{"N": stream}
 	}
+	if value == nil && annotation.Subtype == "Link" {
+		stream, err := r.linkAppearance(annotation)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
+	}
+	if value == nil && annotation.Subtype == "Ink" {
+		stream, err := r.inkAppearance(annotation)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
+	}
+	if value == nil && annotation.Subtype == "Line" {
+		stream, err := r.lineAppearance(annotation)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
+	}
+	if value == nil && (annotation.Subtype == "Square" || annotation.Subtype == "Circle") {
+		stream, err := r.shapeAppearance(annotation)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
+	}
+	if value == nil && annotation.Subtype == "Screen" {
+		return nil
+	}
+	if value == nil && annotation.Subtype == "Movie" {
+		movie, err := r.ReadMovie(annotation.Dictionary["Movie"])
+		if err != nil {
+			return err
+		}
+		if movie.Poster == Boolean(true) {
+			return &UnsupportedError{Feature: "poster extraction from movie"}
+		}
+		poster, ok := movie.Poster.(*Stream)
+		if !ok {
+			return nil
+		}
+		stream := &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Integer(1), Integer(1)}, "Resources": Dictionary{"XObject": Dictionary{"Poster": poster}}}, Data: []byte("/Poster Do"), reader: r}
+		value = Dictionary{"N": stream}
+	}
 	appearance, ok := value.(Dictionary)
 	if !ok {
 		return &UnsupportedError{Feature: "annotation appearance"}
@@ -107,6 +153,9 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		value, err = r.Resolve(states[state])
 		if err != nil {
 			return err
+		}
+		if value == nil {
+			return nil
 		}
 	}
 	stream, ok := value.(*Stream)

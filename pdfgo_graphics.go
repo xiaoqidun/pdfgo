@@ -280,8 +280,20 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			}
 		}
 	}
-	if page.Dictionary["Trans"] != nil {
-		return &UnsupportedError{Feature: `page field "Trans"`}
+	if value, err := r.Resolve(page.Dictionary["Trans"]); err != nil {
+		return err
+	} else if value != nil {
+		transition, ok := value.(Dictionary)
+		if !ok {
+			return fmt.Errorf("invalid page transition")
+		}
+		style, err := r.Resolve(transition["S"])
+		if err != nil {
+			return err
+		}
+		if style != nil && style != Name("R") {
+			return &UnsupportedError{Feature: "page transition " + fmt.Sprint(style)}
+		}
 	}
 	data, err := page.Content()
 	if err != nil {
@@ -709,12 +721,15 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if err != nil {
 				return err
 			}
+			if predefined, ok := object.(Name); ok {
+				object = Array{predefined}
+			}
 			space, ok := object.(Array)
 			if !ok || len(space) == 0 {
 				return &UnsupportedError{Feature: "non-device color space"}
 			}
-			if len(space) == 1 && space[0] == Name("Pattern") {
-				name = "Pattern"
+			if len(space) == 1 && (space[0] == Name("Pattern") || space[0] == Name("DeviceRGB") || space[0] == Name("DeviceGray") || space[0] == Name("DeviceCMYK")) {
+				name = space[0].(Name)
 			} else if len(space) == 2 && space[0] == Name("Pattern") {
 				patternBase, ok = space[1].(Name)
 				if !ok || patternBase != "DeviceGray" && patternBase != "DeviceRGB" && patternBase != "DeviceCMYK" {
@@ -958,7 +973,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 				if pattern.PaintType == 2 && patternBase == "" || pattern.PaintType == 1 && patternBase != "" {
 					return fmt.Errorf("pattern paint type does not match color space")
 				}
-				paint.Tiling, paint.Axial, paint.Radial = pattern, nil, nil
+				paint.Tiling, paint.Axial, paint.Radial, paint.Mesh = pattern, nil, nil, nil
 				if operator == "g" {
 					p.state.style.Fill = paint
 				} else {
@@ -974,11 +989,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 				return err
 			}
 			if operator == "g" {
-				p.state.style.Fill.Axial, p.state.style.Fill.Radial = gradient.Axial, gradient.Radial
-				p.state.style.Fill.Tiling = nil
+				gradient.Alpha = p.state.style.Fill.Alpha
+				p.state.style.Fill = gradient
 			} else {
-				p.state.style.Stroke.Axial, p.state.style.Stroke.Radial = gradient.Axial, gradient.Radial
-				p.state.style.Stroke.Tiling = nil
+				gradient.Alpha = p.state.style.Stroke.Alpha
+				p.state.style.Stroke = gradient
 			}
 			return nil
 		}
@@ -1342,7 +1357,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 // 入参: fill 是否填充, stroke 是否描边
 // 返回: error 颜色状态错误
 func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
-	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil && p.state.style.Fill.Tiling == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil && p.state.style.Stroke.Tiling == nil {
+	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil && p.state.style.Fill.Mesh == nil && p.state.style.Fill.Tiling == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil && p.state.style.Stroke.Mesh == nil && p.state.style.Stroke.Tiling == nil {
 		return fmt.Errorf("missing pattern color")
 	}
 	if p.state.style.RenderingIntent == "AbsoluteColorimetric" && (fill && p.state.fillICC != nil || stroke && p.state.strokeICC != nil) {
