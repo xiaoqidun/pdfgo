@@ -337,7 +337,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	return paint, nil
 }
 
-// shadingStops 解析渐变源空间，DeviceN按仿射着色函数精确映射到备用空间
+// shadingStops 解析渐变源空间，专色按着色函数映射到备用空间
 // 入参: object 颜色空间, function 渐变函数, domain 输入区间
 // 返回: []GradientStop 分段, *ColorSpace 插值空间, *gradientFunction 原始函数, error 解析错误
 func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
@@ -359,6 +359,36 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 	if ok && len(array) > 0 && array[0] == Name("DeviceN") {
 		return p.reader.deviceNGradient(array, function, domain)
 	}
+	if ok && len(array) > 0 && array[0] == Name("Separation") {
+		if len(array) != 4 {
+			return nil, nil, nil, fmt.Errorf("invalid Separation color space")
+		}
+		name, ok := array[1].(Name)
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("invalid Separation colorant")
+		}
+		if name == "None" {
+			return nil, nil, nil, &UnsupportedError{Feature: "Separation None shading"}
+		}
+		space, err := p.reader.readColorSpace(array[2])
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		source, err := p.reader.readGradientFunction(function, 1, 0)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		tint, err := p.reader.readGradientFunction(array[3], space.Components(), 0)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		f := composeGradientFunction(source, tint)
+		var stops []GradientStop
+		if f.linear != nil {
+			stops = clipGradientValues(f.linear(domain), gradientUnitBounds(space.Components()))
+		}
+		return stops, space, f, nil
+	}
 	space, err := p.reader.readColorSpace(object)
 	if err != nil {
 		return nil, nil, nil, err
@@ -378,67 +408,11 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 // 入参: space 多色定义, function 渐变函数, domain 输入区间
 // 返回: []GradientStop 备用空间分段, *ColorSpace 备用空间, *gradientFunction 颜色函数, error 能力或格式错误
 func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	if len(space) != 4 && len(space) != 5 {
-		return nil, nil, nil, fmt.Errorf("invalid DeviceN color space")
-	}
-	value, err := r.Resolve(space[1])
+	alternate, input, output, expressions, err := r.readDeviceNAffine(space)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	names, ok := value.(Array)
-	if !ok || len(names) == 0 {
-		return nil, nil, nil, fmt.Errorf("invalid DeviceN colorants")
-	}
-	if len(names) > 4 {
-		return nil, nil, nil, &UnsupportedError{Feature: "DeviceN gradient component count"}
-	}
-	seen := map[Name]bool{}
-	for _, value := range names {
-		name, ok := value.(Name)
-		if !ok || seen[name] || name == "All" {
-			return nil, nil, nil, fmt.Errorf("invalid DeviceN colorant")
-		}
-		if name == "None" {
-			return nil, nil, nil, &UnsupportedError{Feature: "DeviceN gradient None colorant"}
-		}
-		seen[name] = true
-	}
-	alternate, err := r.readColorSpace(space[2])
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	value, err = r.Resolve(space[3])
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	stream, ok := value.(*Stream)
-	if !ok || stream.Dictionary["FunctionType"] != Integer(4) {
-		return nil, nil, nil, &UnsupportedError{Feature: "DeviceN gradient tint function"}
-	}
-	input, err := r.numberArray(stream.Dictionary["Domain"], 2*len(names))
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	output, err := r.numberArray(stream.Dictionary["Range"], 2*alternate.Components())
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	for index, bounds := range [][]float64{input, output} {
-		for i := 0; i < len(bounds); i += 2 {
-			if bounds[i] > bounds[i+1] || index == 0 && bounds[i] == bounds[i+1] {
-				return nil, nil, nil, fmt.Errorf("invalid DeviceN tint bounds")
-			}
-		}
-	}
-	data, err := stream.Decode()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	expressions, err := affineCalculator(data, len(names), alternate.Components())
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	source, err := r.readGradientFunction(function, len(names), 0)
+	source, err := r.readGradientFunction(function, len(input)/2, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}

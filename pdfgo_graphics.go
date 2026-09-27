@@ -173,13 +173,15 @@ type MarkedContentMark struct {
 
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
 // Warning非空时报告空Type3字形、缺失的ExtGState资源及未保留的内容语义，其他解析错误仍返回错误
+// OptionalContent可覆盖XObject的可选内容状态，缺省使用文档默认配置
 type Visitor struct {
-	Path          func(PathMark) error
-	Text          func(TextMark) error
-	Image         func(ImageMark) error
-	Group         func(GroupMark, func(Visitor) error) error
-	MarkedContent func(MarkedContentMark) error
-	Warning       func(Diagnostic)
+	Path            func(PathMark) error
+	Text            func(TextMark) error
+	Image           func(ImageMark) error
+	Group           func(GroupMark, func(Visitor) error) error
+	MarkedContent   func(MarkedContentMark) error
+	OptionalContent func(Object) (bool, error)
+	Warning         func(Diagnostic)
 }
 
 // graphicsState 保存图形和文字操作的当前状态
@@ -193,7 +195,7 @@ type graphicsState struct {
 	fillPatternBase, strokePatternBase                    Name
 	fillICC, strokeICC                                    *iccColorSpace
 	fillSeparation, strokeSeparation                      *separationSpace
-	fillDeviceN, strokeDeviceN                            *singleDeviceNSpace
+	fillDeviceN, strokeDeviceN                            *deviceNSpace
 }
 
 // pageInterpreter 按内容顺序解释页面或表单
@@ -586,6 +588,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		fill := op.Operator == "f" || op.Operator == "F" || op.Operator == "f*" || op.Operator == "B" || op.Operator == "B*" || op.Operator == "b" || op.Operator == "b*"
 		stroke := op.Operator == "S" || op.Operator == "s" || op.Operator == "B" || op.Operator == "B*" || op.Operator == "b" || op.Operator == "b*"
 		p.path.EvenOdd = op.Operator == "f*" || op.Operator == "B*" || op.Operator == "b*"
+		fill, stroke = p.visiblePaint(fill, stroke)
 		if (fill || stroke) && len(p.path.Segments) > 0 {
 			if err := p.validatePaint(fill, stroke); err != nil {
 				return err
@@ -684,7 +687,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 		var profile *iccColorSpace
 		var separation *separationSpace
-		var deviceN *singleDeviceNSpace
+		var deviceN *deviceNSpace
 		var patternBase Name
 		if name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK" && name != "Pattern" {
 			object, err := p.resource("ColorSpace", name)
@@ -708,7 +711,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 				}
 				name = "Pattern"
 			} else if space[0] == Name("DeviceN") {
-				deviceN, err = p.reader.readSingleDeviceN(space)
+				deviceN, err = p.reader.readDeviceN(space)
 				if err != nil {
 					return err
 				}
@@ -774,7 +777,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 		}
 		if deviceN != nil {
-			paint, err := deviceN.paint(1, p.state.style.RenderingIntent)
+			values := make([]float64, deviceN.components)
+			for i := range values {
+				values[i] = 1
+			}
+			paint, err := deviceN.paint(values, p.state.style.RenderingIntent)
 			if err != nil {
 				return err
 			}
@@ -802,11 +809,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 			operator = "G"
 		}
 		if space == "DeviceN" {
-			values, err := numbers(a, 1)
+			values, err := numbers(a, deviceN.components)
 			if err != nil {
 				return err
 			}
-			paint, err := deviceN.paint(values[0], p.state.style.RenderingIntent)
+			paint, err := deviceN.paint(values, p.state.style.RenderingIntent)
 			if err != nil {
 				return err
 			}
@@ -829,14 +836,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 				return err
 			}
 			if operator == "g" {
-				if separation.name != "None" {
-					paint.Alpha = p.state.style.Fill.Alpha
-				}
+				paint.Alpha = p.state.style.Fill.Alpha
 				p.state.style.Fill = paint
 			} else {
-				if separation.name != "None" {
-					paint.Alpha = p.state.style.Stroke.Alpha
-				}
+				paint.Alpha = p.state.style.Stroke.Alpha
 				p.state.style.Stroke = paint
 			}
 			return nil
@@ -1117,8 +1120,19 @@ func (p *pageInterpreter) showText(data []byte) error {
 		return fmt.Errorf("text without active font")
 	}
 	paintMode := p.state.mode % 4
-	if err := p.validatePaint(paintMode == 0 || paintMode == 2, paintMode == 1 || paintMode == 2); err != nil {
+	fill, stroke := p.visiblePaint(paintMode == 0 || paintMode == 2, paintMode == 1 || paintMode == 2)
+	if err := p.validatePaint(fill, stroke); err != nil {
 		return err
+	}
+	switch {
+	case fill && stroke:
+		paintMode = 2
+	case fill:
+		paintMode = 0
+	case stroke:
+		paintMode = 1
+	default:
+		paintMode = 3
 	}
 	glyphs, err := p.state.font.Decode(data)
 	if err != nil {
@@ -1143,7 +1157,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 		if p.visitor.Text == nil {
 			return fmt.Errorf("text visitor missing")
 		}
-		mark := TextMark{Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: p.state.mode}
+		mark := TextMark{Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: p.state.mode/4*4 + paintMode}
 		if mark.Mode >= 4 {
 			mark.Clip = &TextClip{Font: mark.Font, Glyphs: glyphs, Positions: positions, Matrix: mark.Matrix, Size: mark.Size, HorizontalScale: mark.HorizontalScale}
 			p.textClips = append(p.textClips, mark.Clip)
@@ -1154,6 +1168,19 @@ func (p *pageInterpreter) showText(data []byte) error {
 	}
 	p.textMatrix = p.textMatrix.Mul(Matrix{1, 0, 0, 1, advance.X, advance.Y})
 	return nil
+}
+
+// visiblePaint 排除None分色的着色操作，不改变图形状态中的透明度或裁剪
+// 入参: fill 填充标志, stroke 描边标志
+// 返回: bool 是否填充, bool 是否描边
+func (p *pageInterpreter) visiblePaint(fill, stroke bool) (bool, bool) {
+	if s := p.state.fillSeparation; p.state.fillSpace == "Separation" && s != nil && s.name == "None" {
+		fill = false
+	}
+	if s := p.state.strokeSeparation; p.state.strokeSpace == "Separation" && s != nil && s.name == "None" {
+		stroke = false
+	}
+	return fill, stroke
 }
 
 // resource 从当前作用域读取资源引用
@@ -1195,6 +1222,10 @@ func (p *pageInterpreter) xobject(a []Object) error {
 		return fmt.Errorf("invalid XObject stream")
 	}
 	if stream.Dictionary["Subtype"] == Name("Image") {
+		visible, err := p.optionalVisible(stream.Dictionary["OC"])
+		if err != nil || !visible {
+			return err
+		}
 		image, err := p.reader.ReadImage(stream)
 		if err != nil {
 			return err
@@ -1203,6 +1234,9 @@ func (p *pageInterpreter) xobject(a []Object) error {
 			return &UnsupportedError{Feature: "masked image in isolated group"}
 		}
 		if image.ImageMask {
+			if fill, _ := p.visiblePaint(true, false); !fill {
+				return nil
+			}
 			if err := p.validatePaint(true, false); err != nil {
 				return err
 			}
@@ -1210,6 +1244,7 @@ func (p *pageInterpreter) xobject(a []Object) error {
 		if p.visitor.Image == nil {
 			return fmt.Errorf("image visitor missing")
 		}
+		image.Warning = p.visitor.Warning
 		return p.visitor.Image(ImageMark{image, p.state.matrix, p.state.style})
 	}
 	if stream.Dictionary["Subtype"] != Name("Form") {
@@ -1238,10 +1273,12 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	if p.depth >= 32 {
 		return fmt.Errorf("form recursion limit exceeded")
 	}
-	for _, key := range []Name{"Ref", "OC"} {
-		if stream.Dictionary[key] != nil {
-			return &UnsupportedError{Feature: fmt.Sprintf("form field %q", key)}
-		}
+	visible, err := p.optionalVisible(stream.Dictionary["OC"])
+	if err != nil || !visible {
+		return err
+	}
+	if stream.Dictionary["Ref"] != nil {
+		return &UnsupportedError{Feature: "form field \"Ref\""}
 	}
 	child := *p
 	var groupMark *GroupMark

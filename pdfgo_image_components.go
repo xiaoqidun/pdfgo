@@ -14,15 +14,79 @@
 
 package pdfgo
 
-import "image"
+import (
+	"fmt"
+	"image"
+)
 
 // ImageComponents 保存应用Decode、索引映射及遮罩后的16位非预乘颜色分量
 // Pix逐行交错保存Space.Components()个颜色分量和一个透明度分量
 // 模板图像保留灰度样本，填充颜色及反向覆盖由调用方应用
+// Colorants和Tints保留专色名称及逐像素浓度，供支持相应色料的输出设备使用
 type ImageComponents struct {
-	Space *ColorSpace
-	Rect  image.Rectangle
-	Pix   []uint16
+	Space     *ColorSpace
+	Rect      image.Rectangle
+	Pix       []uint16
+	Colorants []Name
+	Tints     []uint16
+}
+
+// Colorants 读取图像或索引基础空间的专色名称，设备色返回空列表
+// 返回: []Name 色料名称, error 颜色空间格式错误
+func (i *Image) Colorants() ([]Name, error) {
+	object := i.ColorSpace
+	if a, ok := object.(Array); ok && len(a) == 4 && a[0] == Name("Indexed") {
+		var err error
+		object, err = i.reader.Resolve(a[1])
+		if err != nil {
+			return nil, err
+		}
+	}
+	a, ok := object.(Array)
+	if !ok || len(a) == 0 {
+		return nil, nil
+	}
+	if a[0] == Name("Separation") && len(a) == 4 {
+		name, ok := a[1].(Name)
+		if !ok {
+			return nil, fmt.Errorf("invalid Separation colorant")
+		}
+		return []Name{name}, nil
+	}
+	if a[0] != Name("DeviceN") {
+		return nil, nil
+	}
+	if len(a) != 4 && len(a) != 5 {
+		return nil, fmt.Errorf("invalid DeviceN color space")
+	}
+	object, err := i.reader.Resolve(a[1])
+	if err != nil {
+		return nil, err
+	}
+	names, ok := object.(Array)
+	if !ok || len(names) == 0 {
+		return nil, fmt.Errorf("invalid DeviceN colorants")
+	}
+	result := make([]Name, len(names))
+	for n, v := range names {
+		name, ok := v.(Name)
+		if !ok {
+			return nil, fmt.Errorf("invalid DeviceN colorant")
+		}
+		result[n] = name
+	}
+	return result, nil
+}
+
+// TintsAt 返回原始专色的已映射浓度，区域外或无专色时返回nil
+// 入参: x 横坐标, y 纵坐标
+// 返回: []uint16 非预乘浓度，返回切片只读
+func (i *ImageComponents) TintsAt(x, y int) []uint16 {
+	if len(i.Colorants) == 0 || !(image.Point{X: x, Y: y}).In(i.Rect) {
+		return nil
+	}
+	offset := ((y-i.Rect.Min.Y)*i.Rect.Dx() + x - i.Rect.Min.X) * len(i.Colorants)
+	return i.Tints[offset : offset+len(i.Colorants)]
 }
 
 // ValuesAt 返回像素的单位颜色分量及透明度，区域外返回透明值

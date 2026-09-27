@@ -31,6 +31,7 @@ import (
 var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 
 // Image 保存图像原始属性，颜色空间和遮罩保持为PDF对象
+// Warning非空时允许按声明尺寸读取含多余样本的图像，并报告恢复原因
 type Image struct {
 	Width            int
 	Height           int
@@ -42,6 +43,7 @@ type Image struct {
 	Mask             Object
 	SoftMask         Object
 	Stream           *Stream
+	Warning          func(Diagnostic)
 	reader           *Reader
 }
 
@@ -200,7 +202,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	var calibrated *calRGBSpace
 	var profile *iccColorSpace
 	var separation *separationSpace
-	var deviceN *singleDeviceNSpace
+	var deviceN *deviceNSpace
 	switch i.ColorSpace {
 	case Name("DeviceGray"):
 		components = 1
@@ -314,6 +316,16 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 			return nil, &UnsupportedError{Feature: "image source color components"}
 		}
 		target.Rect = bounds
+		target.Colorants, err = i.Colorants()
+		if err != nil {
+			return nil, err
+		}
+		if len(target.Colorants) > 0 {
+			if len(target.Colorants) > 4 || uint64(bounds.Dx()) > uint64(^uint(0)>>1)/uint64(2*len(target.Colorants))/uint64(bounds.Dy()) {
+				return nil, fmt.Errorf("image colorant dimensions exceed platform integer range")
+			}
+			target.Tints = make([]uint16, bounds.Dx()*bounds.Dy()*len(target.Colorants))
+		}
 		stride := target.Space.Components() + 1
 		if uint64(bounds.Dx()) > uint64(^uint(0)>>1)/uint64(2*stride)/uint64(bounds.Dy()) {
 			return nil, fmt.Errorf("image component dimensions exceed platform integer range")
@@ -361,6 +373,17 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 			}
 			if components == 1 {
 				values[1], values[2] = values[0], values[0]
+			}
+			if target != nil && len(target.Colorants) > 0 {
+				tints := values
+				if palette != nil {
+					index := int(math.Max(0, math.Min(float64(len(palette.tints)-1), math.Round(values[0]))))
+					tints = palette.tints[index]
+				}
+				offset := (y*bounds.Dx() + x) * len(target.Colorants)
+				for c := range target.Colorants {
+					target.Tints[offset+c] = uint16(math.Round(math.Max(0, math.Min(1, tints[c])) * 65535))
+				}
 			}
 			if deviceN != nil {
 				values = deviceN.values(values[0])
@@ -466,6 +489,7 @@ func deviceImage(source image.Image) *image.NRGBA64 {
 type imagePalette struct {
 	space  *ColorSpace
 	values [][4]float64
+	tints  [][4]float64
 	colors []color.NRGBA64
 }
 
@@ -492,6 +516,7 @@ func (i *Image) palette() (*imagePalette, error) {
 	components := 0
 	var calibrated *calRGBSpace
 	var profile *iccColorSpace
+	var deviceN *deviceNSpace
 	switch base {
 	case Name("DeviceGray"):
 		components = 1
@@ -500,7 +525,13 @@ func (i *Image) palette() (*imagePalette, error) {
 	case Name("DeviceCMYK"):
 		components = 4
 	default:
-		if space, ok := base.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
+		if space, ok := base.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
+			deviceN, err = i.reader.readDeviceN(space)
+			if err != nil {
+				return nil, err
+			}
+			components = deviceN.components
+		} else if space, ok := base.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
 			profile, err = i.reader.readICCColorSpace(space)
 			if err != nil {
 				return nil, err
@@ -543,7 +574,12 @@ func (i *Image) palette() (*imagePalette, error) {
 	}
 	palette := make([]color.NRGBA64, int(n+1))
 	result := &imagePalette{colors: palette, values: make([][4]float64, len(palette))}
-	if calibrated == nil {
+	if deviceN != nil {
+		result.tints = make([][4]float64, len(palette))
+	}
+	if deviceN != nil {
+		result.space = deviceN.alternate
+	} else if calibrated == nil {
 		result.space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
 	}
 	intent, _ := i.Stream.Dictionary["Intent"].(Name)
@@ -551,6 +587,17 @@ func (i *Image) palette() (*imagePalette, error) {
 		v := data[index*components:]
 		for c := 0; c < components; c++ {
 			result.values[index][c] = float64(v[c]) / 255
+		}
+		if deviceN != nil {
+			result.tints[index] = result.values[index]
+			values := deviceN.values(result.values[index][:components]...)
+			result.values[index] = values
+			rgb, err := deviceN.alternate.RGB(values[:deviceN.alternate.Components()], intent)
+			if err != nil {
+				return nil, err
+			}
+			palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
+			continue
 		}
 		if profile != nil {
 			values := result.values[index]
@@ -777,7 +824,19 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 			return nil, err
 		}
 	case "JPXDecode":
-		if i.ColorSpace == Name("DeviceCMYK") {
+		cmyk := i.ColorSpace == Name("DeviceCMYK")
+		if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
+			object, err := i.reader.Resolve(space[1])
+			if err != nil {
+				return nil, err
+			}
+			profile, ok := object.(*Stream)
+			if !ok {
+				return nil, fmt.Errorf("invalid ICC profile stream")
+			}
+			cmyk = profile.Dictionary["N"] == Integer(4)
+		}
+		if cmyk {
 			return i.jpxCMYKSamples(data)
 		}
 		result, _, err = image.Decode(bytes.NewReader(data))
@@ -925,7 +984,11 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	if expected < uint64(len(data)) {
 		for _, value := range data[expected:] {
 			if value != 0 {
-				return nil, fmt.Errorf("image sample size mismatch")
+				if i.Warning == nil {
+					return nil, fmt.Errorf("image sample size mismatch")
+				}
+				i.Warning(Diagnostic{Message: fmt.Sprintf("image has %d excess sample bytes; decoded using declared dimensions %dx%d", uint64(len(data))-expected, i.Width, i.Height)})
+				break
 			}
 		}
 		data = data[:expected]

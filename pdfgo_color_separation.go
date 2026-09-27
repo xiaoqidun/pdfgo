@@ -26,7 +26,7 @@ type separationSpace struct {
 	lab       *labSpace
 	icc       *iccRGBSpace
 	calRGB    *calRGBSpace
-	transform *tintFunction
+	transform *gradientFunction
 }
 
 // tintFunction 保存单输入函数的定义及采样数据
@@ -93,7 +93,7 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	default:
 		return nil, &UnsupportedError{Feature: "Separation alternate color space"}
 	}
-	transform, err := r.readTintFunction(space[3], channels)
+	transform, err := r.readGradientFunction(space[3], channels, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -281,20 +281,20 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 	if s.name == "All" {
 		return Paint{CMYK: &[4]float64{tint, tint, tint, tint}}, nil
 	}
-	values := s.transform.color(tint)
+	values := s.transform.value(tint)
 	paint := Paint{}
 	switch s.alternate {
 	case "DeviceGray":
 		paint.RGB = [3]float64{values[0], values[0], values[0]}
 	case "DeviceRGB":
-		copy(paint.RGB[:], values)
+		copy(paint.RGB[:], values[:])
 	case "DeviceCMYK":
 		paint.CMYK = &[4]float64{values[0], values[1], values[2], values[3]}
 	case "Lab":
 		color := s.lab.color(values[0], values[1], values[2])
 		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}
 	case "ICCBased":
-		return (&iccColorSpace{rgb: s.icc}).paint(values, intent)
+		return (&iccColorSpace{rgb: s.icc}).paint(values[:3], intent)
 	case "CalRGB":
 		color := s.calRGB.color(values[0], values[1], values[2])
 		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}

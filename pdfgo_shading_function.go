@@ -26,6 +26,34 @@ type gradientFunction struct {
 	linear func([2]float64) []GradientStop
 }
 
+// composeGradientFunction 将单分量渐变输入着色函数，保留分段、跳变及非线性计算
+// 入参: source 浓度函数, tint 着色函数
+// 返回: *gradientFunction 复合颜色函数
+func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
+	f := &gradientFunction{value: func(x float64) [4]float64 {
+		return tint.value(math.Max(0, math.Min(1, source.value(x)[0])))
+	}}
+	if source.linear != nil && tint.linear != nil {
+		f.linear = func(interval [2]float64) []GradientStop {
+			stops := clipGradientValues(source.linear(interval), []float64{0, 1})
+			var result []GradientStop
+			for i, stop := range stops {
+				if i > 0 && stops[i-1].Position < stop.Position {
+					previous := stops[i-1]
+					for _, mapped := range tint.linear([2]float64{previous.Values[0], stop.Values[0]}) {
+						mapped.Position = previous.Position + mapped.Position*(stop.Position-previous.Position)
+						result = append(result, mapped)
+					}
+				} else {
+					result = append(result, GradientStop{Position: stop.Position, Values: tint.value(stop.Values[0])})
+				}
+			}
+			return slices.Compact(result)
+		}
+	}
+	return f
+}
+
 // deviceNGradientFunction 在源函数后应用多色仿射映射，保留非线性和范围截断
 // 入参: source 源函数, input 着色输入区间, output 着色输出区间, expressions 仿射输出表达式
 // 返回: *gradientFunction 备用空间函数
