@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"strings"
 )
@@ -27,9 +28,17 @@ var ErrDestinationNotFound = errors.New("destination not found")
 
 // Annotation 保存注解类型、区域及原始字典，不执行动作
 type Annotation struct {
+	Reference  Reference
 	Subtype    Name
 	Rect       Rectangle
 	Dictionary Dictionary
+}
+
+// PopupAnnotation 保存弹出批注及其父批注引用，Dictionary中的文字信息已按父批注覆盖
+type PopupAnnotation struct {
+	Annotation
+	Parent Reference
+	Open   bool
 }
 
 // Destination 保存文档内目标，空参数表示保持阅读器当前值
@@ -37,6 +46,59 @@ type Destination struct {
 	Page       Reference
 	Mode       Name
 	Parameters Array
+}
+
+// ReadPopupAnnotation 读取弹出批注，继承父批注的Contents、M、C和T，不执行界面操作
+// 入参: object 弹出批注字典或间接引用
+// 返回: PopupAnnotation 弹出批注信息, error 解析错误
+func (r *Reader) ReadPopupAnnotation(object Object) (PopupAnnotation, error) {
+	var popup PopupAnnotation
+	value, err := r.Resolve(object)
+	if err != nil {
+		return popup, err
+	}
+	dict, ok := value.(Dictionary)
+	if !ok || dict["Subtype"] != Name("Popup") {
+		return popup, fmt.Errorf("invalid popup annotation")
+	}
+	popup.Reference, _ = object.(Reference)
+	popup.Subtype = "Popup"
+	popup.Rect, err = r.rectangle(dict["Rect"])
+	if err != nil {
+		return popup, err
+	}
+	popup.Dictionary = maps.Clone(dict)
+	if value, err = r.Resolve(dict["Open"]); err != nil {
+		return popup, err
+	} else if value != nil {
+		open, ok := value.(Boolean)
+		if !ok {
+			return popup, fmt.Errorf("invalid popup open state")
+		}
+		popup.Open = bool(open)
+	}
+	if dict["Parent"] != nil {
+		parent, ok := dict["Parent"].(Reference)
+		if !ok {
+			return popup, fmt.Errorf("invalid popup parent reference")
+		}
+		value, err = r.Resolve(parent)
+		if err != nil {
+			return popup, err
+		}
+		parentDict, ok := value.(Dictionary)
+		if !ok || parentDict["Subtype"] == Name("Popup") {
+			return popup, fmt.Errorf("invalid popup parent annotation")
+		}
+		popup.Parent = parent
+		for _, key := range []Name{"Contents", "M", "C", "T"} {
+			delete(popup.Dictionary, key)
+			if value := parentDict[key]; value != nil {
+				popup.Dictionary[key] = value
+			}
+		}
+	}
+	return popup, nil
 }
 
 // Annotations 按页面顺序读取注解，外观和动作由调用方解释
@@ -68,7 +130,8 @@ func (p *Page) Annotations() ([]Annotation, error) {
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, Annotation{Subtype: subtype, Rect: box, Dictionary: dict})
+		reference, _ := object.(Reference)
+		result = append(result, Annotation{Reference: reference, Subtype: subtype, Rect: box, Dictionary: dict})
 	}
 	return result, nil
 }
@@ -79,6 +142,10 @@ func (p *Page) Annotations() ([]Annotation, error) {
 func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annotation Annotation, visitor Visitor) error {
 	if page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
+	}
+	if annotation.Subtype == "Popup" {
+		_, err := r.ReadPopupAnnotation(annotation.Dictionary)
+		return err
 	}
 	value, err := r.Resolve(annotation.Dictionary["AP"])
 	if err != nil {
