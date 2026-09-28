@@ -719,7 +719,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if err != nil {
 				return err
 			}
-			object, err = p.reader.Resolve(object)
+			object, err = p.reader.resolveColorSpace(object)
 			if err != nil {
 				return err
 			}
@@ -1545,6 +1545,15 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 		if key == "TR" && transfer != nil {
 			continue
 		}
+		if key == "BG" || key == "UCR" {
+			replacement, err := p.reader.Resolve(dict[key+"2"])
+			if err != nil {
+				return err
+			}
+			if replacement != nil {
+				continue
+			}
+		}
 		value, err = p.reader.Resolve(value)
 		if err != nil {
 			return err
@@ -1586,7 +1595,14 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				return err
 			}
 		case "TR", "TR2":
-			if value != Name("Identity") && !(key == "TR2" && value == Name("Default")) {
+			if key == "TR2" && value == Name("Default") {
+				continue
+			}
+			identity, err := p.reader.identityTransfer(value)
+			if err != nil {
+				return err
+			}
+			if !identity {
 				return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
 			}
 		case "Font":

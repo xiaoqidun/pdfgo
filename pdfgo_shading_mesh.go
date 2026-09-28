@@ -42,6 +42,7 @@ type MeshGradient struct {
 	Intent    Name
 	function  *gradientFunction
 	tint      *deviceNSpace
+	lab       *labSpace
 }
 
 // meshBits 按高位优先读取曲面网格的紧凑数值
@@ -52,7 +53,7 @@ type meshBits struct {
 
 // UsesFunction 判断颜色分量是否需在插值后经过函数变换
 // 返回: bool 是否使用颜色函数
-func (g *MeshGradient) UsesFunction() bool { return g.function != nil || g.tint != nil }
+func (g *MeshGradient) UsesFunction() bool { return g.function != nil || g.tint != nil || g.lab != nil }
 
 // PointAt 计算单位参数域内的双三次曲面坐标
 // 入参: u 横向参数, v 纵向参数
@@ -106,6 +107,10 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 		if err != nil {
 			return values, err
 		}
+	}
+	if g.lab != nil {
+		c := g.lab.color(values[0], values[1], values[2])
+		values = [4]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
 	}
 	for c, value := range values {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
@@ -185,6 +190,10 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		}
 	}
 	g := &MeshGradient{Intent: p.state.style.RenderingIntent, Matrix: matrix}
+	object, err = p.reader.resolveColorSpace(object)
+	if err != nil {
+		return Paint{}, err
+	}
 	components := 0
 	if array, ok := object.(Array); ok && len(array) > 0 && array[0] == Name("DeviceN") {
 		g.tint, err = p.reader.readDeviceN(array)
@@ -192,6 +201,26 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 			return Paint{}, err
 		}
 		g.Space, components = g.tint.alternate, g.tint.components
+	} else if array, ok := object.(Array); ok && len(array) > 0 && array[0] == Name("Separation") {
+		separation, err := p.reader.readSeparation(array)
+		if err != nil {
+			return Paint{}, err
+		}
+		if separation.name == "None" {
+			return Paint{}, &UnsupportedError{Feature: "Separation None mesh"}
+		}
+		alternate, lab, err := p.reader.readDeviceNAlternate(array[2])
+		if err != nil {
+			return Paint{}, err
+		}
+		g.tint = &deviceNSpace{alternate: alternate, lab: lab, transform: separation.transform, components: 1}
+		g.Space, components = alternate, 1
+	} else if array, ok := object.(Array); ok && len(array) > 0 && array[0] == Name("Lab") {
+		g.lab, err = p.reader.readLab(array)
+		if err != nil {
+			return Paint{}, err
+		}
+		g.Space, components = &ColorSpace{Model: "DeviceRGB"}, 3
 	} else {
 		g.Space, err = p.reader.readColorSpace(object)
 		if err != nil {

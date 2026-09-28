@@ -223,11 +223,38 @@ func (r *Reader) readBlendingSpace(value Object) (*ColorSpace, error) {
 	return s, nil
 }
 
+// resolveColorSpace 解析颜色空间及数组首项的间接引用，不修改共享数组
+// 入参: value 颜色空间对象
+// 返回: Object 已解析定义, error 引用或类型错误
+func (r *Reader) resolveColorSpace(value Object) (Object, error) {
+	value, err := r.Resolve(value)
+	if err != nil {
+		return nil, err
+	}
+	array, ok := value.(Array)
+	if !ok || len(array) == 0 {
+		return value, nil
+	}
+	if _, ok := array[0].(Name); ok {
+		return value, nil
+	}
+	head, err := r.Resolve(array[0])
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := head.(Name); !ok {
+		return nil, fmt.Errorf("invalid color space family")
+	}
+	array = append(Array(nil), array...)
+	array[0] = head
+	return array, nil
+}
+
 // readColorSpace 解析设备、校准或ICC颜色空间，普通着色不要求逆变换
 // 入参: value 颜色空间定义
 // 返回: *ColorSpace 颜色空间, error 格式或能力错误
 func (r *Reader) readColorSpace(value Object) (*ColorSpace, error) {
-	value, err := r.Resolve(value)
+	value, err := r.resolveColorSpace(value)
 	if err != nil {
 		return nil, err
 	}

@@ -56,7 +56,7 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid Separation colorant")
 	}
-	object, err := r.Resolve(space[2])
+	object, err := r.resolveColorSpace(space[2])
 	if err != nil {
 		return nil, err
 	}

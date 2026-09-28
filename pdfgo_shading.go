@@ -354,7 +354,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 // 入参: object 颜色空间, function 渐变函数, domain 输入区间
 // 返回: []GradientStop 分段, *ColorSpace 插值空间, *gradientFunction 原始函数, error 解析错误
 func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	object, err := p.reader.Resolve(object)
+	object, err := p.reader.resolveColorSpace(object)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -363,7 +363,7 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		object, err = p.reader.Resolve(object)
+		object, err = p.reader.resolveColorSpace(object)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -376,14 +376,18 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 		if len(array) != 4 {
 			return nil, nil, nil, fmt.Errorf("invalid Separation color space")
 		}
-		name, ok := array[1].(Name)
+		colorant, err := p.reader.Resolve(array[1])
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		name, ok := colorant.(Name)
 		if !ok {
 			return nil, nil, nil, fmt.Errorf("invalid Separation colorant")
 		}
 		if name == "None" {
 			return nil, nil, nil, &UnsupportedError{Feature: "Separation None shading"}
 		}
-		space, err := p.reader.readColorSpace(array[2])
+		space, lab, err := p.reader.readDeviceNAlternate(array[2])
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -396,6 +400,17 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 			return nil, nil, nil, err
 		}
 		f := composeGradientFunction(source, tint)
+		if lab != nil {
+			composed := f
+			f = &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+				values, err := composed.evaluate(x)
+				if err != nil {
+					return values, err
+				}
+				c := lab.color(values[0], values[1], values[2])
+				return [4]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}, nil
+			}}
+		}
 		var stops []GradientStop
 		if f.linear != nil {
 			stops = clipGradientValues(f.linear(domain), gradientUnitBounds(space.Components()))
@@ -421,7 +436,7 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 // 入参: space 多色定义, function 渐变函数, domain 输入区间
 // 返回: []GradientStop 备用空间分段, *ColorSpace 备用空间, *gradientFunction 颜色函数, error 能力或格式错误
 func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	tint, err := r.readMultiDeviceN(space)
+	tint, err := r.readDeviceN(space)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -436,8 +451,12 @@ func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64
 		}
 		return tint.values(values[:tint.components]...)
 	}}
-	if tint.expressions != nil {
+	if tint.expressions != nil && tint.lab == nil {
 		mapped = deviceNGradientFunction(source, tint.input, tint.output, tint.expressions)
+	}
+	if tint.transform != nil && tint.lab == nil {
+		composed := composeGradientFunction(source, tint.transform)
+		mapped.linear = composed.linear
 	}
 	var stops []GradientStop
 	if mapped.linear != nil {

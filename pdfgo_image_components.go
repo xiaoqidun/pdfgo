@@ -37,7 +37,7 @@ func (i *Image) Colorants() ([]Name, error) {
 	object := i.ColorSpace
 	if a, ok := object.(Array); ok && len(a) == 4 && a[0] == Name("Indexed") {
 		var err error
-		object, err = i.reader.Resolve(a[1])
+		object, err = i.reader.resolveColorSpace(a[1])
 		if err != nil {
 			return nil, err
 		}
@@ -47,7 +47,11 @@ func (i *Image) Colorants() ([]Name, error) {
 		return nil, nil
 	}
 	if a[0] == Name("Separation") && len(a) == 4 {
-		name, ok := a[1].(Name)
+		value, err := i.reader.Resolve(a[1])
+		if err != nil {
+			return nil, err
+		}
+		name, ok := value.(Name)
 		if !ok {
 			return nil, fmt.Errorf("invalid Separation colorant")
 		}
@@ -69,6 +73,10 @@ func (i *Image) Colorants() ([]Name, error) {
 	}
 	result := make([]Name, len(names))
 	for n, v := range names {
+		v, err = i.reader.Resolve(v)
+		if err != nil {
+			return nil, err
+		}
 		name, ok := v.(Name)
 		if !ok {
 			return nil, fmt.Errorf("invalid DeviceN colorant")

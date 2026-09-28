@@ -216,7 +216,7 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	if mask && bits != 1 {
 		return nil, fmt.Errorf("invalid stencil component depth")
 	}
-	space, err := r.Resolve(dict["ColorSpace"])
+	space, err := r.resolveColorSpace(dict["ColorSpace"])
 	if err != nil {
 		return nil, err
 	}
@@ -889,7 +889,7 @@ func (i *Image) palette() (*imagePalette, error) {
 	if len(array) != 4 || array[0] != Name("Indexed") {
 		return nil, &UnsupportedError{Feature: "image color space"}
 	}
-	base, err := i.reader.Resolve(array[1])
+	base, err := i.reader.resolveColorSpace(array[1])
 	if err != nil {
 		return nil, err
 	}
