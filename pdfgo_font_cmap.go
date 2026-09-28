@@ -19,28 +19,42 @@ import (
 	"fmt"
 )
 
-// fontCmap 读取指定TrueType字符表，不把ToUnicode当作字形索引
-// 入参: data 字体数据, symbolic 是否为符号字体
-// 返回: []byte 字符映射表, Name 映射编码, error 解析错误
-func fontCmap(data []byte, symbolic bool) ([]byte, Name, error) {
+// fontTable 读取SFNT字体的指定表并校验目录与数据范围
+// 入参: data 字体数据, tag 表标签
+// 返回: []byte 表数据或空值, error 解析错误
+func fontTable(data []byte, tag string) ([]byte, error) {
 	if len(data) < 12 {
-		return nil, "", fmt.Errorf("truncated TrueType font")
+		return nil, fmt.Errorf("truncated SFNT font")
 	}
 	count := int(binary.BigEndian.Uint16(data[4:6]))
 	if count > (len(data)-12)/16 {
-		return nil, "", fmt.Errorf("invalid TrueType directory")
+		return nil, fmt.Errorf("invalid SFNT directory")
 	}
-	var cmap []byte
+	var table []byte
 	for n := 0; n < count; n++ {
 		record := data[12+n*16:]
-		if string(record[:4]) != "cmap" {
+		if string(record[:4]) != tag {
 			continue
 		}
 		offset, length := uint64(binary.BigEndian.Uint32(record[8:])), uint64(binary.BigEndian.Uint32(record[12:]))
 		if offset+length > uint64(len(data)) {
-			return nil, "", fmt.Errorf("invalid TrueType cmap")
+			return nil, fmt.Errorf("invalid SFNT %s table", tag)
 		}
-		cmap = data[offset : offset+length]
+		if table != nil {
+			return nil, fmt.Errorf("duplicate SFNT %s table", tag)
+		}
+		table = data[offset : offset+length]
+	}
+	return table, nil
+}
+
+// fontCmap 读取指定TrueType字符表，不把ToUnicode当作字形索引
+// 入参: data 字体数据, symbolic 是否为符号字体
+// 返回: []byte 字符映射表, Name 映射编码, error 解析错误
+func fontCmap(data []byte, symbolic bool) ([]byte, Name, error) {
+	cmap, err := fontTable(data, "cmap")
+	if err != nil {
+		return nil, "", err
 	}
 	if len(cmap) < 4 {
 		return nil, "", fmt.Errorf("missing TrueType cmap")
@@ -101,12 +115,12 @@ func fontCmap(data []byte, symbolic bool) ([]byte, Name, error) {
 	format := binary.BigEndian.Uint16(table)
 	var length uint64
 	switch format {
-	case 0, 4, 6:
+	case 0, 2, 4, 6:
 		if len(table) < 4 {
 			return nil, "", fmt.Errorf("truncated cmap")
 		}
 		length = uint64(binary.BigEndian.Uint16(table[2:]))
-	case 12:
+	case 10, 12, 13:
 		if len(table) < 8 {
 			return nil, "", fmt.Errorf("truncated cmap")
 		}
@@ -147,6 +161,55 @@ func cmapGlyph(table []byte, code uint32) (uint16, error) {
 		if code >= first && code-first < count {
 			return u16(10 + int(code-first)*2), nil
 		}
+	case 2:
+		if len(table) < 526 {
+			return 0, fmt.Errorf("truncated cmap format 2")
+		}
+		if code > 65535 {
+			return 0, nil
+		}
+		key := int(u16(6 + int(code>>8)*2))
+		if code < 256 {
+			if u16(6+int(code)*2) != 0 {
+				return 0, nil
+			}
+			key = 0
+		} else if key == 0 {
+			return 0, nil
+		}
+		if key%8 != 0 || 526+key > len(table) {
+			return 0, fmt.Errorf("invalid cmap subheader")
+		}
+		address := 518 + key
+		first, count := uint32(u16(address)), uint32(u16(address+2))
+		if first+count > 256 {
+			return 0, fmt.Errorf("invalid cmap byte range")
+		}
+		low := code & 255
+		if low < first || low-first >= count {
+			return 0, nil
+		}
+		offset := address + 6 + int(u16(address+6)) + int(low-first)*2
+		if offset+2 > len(table) {
+			return 0, fmt.Errorf("invalid cmap glyph offset")
+		}
+		glyph := u16(offset)
+		if glyph != 0 {
+			glyph += u16(address + 4)
+		}
+		return glyph, nil
+	case 10:
+		if len(table) < 20 {
+			return 0, fmt.Errorf("truncated cmap format 10")
+		}
+		first := uint64(binary.BigEndian.Uint32(table[12:]))
+		count := uint64(binary.BigEndian.Uint32(table[16:]))
+		if count > uint64((len(table)-20)/2) || first+count > 1<<32 {
+			return 0, fmt.Errorf("invalid cmap glyph range")
+		}
+		if uint64(code) >= first && uint64(code)-first < count {
+			return u16(20 + int(uint64(code)-first)*2), nil
+		}
 	case 4:
 		if len(table) < 16 {
 			return 0, fmt.Errorf("truncated cmap format 4")
@@ -179,7 +242,7 @@ func cmapGlyph(table []byte, code uint32) (uint16, error) {
 			}
 			return glyph, nil
 		}
-	case 12:
+	case 12, 13:
 		if len(table) < 16 {
 			return 0, fmt.Errorf("truncated cmap format 12")
 		}
@@ -194,7 +257,10 @@ func cmapGlyph(table []byte, code uint32) (uint16, error) {
 				return 0, fmt.Errorf("reversed cmap range")
 			}
 			if code >= start && code <= end {
-				id := uint64(glyph) + uint64(code-start)
+				id := uint64(glyph)
+				if u16(0) == 12 {
+					id += uint64(code - start)
+				}
 				if id > 65535 {
 					return 0, fmt.Errorf("glyph index overflow")
 				}

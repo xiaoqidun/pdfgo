@@ -185,6 +185,13 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		value = Dictionary{"N": stream}
 	}
+	if value == nil && (annotation.Subtype == "Underline" || annotation.Subtype == "StrikeOut" || annotation.Subtype == "Squiggly") {
+		stream, err := r.textMarkupAppearance(annotation)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
+	}
 	if value == nil && (annotation.Subtype == "Square" || annotation.Subtype == "Circle" || annotation.Subtype == "Polygon" || annotation.Subtype == "PolyLine") {
 		stream, err := r.shapeAppearance(annotation)
 		if err != nil {

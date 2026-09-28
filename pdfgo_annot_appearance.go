@@ -272,6 +272,75 @@ func (r *Reader) inkAppearance(annotation Annotation) (*Stream, error) {
 	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}, "Resources": resources}, Data: []byte(content.String()), reader: r}, nil
 }
 
+// textMarkupAppearance 按文字四边形生成下划线、删除线或波浪线外观
+// 入参: annotation 文字标记注解
+// 返回: *Stream 外观流, error 坐标或颜色错误
+func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
+	value, err := r.Resolve(annotation.Dictionary["QuadPoints"])
+	if err != nil {
+		return nil, err
+	}
+	array, ok := value.(Array)
+	if !ok || len(array) == 0 || len(array)%8 != 0 {
+		return nil, fmt.Errorf("invalid text markup quadrilaterals")
+	}
+	values, err := r.numberArray(array, len(array))
+	if err != nil {
+		return nil, err
+	}
+	border, err := r.readAnnotationBorder(annotation)
+	if err != nil {
+		return nil, err
+	}
+	var content strings.Builder
+	visible, err := r.writeAnnotationColor(&content, border.color, true)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < len(values); i += 8 {
+		points := [4]Point{}
+		for j := range points {
+			points[j] = Point{values[i+j*2], values[i+j*2+1]}
+		}
+		a, b, c, d := points[0], points[1], points[2], points[3]
+		cross := func(a, b, c Point) float64 { return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X) }
+		if cross(a, b, c) < 0 && cross(b, c, d) > 0 {
+			a, b, c, d = c, d, b, a
+		}
+		if cross(a, b, c) <= 0 || cross(b, c, d) <= 0 || cross(c, d, a) <= 0 || cross(d, a, b) <= 0 {
+			return nil, fmt.Errorf("invalid text markup quadrilateral")
+		}
+		dx, dy := b.X-a.X, b.Y-a.Y
+		length := math.Hypot(dx, dy)
+		height := (cross(a, b, c) + cross(a, b, d)) / (2 * length)
+		width := math.Min(1, height/12)
+		if math.IsNaN(height) || math.IsInf(height, 0) || math.IsInf(length, 0) || width <= 0 {
+			return nil, fmt.Errorf("invalid text markup dimensions")
+		}
+		if !visible {
+			continue
+		}
+		fmt.Fprintf(&content, "%g w\n", width)
+		if annotation.Subtype == "StrikeOut" {
+			a, b = Point{(a.X + d.X) / 2, (a.Y + d.Y) / 2}, Point{(b.X + c.X) / 2, (b.Y + c.Y) / 2}
+		}
+		fmt.Fprintf(&content, "%g %g m\n", a.X, a.Y)
+		if annotation.Subtype == "Squiggly" {
+			steps := math.Ceil(length / (2 * width))
+			if math.IsInf(steps, 0) || steps >= float64(int(^uint(0)>>1)) {
+				return nil, fmt.Errorf("text markup wave count overflow")
+			}
+			for j := 1; j < int(steps); j++ {
+				distance := float64(j) * length / steps
+				offset := float64(j%2) * 2 * width
+				fmt.Fprintf(&content, "%g %g l\n", a.X+(distance*dx-offset*dy)/length, a.Y+(distance*dy+offset*dx)/length)
+			}
+		}
+		fmt.Fprintf(&content, "%g %g l S\n", b.X, b.Y)
+	}
+	return r.annotationAppearance(annotation, content.String())
+}
+
 // lineAppearance 按原始端点和笔画属性生成直线注解外观
 // 入参: annotation 直线注解
 // 返回: *Stream 外观流, error 属性错误或未支持的附加效果

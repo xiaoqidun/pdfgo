@@ -347,7 +347,9 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 	glyphNames := map[uint32]string{}
 	for code, gid := range mapping {
 		sid := int(charset[gid])
-		if sid >= 391 {
+		if sid < len(cffStandardNames) {
+			glyphNames[code] = cffStandardNames[sid]
+		} else {
 			if sid-391 >= len(stringsIndex) {
 				return nil, nil, fmt.Errorf("invalid CFF string identifier")
 			}

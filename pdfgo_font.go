@@ -392,24 +392,36 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, err
 		}
 	}
-	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && font.ProgramType != "Type1C" {
+	var cffProgram []byte
+	if font.ProgramType == "Type1C" || font.ProgramType == "CIDFontType0C" {
+		cffProgram = font.Program
+	} else if font.ProgramType == "OpenType" && len(font.Program) >= 4 && string(font.Program[:4]) == "OTTO" {
+		cffProgram, err = fontTable(font.Program, "CFF ")
+		if err != nil {
+			return nil, err
+		}
+		if len(cffProgram) == 0 {
+			return nil, &UnsupportedError{Feature: "OpenType font without CFF table"}
+		}
+	}
+	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && cffProgram == nil {
 		font.simpleCmap, font.cmapEncoding, err = fontCmap(font.Program, font.symbolic)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if font.ProgramType == "Type1C" || font.ProgramType == "CIDFontType0C" {
+	if cffProgram != nil {
 		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "StandardEncoding" {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
 		identity := font.composite && metrics["Subtype"] == Name("CIDFontType2") && font.glyphMap == nil
-		font.cffGlyphs, font.cffNames, err = cffFontMapping(font.Program, font.composite, font.encoding, font.differences, identity)
+		font.cffGlyphs, font.cffNames, err = cffFontMapping(cffProgram, font.composite, font.encoding, font.differences, identity)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if font.composite && len(font.Program) != 0 && metrics["Subtype"] == Name("CIDFontType0") && font.cffGlyphs == nil {
-		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without bare CFF program"}
+		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without CFF program"}
 	}
 	if font.composite && metrics["CIDSystemInfo"] != nil {
 		value, err := r.Resolve(metrics["CIDSystemInfo"])
@@ -495,6 +507,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		name := ""
 		if !f.composite {
 			name = f.differences[code]
+			if f.cffNames != nil {
+				name = f.cffNames[code]
+			}
 			if name == "" {
 				encoding := pdfStandardNames
 				switch f.encoding {
