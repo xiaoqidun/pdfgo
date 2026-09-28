@@ -16,7 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
-	_ "embed"
+	"embed"
 	"encoding/binary"
 	"fmt"
 	"strconv"
@@ -120,31 +120,36 @@ func (s *type1EncodingScanner) next() string {
 	return string(s.data[start:s.pos])
 }
 
-// adobeGlyphList 保存Adobe字形名称映射资源
+// adobeGlyphResources 保存Adobe字形映射、命名资源及授权文件
 // https://github.com/adobe-type-tools/agl-aglfn
 //
-//go:embed assets/glyph/agl-aglfn/glyphlist.txt
-var adobeGlyphList []byte
-
-// adobeDingbatList 保存Adobe特殊符号字形名称映射资源
-// https://github.com/adobe-type-tools/agl-aglfn
-//
-//go:embed assets/glyph/agl-aglfn/zapfdingbats.txt
-var adobeDingbatList []byte
+//go:embed assets/glyph/agl-aglfn
+var adobeGlyphResources embed.FS
 
 // adobeGlyphNames 按需构建字形名称与Unicode映射
 var adobeGlyphNames = sync.OnceValue(func() map[string]string {
-	return parseGlyphNames(adobeGlyphList)
+	return loadGlyphNames("glyphlist.txt")
 })
 
 // dingbatGlyphNames 按需合并特殊符号与通用字形名称映射
 var dingbatGlyphNames = sync.OnceValue(func() map[string]string {
-	names := parseGlyphNames(adobeGlyphList)
-	for name, value := range parseGlyphNames(adobeDingbatList) {
+	names := loadGlyphNames("glyphlist.txt")
+	for name, value := range loadGlyphNames("zapfdingbats.txt") {
 		names[name] = value
 	}
 	return names
 })
+
+// loadGlyphNames 加载内置字形映射，缺失必要资源时报告构建错误
+// 入参: name 内置映射文件名
+// 返回: map[string]string 名称映射
+func loadGlyphNames(name string) map[string]string {
+	data, err := adobeGlyphResources.ReadFile("assets/glyph/agl-aglfn/" + name)
+	if err != nil {
+		panic(err)
+	}
+	return parseGlyphNames(data)
+}
 
 // parseGlyphNames 读取Adobe字形列表的名称和Unicode字段
 // 入参: data 字形列表资源
