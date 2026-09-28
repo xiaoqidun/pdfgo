@@ -344,13 +344,20 @@ func (r *Reader) parseAt(offset int64, parse func(*objectParser) error) error {
 		return fmt.Errorf("object offset outside file")
 	}
 	remaining := r.size - offset
+	var data []byte
 	for length := min(remaining, int64(4096)); ; length = min(remaining, length+min(length, remaining-length)) {
-		data, err := r.readRange(offset, length)
-		if err != nil {
+		if uint64(length) > uint64(^uint(0)>>1) {
+			return fmt.Errorf("invalid file range")
+		}
+		previous := len(data)
+		window := make([]byte, int(length))
+		copy(window, data)
+		if _, err := io.ReadFull(io.NewSectionReader(r.source, offset+int64(previous), length-int64(previous)), window[previous:]); err != nil {
 			return err
 		}
+		data = window
 		p := objectParser{data: data}
-		err = parse(&p)
+		err := parse(&p)
 		if int64(p.pos) >= length-1 && length < remaining {
 			continue
 		}

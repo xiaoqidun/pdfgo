@@ -636,6 +636,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if palette != nil {
 		ranges[1] = float64((uint32(1) << i.BitsPerComponent) - 1)
 	}
+	defaultDecode := true
 	if len(i.Decode) != 0 {
 		if len(i.Decode) != len(ranges) {
 			return nil, fmt.Errorf("invalid image Decode array")
@@ -645,6 +646,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 				return nil, fmt.Errorf("invalid image Decode value")
 			}
+			defaultDecode = defaultDecode && v == ranges[n]
 			ranges[n] = v
 		}
 	}
@@ -673,7 +675,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if mask != nil {
 		mask.bounds = bounds
 	}
-	if target == nil && calibrated == nil && lab == nil && profile == nil && separation == nil && deviceN == nil && components != 4 && len(keys) == 0 && len(matte) == 0 && len(i.Decode) == 0 {
+	if target == nil && calibrated == nil && lab == nil && profile == nil && separation == nil && deviceN == nil && components != 4 && len(keys) == 0 && len(matte) == 0 && defaultDecode {
 		byteExact := imageByteExact(samples)
 		if mask != nil {
 			byteExact = byteExact && imageByteExact(mask)

@@ -158,7 +158,14 @@ func validNumber(s string) bool {
 // name 读取名称并解除十六进制转义
 func (p *objectParser) name() (Object, error) {
 	p.pos++
-	var value []byte
+	start := p.pos
+	for p.pos < len(p.data) && !isDelimiter(p.data[p.pos]) && p.data[p.pos] != '#' {
+		p.pos++
+	}
+	if p.pos == len(p.data) || isDelimiter(p.data[p.pos]) {
+		return Name(p.data[start:p.pos]), nil
+	}
+	value := append([]byte(nil), p.data[start:p.pos]...)
 	for p.pos < len(p.data) && !isDelimiter(p.data[p.pos]) {
 		b := p.data[p.pos]
 		p.pos++
