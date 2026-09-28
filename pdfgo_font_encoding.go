@@ -121,14 +121,37 @@ func (s *type1EncodingScanner) next() string {
 }
 
 // adobeGlyphList 保存Adobe字形名称映射资源
+// https://github.com/adobe-type-tools/agl-aglfn
 //
-//go:embed assets/glyph/glyphlist.txt
+//go:embed assets/glyph/agl-aglfn/glyphlist.txt
 var adobeGlyphList []byte
+
+// adobeDingbatList 保存Adobe特殊符号字形名称映射资源
+// https://github.com/adobe-type-tools/agl-aglfn
+//
+//go:embed assets/glyph/agl-aglfn/zapfdingbats.txt
+var adobeDingbatList []byte
 
 // adobeGlyphNames 按需构建字形名称与Unicode映射
 var adobeGlyphNames = sync.OnceValue(func() map[string]string {
+	return parseGlyphNames(adobeGlyphList)
+})
+
+// dingbatGlyphNames 按需合并特殊符号与通用字形名称映射
+var dingbatGlyphNames = sync.OnceValue(func() map[string]string {
+	names := parseGlyphNames(adobeGlyphList)
+	for name, value := range parseGlyphNames(adobeDingbatList) {
+		names[name] = value
+	}
+	return names
+})
+
+// parseGlyphNames 读取Adobe字形列表的名称和Unicode字段
+// 入参: data 字形列表资源
+// 返回: map[string]string 名称映射
+func parseGlyphNames(data []byte) map[string]string {
 	names := make(map[string]string)
-	for _, line := range strings.Split(string(adobeGlyphList), "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		if line == "" || line[0] == '#' {
 			continue
 		}
@@ -147,20 +170,27 @@ var adobeGlyphNames = sync.OnceValue(func() map[string]string {
 		names[name] = value.String()
 	}
 	return names
-})
+}
 
 // glyphNameUnicode 按Adobe字形名称规则取得Unicode文本
 // 入参: name 字形名称
 // 返回: string Unicode文本, bool 是否有明确映射
 func glyphNameUnicode(name string) (string, bool) {
+	return glyphNameUnicodeMap(name, adobeGlyphNames())
+}
+
+// glyphNameUnicodeMap 按指定字形列表解析名称、后缀及组合字形
+// 入参: name 字形名称, names 字形列表
+// 返回: string Unicode文本, bool 是否有明确映射
+func glyphNameUnicodeMap(name string, names map[string]string) (string, bool) {
 	name, _, _ = strings.Cut(name, ".")
-	if value, ok := adobeGlyphNames()[name]; ok {
+	if value, ok := names[name]; ok {
 		return value, true
 	}
 	if strings.Contains(name, "_") {
 		var value strings.Builder
 		for _, part := range strings.Split(name, "_") {
-			text, ok := glyphNameUnicode(part)
+			text, ok := glyphNameUnicodeMap(part, names)
 			if !ok {
 				return "", false
 			}

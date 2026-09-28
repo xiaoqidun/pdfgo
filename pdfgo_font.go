@@ -531,7 +531,11 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		}
 		if !ok && !f.composite {
 			if name != "" && name != ".notdef" {
-				text, ok = glyphNameUnicode(name)
+				if f.Name == "ZapfDingbats" {
+					text, ok = glyphNameUnicodeMap(name, dingbatGlyphNames())
+				} else {
+					text, ok = glyphNameUnicode(name)
+				}
 				if !ok && f.Subtype == Name("Type1") && len(f.Program) != 0 {
 					ok = true
 				}

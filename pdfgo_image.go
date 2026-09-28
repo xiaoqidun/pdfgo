@@ -959,52 +959,14 @@ func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error
 	if i.BitsPerComponent != 1 {
 		return nil, fmt.Errorf("invalid CCITT component depth")
 	}
-	k, err := integerDefault(params, "K", 0)
+	reader, endOfBlock, err := ccittImageReader(bytes.NewReader(data), i.Width, i.Height, params)
 	if err != nil {
 		return nil, err
-	}
-	if k >= 0 {
-		return nil, &UnsupportedError{Feature: "CCITT Group 3"}
-	}
-	columns, err := integerDefault(params, "Columns", 1728)
-	if err != nil {
-		return nil, err
-	}
-	if columns != int64(i.Width) || columns <= 0 || i.Height <= 0 {
-		return nil, fmt.Errorf("CCITT dimensions differ from image dictionary")
-	}
-	rows, err := integerDefault(params, "Rows", 0)
-	if err != nil || rows < 0 {
-		return nil, fmt.Errorf("invalid CCITT Rows")
-	}
-	endOfBlock, align, invert, endOfLine := true, false, false, false
-	for _, flag := range []struct {
-		name  Name
-		value *bool
-	}{{"EndOfBlock", &endOfBlock}, {"EncodedByteAlign", &align}, {"BlackIs1", &invert}, {"EndOfLine", &endOfLine}} {
-		if value := params[flag.name]; value != nil {
-			boolean, ok := value.(Boolean)
-			if !ok {
-				return nil, fmt.Errorf("invalid CCITT %s", flag.name)
-			}
-			*flag.value = bool(boolean)
-		}
-	}
-	if endOfLine {
-		return nil, &UnsupportedError{Feature: "CCITT Group 4 end-of-line markers"}
-	}
-	if !endOfBlock && rows != 0 && rows != int64(i.Height) {
-		return nil, &UnsupportedError{Feature: "CCITT Rows differing from image height"}
-	}
-	height := i.Height
-	if endOfBlock {
-		height = ccitt.AutoDetectHeight
 	}
 	stride := (uint64(i.Width) + 7) / 8
 	if stride > uint64(^uint(0)>>1)/uint64(i.Height) {
 		return nil, fmt.Errorf("CCITT sample size exceeds platform integer range")
 	}
-	reader := ccitt.NewReader(bytes.NewReader(data), ccitt.MSB, ccitt.Group4, i.Width, height, &ccitt.Options{Align: align, Invert: invert})
 	samples := make([]byte, int(stride)*i.Height)
 	if _, err := io.ReadFull(reader, samples); err != nil {
 		return nil, err
@@ -1020,6 +982,53 @@ func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error
 		}
 	}
 	return i.rawSamples(samples)
+}
+
+// ccittImageReader 按图像尺寸和过滤器参数建立CCITT解码器
+// 入参: source 编码数据, width 图像宽度, height 图像高度, params 解码参数
+// 返回: io.Reader 样本读取器, bool 是否需要块结束标记, error 参数错误
+func ccittImageReader(source io.Reader, width, height int, params Dictionary) (io.Reader, bool, error) {
+	k, err := integerDefault(params, "K", 0)
+	if err != nil {
+		return nil, false, err
+	}
+	if k >= 0 {
+		return nil, false, &UnsupportedError{Feature: "CCITT Group 3"}
+	}
+	columns, err := integerDefault(params, "Columns", 1728)
+	if err != nil {
+		return nil, false, err
+	}
+	if columns != int64(width) || columns <= 0 || height <= 0 {
+		return nil, false, fmt.Errorf("CCITT dimensions differ from image dictionary")
+	}
+	rows, err := integerDefault(params, "Rows", 0)
+	if err != nil || rows < 0 {
+		return nil, false, fmt.Errorf("invalid CCITT Rows")
+	}
+	endOfBlock, align, invert, endOfLine := true, false, false, false
+	for _, flag := range []struct {
+		name  Name
+		value *bool
+	}{{"EndOfBlock", &endOfBlock}, {"EncodedByteAlign", &align}, {"BlackIs1", &invert}, {"EndOfLine", &endOfLine}} {
+		if value := params[flag.name]; value != nil {
+			boolean, ok := value.(Boolean)
+			if !ok {
+				return nil, false, fmt.Errorf("invalid CCITT %s", flag.name)
+			}
+			*flag.value = bool(boolean)
+		}
+	}
+	if endOfLine {
+		return nil, false, &UnsupportedError{Feature: "CCITT Group 4 end-of-line markers"}
+	}
+	if !endOfBlock && rows != 0 && rows != int64(height) {
+		return nil, false, &UnsupportedError{Feature: "CCITT Rows differing from image height"}
+	}
+	if endOfBlock {
+		height = ccitt.AutoDetectHeight
+	}
+	return ccitt.NewReader(source, ccitt.MSB, ccitt.Group4, width, height, &ccitt.Options{Align: align, Invert: invert}), endOfBlock, nil
 }
 
 // rawSamples 将已解压的设备色彩样本或颜色索引展开为图像

@@ -100,6 +100,8 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 	length := 0
 	if len(filters) == 0 {
 		length, err = inlineSampleLength(dict)
+	} else if filters[0] == Name("CCITTFaxDecode") {
+		length, err = inlineCCITTLength(data, dict, params[0])
 	} else {
 		length, err = inlineFilterLength(data, filters[0].(Name), params[0])
 	}
@@ -119,6 +121,61 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 		return nil, p.fail("missing inline image end")
 	}
 	return stream, nil
+}
+
+// inlineByteReader 限制解码器预读，避免读取内联图像后的内容操作符
+type inlineByteReader struct {
+	data []byte
+	pos  int
+}
+
+// Read 每次提供一个编码字节，并记录已消费长度
+// 入参: p 目标缓冲区
+// 返回: int 字节数, error 读取错误
+func (r *inlineByteReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.pos == len(r.data) {
+		return 0, io.EOF
+	}
+	p[0] = r.data[r.pos]
+	r.pos++
+	return 1, nil
+}
+
+// inlineCCITTLength 按声明行数或块结束标记解码并确定内联数据边界
+// 入参: data 内容流余下数据, dict 图像字典, params 解码参数
+// 返回: int 编码字节数, error 图像或编码错误
+func inlineCCITTLength(data []byte, dict Dictionary, params Object) (int, error) {
+	length, err := inlineSampleLength(dict)
+	if err != nil {
+		return 0, err
+	}
+	depth := dict["BitsPerComponent"]
+	if depth != Integer(1) && !(depth == nil && dict["ImageMask"] == Boolean(true)) {
+		return 0, fmt.Errorf("invalid CCITT component depth")
+	}
+	source := &inlineByteReader{data: data}
+	parameters, _ := params.(Dictionary)
+	reader, endOfBlock, err := ccittImageReader(source, int(dict["Width"].(Integer)), int(dict["Height"].(Integer)), parameters)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := io.CopyN(io.Discard, reader, int64(length)); err != nil {
+		return 0, err
+	}
+	if endOfBlock {
+		var extra [1]byte
+		n, err := reader.Read(extra[:])
+		if n != 0 {
+			return 0, fmt.Errorf("CCITT dimensions differ from image dictionary")
+		}
+		if err != io.EOF {
+			return 0, err
+		}
+	}
+	return source.pos, nil
 }
 
 // inlineSampleLength 计算未压缩图像逐行字节对齐后的数据长度
