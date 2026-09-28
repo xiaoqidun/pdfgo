@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"maps"
 	"math"
-	"strings"
 )
 
 // ErrDestinationNotFound 表示命名目标在文档目标表中不存在
@@ -161,7 +160,14 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		return err
 	}
 	if value == nil && annotation.Subtype == "Widget" {
-		stream, err := r.emptyTextAppearance(annotation)
+		stream, err := r.widgetAppearance(ctx, page, annotation)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
+	}
+	if value == nil && annotation.Subtype == "FreeText" {
+		stream, err := r.variableTextAppearance(ctx, page, annotation)
 		if err != nil {
 			return err
 		}
@@ -236,7 +242,11 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		return err
 	}
 	if states, ok := value.(Dictionary); ok {
-		state, ok := annotation.Dictionary["AS"].(Name)
+		selected, err := r.Resolve(annotation.Dictionary["AS"])
+		if err != nil {
+			return err
+		}
+		state, ok := selected.(Name)
 		if !ok {
 			return fmt.Errorf("missing annotation appearance state")
 		}
@@ -266,7 +276,7 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		if !ok {
 			return fmt.Errorf("invalid appearance matrix")
 		}
-		values, err := numbers(array, 6)
+		values, err := r.numberArray(array, 6)
 		if err != nil {
 			return err
 		}
@@ -332,6 +342,18 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 		current, ok = value.(Dictionary)
 		if !ok {
 			return nil, fmt.Errorf("invalid field parent")
+		}
+	}
+	defaults, err := r.formDefaults()
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range []Name{"DA", "Q"} {
+		if result[key] == nil {
+			result[key], err = r.Resolve(defaults[key])
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	return result, nil
@@ -445,91 +467,6 @@ func (r *Reader) ReadDestination(object Object) (Destination, error) {
 		}
 	}
 	return Destination{Page: page, Mode: mode, Parameters: parameters}, nil
-}
-
-// emptyTextAppearance 按空文本字段的背景和边框生成外观，不猜测缺失文本布局
-// 入参: annotation 表单控件
-// 返回: *Stream 外观流, error 字段或外观错误
-func (r *Reader) emptyTextAppearance(annotation Annotation) (*Stream, error) {
-	field, err := r.ReadField(annotation)
-	if err != nil {
-		return nil, err
-	}
-	value, empty := field["V"].(String)
-	if field["FT"] != Name("Tx") || field["V"] != nil && (!empty || len(value) != 0) || field["RV"] != nil {
-		return nil, &UnsupportedError{Feature: "widget appearance generation"}
-	}
-	object, err := r.Resolve(annotation.Dictionary["MK"])
-	if err != nil {
-		return nil, err
-	}
-	mk, ok := object.(Dictionary)
-	if object != nil && !ok {
-		return nil, fmt.Errorf("invalid widget appearance characteristics")
-	}
-	w, h := annotation.Rect.XMax-annotation.Rect.XMin, annotation.Rect.YMax-annotation.Rect.YMin
-	if w <= 0 || h <= 0 {
-		return nil, fmt.Errorf("invalid widget bounds")
-	}
-	var content strings.Builder
-	for _, key := range []Name{"BG", "BC"} {
-		object, err := r.Resolve(mk[key])
-		if err != nil {
-			return nil, err
-		}
-		if object == nil {
-			continue
-		}
-		values, ok := object.(Array)
-		if !ok {
-			return nil, fmt.Errorf("invalid widget color")
-		}
-		if len(values) == 0 {
-			continue
-		}
-		operators := map[int]string{1: "g", 3: "rg", 4: "k"}
-		op, ok := operators[len(values)]
-		if !ok {
-			return nil, fmt.Errorf("invalid widget color components")
-		}
-		if key == "BC" {
-			op = strings.ToUpper(op)
-		}
-		for _, value := range values {
-			n, err := r.number(value)
-			if err != nil {
-				return nil, err
-			}
-			fmt.Fprintf(&content, "%g ", n)
-		}
-		fmt.Fprintf(&content, "%s\n", op)
-		if key == "BG" {
-			fmt.Fprintf(&content, "0 0 %g %g re f\n", w, h)
-			continue
-		}
-		object, err = r.Resolve(annotation.Dictionary["BS"])
-		if err != nil {
-			return nil, err
-		}
-		style, ok := object.(Dictionary)
-		if object != nil && !ok {
-			return nil, fmt.Errorf("invalid widget border style")
-		}
-		width := 1.0
-		if style["W"] != nil {
-			width, err = r.number(style["W"])
-			if err != nil || width < 0 {
-				return nil, fmt.Errorf("invalid widget border width")
-			}
-		}
-		if style["S"] != nil && style["S"] != Name("S") {
-			return nil, &UnsupportedError{Feature: "generated widget border style"}
-		}
-		if width > 0 {
-			fmt.Fprintf(&content, "%g w %g %g %g %g re S\n", width, width/2, width/2, math.Max(0, w-width), math.Max(0, h-width))
-		}
-	}
-	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Real(w), Real(h)}}, Data: []byte(content.String()), reader: r}, nil
 }
 
 // readDestinations 缓存旧式目标字典和名称树，检测递归引用

@@ -1452,7 +1452,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		if !ok {
 			return fmt.Errorf("invalid form matrix")
 		}
-		m, err := numbers(array, 6)
+		m, err := p.reader.numberArray(array, 6)
 		if err != nil {
 			return err
 		}
