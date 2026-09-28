@@ -272,7 +272,7 @@ func (r *Reader) inkAppearance(annotation Annotation) (*Stream, error) {
 	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}, "Resources": resources}, Data: []byte(content.String()), reader: r}, nil
 }
 
-// textMarkupAppearance 按文字四边形生成下划线、删除线或波浪线外观
+// textMarkupAppearance 按文字四边形生成高亮、下划线、删除线或波浪线外观
 // 入参: annotation 文字标记注解
 // 返回: *Stream 外观流, error 坐标或颜色错误
 func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
@@ -293,7 +293,7 @@ func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
 		return nil, err
 	}
 	var content strings.Builder
-	visible, err := r.writeAnnotationColor(&content, border.color, true)
+	visible, err := r.writeAnnotationColor(&content, border.color, annotation.Subtype != "Highlight")
 	if err != nil {
 		return nil, err
 	}
@@ -318,6 +318,10 @@ func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
 			return nil, fmt.Errorf("invalid text markup dimensions")
 		}
 		if !visible {
+			continue
+		}
+		if annotation.Subtype == "Highlight" {
+			fmt.Fprintf(&content, "%g %g m %g %g l %g %g l %g %g l h f\n", a.X, a.Y, b.X, b.Y, c.X, c.Y, d.X, d.Y)
 			continue
 		}
 		fmt.Fprintf(&content, "%g w\n", width)
@@ -425,20 +429,11 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 	}
 	box := annotation.Rect
 	inner := box
-	if (annotation.Subtype == "Square" || annotation.Subtype == "Circle") && annotation.Dictionary["RD"] != nil {
-		inset, err := r.numberArray(annotation.Dictionary["RD"], 4)
+	if annotation.Subtype == "Square" || annotation.Subtype == "Circle" {
+		inner, err = r.annotationContentBounds(annotation)
 		if err != nil {
 			return nil, err
 		}
-		for _, n := range inset {
-			if n < 0 {
-				return nil, fmt.Errorf("invalid annotation inset")
-			}
-		}
-		inner.XMin += inset[0]
-		inner.YMax -= inset[1]
-		inner.XMax -= inset[2]
-		inner.YMin += inset[3]
 	}
 	if inner.XMin >= inner.XMax || inner.YMin >= inner.YMax {
 		return nil, fmt.Errorf("empty annotation shape")
@@ -634,6 +629,32 @@ func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Ann
 	return nil
 }
 
+// annotationContentBounds 按矩形差值取得注解内部绘制区域
+// 入参: annotation 注解
+// 返回: Rectangle 内部区域, error 差值或边界错误
+func (r *Reader) annotationContentBounds(annotation Annotation) (Rectangle, error) {
+	box := annotation.Rect
+	if annotation.Dictionary["RD"] != nil {
+		inset, err := r.numberArray(annotation.Dictionary["RD"], 4)
+		if err != nil {
+			return Rectangle{}, err
+		}
+		for _, value := range inset {
+			if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+				return Rectangle{}, fmt.Errorf("invalid annotation inset")
+			}
+		}
+		box.XMin += inset[0]
+		box.YMax -= inset[1]
+		box.XMax -= inset[2]
+		box.YMin += inset[3]
+	}
+	if box.XMin >= box.XMax || box.YMin >= box.YMax {
+		return Rectangle{}, fmt.Errorf("empty annotation content bounds")
+	}
+	return box, nil
+}
+
 // annotationAppearance 将组合图形的不透明度应用一次，避免填充和描边重叠变暗
 // 入参: annotation 注解, content 外观绘制内容
 // 返回: *Stream 外观流, error 不透明度错误
@@ -641,17 +662,25 @@ func (r *Reader) annotationAppearance(annotation Annotation, content string) (*S
 	box := annotation.Rect
 	bbox := Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}
 	body := &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox}, Data: []byte(content), reader: r}
-	if annotation.Dictionary["CA"] == nil {
+	if annotation.Dictionary["CA"] == nil && annotation.Subtype != "Highlight" {
 		return body, nil
 	}
-	alpha, err := r.number(annotation.Dictionary["CA"])
-	if err != nil || alpha < 0 || alpha > 1 || math.IsNaN(alpha) {
-		return nil, fmt.Errorf("invalid annotation opacity")
+	alpha := 1.0
+	if annotation.Dictionary["CA"] != nil {
+		var err error
+		alpha, err = r.number(annotation.Dictionary["CA"])
+		if err != nil || alpha < 0 || alpha > 1 || math.IsNaN(alpha) {
+			return nil, fmt.Errorf("invalid annotation opacity")
+		}
 	}
-	if alpha == 1 {
+	if alpha == 1 && annotation.Subtype != "Highlight" {
 		return body, nil
 	}
 	body.Dictionary["Group"] = Dictionary{"S": Name("Transparency"), "I": Boolean(true)}
-	resources := Dictionary{"XObject": Dictionary{"Shape": body}, "ExtGState": Dictionary{"Opacity": Dictionary{"CA": Real(alpha), "ca": Real(alpha)}}}
+	state := Dictionary{"CA": Real(alpha), "ca": Real(alpha)}
+	if annotation.Subtype == "Highlight" {
+		state["BM"] = Name("Multiply")
+	}
+	resources := Dictionary{"XObject": Dictionary{"Shape": body}, "ExtGState": Dictionary{"Opacity": state}}
 	return &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox, "Resources": resources}, Data: []byte("/Opacity gs /Shape Do"), reader: r}, nil
 }

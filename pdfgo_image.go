@@ -191,7 +191,18 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		mask = bool(b)
 	}
 	bits := int64(1)
-	if !mask || dict["BitsPerComponent"] != nil {
+	var embeddedSpace Object
+	var jpxDepth int
+	if !mask {
+		jpxDepth, embeddedSpace, err = r.jpxDefaults(stream)
+		if err != nil {
+			return nil, err
+		}
+		if jpxDepth != 0 {
+			bits = int64(jpxDepth)
+		}
+	}
+	if jpxDepth == 0 && (dict["BitsPerComponent"] != nil || !mask) {
 		bits, err = readInteger("BitsPerComponent")
 		if err != nil {
 			return nil, err
@@ -207,9 +218,15 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	decodeObject, err := r.Resolve(dict["Decode"])
-	if err != nil {
-		return nil, err
+	if space == nil {
+		space = embeddedSpace
+	}
+	var decodeObject Object
+	if jpxDepth == 0 {
+		decodeObject, err = r.Resolve(dict["Decode"])
+		if err != nil {
+			return nil, err
+		}
 	}
 	decode, ok := decodeObject.(Array)
 	if decodeObject != nil && !ok {
@@ -253,10 +270,10 @@ func (s *deviceSampleImage) At(x, y int) color.Color {
 	if !image.Pt(x, y).In(s.Bounds()) {
 		return color.NRGBA64{}
 	}
-	r, g, b, _ := s.source.At(x, y).RGBA()
-	pixel := color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: 65535}
+	pixel := imageNRGBASample(s.source.At(x, y))
+	pixel.A = 65535
 	if s.palette != nil {
-		index := int(math.Max(0, math.Min(float64(len(s.palette.colors)-1), math.Round(float64(r)/65535*s.maximum))))
+		index := int(math.Max(0, math.Min(float64(len(s.palette.colors)-1), math.Round(float64(pixel.R)/65535*s.maximum))))
 		pixel = s.palette.colors[index]
 	}
 	alpha := uint32(65535)
@@ -405,6 +422,12 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 		}
 		if cmyk {
 			return i.jpxCMYKSamples(data)
+		}
+		if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
+			data, err = jpxCodestream(data)
+			if err != nil {
+				return nil, err
+			}
 		}
 		result, _, err = image.Decode(bytes.NewReader(data))
 		if err != nil {
@@ -555,7 +578,11 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if components == 0 {
 		return nil, &UnsupportedError{Feature: "image color space"}
 	}
-	if i.Stream.Dictionary["SMaskInData"] != nil {
+	embeddedMask, err := i.reader.Resolve(i.Stream.Dictionary["SMaskInData"])
+	if err != nil {
+		return nil, err
+	}
+	if embeddedMask != nil && embeddedMask != Integer(0) {
 		return nil, &UnsupportedError{Feature: "image field SMaskInData"}
 	}
 	if intent := i.Stream.Dictionary["Intent"]; intent != nil && intent != Name("Perceptual") && intent != Name("RelativeColorimetric") && intent != Name("AbsoluteColorimetric") && intent != Name("Saturation") {
@@ -601,6 +628,10 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		return nil, fmt.Errorf("masked image dimensions exceed platform integer range")
 	}
 	if samples.Bounds() != bounds {
+		switch samples.(type) {
+		case *image.NRGBA, *image.NRGBA64:
+			samples = &deviceSampleImage{source: samples, byteExact: imageByteExact(samples)}
+		}
 		samples = &imageResample{source: samples, bounds: bounds, interpolate: i.Interpolate && palette == nil}
 	}
 	if mask != nil {
@@ -677,8 +708,8 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 					values[c] = float64(cmyk[c]) / 65535
 				}
 			} else {
-				r, g, b, _ := sampleColor.RGBA()
-				values = [4]float64{float64(r) / 65535, float64(g) / 65535, float64(b) / 65535}
+				pixel := imageNRGBASample(sampleColor)
+				values = [4]float64{float64(pixel.R) / 65535, float64(pixel.G) / 65535, float64(pixel.B) / 65535}
 			}
 			transparent := len(keys) != 0
 			for c := 0; c < components; c++ {
@@ -1221,6 +1252,19 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 		return &image.Gray16{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 	}
 	return &image.Gray{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
+}
+
+// imageNRGBASample 取得非预乘颜色，保留透明像素中仍有效的原始颜色分量
+// 入参: pixel 样本颜色
+// 返回: color.NRGBA64 非预乘颜色
+func imageNRGBASample(pixel color.Color) color.NRGBA64 {
+	switch c := pixel.(type) {
+	case color.NRGBA:
+		return color.NRGBA64{R: uint16(c.R) * 257, G: uint16(c.G) * 257, B: uint16(c.B) * 257, A: uint16(c.A) * 257}
+	case color.NRGBA64:
+		return c
+	}
+	return color.NRGBA64Model.Convert(pixel).(color.NRGBA64)
 }
 
 // imageCMYKSample 统一取得八位或十六位四色样本，保留黑色分量

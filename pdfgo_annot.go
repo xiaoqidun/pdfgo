@@ -174,6 +174,13 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		value = Dictionary{"N": stream}
 	}
+	if value == nil && (annotation.Subtype == "Text" || annotation.Subtype == "FileAttachment" || annotation.Subtype == "Sound" || annotation.Subtype == "Caret") {
+		stream, err := r.iconAppearance(annotation)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
+	}
 	if value == nil && annotation.Subtype == "Ink" {
 		stream, err := r.inkAppearance(annotation)
 		if err != nil {
@@ -188,7 +195,7 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		value = Dictionary{"N": stream}
 	}
-	if value == nil && (annotation.Subtype == "Underline" || annotation.Subtype == "StrikeOut" || annotation.Subtype == "Squiggly") {
+	if value == nil && (annotation.Subtype == "Highlight" || annotation.Subtype == "Underline" || annotation.Subtype == "StrikeOut" || annotation.Subtype == "Squiggly") {
 		stream, err := r.textMarkupAppearance(annotation)
 		if err != nil {
 			return err

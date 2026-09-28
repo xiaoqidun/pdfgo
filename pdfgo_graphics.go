@@ -1541,6 +1541,18 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 		}
 		switch key {
 		case "Type":
+		case "TK":
+			flag, ok := value.(Boolean)
+			if !ok || p.inText {
+				return fmt.Errorf("invalid text knockout state")
+			}
+			if !flag {
+				return &UnsupportedError{Feature: "non-knockout text"}
+			}
+		case "HT":
+			if value != Name("Default") {
+				return &UnsupportedError{Feature: "custom halftone"}
+			}
 		case "D":
 			values, ok := value.(Array)
 			if !ok || len(values) != 2 {
