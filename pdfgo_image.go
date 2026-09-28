@@ -543,11 +543,11 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
-		deviceN, err = i.reader.readSingleDeviceN(space)
+		deviceN, err = i.reader.readDeviceN(space)
 		if err != nil {
 			return nil, err
 		}
-		components = 1
+		components = deviceN.components
 	}
 	if palette != nil {
 		components = 1
@@ -558,7 +558,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if i.Stream.Dictionary["SMaskInData"] != nil {
 		return nil, &UnsupportedError{Feature: "image field SMaskInData"}
 	}
-	if intent := i.Stream.Dictionary["Intent"]; intent != nil && intent != Name("Perceptual") && intent != Name("RelativeColorimetric") {
+	if intent := i.Stream.Dictionary["Intent"]; intent != nil && intent != Name("Perceptual") && intent != Name("RelativeColorimetric") && intent != Name("AbsoluteColorimetric") && intent != Name("Saturation") {
 		return nil, &UnsupportedError{Feature: "image rendering intent"}
 	}
 	ranges := make([]float64, components*2)
@@ -713,7 +713,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				}
 			}
 			if deviceN != nil {
-				values = deviceN.values(values[0])
+				values = deviceN.values(values[:components]...)
 			}
 			if target != nil {
 				if palette != nil {
@@ -1118,10 +1118,11 @@ func ccittImageReader(source io.Reader, width, height int, params Dictionary) (i
 func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	components := 0
 	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
-		if _, err := i.reader.readSingleDeviceN(space); err != nil {
+		deviceN, err := i.reader.readDeviceN(space)
+		if err != nil {
 			return nil, err
 		}
-		components = 1
+		components = deviceN.components
 	}
 	switch i.ColorSpace {
 	case Name("DeviceGray"):
@@ -1199,14 +1200,14 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 		return out, nil
 	}
 	maximum := (uint32(1) << i.BitsPerComponent) - 1
-	if components == 3 {
+	if components == 2 || components == 3 {
 		out := image.NewNRGBA64(image.Rect(0, 0, i.Width, i.Height))
 		for y := 0; y < i.Height; y++ {
 			line := data[y*stride : (y+1)*stride]
 			for x := 0; x < i.Width; x++ {
 				var values [3]uint16
-				for c := range values {
-					values[c] = uint16(uint32(packedSample(line, x*3+c, i.BitsPerComponent)) * 65535 / maximum)
+				for c := 0; c < components; c++ {
+					values[c] = uint16(uint32(packedSample(line, x*components+c, i.BitsPerComponent)) * 65535 / maximum)
 				}
 				out.SetNRGBA64(x, y, color.NRGBA64{R: values[0], G: values[1], B: values[2], A: 65535})
 			}

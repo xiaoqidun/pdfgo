@@ -202,7 +202,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 				return nil, fmt.Errorf("invalid CIDToGIDMap length")
 			}
 		}
-	} else if subtype == Name("TrueType") || subtype == Name("Type1") || subtype == Name("Type3") {
+	} else if subtype == Name("TrueType") || (subtype == Name("Type1") || subtype == Name("MMType1")) || subtype == Name("Type3") {
 		encoding, err := r.Resolve(dict["Encoding"])
 		if err != nil {
 			return nil, err
@@ -386,7 +386,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			font.ProgramType = "CIDFontType0C"
 		}
 	}
-	if subtype == Name("Type1") && font.ProgramType == "FontFile" && dict["Encoding"] == nil {
+	if (subtype == Name("Type1") || subtype == Name("MMType1")) && font.ProgramType == "FontFile" && dict["Encoding"] == nil {
 		font.differences, err = type1BuiltInEncoding(font.Program)
 		if err != nil {
 			return nil, err
@@ -547,7 +547,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 				} else {
 					text, ok = glyphNameUnicode(name)
 				}
-				if !ok && f.Subtype == Name("Type1") && len(f.Program) != 0 {
+				if !ok && (f.Subtype == Name("Type1") || f.Subtype == Name("MMType1")) && len(f.Program) != 0 {
 					ok = true
 				}
 			}
@@ -562,7 +562,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			if f.composite {
 				return nil, &UnsupportedError{Feature: "CID without Unicode mapping"}
 			}
-			if f.Subtype == Name("Type1") && len(f.Program) != 0 && name == ".notdef" {
+			if (f.Subtype == Name("Type1") || f.Subtype == Name("MMType1")) && len(f.Program) != 0 && name == ".notdef" {
 				return nil, &UnsupportedError{Feature: "undefined Type1 glyph"}
 			}
 			if f.Subtype == Name("Type3") && f.differences[code] != "" {
@@ -602,7 +602,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		if f.composite {
 			glyph.CID = uint16(cid)
 		}
-		if f.Subtype == Name("Type1") {
+		if f.Subtype == Name("Type1") || f.Subtype == Name("MMType1") {
 			glyph.Name = name
 		}
 		if f.Subtype == Name("Type3") {

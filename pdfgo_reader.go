@@ -41,6 +41,14 @@ type Reader struct {
 	security           *standardSecurity
 }
 
+// ReaderOptions 设置密码编码及可恢复结构错误的诊断接收方式
+// Warning非空时允许使用超出错误Size声明的已有交叉引用，不重建或猜测对象
+type ReaderOptions struct {
+	Password     []byte
+	PasswordUTF8 bool
+	Warning      func(Diagnostic)
+}
+
 // objectStream 保留最近访问的对象流索引和解码数据，避免逐对象重复解压
 type objectStream struct {
 	reference Reference
@@ -98,102 +106,20 @@ func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
 // 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码
 // 返回: *Reader 阅读器, error 错误信息
 func NewReaderWithPassword(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
-	return newReaderWithPassword(source, size, password, false)
+	return NewReaderWithOptions(source, size, ReaderOptions{Password: password})
 }
 
 // NewReaderWithUTF8Password 自动按安全处理器版本转换UTF-8密码并读取PDF
 // 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码的UTF-8字节
 // 返回: *Reader 阅读器, error 错误信息
 func NewReaderWithUTF8Password(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
-	return newReaderWithPassword(source, size, password, true)
+	return NewReaderWithOptions(source, size, ReaderOptions{Password: password, PasswordUTF8: true})
 }
 
-// Close 关闭Open持有的文件，不关闭NewReader的外部数据源
-// 返回: error 关闭错误
-func (r *Reader) Close() error {
-	if r.closer == nil {
-		return nil
-	}
-	err := r.closer.Close()
-	r.closer = nil
-	return err
-}
-
-// Resolve 解析间接引用，直接对象原样返回
-// 入参: object 待解析对象
-// 返回: Object 解析后的对象, error 错误信息
-func (r *Reader) Resolve(object Object) (Object, error) {
-	ref, ok := object.(Reference)
-	if !ok {
-		return object, nil
-	}
-	object, err := r.Object(ref)
-	if err != nil {
-		return nil, err
-	}
-	if _, ok := object.(Reference); !ok {
-		return object, nil
-	}
-	seen := map[Reference]bool{ref: true}
-	for {
-		ref, ok := object.(Reference)
-		if !ok {
-			return object, nil
-		}
-		if seen[ref] {
-			return nil, fmt.Errorf("cyclic indirect reference")
-		}
-		seen[ref] = true
-		var err error
-		object, err = r.Object(ref)
-		if err != nil {
-			return nil, err
-		}
-	}
-}
-
-// Object 按编号与代数读取间接对象
-// 不存在或已释放的引用按PDF规则返回空对象
-// 入参: ref 间接引用
-// 返回: Object 对象, error 错误信息
-func (r *Reader) Object(ref Reference) (Object, error) {
-	if value, ok := r.cache[ref]; ok {
-		return value, nil
-	}
-	entry, ok := r.xref[ref.Number]
-	if !ok || entry.kind == 0 || (entry.kind == 1 && entry.generation != ref.Generation) || (entry.kind == 2 && ref.Generation != 0) {
-		return nil, nil
-	}
-	if r.loading[ref] || len(r.loading) >= 256 {
-		return nil, fmt.Errorf("cyclic or excessive object dependency")
-	}
-	r.loading[ref] = true
-	defer delete(r.loading, ref)
-	var value Object
-	var err error
-	if entry.kind == 2 {
-		value, err = r.compressedObject(ref, entry)
-	} else {
-		var actual Reference
-		actual, value, err = r.indirect(entry.position)
-		if err == nil && actual != ref {
-			err = fmt.Errorf("cross-reference object mismatch")
-		}
-		if err == nil && r.security != nil {
-			value, err = r.security.decryptObject(value, ref)
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	r.cache[ref] = value
-	return value, nil
-}
-
-// newReaderWithPassword 读取交叉引用并按调用方的密码编码约定认证
-// 入参: source 随机读取器, size 文件字节数, password 密码, utf8Password 是否转换UTF-8输入
+// NewReaderWithOptions 按读取选项打开PDF，源读取器仍由调用方管理
+// 入参: source 随机读取器, size 文件字节数, options 密码及诊断选项
 // 返回: *Reader 阅读器, error 错误信息
-func newReaderWithPassword(source io.ReaderAt, size int64, password []byte, utf8Password bool) (*Reader, error) {
+func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions) (*Reader, error) {
 	if size < 8 {
 		return nil, fmt.Errorf("invalid file size")
 	}
@@ -282,12 +208,21 @@ func newReaderWithPassword(source io.ReaderAt, size int64, password []byte, utf8
 	if !ok || sizeObject <= 0 {
 		return nil, fmt.Errorf("invalid trailer size")
 	}
+	recovered := false
 	for id := range r.xref {
 		if id >= int64(sizeObject) {
-			delete(r.xref, id)
+			if options.Warning == nil {
+				delete(r.xref, id)
+			} else {
+				recovered = true
+			}
 		}
 	}
-	if utf8Password {
+	if recovered {
+		options.Warning(Diagnostic{Message: "cross-reference entries exceed trailer Size; existing entries retained"})
+	}
+	password := options.Password
+	if options.PasswordUTF8 {
 		password, err = r.encodePassword(password)
 		if err != nil {
 			return nil, err
@@ -309,6 +244,88 @@ func newReaderWithPassword(source io.ReaderAt, size int64, password []byte, utf8
 		r.Version = string(v)
 	}
 	return r, nil
+}
+
+// Close 关闭Open持有的文件，不关闭NewReader的外部数据源
+// 返回: error 关闭错误
+func (r *Reader) Close() error {
+	if r.closer == nil {
+		return nil
+	}
+	err := r.closer.Close()
+	r.closer = nil
+	return err
+}
+
+// Resolve 解析间接引用，直接对象原样返回
+// 入参: object 待解析对象
+// 返回: Object 解析后的对象, error 错误信息
+func (r *Reader) Resolve(object Object) (Object, error) {
+	ref, ok := object.(Reference)
+	if !ok {
+		return object, nil
+	}
+	object, err := r.Object(ref)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := object.(Reference); !ok {
+		return object, nil
+	}
+	seen := map[Reference]bool{ref: true}
+	for {
+		ref, ok := object.(Reference)
+		if !ok {
+			return object, nil
+		}
+		if seen[ref] {
+			return nil, fmt.Errorf("cyclic indirect reference")
+		}
+		seen[ref] = true
+		var err error
+		object, err = r.Object(ref)
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+// Object 按编号与代数读取间接对象
+// 不存在或已释放的引用按PDF规则返回空对象
+// 入参: ref 间接引用
+// 返回: Object 对象, error 错误信息
+func (r *Reader) Object(ref Reference) (Object, error) {
+	if value, ok := r.cache[ref]; ok {
+		return value, nil
+	}
+	entry, ok := r.xref[ref.Number]
+	if !ok || entry.kind == 0 || (entry.kind == 1 && entry.generation != ref.Generation) || (entry.kind == 2 && ref.Generation != 0) {
+		return nil, nil
+	}
+	if r.loading[ref] || len(r.loading) >= 256 {
+		return nil, fmt.Errorf("cyclic or excessive object dependency")
+	}
+	r.loading[ref] = true
+	defer delete(r.loading, ref)
+	var value Object
+	var err error
+	if entry.kind == 2 {
+		value, err = r.compressedObject(ref, entry)
+	} else {
+		var actual Reference
+		actual, value, err = r.indirect(entry.position)
+		if err == nil && actual != ref {
+			err = fmt.Errorf("cross-reference object mismatch")
+		}
+		if err == nil && r.security != nil {
+			value, err = r.security.decryptObject(value, ref)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.cache[ref] = value
+	return value, nil
 }
 
 // readRange 按需读取对象片段并检查文件边界和平台整数溢出

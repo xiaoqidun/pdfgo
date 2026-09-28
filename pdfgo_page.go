@@ -207,6 +207,9 @@ func (r *Reader) readPage(ref Reference, dict Dictionary, attrs pageAttributes) 
 	if err != nil {
 		return nil, err
 	}
+	if media.XMin == media.XMax || media.YMin == media.YMax {
+		return nil, fmt.Errorf("empty media box")
+	}
 	crop := media
 	if attrs.cropBox != nil {
 		crop, err = r.rectangle(attrs.cropBox)
@@ -274,10 +277,10 @@ func (r *Reader) rectangle(object Object) (Rectangle, error) {
 		if err != nil {
 			return Rectangle{}, err
 		}
+		if math.IsNaN(values[i]) || math.IsInf(values[i], 0) {
+			return Rectangle{}, fmt.Errorf("invalid rectangle coordinate")
+		}
 	}
 	rect := Rectangle{math.Min(values[0], values[2]), math.Min(values[1], values[3]), math.Max(values[0], values[2]), math.Max(values[1], values[3])}
-	if rect.XMin == rect.XMax || rect.YMin == rect.YMax {
-		return Rectangle{}, fmt.Errorf("empty rectangle")
-	}
 	return rect, nil
 }

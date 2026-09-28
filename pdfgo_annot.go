@@ -149,6 +149,9 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
 	}
+	if annotation.Rect.XMin == annotation.Rect.XMax || annotation.Rect.YMin == annotation.Rect.YMax {
+		return ctx.Err()
+	}
 	if annotation.Subtype == "Popup" {
 		_, err := r.ReadPopupAnnotation(annotation.Dictionary)
 		return err
