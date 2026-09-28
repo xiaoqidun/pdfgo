@@ -96,7 +96,10 @@ func gradientValues(stops []GradientStop, function *gradientFunction, domain [2]
 		return gradientValue(stops, position), nil
 	}
 	position = math.Max(0, math.Min(1, position))
-	values := function.value(domain[0] + position*(domain[1]-domain[0]))
+	values, err := function.evaluate(domain[0] + position*(domain[1]-domain[0]))
+	if err != nil {
+		return [4]float64{}, err
+	}
 	for i, value := range values {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return [4]float64{}, fmt.Errorf("nonfinite gradient color")
@@ -414,24 +417,33 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 	return stops, space, f, nil
 }
 
-// deviceNGradient 精确展开多色渐变的仿射着色与范围截断
+// deviceNGradient 组合多色渐变与着色函数，仅为可精确表示的函数展开分段
 // 入参: space 多色定义, function 渐变函数, domain 输入区间
 // 返回: []GradientStop 备用空间分段, *ColorSpace 备用空间, *gradientFunction 颜色函数, error 能力或格式错误
 func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	alternate, input, output, expressions, err := r.readDeviceNAffine(space)
+	tint, err := r.readMultiDeviceN(space)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	source, err := r.readGradientFunction(function, len(input)/2, 0)
+	source, err := r.readGradientFunction(function, tint.components, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	mapped := deviceNGradientFunction(source, input, output, expressions)
+	mapped := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+		values, err := source.evaluate(x)
+		if err != nil {
+			return values, err
+		}
+		return tint.values(values[:tint.components]...)
+	}}
+	if tint.program == nil {
+		mapped = deviceNGradientFunction(source, tint.input, tint.output, tint.expressions)
+	}
 	var stops []GradientStop
 	if mapped.linear != nil {
-		stops = clipGradientValues(mapped.linear(domain), gradientUnitBounds(alternate.Components()))
+		stops = clipGradientValues(mapped.linear(domain), gradientUnitBounds(tint.alternate.Components()))
 	}
-	return stops, alternate, mapped, nil
+	return stops, tint.alternate, mapped, nil
 }
 
 // clipGradientValues 在截断位置增加精确断点，不改变其余分段或跳变

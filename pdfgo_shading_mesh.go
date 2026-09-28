@@ -94,10 +94,18 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 		}
 	}
 	if g.function != nil {
-		values = g.function.value(values[0])
+		var err error
+		values, err = g.function.evaluate(values[0])
+		if err != nil {
+			return values, err
+		}
 	}
 	if g.tint != nil {
-		values = g.tint.values(values[:g.tint.components]...)
+		var err error
+		values, err = g.tint.values(values[:g.tint.components]...)
+		if err != nil {
+			return values, err
+		}
 	}
 	for c, value := range values {
 		if math.IsNaN(value) || math.IsInf(value, 0) {

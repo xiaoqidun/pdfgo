@@ -31,13 +31,20 @@ type SoftMask struct {
 
 // Transfer 将蒙版透明度或亮度映射到最终不透明度
 // 入参: value 蒙版采样值
-// 返回: float64 限定在零至一之间的不透明度
-func (m *SoftMask) Transfer(value float64) float64 {
+// 返回: float64 限定在零至一之间的不透明度, error 传递函数错误
+func (m *SoftMask) Transfer(value float64) (float64, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, fmt.Errorf("invalid mask transfer input")
+	}
 	value = math.Max(0, math.Min(1, value))
 	if m.transfer != nil {
-		value = m.transfer.value(value)[0]
+		values, err := m.transfer.evaluate(value)
+		if err != nil {
+			return 0, err
+		}
+		value = values[0]
 	}
-	return math.Max(0, math.Min(1, value))
+	return math.Max(0, math.Min(1, value)), nil
 }
 
 // Walk 访问蒙版图元，坐标与引用蒙版的页面一致

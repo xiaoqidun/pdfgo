@@ -32,11 +32,13 @@ var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 
 // Image 保存图像原始属性，颜色空间和遮罩保持为PDF对象
 // Warning非空时允许按声明尺寸读取含多余样本的图像，并报告恢复原因
+// Intent为空时继承绘图状态，单独解码使用相对色度
 type Image struct {
 	Width            int
 	Height           int
 	BitsPerComponent int
 	ColorSpace       Object
+	Intent           Name
 	Decode           Array
 	ImageMask        bool
 	Interpolate      bool
@@ -239,7 +241,40 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	if interpolate != nil && interpolate != Boolean(true) && interpolate != Boolean(false) {
 		return nil, fmt.Errorf("invalid image interpolation flag")
 	}
-	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Decode: decode, ImageMask: mask, Interpolate: interpolate == Boolean(true), Mask: dict["Mask"], SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
+	var intent Name
+	value, err := r.Resolve(dict["Intent"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		var ok bool
+		intent, ok = value.(Name)
+		if !ok {
+			return nil, fmt.Errorf("invalid image rendering intent")
+		}
+		intent = normalizeRenderingIntent(intent)
+	}
+	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Intent: intent, Decode: decode, ImageMask: mask, Interpolate: interpolate == Boolean(true), Mask: dict["Mask"], SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
+}
+
+// renderingIntent 取得图像有效渲染意图，支持直接构造的图像及间接字典值
+// 返回: Name 渲染意图, error 解析或类型错误
+func (i *Image) renderingIntent() (Name, error) {
+	if i.Intent != "" {
+		return normalizeRenderingIntent(i.Intent), nil
+	}
+	value, err := i.reader.Resolve(i.Stream.Dictionary["Intent"])
+	if err != nil {
+		return "", err
+	}
+	if value == nil {
+		return "RelativeColorimetric", nil
+	}
+	intent, ok := value.(Name)
+	if !ok {
+		return "", fmt.Errorf("invalid image rendering intent")
+	}
+	return normalizeRenderingIntent(intent), nil
 }
 
 // DecodeImage 应用Decode映射及颜色空间变换，合成遮罩后返回非预乘透明图像
@@ -585,8 +620,9 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if embeddedMask != nil && embeddedMask != Integer(0) {
 		return nil, &UnsupportedError{Feature: "image field SMaskInData"}
 	}
-	if intent := i.Stream.Dictionary["Intent"]; intent != nil && intent != Name("Perceptual") && intent != Name("RelativeColorimetric") && intent != Name("AbsoluteColorimetric") && intent != Name("Saturation") {
-		return nil, &UnsupportedError{Feature: "image rendering intent"}
+	intent, err := i.renderingIntent()
+	if err != nil {
+		return nil, err
 	}
 	ranges := make([]float64, components*2)
 	for c := 0; c < components; c++ {
@@ -685,7 +721,6 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		}
 		target.Pix = make([]uint16, bounds.Dx()*bounds.Dy()*stride)
 	}
-	intent, _ := i.Stream.Dictionary["Intent"].(Name)
 	maximum := float64((uint32(1) << i.BitsPerComponent) - 1)
 	for y := 0; y < bounds.Dy(); y++ {
 		for x := 0; x < bounds.Dx(); x++ {
@@ -744,7 +779,10 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				}
 			}
 			if deviceN != nil {
-				values = deviceN.values(values[:components]...)
+				values, err = deviceN.values(values[:components]...)
+				if err != nil {
+					return nil, err
+				}
 			}
 			if target != nil {
 				if palette != nil {
@@ -937,7 +975,10 @@ func (i *Image) palette() (*imagePalette, error) {
 	} else if calibrated == nil && lab == nil {
 		result.space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
 	}
-	intent, _ := i.Stream.Dictionary["Intent"].(Name)
+	intent, err := i.renderingIntent()
+	if err != nil {
+		return nil, err
+	}
 	for index := range palette {
 		v := data[index*components:]
 		for c := 0; c < components; c++ {
@@ -951,7 +992,10 @@ func (i *Image) palette() (*imagePalette, error) {
 		}
 		if deviceN != nil {
 			result.tints[index] = result.values[index]
-			values := deviceN.values(result.values[index][:components]...)
+			values, err := deviceN.values(result.values[index][:components]...)
+			if err != nil {
+				return nil, err
+			}
 			result.values[index] = values
 			rgb, err := deviceN.alternate.RGB(values[:deviceN.alternate.Components()], intent)
 			if err != nil {

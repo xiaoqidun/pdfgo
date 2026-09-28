@@ -51,6 +51,9 @@ func affineCalculator(data []byte, inputs, outputs int) ([]affineValue, error) {
 		stack[i][i+1] = 1
 	}
 	for {
+		if len(stack) > calculatorStackSize {
+			return nil, fmt.Errorf("calculator stack overflow")
+		}
 		p.skipSpace()
 		if p.pos == len(data) {
 			return nil, fmt.Errorf("unterminated calculator procedure")

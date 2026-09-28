@@ -22,16 +22,31 @@ import (
 
 // gradientFunction 保存已解析的一维颜色函数及可精确展开的线性分段
 type gradientFunction struct {
-	value  func(float64) [4]float64
-	linear func([2]float64) []GradientStop
+	value     func(float64) [4]float64
+	calculate func(float64) ([4]float64, error)
+	linear    func([2]float64) []GradientStop
+}
+
+// evaluate 计算颜色函数并传递运行时算术错误
+// 入参: x 输入分量
+// 返回: [4]float64 输出分量, error 求值错误
+func (f *gradientFunction) evaluate(x float64) ([4]float64, error) {
+	if f.calculate != nil {
+		return f.calculate(x)
+	}
+	return f.value(x), nil
 }
 
 // composeGradientFunction 将单分量渐变输入着色函数，保留分段、跳变及非线性计算
 // 入参: source 浓度函数, tint 着色函数
 // 返回: *gradientFunction 复合颜色函数
 func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
-	f := &gradientFunction{value: func(x float64) [4]float64 {
-		return tint.value(math.Max(0, math.Min(1, source.value(x)[0])))
+	f := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+		values, err := source.evaluate(x)
+		if err != nil {
+			return [4]float64{}, err
+		}
+		return tint.evaluate(math.Max(0, math.Min(1, values[0])))
 	}}
 	if source.linear != nil && tint.linear != nil {
 		f.linear = func(interval [2]float64) []GradientStop {
@@ -45,7 +60,8 @@ func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
 						result = append(result, mapped)
 					}
 				} else {
-					result = append(result, GradientStop{Position: stop.Position, Values: tint.value(stop.Values[0])})
+					values := gradientValue(tint.linear([2]float64{stop.Values[0], stop.Values[0]}), 0)
+					result = append(result, GradientStop{Position: stop.Position, Values: values})
 				}
 			}
 			return slices.Compact(result)
@@ -68,9 +84,13 @@ func deviceNGradientFunction(source *gradientFunction, input, output []float64, 
 		}
 		return
 	}
-	f := &gradientFunction{value: func(x float64) [4]float64 {
-		values := clipGradientValue(clipGradientValue(source.value(x), unit), input)
-		return clipGradientValue(transform(values), output)
+	f := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+		values, err := source.evaluate(x)
+		if err != nil {
+			return [4]float64{}, err
+		}
+		values = clipGradientValue(clipGradientValue(values, unit), input)
+		return clipGradientValue(transform(values), output), nil
 	}}
 	if source.linear != nil {
 		f.linear = func(interval [2]float64) []GradientStop {
@@ -84,7 +104,7 @@ func deviceNGradientFunction(source *gradientFunction, input, output []float64, 
 	return f
 }
 
-// readGradientFunction 解析采样、指数、拼接及仿射计算器函数，不近似非线性函数
+// readGradientFunction 解析采样、指数、拼接及计算器函数，不近似非线性函数
 // 入参: object 函数对象, channels 输出分量数, depth 嵌套深度
 // 返回: *gradientFunction 颜色函数, error 解析错误
 func (r *Reader) readGradientFunction(object Object, channels, depth int) (*gradientFunction, error) {
@@ -108,9 +128,13 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 			}
 			linear = linear && parts[i].linear != nil
 		}
-		f := &gradientFunction{value: func(x float64) (values [4]float64) {
+		f := &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
 			for c, part := range parts {
-				values[c] = part.value(x)[0]
+				result, evalErr := part.evaluate(x)
+				if evalErr != nil {
+					return values, evalErr
+				}
+				values[c] = result[0]
 			}
 			return
 		}}
@@ -175,8 +199,23 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		if err != nil {
 			return nil, err
 		}
+		program, err := compileCalculator(data)
+		if err != nil {
+			return nil, err
+		}
 		expressions, err := affineCalculator(data, 1, channels)
 		if err != nil {
+			return &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
+				x = math.Max(domain[0], math.Min(domain[1], x))
+				err = evaluateCalculator(program, []float64{x}, values[:channels])
+				if err != nil {
+					return values, err
+				}
+				return clipGradientValue(values, limits), nil
+			}}, nil
+		}
+		var output [4]float64
+		if err := evaluateCalculator(program, domain[:1], output[:channels]); err != nil {
 			return nil, err
 		}
 		stops := []GradientStop{{Position: 0}, {Position: 1}}
@@ -226,7 +265,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		}
 		linear = linear && (points[i] == points[i+1] || parts[i].linear != nil)
 	}
-	f := &gradientFunction{value: func(x float64) (values [4]float64) {
+	f := &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
 		x = math.Max(domain[0], math.Min(domain[1], x))
 		for i, part := range parts {
 			if points[i] == points[i+1] {
@@ -234,11 +273,14 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 			}
 			if x < points[i+1] || points[i+1] == domain[1] {
 				t := encode[2*i] + (x-points[i])/(points[i+1]-points[i])*(encode[2*i+1]-encode[2*i])
-				values = part.value(t)
+				values, err = part.evaluate(t)
+				if err != nil {
+					return values, err
+				}
 				break
 			}
 		}
-		return clipGradientValue(values, limits)
+		return clipGradientValue(values, limits), nil
 	}}
 	if linear {
 		var stops []GradientStop

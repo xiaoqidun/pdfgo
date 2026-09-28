@@ -1163,10 +1163,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("invalid rendering intent operands")
 		}
 		intent, ok := a[0].(Name)
-		if !ok || intent != "RelativeColorimetric" && intent != "AbsoluteColorimetric" && intent != "Perceptual" && intent != "Saturation" {
+		if !ok {
 			return fmt.Errorf("invalid rendering intent")
 		}
-		p.state.style.RenderingIntent = intent
+		p.state.style.RenderingIntent = normalizeRenderingIntent(intent)
 	case "i":
 		n, err := numbers(a, 1)
 		if err != nil {
@@ -1337,6 +1337,9 @@ func (p *pageInterpreter) image(stream *Stream) error {
 	image, err := p.reader.ReadImage(stream)
 	if err != nil {
 		return err
+	}
+	if image.Intent == "" {
+		image.Intent = normalizeRenderingIntent(p.state.style.RenderingIntent)
 	}
 	if p.opaqueGroup && (image.Mask != nil || image.SoftMask != nil || image.ImageMask) {
 		return &UnsupportedError{Feature: "masked image in isolated group"}

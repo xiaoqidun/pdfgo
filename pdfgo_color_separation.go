@@ -24,8 +24,9 @@ type separationSpace struct {
 	name      Name
 	alternate Name
 	lab       *labSpace
-	icc       *iccRGBSpace
+	icc       *iccColorSpace
 	calRGB    *calRGBSpace
+	gray      bool
 	transform *gradientFunction
 }
 
@@ -46,7 +47,11 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	if len(space) != 4 || space[0] != Name("Separation") {
 		return nil, fmt.Errorf("invalid Separation color space")
 	}
-	name, ok := space[1].(Name)
+	colorant, err := r.Resolve(space[1])
+	if err != nil {
+		return nil, err
+	}
+	name, ok := colorant.(Name)
 	if !ok {
 		return nil, fmt.Errorf("invalid Separation colorant")
 	}
@@ -56,8 +61,9 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	}
 	alternate, ok := object.(Name)
 	var lab *labSpace
-	var icc *iccRGBSpace
+	var icc *iccColorSpace
 	var calibrated *calRGBSpace
+	gray := false
 	if !ok {
 		array, arrayOK := object.(Array)
 		if !arrayOK || len(array) != 2 {
@@ -68,11 +74,14 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 			lab, err = r.readLab(array)
 			alternate = "Lab"
 		case Name("ICCBased"):
-			icc, err = r.readICCRGB(array)
+			icc, err = r.readICCColorSpace(array)
 			alternate = "ICCBased"
 		case Name("CalRGB"):
 			calibrated, err = r.readCalRGB(array)
 			alternate = "CalRGB"
+		case Name("CalGray"):
+			calibrated, err = r.readCalGray(array)
+			alternate, gray = "CalGray", true
 		default:
 			return nil, &UnsupportedError{Feature: "Separation alternate color space"}
 		}
@@ -82,11 +91,13 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	}
 	channels := 0
 	switch alternate {
-	case "DeviceGray":
+	case "DeviceGray", "CalGray":
 		channels = 1
 	case "DeviceRGB":
 		channels = 3
-	case "Lab", "ICCBased", "CalRGB":
+	case "ICCBased":
+		channels = icc.components()
+	case "Lab", "CalRGB":
 		channels = 3
 	case "DeviceCMYK":
 		channels = 4
@@ -97,7 +108,7 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &separationSpace{name: name, alternate: alternate, lab: lab, icc: icc, calRGB: calibrated, transform: transform}, nil
+	return &separationSpace{name: name, alternate: alternate, lab: lab, icc: icc, calRGB: calibrated, gray: gray, transform: transform}, nil
 }
 
 // readTintFunction 读取一维采样或指数着色函数
@@ -281,7 +292,10 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 	if s.name == "All" {
 		return Paint{CMYK: &[4]float64{tint, tint, tint, tint}}, nil
 	}
-	values := s.transform.value(tint)
+	values, err := s.transform.evaluate(tint)
+	if err != nil {
+		return Paint{}, err
+	}
 	paint := Paint{}
 	switch s.alternate {
 	case "DeviceGray":
@@ -294,8 +308,11 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 		color := s.lab.color(values[0], values[1], values[2])
 		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}
 	case "ICCBased":
-		return (&iccColorSpace{rgb: s.icc}).paint(values[:3], intent)
-	case "CalRGB":
+		return s.icc.paint(values[:s.icc.components()], intent)
+	case "CalRGB", "CalGray":
+		if s.gray {
+			values[1], values[2] = values[0], values[0]
+		}
 		color := s.calRGB.color(values[0], values[1], values[2])
 		paint.RGB = [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}
 	}

@@ -42,6 +42,18 @@ type graphicsColorSpace struct {
 	palette *imagePalette
 }
 
+// normalizeRenderingIntent 将未识别的渲染意图按PDF规则映射为相对色度
+// 入参: intent 渲染意图名称
+// 返回: Name 有效渲染意图
+func normalizeRenderingIntent(intent Name) Name {
+	switch intent {
+	case "Perceptual", "AbsoluteColorimetric", "Saturation":
+		return intent
+	default:
+		return "RelativeColorimetric"
+	}
+}
+
 // paint 将页面颜色操作数转换为画刷，索引色保留基色空间分量
 // 入参: values 颜色分量
 // 返回: Paint 画刷, error 无效分量
