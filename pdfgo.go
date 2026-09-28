@@ -31,14 +31,14 @@ type SyntaxError struct {
 	Message string
 }
 
-// Error 返回错误信息
-func (e *SyntaxError) Error() string {
-	return fmt.Sprintf("offset %d: %s", e.Offset, e.Message)
-}
-
 // UnsupportedError 表示尚未支持的PDF能力
 type UnsupportedError struct {
 	Feature string
+}
+
+// Error 返回错误信息
+func (e *SyntaxError) Error() string {
+	return fmt.Sprintf("offset %d: %s", e.Offset, e.Message)
 }
 
 // Error 返回错误信息

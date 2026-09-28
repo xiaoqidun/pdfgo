@@ -27,6 +27,24 @@ type Movie struct {
 	Poster        Object
 }
 
+// Sound 保存音频采样参数和数据流，不执行播放或格式转换
+type Sound struct {
+	Stream      *Stream
+	Rate        float64
+	Channels    int
+	Bits        int
+	Encoding    Name
+	Compression Name
+	File        *FileSpecification
+}
+
+// FileSpecification 保存PDF文件说明，不读取外部文件或访问网络
+type FileSpecification struct {
+	Name        string
+	Description string
+	Embedded    *Stream
+}
+
 // ReadMovie 读取视频字典，未声明尺寸时保留零值
 // 入参: object 视频字典或间接引用
 // 返回: Movie 视频信息, error 字典或显示参数错误
@@ -85,17 +103,6 @@ func (r *Reader) ReadMovie(object Object) (Movie, error) {
 		return movie, fmt.Errorf("invalid movie poster")
 	}
 	return movie, nil
-}
-
-// Sound 保存音频采样参数和数据流，不执行播放或格式转换
-type Sound struct {
-	Stream      *Stream
-	Rate        float64
-	Channels    int
-	Bits        int
-	Encoding    Name
-	Compression Name
-	File        *FileSpecification
 }
 
 // ReadSound 读取音频对象，原始多字节样本采用大端顺序
@@ -160,13 +167,6 @@ func (r *Reader) ReadSound(object Object) (Sound, error) {
 		return result, fmt.Errorf("invalid sound encoding")
 	}
 	return result, nil
-}
-
-// FileSpecification 保存PDF文件说明，不读取外部文件或访问网络
-type FileSpecification struct {
-	Name        string
-	Description string
-	Embedded    *Stream
 }
 
 // ReadFileSpecification 解析文件名、说明和可选的内嵌数据流，优先使用Unicode文件名

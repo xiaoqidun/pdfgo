@@ -133,6 +133,74 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 	return nil
 }
 
+// Content 读取并依次连接页面内容流，保留流间的图形状态语义
+// 返回: []byte 内容操作符数据, error 错误信息
+func (p *Page) Content() ([]byte, error) {
+	var out bytes.Buffer
+	if _, err := p.WriteContent(context.Background(), &out); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// WriteContent 逐个解码并输出页面内容流，以换行分隔，不拼接整页内容；单个流仍完整解码
+// 入参: ctx 取消上下文，在流之间检查, writer 输出流
+// 返回: int64 已写字节数, error 解码或写入错误，出错时可能已有部分输出
+func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	value, err := p.reader.Resolve(p.Dictionary["Contents"])
+	if err != nil {
+		return 0, err
+	}
+	if value == nil {
+		return 0, nil
+	}
+	objects := Array{value}
+	if array, ok := value.(Array); ok {
+		objects = array
+	}
+	var written int64
+	for _, object := range objects {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		resolved, err := p.reader.Resolve(object)
+		if err != nil {
+			return written, err
+		}
+		stream, ok := resolved.(*Stream)
+		if !ok {
+			return written, fmt.Errorf("page content is not a stream")
+		}
+		data, err := stream.Decode()
+		if err != nil {
+			return written, err
+		}
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, err := writer.Write(data)
+		written += int64(n)
+		if err != nil {
+			return written, err
+		}
+		if n != len(data) {
+			return written, io.ErrShortWrite
+		}
+		n, err = io.WriteString(writer, "\n")
+		written += int64(n)
+		if err != nil {
+			return written, err
+		}
+		if n != 1 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
+}
+
 // readPage 解析继承属性并检查页面尺寸
 func (r *Reader) readPage(ref Reference, dict Dictionary, attrs pageAttributes) (*Page, error) {
 	media, err := r.rectangle(attrs.mediaBox)
@@ -212,72 +280,4 @@ func (r *Reader) rectangle(object Object) (Rectangle, error) {
 		return Rectangle{}, fmt.Errorf("empty rectangle")
 	}
 	return rect, nil
-}
-
-// Content 读取并依次连接页面内容流，保留流间的图形状态语义
-// 返回: []byte 内容操作符数据, error 错误信息
-func (p *Page) Content() ([]byte, error) {
-	var out bytes.Buffer
-	if _, err := p.WriteContent(context.Background(), &out); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
-}
-
-// WriteContent 逐个解码并输出页面内容流，以换行分隔，不拼接整页内容；单个流仍完整解码
-// 入参: ctx 取消上下文，在流之间检查, writer 输出流
-// 返回: int64 已写字节数, error 解码或写入错误，出错时可能已有部分输出
-func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	value, err := p.reader.Resolve(p.Dictionary["Contents"])
-	if err != nil {
-		return 0, err
-	}
-	if value == nil {
-		return 0, nil
-	}
-	objects := Array{value}
-	if array, ok := value.(Array); ok {
-		objects = array
-	}
-	var written int64
-	for _, object := range objects {
-		if err := ctx.Err(); err != nil {
-			return written, err
-		}
-		resolved, err := p.reader.Resolve(object)
-		if err != nil {
-			return written, err
-		}
-		stream, ok := resolved.(*Stream)
-		if !ok {
-			return written, fmt.Errorf("page content is not a stream")
-		}
-		data, err := stream.Decode()
-		if err != nil {
-			return written, err
-		}
-		if err := ctx.Err(); err != nil {
-			return written, err
-		}
-		n, err := writer.Write(data)
-		written += int64(n)
-		if err != nil {
-			return written, err
-		}
-		if n != len(data) {
-			return written, io.ErrShortWrite
-		}
-		n, err = io.WriteString(writer, "\n")
-		written += int64(n)
-		if err != nil {
-			return written, err
-		}
-		if n != 1 {
-			return written, io.ErrShortWrite
-		}
-	}
-	return written, nil
 }

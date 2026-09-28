@@ -29,12 +29,6 @@ import (
 //go:embed assets/afm
 var coreFontResources embed.FS
 
-// coreFontMetrics 保存标准字体的缺省编码及千分之一字宽
-type coreFontMetrics struct {
-	names  [256]string
-	widths map[string]float64
-}
-
 // coreFonts 按需加载标准字体度量，后续解码共享只读数据
 var coreFonts = sync.OnceValues(func() (map[string]*coreFontMetrics, error) {
 	fonts := make(map[string]*coreFontMetrics, 14)
@@ -51,6 +45,12 @@ var coreFonts = sync.OnceValues(func() (map[string]*coreFontMetrics, error) {
 	}
 	return fonts, nil
 })
+
+// coreFontMetrics 保存标准字体的缺省编码及千分之一字宽
+type coreFontMetrics struct {
+	names  [256]string
+	widths map[string]float64
+}
 
 // parseCoreFontMetrics 读取内置AFM资源中的字符编码、名称和横向字宽
 // 入参: data 原始AFM资源

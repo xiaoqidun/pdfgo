@@ -33,6 +33,23 @@ type TilingPattern struct {
 	depth     int
 }
 
+// Walk 独立解释图案单元内容，保留图案边界与无色图案的基色
+// 入参: ctx 取消上下文, base 无色图案基色, visitor 绘制访问器
+// 返回: error 解析或访问错误
+func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) error {
+	if p.depth > 64 {
+		return &UnsupportedError{Feature: "nested pattern depth"}
+	}
+	base.Tiling, base.Axial, base.Radial = nil, nil, nil
+	base.Alpha = 1
+	box := p.BBox
+	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
+	style := Style{Fill: base, Stroke: base, LineWidth: 1, MiterLimit: 10, Clips: []Path{clip}}
+	child := pageInterpreter{reader: p.reader, resources: p.resources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
+	child.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: style}
+	return child.run(p.data)
+}
+
 // tilingPattern 读取平铺图案，着色图案交由shadingPattern处理
 // 入参: name 图案资源名
 // 返回: *TilingPattern 平铺图案, error 解析错误
@@ -106,23 +123,6 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 		return nil, err
 	}
 	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1}, nil
-}
-
-// Walk 独立解释图案单元内容，保留图案边界与无色图案的基色
-// 入参: ctx 取消上下文, base 无色图案基色, visitor 绘制访问器
-// 返回: error 解析或访问错误
-func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) error {
-	if p.depth > 64 {
-		return &UnsupportedError{Feature: "nested pattern depth"}
-	}
-	base.Tiling, base.Axial, base.Radial = nil, nil, nil
-	base.Alpha = 1
-	box := p.BBox
-	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
-	style := Style{Fill: base, Stroke: base, LineWidth: 1, MiterLimit: 10, Clips: []Path{clip}}
-	child := pageInterpreter{reader: p.reader, resources: p.resources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
-	child.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: style}
-	return child.run(p.data)
 }
 
 // patternBaseColor 按底层设备色空间解释无色图案的颜色分量

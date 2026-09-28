@@ -23,118 +23,6 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-// encodePassword 按加密版本转换用户输入，不改变调用方的密码字节
-// 入参: password UTF-8密码
-// 返回: []byte 已编码密码, error 编码或准备错误
-func (r *Reader) encodePassword(password []byte) ([]byte, error) {
-	object, err := r.Resolve(r.Trailer["Encrypt"])
-	if err != nil || object == nil {
-		return nil, err
-	}
-	dict, ok := object.(Dictionary)
-	if !ok {
-		return nil, fmt.Errorf("invalid encryption dictionary")
-	}
-	revision, _ := dict["R"].(Integer)
-	if revision >= 5 {
-		return preparePassword(password)
-	}
-	if !utf8.Valid(password) {
-		return nil, ErrPassword
-	}
-	result := make([]byte, 0, len(password))
-	for _, c := range string(password) {
-		found := false
-		for code := 0; code < 256; code++ {
-			decoded := rune(code)
-			if mapped, ok := pdfDocCharacters[byte(code)]; ok {
-				if mapped == 0 {
-					continue
-				}
-				decoded = mapped
-			}
-			if decoded == c {
-				result = append(result, byte(code))
-				found = true
-				break
-			}
-		}
-		if !found {
-			clear(result)
-			return nil, ErrPassword
-		}
-	}
-	return result, nil
-}
-
-// preparePassword 执行RFC4013的查询字符串准备及Unicode3.2双向文字检查
-// 入参: password UTF-8密码
-// 返回: []byte SASLprep结果, error 准备错误
-func preparePassword(password []byte) ([]byte, error) {
-	if !utf8.Valid(password) {
-		return nil, ErrPassword
-	}
-	mapped := make([]byte, 0, len(password))
-	defer func() { clear(mapped) }()
-	for _, c := range string(password) {
-		if passwordRangeContains(passwordMapped, c) {
-			continue
-		}
-		if passwordRangeContains(passwordSpace, c) {
-			c = ' '
-		}
-		switch c {
-		case 194664:
-			c = 0x2136a
-		case 194676:
-			c = 0x5f33
-		case 194847:
-			c = 0x43ab
-		case 194911:
-			c = 0x7aae
-		case 195007:
-			c = 0x4d57
-		}
-		mapped = utf8.AppendRune(mapped, c)
-	}
-	result := make([]byte, 0, len(mapped))
-	defer func() { clear(result) }()
-	start := 0
-	for offset, c := range string(mapped) {
-		if !passwordRangeContains(passwordUnassigned, c) {
-			continue
-		}
-		result = append(result, norm.NFKC.Bytes(mapped[start:offset])...)
-		result = utf8.AppendRune(result, c)
-		start = offset + utf8.RuneLen(c)
-	}
-	result = append(result, norm.NFKC.Bytes(mapped[start:])...)
-	randal, left := false, false
-	for _, c := range string(result) {
-		if passwordRangeContains(passwordProhibited, c) {
-			clear(result)
-			return nil, ErrPassword
-		}
-		randal = randal || passwordRangeContains(passwordRandal, c)
-		left = left || passwordRangeContains(passwordLeft, c)
-	}
-	first, _ := utf8.DecodeRune(result)
-	last, _ := utf8.DecodeLastRune(result)
-	if randal && (left || !passwordRangeContains(passwordRandal, first) || !passwordRangeContains(passwordRandal, last)) {
-		clear(result)
-		return nil, ErrPassword
-	}
-	return bytes.Clone(result[:min(len(result), 127)]), nil
-}
-
-// passwordRangeContains 在RFC3454的Unicode3.2区间表中查找字符
-// 入参: ranges 有序闭区间, value 字符
-// 返回: bool 是否包含
-func passwordRangeContains(ranges [][2]rune, value rune) bool {
-	i := sort.Search(len(ranges), func(i int) bool { return ranges[i][1] >= value })
-	return i < len(ranges) && ranges[i][0] <= value
-}
-
 // passwordUnassigned 保存RFC3454的Unicode3.2未分配字符区间
 var passwordUnassigned = [][2]rune{
 	{0x221, 0x221},
@@ -995,4 +883,116 @@ var passwordLeft = [][2]rune{
 	{0x2f800, 0x2fa1d},
 	{0xf0000, 0xffffd},
 	{0x100000, 0x10fffd},
+}
+
+// encodePassword 按加密版本转换用户输入，不改变调用方的密码字节
+// 入参: password UTF-8密码
+// 返回: []byte 已编码密码, error 编码或准备错误
+func (r *Reader) encodePassword(password []byte) ([]byte, error) {
+	object, err := r.Resolve(r.Trailer["Encrypt"])
+	if err != nil || object == nil {
+		return nil, err
+	}
+	dict, ok := object.(Dictionary)
+	if !ok {
+		return nil, fmt.Errorf("invalid encryption dictionary")
+	}
+	revision, _ := dict["R"].(Integer)
+	if revision >= 5 {
+		return preparePassword(password)
+	}
+	if !utf8.Valid(password) {
+		return nil, ErrPassword
+	}
+	result := make([]byte, 0, len(password))
+	for _, c := range string(password) {
+		found := false
+		for code := 0; code < 256; code++ {
+			decoded := rune(code)
+			if mapped, ok := pdfDocCharacters[byte(code)]; ok {
+				if mapped == 0 {
+					continue
+				}
+				decoded = mapped
+			}
+			if decoded == c {
+				result = append(result, byte(code))
+				found = true
+				break
+			}
+		}
+		if !found {
+			clear(result)
+			return nil, ErrPassword
+		}
+	}
+	return result, nil
+}
+
+// preparePassword 执行RFC4013的查询字符串准备及Unicode3.2双向文字检查
+// 入参: password UTF-8密码
+// 返回: []byte SASLprep结果, error 准备错误
+func preparePassword(password []byte) ([]byte, error) {
+	if !utf8.Valid(password) {
+		return nil, ErrPassword
+	}
+	mapped := make([]byte, 0, len(password))
+	defer func() { clear(mapped) }()
+	for _, c := range string(password) {
+		if passwordRangeContains(passwordMapped, c) {
+			continue
+		}
+		if passwordRangeContains(passwordSpace, c) {
+			c = ' '
+		}
+		switch c {
+		case 194664:
+			c = 0x2136a
+		case 194676:
+			c = 0x5f33
+		case 194847:
+			c = 0x43ab
+		case 194911:
+			c = 0x7aae
+		case 195007:
+			c = 0x4d57
+		}
+		mapped = utf8.AppendRune(mapped, c)
+	}
+	result := make([]byte, 0, len(mapped))
+	defer func() { clear(result) }()
+	start := 0
+	for offset, c := range string(mapped) {
+		if !passwordRangeContains(passwordUnassigned, c) {
+			continue
+		}
+		result = append(result, norm.NFKC.Bytes(mapped[start:offset])...)
+		result = utf8.AppendRune(result, c)
+		start = offset + utf8.RuneLen(c)
+	}
+	result = append(result, norm.NFKC.Bytes(mapped[start:])...)
+	randal, left := false, false
+	for _, c := range string(result) {
+		if passwordRangeContains(passwordProhibited, c) {
+			clear(result)
+			return nil, ErrPassword
+		}
+		randal = randal || passwordRangeContains(passwordRandal, c)
+		left = left || passwordRangeContains(passwordLeft, c)
+	}
+	first, _ := utf8.DecodeRune(result)
+	last, _ := utf8.DecodeLastRune(result)
+	if randal && (left || !passwordRangeContains(passwordRandal, first) || !passwordRangeContains(passwordRandal, last)) {
+		clear(result)
+		return nil, ErrPassword
+	}
+	return bytes.Clone(result[:min(len(result), 127)]), nil
+}
+
+// passwordRangeContains 在RFC3454的Unicode3.2区间表中查找字符
+// 入参: ranges 有序闭区间, value 字符
+// 返回: bool 是否包含
+func passwordRangeContains(ranges [][2]rune, value rune) bool {
+	i := sort.Search(len(ranges), func(i int) bool { return ranges[i][1] >= value })
+	return i < len(ranges) && ranges[i][0] <= value
 }

@@ -159,13 +159,6 @@ func (s *ColorSpace) Convert(values []float64, source *ColorSpace, intent Name) 
 	return result, nil
 }
 
-// deviceCMYKRGB 按PDF设备颜色转换规则叠加黑色分量后取补色
-// 入参: values CMYK单位分量
-// 返回: [3]float64 RGB单位分量
-func deviceCMYKRGB(values []float64) [3]float64 {
-	return [3]float64{1 - math.Min(1, values[0]+values[3]), 1 - math.Min(1, values[1]+values[3]), 1 - math.Min(1, values[2]+values[3])}
-}
-
 // Luminosity 按PDF蒙版规则计算亮度，ICC使用连接空间的Y分量
 // 入参: values 已合成的颜色分量, intent 渲染意图
 // 返回: float64 单位亮度, error 分量或变换错误
@@ -192,6 +185,13 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 	}
 	rgb, err := s.RGB(values, intent)
 	return .3*rgb[0] + .59*rgb[1] + .11*rgb[2], err
+}
+
+// deviceCMYKRGB 按PDF设备颜色转换规则叠加黑色分量后取补色
+// 入参: values CMYK单位分量
+// 返回: [3]float64 RGB单位分量
+func deviceCMYKRGB(values []float64) [3]float64 {
+	return [3]float64{1 - math.Min(1, values[0]+values[3]), 1 - math.Min(1, values[1]+values[3]), 1 - math.Min(1, values[2]+values[3])}
 }
 
 // validate 检查混合分量数与单位范围

@@ -109,20 +109,6 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 	return ctx.Err()
 }
 
-// catalogDictionary 读取目录字典，不执行目录中的动作
-// 返回: Dictionary 目录, error 结构错误
-func (r *Reader) catalogDictionary() (Dictionary, error) {
-	value, err := r.Resolve(r.Trailer["Root"])
-	if err != nil {
-		return nil, err
-	}
-	catalog, ok := value.(Dictionary)
-	if !ok {
-		return nil, fmt.Errorf("invalid catalog")
-	}
-	return catalog, nil
-}
-
 // WalkEmbeddedFiles 枚举文档名称树中的附件，不解码数据、不读取外部文件
 // 入参: ctx 取消上下文, visit 名称树原始键和文件说明的访问函数
 // 返回: error 名称树、文件说明或访问错误
@@ -149,4 +135,18 @@ func (r *Reader) WalkEmbeddedFiles(ctx context.Context, visit func(string, FileS
 		}
 		return visit(name, file)
 	})
+}
+
+// catalogDictionary 读取目录字典，不执行目录中的动作
+// 返回: Dictionary 目录, error 结构错误
+func (r *Reader) catalogDictionary() (Dictionary, error) {
+	value, err := r.Resolve(r.Trailer["Root"])
+	if err != nil {
+		return nil, err
+	}
+	catalog, ok := value.(Dictionary)
+	if !ok {
+		return nil, fmt.Errorf("invalid catalog")
+	}
+	return catalog, nil
 }

@@ -47,6 +47,49 @@ type Image struct {
 	reader           *Reader
 }
 
+// deviceSampleImage 按需组合设备色或索引色样本与遮罩，不重复展开像素缓冲
+type deviceSampleImage struct {
+	source    image.Image
+	mask      *imageResample
+	inverted  bool
+	palette   *imagePalette
+	maximum   float64
+	byteExact bool
+}
+
+// imagePalette 保存索引色的原始分量和显示颜色
+type imagePalette struct {
+	space  *ColorSpace
+	values [][4]float64
+	tints  [][4]float64
+	colors []color.NRGBA64
+}
+
+// imageResample 在统一图像坐标中采样，不缩减任一轴的原始采样数
+type imageResample struct {
+	source      image.Image
+	bounds      image.Rectangle
+	interpolate bool
+}
+
+// cmykSample 保存未经过色彩管理的十六位四色分量
+type cmykSample [4]uint16
+
+// packedCMYKImage 保留逐行对齐的四色样本，按需无损展开分量
+type packedCMYKImage struct {
+	data          []byte
+	rect          image.Rectangle
+	stride, depth int
+}
+
+// packedGrayImage 保留低位深灰度或索引样本的逐行紧凑布局
+type packedGrayImage struct {
+	data   []byte
+	rect   image.Rectangle
+	stride int
+	depth  int
+}
+
 // JBIG2File 无损封装可直接复用的单页JBIG2图像及全局段
 // 不适合直接复用的图像返回nil，调用DecodeImage可得到已应用颜色与遮罩的像素
 // 返回: []byte 完整JBIG2文件, error 解码参数或资源错误
@@ -188,6 +231,255 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 // 返回: image.Image 解码图像, error 错误信息
 func (i *Image) DecodeImage() (image.Image, error) {
 	return i.decodeImage(nil)
+}
+
+// ColorModel 返回可无损表达原始采样精度的非预乘颜色模型
+// 返回: color.Model 颜色模型
+func (s *deviceSampleImage) ColorModel() color.Model {
+	if s.byteExact {
+		return color.NRGBAModel
+	}
+	return color.NRGBA64Model
+}
+
+// Bounds 返回对齐后的图像边界
+// 返回: image.Rectangle 图像边界
+func (s *deviceSampleImage) Bounds() image.Rectangle { return s.source.Bounds() }
+
+// At 按原始采样精度返回非预乘颜色，边界外透明
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 像素颜色
+func (s *deviceSampleImage) At(x, y int) color.Color {
+	if !image.Pt(x, y).In(s.Bounds()) {
+		return color.NRGBA64{}
+	}
+	r, g, b, _ := s.source.At(x, y).RGBA()
+	pixel := color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: 65535}
+	if s.palette != nil {
+		index := int(math.Max(0, math.Min(float64(len(s.palette.colors)-1), math.Round(float64(r)/65535*s.maximum))))
+		pixel = s.palette.colors[index]
+	}
+	alpha := uint32(65535)
+	if s.mask != nil {
+		alpha, _, _, _ = s.mask.At(x, y).RGBA()
+		if s.inverted {
+			alpha = 65535 - alpha
+		}
+	}
+	pixel.A = uint16(uint32(pixel.A) * alpha / 65535)
+	if s.byteExact {
+		return color.NRGBA{R: uint8(pixel.R >> 8), G: uint8(pixel.G >> 8), B: uint8(pixel.B >> 8), A: uint8(pixel.A >> 8)}
+	}
+	return pixel
+}
+
+// ColorModel 返回原始图像的颜色模型
+// 返回: color.Model 颜色模型
+func (s *imageResample) ColorModel() color.Model { return s.source.ColorModel() }
+
+// Bounds 返回合成图像的采样边界
+// 返回: image.Rectangle 采样边界
+func (s *imageResample) Bounds() image.Rectangle { return s.bounds }
+
+// At 按像素中心执行最近邻或双线性采样，保留原始CMYK分量
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 采样颜色
+func (s *imageResample) At(x, y int) color.Color {
+	b := s.source.Bounds()
+	if b == s.bounds {
+		return s.source.At(x, y)
+	}
+	sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
+	sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
+	if !s.interpolate {
+		return s.source.At(b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
+	}
+	x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
+	fx, fy := sx-float64(x0), sy-float64(y0)
+	var values [4]float64
+	_, cmyk := imageCMYKSample(s.source.At(b.Min.X, b.Min.Y))
+	for dy := 0; dy < 2; dy++ {
+		for dx := 0; dx < 2; dx++ {
+			weightX, weightY := 1-fx, 1-fy
+			if dx == 1 {
+				weightX = fx
+			}
+			if dy == 1 {
+				weightY = fy
+			}
+			pixel := s.source.At(b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy)))
+			r, g, b, a := pixel.RGBA()
+			if cmyk {
+				c, _ := imageCMYKSample(pixel)
+				r, g, b, a = uint32(c[0]), uint32(c[1]), uint32(c[2]), uint32(c[3])
+			}
+			for i, v := range [4]uint32{r, g, b, a} {
+				values[i] += float64(v) * weightX * weightY
+			}
+		}
+	}
+	if cmyk {
+		return cmykSample{uint16(math.Round(values[0])), uint16(math.Round(values[1])), uint16(math.Round(values[2])), uint16(math.Round(values[3]))}
+	}
+	return color.RGBA64{R: uint16(math.Round(values[0])), G: uint16(math.Round(values[1])), B: uint16(math.Round(values[2])), A: uint16(math.Round(values[3]))}
+}
+
+// DecodeSamples 解码原始图像样本，不应用Decode数组、遮罩或色彩管理
+// 返回的灰度值用于样本解释，不代表图像已完成页面合成
+// CMYK图像还原DCT分量，取消通用JPEG解码器的Adobe反相处理
+// 返回: image.Image 样本图像, error 错误信息
+func (i *Image) DecodeSamples() (image.Image, error) {
+	filters, parameters, err := i.Stream.filterChain(i.reader)
+	if err != nil {
+		return nil, err
+	}
+	terminal := Name("")
+	var terminalParams Dictionary
+	if len(filters) > 0 {
+		last := filters[len(filters)-1]
+		if last == Name("DCTDecode") || last == Name("JBIG2Decode") || last == Name("JPXDecode") || last == Name("CCITTFaxDecode") {
+			terminal = last.(Name)
+			if parameters[len(filters)-1] != nil {
+				var ok bool
+				terminalParams, ok = parameters[len(filters)-1].(Dictionary)
+				if !ok {
+					return nil, fmt.Errorf("invalid image decode parameters")
+				}
+			}
+			filters = filters[:len(filters)-1]
+			parameters = parameters[:len(parameters)-1]
+		}
+	}
+	data, err := (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: i.Stream.Data}).Decode()
+	if err != nil {
+		return nil, err
+	}
+	var result image.Image
+	switch terminal {
+	case "CCITTFaxDecode":
+		return i.ccittSamples(data, terminalParams)
+	case "DCTDecode":
+		result, err = i.jpegSamples(data, terminalParams)
+		if err != nil {
+			return nil, err
+		}
+	case "JBIG2Decode":
+		if i.BitsPerComponent != 1 {
+			return nil, fmt.Errorf("invalid JBIG2 component depth")
+		}
+		var globals []byte
+		if terminalParams["JBIG2Globals"] != nil {
+			object, err := i.reader.Resolve(terminalParams["JBIG2Globals"])
+			if err != nil {
+				return nil, err
+			}
+			stream, ok := object.(*Stream)
+			if !ok {
+				return nil, fmt.Errorf("invalid JBIG2 globals")
+			}
+			globals, err = stream.Decode()
+			if err != nil {
+				return nil, err
+			}
+		}
+		decoder, err := jbig2.NewDecoderWithGlobals(bytes.NewReader(data), globals)
+		if err != nil {
+			return nil, err
+		}
+		result, err = decoder.Decode()
+		if err != nil {
+			return nil, err
+		}
+	case "JPXDecode":
+		cmyk := i.ColorSpace == Name("DeviceCMYK")
+		if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
+			object, err := i.reader.Resolve(space[1])
+			if err != nil {
+				return nil, err
+			}
+			profile, ok := object.(*Stream)
+			if !ok {
+				return nil, fmt.Errorf("invalid ICC profile stream")
+			}
+			cmyk = profile.Dictionary["N"] == Integer(4)
+		}
+		if cmyk {
+			return i.jpxCMYKSamples(data)
+		}
+		result, _, err = image.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return i.rawSamples(data)
+	}
+	if result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height {
+		return nil, fmt.Errorf("decoded image dimensions differ from dictionary")
+	}
+	return result, nil
+}
+
+// RGBA 返回不透明的设备色预览，原始分量由图像解码流程解释
+// 返回: uint32 红、绿、蓝及透明度
+func (c cmykSample) RGBA() (uint32, uint32, uint32, uint32) {
+	k := uint64(65535 - c[3])
+	return uint32(uint64(65535-c[0]) * k / 65535), uint32(uint64(65535-c[1]) * k / 65535), uint32(uint64(65535-c[2]) * k / 65535), 65535
+}
+
+// ColorModel 返回保留十六位四色样本的颜色模型
+// 返回: color.Model 颜色模型
+func (s *packedCMYKImage) ColorModel() color.Model {
+	return color.ModelFunc(func(c color.Color) color.Color {
+		if sample, ok := imageCMYKSample(c); ok {
+			return sample
+		}
+		r, g, b, _ := c.RGBA()
+		white := max(r, g, b)
+		if white == 0 {
+			return cmykSample{0, 0, 0, 65535}
+		}
+		return cmykSample{uint16((white - r) * 65535 / white), uint16((white - g) * 65535 / white), uint16((white - b) * 65535 / white), uint16(65535 - white)}
+	})
+}
+
+// Bounds 返回原始样本边界
+// 返回: image.Rectangle 图像边界
+func (s *packedCMYKImage) Bounds() image.Rectangle { return s.rect }
+
+// At 读取逐行打包的四色分量，边界外返回零透明度
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 样本颜色
+func (s *packedCMYKImage) At(x, y int) color.Color {
+	if !image.Pt(x, y).In(s.rect) {
+		return color.RGBA64{}
+	}
+	line := s.data[(y-s.rect.Min.Y)*s.stride:]
+	var sample cmykSample
+	for c := range sample {
+		value := uint32(packedSample(line, (x-s.rect.Min.X)*4+c, s.depth))
+		sample[c] = uint16(value * 65535 / ((uint32(1) << s.depth) - 1))
+	}
+	return sample
+}
+
+// ColorModel 返回十六位灰度模型
+// 返回: color.Model 颜色模型
+func (s *packedGrayImage) ColorModel() color.Model { return color.Gray16Model }
+
+// Bounds 返回原始采样边界
+// 返回: image.Rectangle 图像边界
+func (s *packedGrayImage) Bounds() image.Rectangle { return s.rect }
+
+// At 将单个紧凑样本无损展开为十六位灰度，边界外返回零值
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 灰度样本
+func (s *packedGrayImage) At(x, y int) color.Color {
+	if !image.Pt(x, y).In(s.rect) {
+		return color.Gray16{}
+	}
+	line := s.data[(y-s.rect.Min.Y)*s.stride:]
+	value := uint32(packedSample(line, x-s.rect.Min.X, s.depth))
+	return color.Gray16{Y: uint16(value * 65535 / ((uint32(1) << s.depth) - 1))}
 }
 
 // decodeImage 共用解码、遮罩和预混合恢复流程，按需保留颜色分量
@@ -494,25 +786,6 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	return out, nil
 }
 
-// deviceSampleImage 按需组合设备色或索引色样本与遮罩，不重复展开像素缓冲
-type deviceSampleImage struct {
-	source    image.Image
-	mask      *imageResample
-	inverted  bool
-	palette   *imagePalette
-	maximum   float64
-	byteExact bool
-}
-
-// ColorModel 返回可无损表达原始采样精度的非预乘颜色模型
-// 返回: color.Model 颜色模型
-func (s *deviceSampleImage) ColorModel() color.Model {
-	if s.byteExact {
-		return color.NRGBAModel
-	}
-	return color.NRGBA64Model
-}
-
 // imageByteExact 判断样本及重采样结果是否可由八位分量无损表达
 // 入参: source 样本图像
 // 返回: bool 是否可无损表达
@@ -529,45 +802,6 @@ func imageByteExact(source image.Image) bool {
 	default:
 		return false
 	}
-}
-
-// Bounds 返回对齐后的图像边界
-// 返回: image.Rectangle 图像边界
-func (s *deviceSampleImage) Bounds() image.Rectangle { return s.source.Bounds() }
-
-// At 按原始采样精度返回非预乘颜色，边界外透明
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.Color 像素颜色
-func (s *deviceSampleImage) At(x, y int) color.Color {
-	if !image.Pt(x, y).In(s.Bounds()) {
-		return color.NRGBA64{}
-	}
-	r, g, b, _ := s.source.At(x, y).RGBA()
-	pixel := color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: 65535}
-	if s.palette != nil {
-		index := int(math.Max(0, math.Min(float64(len(s.palette.colors)-1), math.Round(float64(r)/65535*s.maximum))))
-		pixel = s.palette.colors[index]
-	}
-	alpha := uint32(65535)
-	if s.mask != nil {
-		alpha, _, _, _ = s.mask.At(x, y).RGBA()
-		if s.inverted {
-			alpha = 65535 - alpha
-		}
-	}
-	pixel.A = uint16(uint32(pixel.A) * alpha / 65535)
-	if s.byteExact {
-		return color.NRGBA{R: uint8(pixel.R >> 8), G: uint8(pixel.G >> 8), B: uint8(pixel.B >> 8), A: uint8(pixel.A >> 8)}
-	}
-	return pixel
-}
-
-// imagePalette 保存索引色的原始分量和显示颜色
-type imagePalette struct {
-	space  *ColorSpace
-	values [][4]float64
-	tints  [][4]float64
-	colors []color.NRGBA64
 }
 
 // palette 解析索引色查找表，保留原始索引样本供Decode和色键遮罩使用
@@ -799,159 +1033,6 @@ func (i *Image) decodeMask(components int) (*imageResample, []float64, bool, []f
 	return &imageResample{source: decoded, bounds: decoded.Bounds(), interpolate: mask.Interpolate}, nil, !soft, matte, nil
 }
 
-// imageResample 在统一图像坐标中采样，不缩减任一轴的原始采样数
-type imageResample struct {
-	source      image.Image
-	bounds      image.Rectangle
-	interpolate bool
-}
-
-// ColorModel 返回原始图像的颜色模型
-// 返回: color.Model 颜色模型
-func (s *imageResample) ColorModel() color.Model { return s.source.ColorModel() }
-
-// Bounds 返回合成图像的采样边界
-// 返回: image.Rectangle 采样边界
-func (s *imageResample) Bounds() image.Rectangle { return s.bounds }
-
-// At 按像素中心执行最近邻或双线性采样，保留原始CMYK分量
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.Color 采样颜色
-func (s *imageResample) At(x, y int) color.Color {
-	b := s.source.Bounds()
-	if b == s.bounds {
-		return s.source.At(x, y)
-	}
-	sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
-	sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
-	if !s.interpolate {
-		return s.source.At(b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
-	}
-	x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
-	fx, fy := sx-float64(x0), sy-float64(y0)
-	var values [4]float64
-	_, cmyk := imageCMYKSample(s.source.At(b.Min.X, b.Min.Y))
-	for dy := 0; dy < 2; dy++ {
-		for dx := 0; dx < 2; dx++ {
-			weightX, weightY := 1-fx, 1-fy
-			if dx == 1 {
-				weightX = fx
-			}
-			if dy == 1 {
-				weightY = fy
-			}
-			pixel := s.source.At(b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy)))
-			r, g, b, a := pixel.RGBA()
-			if cmyk {
-				c, _ := imageCMYKSample(pixel)
-				r, g, b, a = uint32(c[0]), uint32(c[1]), uint32(c[2]), uint32(c[3])
-			}
-			for i, v := range [4]uint32{r, g, b, a} {
-				values[i] += float64(v) * weightX * weightY
-			}
-		}
-	}
-	if cmyk {
-		return cmykSample{uint16(math.Round(values[0])), uint16(math.Round(values[1])), uint16(math.Round(values[2])), uint16(math.Round(values[3]))}
-	}
-	return color.RGBA64{R: uint16(math.Round(values[0])), G: uint16(math.Round(values[1])), B: uint16(math.Round(values[2])), A: uint16(math.Round(values[3]))}
-}
-
-// DecodeSamples 解码原始图像样本，不应用Decode数组、遮罩或色彩管理
-// 返回的灰度值用于样本解释，不代表图像已完成页面合成
-// CMYK图像还原DCT分量，取消通用JPEG解码器的Adobe反相处理
-// 返回: image.Image 样本图像, error 错误信息
-func (i *Image) DecodeSamples() (image.Image, error) {
-	filters, parameters, err := i.Stream.filterChain(i.reader)
-	if err != nil {
-		return nil, err
-	}
-	terminal := Name("")
-	var terminalParams Dictionary
-	if len(filters) > 0 {
-		last := filters[len(filters)-1]
-		if last == Name("DCTDecode") || last == Name("JBIG2Decode") || last == Name("JPXDecode") || last == Name("CCITTFaxDecode") {
-			terminal = last.(Name)
-			if parameters[len(filters)-1] != nil {
-				var ok bool
-				terminalParams, ok = parameters[len(filters)-1].(Dictionary)
-				if !ok {
-					return nil, fmt.Errorf("invalid image decode parameters")
-				}
-			}
-			filters = filters[:len(filters)-1]
-			parameters = parameters[:len(parameters)-1]
-		}
-	}
-	data, err := (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: i.Stream.Data}).Decode()
-	if err != nil {
-		return nil, err
-	}
-	var result image.Image
-	switch terminal {
-	case "CCITTFaxDecode":
-		return i.ccittSamples(data, terminalParams)
-	case "DCTDecode":
-		result, err = i.jpegSamples(data, terminalParams)
-		if err != nil {
-			return nil, err
-		}
-	case "JBIG2Decode":
-		if i.BitsPerComponent != 1 {
-			return nil, fmt.Errorf("invalid JBIG2 component depth")
-		}
-		var globals []byte
-		if terminalParams["JBIG2Globals"] != nil {
-			object, err := i.reader.Resolve(terminalParams["JBIG2Globals"])
-			if err != nil {
-				return nil, err
-			}
-			stream, ok := object.(*Stream)
-			if !ok {
-				return nil, fmt.Errorf("invalid JBIG2 globals")
-			}
-			globals, err = stream.Decode()
-			if err != nil {
-				return nil, err
-			}
-		}
-		decoder, err := jbig2.NewDecoderWithGlobals(bytes.NewReader(data), globals)
-		if err != nil {
-			return nil, err
-		}
-		result, err = decoder.Decode()
-		if err != nil {
-			return nil, err
-		}
-	case "JPXDecode":
-		cmyk := i.ColorSpace == Name("DeviceCMYK")
-		if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-			object, err := i.reader.Resolve(space[1])
-			if err != nil {
-				return nil, err
-			}
-			profile, ok := object.(*Stream)
-			if !ok {
-				return nil, fmt.Errorf("invalid ICC profile stream")
-			}
-			cmyk = profile.Dictionary["N"] == Integer(4)
-		}
-		if cmyk {
-			return i.jpxCMYKSamples(data)
-		}
-		result, _, err = image.Decode(bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-	default:
-		return i.rawSamples(data)
-	}
-	if result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height {
-		return nil, fmt.Errorf("decoded image dimensions differ from dictionary")
-	}
-	return result, nil
-}
-
 // ccittSamples 按PDF参数解码CCITT Group4样本，保留黑白映射及行边界
 // 入参: data 编码数据, params 解码参数
 // 返回: image.Image 样本图像, error 错误信息
@@ -1141,16 +1222,6 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	return &image.Gray{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 }
 
-// cmykSample 保存未经过色彩管理的十六位四色分量
-type cmykSample [4]uint16
-
-// RGBA 返回不透明的设备色预览，原始分量由图像解码流程解释
-// 返回: uint32 红、绿、蓝及透明度
-func (c cmykSample) RGBA() (uint32, uint32, uint32, uint32) {
-	k := uint64(65535 - c[3])
-	return uint32(uint64(65535-c[0]) * k / 65535), uint32(uint64(65535-c[1]) * k / 65535), uint32(uint64(65535-c[2]) * k / 65535), 65535
-}
-
 // imageCMYKSample 统一取得八位或十六位四色样本，保留黑色分量
 // 入参: pixel 样本颜色
 // 返回: cmykSample 四色分量, bool 是否为四色样本
@@ -1162,75 +1233,4 @@ func imageCMYKSample(pixel color.Color) (cmykSample, bool) {
 		return c, true
 	}
 	return cmykSample{}, false
-}
-
-// packedCMYKImage 保留逐行对齐的四色样本，按需无损展开分量
-type packedCMYKImage struct {
-	data          []byte
-	rect          image.Rectangle
-	stride, depth int
-}
-
-// ColorModel 返回保留十六位四色样本的颜色模型
-// 返回: color.Model 颜色模型
-func (s *packedCMYKImage) ColorModel() color.Model {
-	return color.ModelFunc(func(c color.Color) color.Color {
-		if sample, ok := imageCMYKSample(c); ok {
-			return sample
-		}
-		r, g, b, _ := c.RGBA()
-		white := max(r, g, b)
-		if white == 0 {
-			return cmykSample{0, 0, 0, 65535}
-		}
-		return cmykSample{uint16((white - r) * 65535 / white), uint16((white - g) * 65535 / white), uint16((white - b) * 65535 / white), uint16(65535 - white)}
-	})
-}
-
-// Bounds 返回原始样本边界
-// 返回: image.Rectangle 图像边界
-func (s *packedCMYKImage) Bounds() image.Rectangle { return s.rect }
-
-// At 读取逐行打包的四色分量，边界外返回零透明度
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.Color 样本颜色
-func (s *packedCMYKImage) At(x, y int) color.Color {
-	if !image.Pt(x, y).In(s.rect) {
-		return color.RGBA64{}
-	}
-	line := s.data[(y-s.rect.Min.Y)*s.stride:]
-	var sample cmykSample
-	for c := range sample {
-		value := uint32(packedSample(line, (x-s.rect.Min.X)*4+c, s.depth))
-		sample[c] = uint16(value * 65535 / ((uint32(1) << s.depth) - 1))
-	}
-	return sample
-}
-
-// packedGrayImage 保留低位深灰度或索引样本的逐行紧凑布局
-type packedGrayImage struct {
-	data   []byte
-	rect   image.Rectangle
-	stride int
-	depth  int
-}
-
-// ColorModel 返回十六位灰度模型
-// 返回: color.Model 颜色模型
-func (s *packedGrayImage) ColorModel() color.Model { return color.Gray16Model }
-
-// Bounds 返回原始采样边界
-// 返回: image.Rectangle 图像边界
-func (s *packedGrayImage) Bounds() image.Rectangle { return s.rect }
-
-// At 将单个紧凑样本无损展开为十六位灰度，边界外返回零值
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.Color 灰度样本
-func (s *packedGrayImage) At(x, y int) color.Color {
-	if !image.Pt(x, y).In(s.rect) {
-		return color.Gray16{}
-	}
-	line := s.data[(y-s.rect.Min.Y)*s.stride:]
-	value := uint32(packedSample(line, x-s.rect.Min.X, s.depth))
-	return color.Gray16{Y: uint16(value * 65535 / ((uint32(1) << s.depth) - 1))}
 }

@@ -21,6 +21,27 @@ import (
 	"io"
 )
 
+// inlineByteReader 限制解码器预读，避免读取内联图像后的内容操作符
+type inlineByteReader struct {
+	data []byte
+	pos  int
+}
+
+// Read 每次提供一个编码字节，并记录已消费长度
+// 入参: p 目标缓冲区
+// 返回: int 字节数, error 读取错误
+func (r *inlineByteReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.pos == len(r.data) {
+		return 0, io.EOF
+	}
+	p[0] = r.data[r.pos]
+	r.pos++
+	return 1, nil
+}
+
 // inlineImage 读取内联图像字典并按样本长度或过滤器结束标记定位数据
 // 入参: resolve 当前作用域颜色空间解析器
 // 返回: *Stream 展开缩写后的图像流, error 字典或数据边界错误
@@ -121,27 +142,6 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 		return nil, p.fail("missing inline image end")
 	}
 	return stream, nil
-}
-
-// inlineByteReader 限制解码器预读，避免读取内联图像后的内容操作符
-type inlineByteReader struct {
-	data []byte
-	pos  int
-}
-
-// Read 每次提供一个编码字节，并记录已消费长度
-// 入参: p 目标缓冲区
-// 返回: int 字节数, error 读取错误
-func (r *inlineByteReader) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if r.pos == len(r.data) {
-		return 0, io.EOF
-	}
-	p[0] = r.data[r.pos]
-	r.pos++
-	return 1, nil
 }
 
 // inlineCCITTLength 按声明行数或块结束标记解码并确定内联数据边界

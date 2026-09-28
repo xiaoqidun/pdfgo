@@ -22,10 +22,10 @@ import (
 	"unicode/utf16"
 )
 
+var errInvalidUnicodeSurrogate = errors.New("invalid Unicode surrogate")
+
 // UnicodeMap 保存字符码到Unicode文本的映射，不将字符码等同于字形编号
 type UnicodeMap map[string]string
-
-var errInvalidUnicodeSurrogate = errors.New("invalid Unicode surrogate")
 
 // ParseUnicodeMap 读取ToUnicode映射中的字符与范围定义
 // 入参: data 已解码的CMap数据

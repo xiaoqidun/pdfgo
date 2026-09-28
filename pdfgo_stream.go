@@ -33,6 +33,87 @@ type Stream struct {
 	decrypted  bool
 }
 
+// Decode 解码通用流过滤器，图像专用过滤器由图像接口处理
+// 阅读器返回的流按需解析参数引用，手工构造的流需提供直接参数
+// 返回: []byte 解码数据, error 错误信息
+func (s *Stream) Decode() ([]byte, error) {
+	filters, params, err := s.filterChain(s.reader)
+	if err != nil {
+		return nil, err
+	}
+	data := s.Data
+	for i, filter := range filters {
+		name := filter.(Name)
+		dict, _ := params[i].(Dictionary)
+		var err error
+		switch name {
+		case "Crypt":
+			if i != 0 || dict["Name"] != nil && dict["Name"] != Name("Identity") {
+				return nil, &UnsupportedError{Feature: "stream crypt filter"}
+			}
+		case "FlateDecode":
+			var reader io.ReadCloser
+			reader, err = zlib.NewReader(bytes.NewReader(data))
+			if err == nil {
+				data, err = io.ReadAll(reader)
+				closeErr := reader.Close()
+				if err == nil {
+					err = closeErr
+				}
+			}
+		case "LZWDecode":
+			var early int64
+			early, err = integerDefault(dict, "EarlyChange", 1)
+			if err == nil {
+				data, err = decodeLZW(data, early)
+			}
+		case "ASCIIHexDecode":
+			end := bytes.IndexByte(data, '>')
+			if end < 0 {
+				return nil, fmt.Errorf("missing ASCIIHex terminator")
+			}
+			var digits []byte
+			for _, b := range data[:end] {
+				if !isSpace(b) {
+					digits = append(digits, b)
+				}
+			}
+			if len(digits)%2 != 0 {
+				digits = append(digits, '0')
+			}
+			data = make([]byte, len(digits)/2)
+			_, err = hex.Decode(data, digits)
+		case "ASCII85Decode":
+			end := bytes.Index(data, []byte("~>"))
+			if end < 0 {
+				return nil, fmt.Errorf("missing ASCII85 terminator")
+			}
+			encoded, validateErr := validateASCII85(data[:end])
+			if validateErr != nil {
+				return nil, validateErr
+			}
+			data, err = io.ReadAll(ascii85.NewDecoder(bytes.NewReader(encoded)))
+		case "RunLengthDecode":
+			data, err = decodeRunLength(data)
+		default:
+			return nil, &UnsupportedError{Feature: "stream filter " + string(name)}
+		}
+		if err != nil {
+			return nil, err
+		}
+		if name == "FlateDecode" || name == "LZWDecode" {
+			data, err = decodePredictor(data, dict)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(filters) == 0 {
+		return bytes.Clone(data), nil
+	}
+	return data, nil
+}
+
 func (*Stream) pdfObject() {}
 
 // filterChain 解析过滤器及解码参数的间接引用，不修改源字典
@@ -115,87 +196,6 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 		return filters[1:], params[1:], nil
 	}
 	return filters, params, nil
-}
-
-// Decode 解码通用流过滤器，图像专用过滤器由图像接口处理
-// 阅读器返回的流按需解析参数引用，手工构造的流需提供直接参数
-// 返回: []byte 解码数据, error 错误信息
-func (s *Stream) Decode() ([]byte, error) {
-	filters, params, err := s.filterChain(s.reader)
-	if err != nil {
-		return nil, err
-	}
-	data := s.Data
-	for i, filter := range filters {
-		name := filter.(Name)
-		dict, _ := params[i].(Dictionary)
-		var err error
-		switch name {
-		case "Crypt":
-			if i != 0 || dict["Name"] != nil && dict["Name"] != Name("Identity") {
-				return nil, &UnsupportedError{Feature: "stream crypt filter"}
-			}
-		case "FlateDecode":
-			var reader io.ReadCloser
-			reader, err = zlib.NewReader(bytes.NewReader(data))
-			if err == nil {
-				data, err = io.ReadAll(reader)
-				closeErr := reader.Close()
-				if err == nil {
-					err = closeErr
-				}
-			}
-		case "LZWDecode":
-			var early int64
-			early, err = integerDefault(dict, "EarlyChange", 1)
-			if err == nil {
-				data, err = decodeLZW(data, early)
-			}
-		case "ASCIIHexDecode":
-			end := bytes.IndexByte(data, '>')
-			if end < 0 {
-				return nil, fmt.Errorf("missing ASCIIHex terminator")
-			}
-			var digits []byte
-			for _, b := range data[:end] {
-				if !isSpace(b) {
-					digits = append(digits, b)
-				}
-			}
-			if len(digits)%2 != 0 {
-				digits = append(digits, '0')
-			}
-			data = make([]byte, len(digits)/2)
-			_, err = hex.Decode(data, digits)
-		case "ASCII85Decode":
-			end := bytes.Index(data, []byte("~>"))
-			if end < 0 {
-				return nil, fmt.Errorf("missing ASCII85 terminator")
-			}
-			encoded, validateErr := validateASCII85(data[:end])
-			if validateErr != nil {
-				return nil, validateErr
-			}
-			data, err = io.ReadAll(ascii85.NewDecoder(bytes.NewReader(encoded)))
-		case "RunLengthDecode":
-			data, err = decodeRunLength(data)
-		default:
-			return nil, &UnsupportedError{Feature: "stream filter " + string(name)}
-		}
-		if err != nil {
-			return nil, err
-		}
-		if name == "FlateDecode" || name == "LZWDecode" {
-			data, err = decodePredictor(data, dict)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	if len(filters) == 0 {
-		return bytes.Clone(data), nil
-	}
-	return data, nil
 }
 
 // decodeLZW 解码高位优先的PDF变长字典编码，支持两种码宽增长规则

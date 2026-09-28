@@ -44,6 +44,12 @@ type MeshGradient struct {
 	tint      *deviceNSpace
 }
 
+// meshBits 按高位优先读取曲面网格的紧凑数值
+type meshBits struct {
+	data []byte
+	pos  int
+}
+
 // UsesFunction 判断颜色分量是否需在插值后经过函数变换
 // 返回: bool 是否使用颜色函数
 func (g *MeshGradient) UsesFunction() bool { return g.function != nil || g.tint != nil }
@@ -108,12 +114,6 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 func meshBernstein(t float64) [4]float64 {
 	s := 1 - t
 	return [4]float64{s * s * s, 3 * t * s * s, 3 * t * t * s, t * t * t}
-}
-
-// meshBits 按高位优先读取曲面网格的紧凑数值
-type meshBits struct {
-	data []byte
-	pos  int
 }
 
 // read 读取指定位数的无符号整数

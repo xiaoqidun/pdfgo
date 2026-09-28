@@ -26,44 +26,6 @@ type Matrix [6]float64
 // Point 表示用户空间坐标
 type Point struct{ X, Y float64 }
 
-// Identity 返回单位矩阵
-// 返回: Matrix 单位矩阵
-func Identity() Matrix { return Matrix{1, 0, 0, 1, 0, 0} }
-
-// Mul 按当前矩阵乘以右侧矩阵进行坐标组合
-// 入参: n 右侧矩阵
-// 返回: Matrix 组合矩阵
-func (m Matrix) Mul(n Matrix) Matrix {
-	return Matrix{
-		m[0]*n[0] + m[2]*n[1], m[1]*n[0] + m[3]*n[1],
-		m[0]*n[2] + m[2]*n[3], m[1]*n[2] + m[3]*n[3],
-		m[0]*n[4] + m[2]*n[5] + m[4], m[1]*n[4] + m[3]*n[5] + m[5],
-	}
-}
-
-// Apply 将点变换到目标坐标空间
-// 入参: p 原始坐标点
-// 返回: Point 变换后的坐标点
-func (m Matrix) Apply(p Point) Point {
-	return Point{m[0]*p.X + m[2]*p.Y + m[4], m[1]*p.X + m[3]*p.Y + m[5]}
-}
-
-// Inverse 返回可逆仿射矩阵的逆变换
-// 返回: Matrix 逆矩阵, bool 是否存在有限逆矩阵
-func (m Matrix) Inverse() (Matrix, bool) {
-	d := m[0]*m[3] - m[1]*m[2]
-	if d == 0 {
-		return Matrix{}, false
-	}
-	n := Matrix{m[3] / d, -m[1] / d, -m[2] / d, m[0] / d, (m[2]*m[5] - m[3]*m[4]) / d, (m[1]*m[4] - m[0]*m[5]) / d}
-	for _, v := range n {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return Matrix{}, false
-		}
-	}
-	return n, true
-}
-
 // Segment 保存直线、三次曲线或闭合路径，坐标已变换到页面用户空间
 type Segment struct {
 	Operator string
@@ -223,6 +185,44 @@ type pageInterpreter struct {
 	bounds                 Rectangle
 	uncoloredPattern       bool
 	type3                  bool
+}
+
+// Identity 返回单位矩阵
+// 返回: Matrix 单位矩阵
+func Identity() Matrix { return Matrix{1, 0, 0, 1, 0, 0} }
+
+// Mul 按当前矩阵乘以右侧矩阵进行坐标组合
+// 入参: n 右侧矩阵
+// 返回: Matrix 组合矩阵
+func (m Matrix) Mul(n Matrix) Matrix {
+	return Matrix{
+		m[0]*n[0] + m[2]*n[1], m[1]*n[0] + m[3]*n[1],
+		m[0]*n[2] + m[2]*n[3], m[1]*n[2] + m[3]*n[3],
+		m[0]*n[4] + m[2]*n[5] + m[4], m[1]*n[4] + m[3]*n[5] + m[5],
+	}
+}
+
+// Apply 将点变换到目标坐标空间
+// 入参: p 原始坐标点
+// 返回: Point 变换后的坐标点
+func (m Matrix) Apply(p Point) Point {
+	return Point{m[0]*p.X + m[2]*p.Y + m[4], m[1]*p.X + m[3]*p.Y + m[5]}
+}
+
+// Inverse 返回可逆仿射矩阵的逆变换
+// 返回: Matrix 逆矩阵, bool 是否存在有限逆矩阵
+func (m Matrix) Inverse() (Matrix, bool) {
+	d := m[0]*m[3] - m[1]*m[2]
+	if d == 0 {
+		return Matrix{}, false
+	}
+	n := Matrix{m[3] / d, -m[1] / d, -m[2] / d, m[0] / d, (m[2]*m[5] - m[3]*m[4]) / d, (m[1]*m[4] - m[0]*m[5]) / d}
+	for _, v := range n {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return Matrix{}, false
+		}
+	}
+	return n, true
 }
 
 // WalkPage 解释页面内容并按绘制顺序访问可准确表达的图元，注解由Page.Annotations读取

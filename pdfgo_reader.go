@@ -108,6 +108,88 @@ func NewReaderWithUTF8Password(source io.ReaderAt, size int64, password []byte) 
 	return newReaderWithPassword(source, size, password, true)
 }
 
+// Close 关闭Open持有的文件，不关闭NewReader的外部数据源
+// 返回: error 关闭错误
+func (r *Reader) Close() error {
+	if r.closer == nil {
+		return nil
+	}
+	err := r.closer.Close()
+	r.closer = nil
+	return err
+}
+
+// Resolve 解析间接引用，直接对象原样返回
+// 入参: object 待解析对象
+// 返回: Object 解析后的对象, error 错误信息
+func (r *Reader) Resolve(object Object) (Object, error) {
+	ref, ok := object.(Reference)
+	if !ok {
+		return object, nil
+	}
+	object, err := r.Object(ref)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := object.(Reference); !ok {
+		return object, nil
+	}
+	seen := map[Reference]bool{ref: true}
+	for {
+		ref, ok := object.(Reference)
+		if !ok {
+			return object, nil
+		}
+		if seen[ref] {
+			return nil, fmt.Errorf("cyclic indirect reference")
+		}
+		seen[ref] = true
+		var err error
+		object, err = r.Object(ref)
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+// Object 按编号与代数读取间接对象
+// 不存在或已释放的引用按PDF规则返回空对象
+// 入参: ref 间接引用
+// 返回: Object 对象, error 错误信息
+func (r *Reader) Object(ref Reference) (Object, error) {
+	if value, ok := r.cache[ref]; ok {
+		return value, nil
+	}
+	entry, ok := r.xref[ref.Number]
+	if !ok || entry.kind == 0 || (entry.kind == 1 && entry.generation != ref.Generation) || (entry.kind == 2 && ref.Generation != 0) {
+		return nil, nil
+	}
+	if r.loading[ref] || len(r.loading) >= 256 {
+		return nil, fmt.Errorf("cyclic or excessive object dependency")
+	}
+	r.loading[ref] = true
+	defer delete(r.loading, ref)
+	var value Object
+	var err error
+	if entry.kind == 2 {
+		value, err = r.compressedObject(ref, entry)
+	} else {
+		var actual Reference
+		actual, value, err = r.indirect(entry.position)
+		if err == nil && actual != ref {
+			err = fmt.Errorf("cross-reference object mismatch")
+		}
+		if err == nil && r.security != nil {
+			value, err = r.security.decryptObject(value, ref)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.cache[ref] = value
+	return value, nil
+}
+
 // newReaderWithPassword 读取交叉引用并按调用方的密码编码约定认证
 // 入参: source 随机读取器, size 文件字节数, password 密码, utf8Password 是否转换UTF-8输入
 // 返回: *Reader 阅读器, error 错误信息
@@ -229,17 +311,6 @@ func newReaderWithPassword(source io.ReaderAt, size int64, password []byte, utf8
 	return r, nil
 }
 
-// Close 关闭Open持有的文件，不关闭NewReader的外部数据源
-// 返回: error 关闭错误
-func (r *Reader) Close() error {
-	if r.closer == nil {
-		return nil
-	}
-	err := r.closer.Close()
-	r.closer = nil
-	return err
-}
-
 // readRange 按需读取对象片段并检查文件边界和平台整数溢出
 func (r *Reader) readRange(offset, length int64) ([]byte, error) {
 	if offset < 0 || length < 0 || offset > r.size || length > r.size-offset || uint64(length) > uint64(^uint(0)>>1) {
@@ -272,77 +343,6 @@ func (r *Reader) parseAt(offset int64, parse func(*objectParser) error) error {
 		}
 		return err
 	}
-}
-
-// Resolve 解析间接引用，直接对象原样返回
-// 入参: object 待解析对象
-// 返回: Object 解析后的对象, error 错误信息
-func (r *Reader) Resolve(object Object) (Object, error) {
-	ref, ok := object.(Reference)
-	if !ok {
-		return object, nil
-	}
-	object, err := r.Object(ref)
-	if err != nil {
-		return nil, err
-	}
-	if _, ok := object.(Reference); !ok {
-		return object, nil
-	}
-	seen := map[Reference]bool{ref: true}
-	for {
-		ref, ok := object.(Reference)
-		if !ok {
-			return object, nil
-		}
-		if seen[ref] {
-			return nil, fmt.Errorf("cyclic indirect reference")
-		}
-		seen[ref] = true
-		var err error
-		object, err = r.Object(ref)
-		if err != nil {
-			return nil, err
-		}
-	}
-}
-
-// Object 按编号与代数读取间接对象
-// 不存在或已释放的引用按PDF规则返回空对象
-// 入参: ref 间接引用
-// 返回: Object 对象, error 错误信息
-func (r *Reader) Object(ref Reference) (Object, error) {
-	if value, ok := r.cache[ref]; ok {
-		return value, nil
-	}
-	entry, ok := r.xref[ref.Number]
-	if !ok || entry.kind == 0 || (entry.kind == 1 && entry.generation != ref.Generation) || (entry.kind == 2 && ref.Generation != 0) {
-		return nil, nil
-	}
-	if r.loading[ref] || len(r.loading) >= 256 {
-		return nil, fmt.Errorf("cyclic or excessive object dependency")
-	}
-	r.loading[ref] = true
-	defer delete(r.loading, ref)
-	var value Object
-	var err error
-	if entry.kind == 2 {
-		value, err = r.compressedObject(ref, entry)
-	} else {
-		var actual Reference
-		actual, value, err = r.indirect(entry.position)
-		if err == nil && actual != ref {
-			err = fmt.Errorf("cross-reference object mismatch")
-		}
-		if err == nil && r.security != nil {
-			value, err = r.security.decryptObject(value, ref)
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	r.cache[ref] = value
-	return value, nil
 }
 
 // indirect 从文件偏移读取完整间接对象
