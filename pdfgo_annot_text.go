@@ -284,6 +284,17 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	dict := annotation.Dictionary
 	free := annotation.Subtype == "FreeText"
 	textObject := dict["V"]
+	var choice *ChoiceField
+	if dict["FT"] == Name("Sig") && textObject == nil {
+		return nil
+	}
+	if dict["FT"] == Name("Ch") {
+		value, err := r.readChoiceField(dict)
+		if err != nil {
+			return err
+		}
+		choice = &value
+	}
 	if free {
 		textObject = dict["Contents"]
 	} else if dict["FT"] == Name("Btn") {
@@ -291,14 +302,34 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			return &UnsupportedError{Feature: "generated button icon"}
 		}
 		textObject = mk["CA"]
-	} else if dict["FT"] != Name("Tx") {
+	} else if dict["FT"] != Name("Tx") && choice == nil {
 		return &UnsupportedError{Feature: "generated field type"}
 	}
-	text, err := r.annotationTextString(textObject)
+	var text string
+	var err error
+	if choice == nil {
+		text, err = r.annotationTextString(textObject)
+	} else if choice.Combo {
+		if len(choice.Selected) != 0 {
+			text = choice.Options[choice.Selected[0]].Label
+		} else if len(choice.Values) != 0 {
+			text = choice.Values[0]
+		}
+	} else {
+		labels := make([]string, 0, len(choice.Options)-choice.TopIndex)
+		normalize := strings.NewReplacer("\r", " ", "\n", " ")
+		for _, option := range choice.Options[choice.TopIndex:] {
+			labels = append(labels, normalize.Replace(option.Label))
+		}
+		text = strings.Join(labels, "\n")
+	}
 	if err != nil {
 		return err
 	}
-	if text == "" {
+	if choice != nil && choice.Combo {
+		text = strings.NewReplacer("\r", " ", "\n", " ").Replace(text)
+	}
+	if text == "" && !(choice != nil && !choice.Combo && len(choice.Options) > choice.TopIndex) {
 		return nil
 	}
 	if flags&(1<<25) != 0 {
@@ -307,7 +338,8 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if flags&(1<<13) != 0 {
 		text = strings.Repeat("*", utf8.RuneCountInString(text))
 	}
-	multiline := free || flags&(1<<12) != 0
+	list := choice != nil && !choice.Combo
+	multiline := free || flags&(1<<12) != 0 || list
 	if !multiline {
 		text = strings.ReplaceAll(text, "\n", " ")
 	}
@@ -404,6 +436,9 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		return fmt.Errorf("field value exceeds comb length")
 	}
 	size := p.state.fontSize
+	if list && size == 0 {
+		size = math.Min(12, height)
+	}
 	if size == 0 {
 		low, high := 0.0, height
 		for range 32 {
@@ -439,16 +474,28 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		return fmt.Errorf("invalid automatic font size")
 	}
 	fmt.Fprintf(content, "q %g %g %g %g re W n\n", x, y, width, height)
-	if !free {
-		content.WriteString("/Tx BMC\n")
-	}
-	fmt.Fprintf(content, "BT\n%s\n/%s %g Tf\n", stateContent.String(), escapeAnnotationName(fontName), size)
-	lines := annotationLines(letters, p.state, size, width, multiline)
-	baseline := y + (height-size)/2 + size*.2 - p.state.rise
 	leading := p.state.leading
 	if leading <= 0 {
 		leading = size * 1.2
 	}
+	if list {
+		for _, selected := range choice.Selected {
+			row := selected - choice.TopIndex
+			if row >= 0 && float64(row)*leading < height {
+				fmt.Fprintf(content, "q 0.153 0.392 0.714 rg %g %g %g %g re f Q\n", x, y+height-float64(row+1)*leading, width, leading)
+			}
+		}
+	}
+	if !free {
+		content.WriteString("/Tx BMC\n")
+	}
+	fmt.Fprintf(content, "BT\n%s\n/%s %g Tf\n", stateContent.String(), escapeAnnotationName(fontName), size)
+	lineWidth := width
+	if list {
+		lineWidth = math.Inf(1)
+	}
+	lines := annotationLines(letters, p.state, size, lineWidth, multiline)
+	baseline := y + (height-size)/2 + size*.2 - p.state.rise
 	if multiline {
 		baseline = y + height - size - p.state.rise
 	}
@@ -465,6 +512,15 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		}
 	} else {
 		for i, line := range lines {
+			if list {
+				if float64(i)*leading >= height {
+					break
+				}
+				content.WriteString("0 g\n" + stateContent.String())
+				if _, selected := slices.BinarySearch(choice.Selected, choice.TopIndex+i); selected {
+					content.WriteString("1 g\n")
+				}
+			}
 			left := x + float64(align)*(width-annotationLineWidth(line, p.state, size))/2
 			fmt.Fprintf(content, "1 0 0 1 %g %g Tm <", left, baseline-float64(i)*leading)
 			for _, letter := range line {

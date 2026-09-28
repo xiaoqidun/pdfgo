@@ -145,6 +145,16 @@ func (p *Page) Annotations() ([]Annotation, error) {
 // 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器
 // 返回: error 外观缺失、解析或访问错误
 func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annotation Annotation, visitor Visitor) error {
+	if object := annotation.Dictionary["OC"]; object != nil {
+		visible := visitor.OptionalContent
+		if visible == nil {
+			visible = r.OptionalContentVisible
+		}
+		show, err := visible(object)
+		if err != nil || !show {
+			return err
+		}
+	}
 	if page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
 	}
@@ -310,7 +320,7 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 	for key, value := range annotation.Dictionary {
 		result[key] = value
 	}
-	inherited := []Name{"FT", "Ff", "V", "DV", "DA", "Q", "Opt", "MaxLen"}
+	inherited := []Name{"FT", "Ff", "V", "DV", "DA", "Q", "Opt", "MaxLen", "I", "TI", "RV", "DS"}
 	for _, key := range inherited {
 		delete(result, key)
 	}
