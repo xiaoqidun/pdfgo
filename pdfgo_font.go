@@ -475,6 +475,14 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 // 入参: data 原始文字字节
 // 返回: []Glyph 字符信息, error 错误信息
 func (f *Font) Decode(data []byte) ([]Glyph, error) {
+	var core *coreFontMetrics
+	if f.Subtype == "Type1" && len(f.Program) == 0 {
+		fonts, err := coreFonts()
+		if err != nil {
+			return nil, err
+		}
+		core = fonts[f.Name]
+	}
 	step := 1
 	if f.composite {
 		step = 2
@@ -512,6 +520,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			}
 			if name == "" {
 				encoding := pdfStandardNames
+				if core != nil && f.encoding == "" {
+					encoding = core.names[:]
+				}
 				switch f.encoding {
 				case Name("WinAnsiEncoding"):
 					encoding = pdfWinAnsiNames
@@ -558,7 +569,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 				text = ""
 			} else if f.encoding == Name("WinAnsiEncoding") {
 				text = string(charmap.Windows1252.DecodeByte(raw[0]))
-			} else if raw[0] >= 32 && raw[0] <= 126 && (f.encoding == "" || f.encoding == Name("StandardEncoding")) {
+			} else if core == nil && raw[0] >= 32 && raw[0] <= 126 && (f.encoding == "" || f.encoding == Name("StandardEncoding")) {
 				text = string(rune(raw[0]))
 			} else {
 				return nil, &UnsupportedError{Feature: "unmapped simple font character"}
@@ -567,16 +578,17 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		width, ok := f.widths[cid]
 		if !ok {
 			width = f.defaultWidth
-			if len(f.widths) == 0 && len(f.Program) == 0 && f.Subtype == Name("Type1") {
-				if standardWidth, found := f.coreLatinWidth(code); found {
+			if len(f.widths) == 0 && core != nil {
+				if standardWidth, found := core.widths[name]; found {
 					width = standardWidth
+					ok = true
 				}
 			}
 		}
 		if f.Subtype == Name("Type3") {
 			width *= f.type3Matrix[0] * 1000
 		}
-		if width == 0 && len(f.widths) == 0 && !f.composite {
+		if !ok && width == 0 && len(f.widths) == 0 && !f.composite {
 			return nil, &UnsupportedError{Feature: "unembedded standard font metrics"}
 		}
 		glyph := Glyph{Code: code, Text: text, Width: width, WordSpace: step == 1 && code == 32}
@@ -703,28 +715,4 @@ func predefinedCodeUnicode(name Name, raw []byte) (string, bool) {
 		return string(value), utf8.ValidRune(value)
 	}
 	return "", false
-}
-
-// coreLatinWidth 读取标准西文字体的内建宽度
-func (f *Font) coreLatinWidth(code uint32) (float64, bool) {
-	widths, ok := pdfCoreLatinWidths[f.Name]
-	if !ok || code > 255 {
-		return 0, false
-	}
-	name := f.differences[code]
-	if name == "" {
-		encoding := pdfStandardNames
-		switch f.encoding {
-		case Name("WinAnsiEncoding"):
-			encoding = pdfWinAnsiNames
-		case Name("MacRomanEncoding"):
-			encoding = pdfMacRomanNames
-		case "", Name("StandardEncoding"):
-		default:
-			return 0, false
-		}
-		name = encoding[code]
-	}
-	width, ok := widths[name]
-	return float64(width), ok
 }
