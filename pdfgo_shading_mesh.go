@@ -21,7 +21,7 @@ import (
 )
 
 // MeshPatch 保存双三次曲面控制点及四角分量，Points按u、v索引
-// Colors依次对应(0,0)、(0,1)、(1,1)、(1,0)，有函数时仅首分量为函数输入
+// Colors依次对应(0,0)、(0,1)、(1,1)、(1,0)，有着色函数时仅首分量为函数输入
 type MeshPatch struct {
 	Points [4][4]Point
 	Colors [4][4]float64
@@ -41,11 +41,12 @@ type MeshGradient struct {
 	Space     *ColorSpace
 	Intent    Name
 	function  *gradientFunction
+	tint      *deviceNSpace
 }
 
 // UsesFunction 判断颜色分量是否需在插值后经过函数变换
 // 返回: bool 是否使用颜色函数
-func (g *MeshGradient) UsesFunction() bool { return g.function != nil }
+func (g *MeshGradient) UsesFunction() bool { return g.function != nil || g.tint != nil }
 
 // PointAt 计算单位参数域内的双三次曲面坐标
 // 入参: u 横向参数, v 纵向参数
@@ -62,9 +63,9 @@ func (p MeshPatch) PointAt(u, v float64) Point {
 	return point
 }
 
-// ValuesAt 插值源分量后执行颜色函数，三角形编号接在曲面之后
+// ValuesAt 插值源分量后依次执行着色函数和专色变换，三角形编号接在曲面之后
 // 入参: patch 网格序号, u 横向参数或第二顶点权重, v 纵向参数或第三顶点权重
-// 返回: [4]float64 源颜色分量, error 参数或颜色错误
+// 返回: [4]float64 Space颜色空间分量, error 参数或颜色错误
 func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 	if patch < 0 || patch >= len(g.Patches)+len(g.Triangles) || math.IsNaN(u) || math.IsNaN(v) || u < 0 || u > 1 || v < 0 || v > 1 {
 		return [4]float64{}, fmt.Errorf("invalid mesh evaluation")
@@ -88,6 +89,9 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 	}
 	if g.function != nil {
 		values = g.function.value(values[0])
+	}
+	if g.tint != nil {
+		values = g.tint.values(values[:g.tint.components]...)
 	}
 	for c, value := range values {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
@@ -158,12 +162,35 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		}
 		depths[i] = int(n)
 	}
-	space, err := p.reader.readColorSpace(d["ColorSpace"])
+	object, err := p.reader.Resolve(d["ColorSpace"])
 	if err != nil {
 		return Paint{}, err
 	}
-	g := &MeshGradient{Space: space, Intent: p.state.style.RenderingIntent, Matrix: matrix}
-	components := space.Components()
+	if name, ok := object.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
+		object, err = p.resource("ColorSpace", name)
+		if err != nil {
+			return Paint{}, err
+		}
+		object, err = p.reader.Resolve(object)
+		if err != nil {
+			return Paint{}, err
+		}
+	}
+	g := &MeshGradient{Intent: p.state.style.RenderingIntent, Matrix: matrix}
+	components := 0
+	if array, ok := object.(Array); ok && len(array) > 0 && array[0] == Name("DeviceN") {
+		g.tint, err = p.reader.readDeviceN(array)
+		if err != nil {
+			return Paint{}, err
+		}
+		g.Space, components = g.tint.alternate, g.tint.components
+	} else {
+		g.Space, err = p.reader.readColorSpace(object)
+		if err != nil {
+			return Paint{}, err
+		}
+		components = g.Space.Components()
+	}
 	if components > 4 {
 		return Paint{}, &UnsupportedError{Feature: "mesh color component count"}
 	}
