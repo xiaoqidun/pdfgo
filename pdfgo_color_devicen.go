@@ -27,6 +27,7 @@ type deviceNSpace struct {
 	input, output []float64
 	expressions   []affineValue
 	program       []calculatorInstruction
+	sampled       *sampledFunction
 }
 
 // paint 按专色浓度生成备用空间颜色并保留原始分量
@@ -42,7 +43,7 @@ func (s *deviceNSpace) paint(tints []float64, intent Name) (Paint, error) {
 		return Paint{}, err
 	}
 	paint := Paint{RGB: rgb, Space: s.alternate, Values: values}
-	if s.alternate.Model == "DeviceCMYK" {
+	if s.alternate.Model == "DeviceCMYK" && !s.alternate.Calibrated() {
 		paint.CMYK = &values
 	}
 	return paint, nil
@@ -53,7 +54,21 @@ func (s *deviceNSpace) paint(tints []float64, intent Name) (Paint, error) {
 // 返回: [4]float64 备用空间分量, error 着色函数错误
 func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 	var values [4]float64
-	if s.transform != nil {
+	if len(tints) != s.components {
+		return values, fmt.Errorf("invalid DeviceN component count")
+	}
+	for _, tint := range tints {
+		if math.IsNaN(tint) || math.IsInf(tint, 0) {
+			return values, fmt.Errorf("invalid DeviceN tint")
+		}
+	}
+	if s.sampled != nil {
+		var input [4]float64
+		for i, tint := range tints {
+			input[i] = math.Max(0, math.Min(1, tint))
+		}
+		s.sampled.evaluate(input[:s.components], values[:s.alternate.Components()])
+	} else if s.transform != nil {
 		var err error
 		values, err = s.transform.evaluate(math.Max(0, math.Min(1, tints[0])))
 		if err != nil {
@@ -120,7 +135,7 @@ func (r *Reader) readSingleDeviceN(space Array) (*deviceNSpace, error) {
 	return &deviceNSpace{alternate: alternate, transform: transform, components: 1}, nil
 }
 
-// readDeviceN 解析单分量函数或多分量计算器专色变换
+// readDeviceN 解析单分量函数或多分量采样与计算器专色变换
 // 入参: space 颜色空间数组
 // 返回: *deviceNSpace 着色定义, error 格式或能力错误
 func (r *Reader) readDeviceN(space Array) (*deviceNSpace, error) {
@@ -137,7 +152,7 @@ func (r *Reader) readDeviceN(space Array) (*deviceNSpace, error) {
 	return r.readMultiDeviceN(space)
 }
 
-// readMultiDeviceN 读取多分量专色的备用空间、区间和计算器着色函数
+// readMultiDeviceN 读取多分量专色的备用空间、区间和着色函数
 // 入参: space 多色定义
 // 返回: *deviceNSpace 专色变换, error 解析错误
 func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
@@ -175,6 +190,13 @@ func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
 		return nil, err
 	}
 	stream, ok := value.(*Stream)
+	if ok && stream.Dictionary["FunctionType"] == Integer(0) {
+		function, err := r.readSampledFunction(stream, len(names), alternate.Components())
+		if err != nil {
+			return nil, err
+		}
+		return &deviceNSpace{alternate: alternate, components: len(names), sampled: function}, nil
+	}
 	if !ok || stream.Dictionary["FunctionType"] != Integer(4) {
 		return nil, &UnsupportedError{Feature: "DeviceN tint function"}
 	}

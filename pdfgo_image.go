@@ -894,9 +894,13 @@ func (i *Image) palette() (*imagePalette, error) {
 		return nil, err
 	}
 	components := 0
+	if a, ok := base.(Array); ok && len(a) == 1 {
+		base = a[0]
+	}
 	var calibrated *calRGBSpace
 	var profile *iccColorSpace
 	var deviceN *deviceNSpace
+	var separation *separationSpace
 	var lab *labSpace
 	switch base {
 	case Name("DeviceGray"):
@@ -906,7 +910,13 @@ func (i *Image) palette() (*imagePalette, error) {
 	case Name("DeviceCMYK"):
 		components = 4
 	default:
-		if space, ok := base.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
+		if space, ok := base.(Array); ok && len(space) > 0 && space[0] == Name("Separation") {
+			separation, err = i.reader.readSeparation(space)
+			if err != nil {
+				return nil, err
+			}
+			components = 1
+		} else if space, ok := base.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
 			deviceN, err = i.reader.readDeviceN(space)
 			if err != nil {
 				return nil, err
@@ -972,7 +982,7 @@ func (i *Image) palette() (*imagePalette, error) {
 	}
 	if deviceN != nil {
 		result.space = deviceN.alternate
-	} else if calibrated == nil && lab == nil {
+	} else if calibrated == nil && lab == nil && separation == nil {
 		result.space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
 	}
 	intent, err := i.renderingIntent()
@@ -983,6 +993,26 @@ func (i *Image) palette() (*imagePalette, error) {
 		v := data[index*components:]
 		for c := 0; c < components; c++ {
 			result.values[index][c] = float64(v[c]) / 255
+		}
+		if separation != nil {
+			paint, err := separation.paint(result.values[index][0], intent)
+			if err != nil {
+				return nil, err
+			}
+			rgb := paint.RGB
+			if paint.CMYK != nil {
+				rgb = deviceCMYKRGB(paint.CMYK[:])
+				result.space = &ColorSpace{Model: "DeviceCMYK"}
+				result.values[index] = *paint.CMYK
+			} else if paint.Space != nil {
+				result.space, result.values[index] = paint.Space, paint.Values
+			}
+			alpha := uint16(65535)
+			if separation.name == "None" {
+				alpha = 0
+			}
+			palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: alpha}
+			continue
 		}
 		if lab != nil {
 			values := [4]float64{float64(v[0]) * 100 / 255, lab.rangeAB[0] + float64(v[1])*(lab.rangeAB[1]-lab.rangeAB[0])/255, lab.rangeAB[2] + float64(v[2])*(lab.rangeAB[3]-lab.rangeAB[2])/255}

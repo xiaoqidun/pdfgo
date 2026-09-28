@@ -125,34 +125,19 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1}, nil
 }
 
-// patternBaseColor 按底层设备色空间解释无色图案的颜色分量
-// 入参: paint 当前画刷, space 底层色空间, operands 颜色分量
-// 返回: error 不支持的分量或解析错误
-func patternBaseColor(paint *Paint, space Name, operands []Object) error {
-	count := 1
-	switch space {
-	case "DeviceRGB":
-		count = 3
-	case "DeviceCMYK":
-		count = 4
-	case "DeviceGray":
-	default:
-		return &UnsupportedError{Feature: "uncolored pattern base color space"}
-	}
-	values, err := numbers(operands, count)
+// patternBaseColor 按底层颜色空间解释无色图案的颜色分量
+// 入参: paint 当前画刷, space 底层色空间, operands 颜色分量, intent 渲染意图
+// 返回: error 分量或颜色转换错误
+func patternBaseColor(paint *Paint, space *patternColorSpace, operands []Object, intent Name) error {
+	values, err := numbers(operands, space.components)
 	if err != nil {
 		return err
 	}
-	for n, value := range values {
-		values[n] = math.Max(0, math.Min(1, value))
+	base, err := space.convert(values, intent)
+	if err != nil {
+		return err
 	}
-	paint.CMYK = nil
-	if count == 1 {
-		paint.RGB = [3]float64{values[0], values[0], values[0]}
-	} else if count == 3 {
-		paint.RGB = [3]float64{values[0], values[1], values[2]}
-	} else {
-		paint.CMYK = &[4]float64{values[0], values[1], values[2], values[3]}
-	}
+	base.Alpha = paint.Alpha
+	*paint = base
 	return nil
 }

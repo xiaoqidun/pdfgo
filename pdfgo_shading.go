@@ -436,7 +436,7 @@ func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64
 		}
 		return tint.values(values[:tint.components]...)
 	}}
-	if tint.program == nil {
+	if tint.expressions != nil {
 		mapped = deviceNGradientFunction(source, tint.input, tint.output, tint.expressions)
 	}
 	var stops []GradientStop

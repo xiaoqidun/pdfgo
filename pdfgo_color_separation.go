@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 )
@@ -271,6 +272,21 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 // 返回: float64 采样值
 func (f *tintFunction) sample(index int) float64 {
 	bit := index * f.bits
+	data := f.samples[bit/8:]
+	switch f.bits {
+	case 1, 2, 4:
+		return float64(data[0] >> (8 - f.bits - bit%8) & byte((1<<f.bits)-1))
+	case 8:
+		return float64(data[0])
+	case 12:
+		return float64(binary.BigEndian.Uint16(data) >> (4 - bit%8) & 4095)
+	case 16:
+		return float64(binary.BigEndian.Uint16(data))
+	case 24:
+		return float64(uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2]))
+	case 32:
+		return float64(binary.BigEndian.Uint32(data))
+	}
 	var value uint32
 	for n := 0; n < f.bits; n++ {
 		value = value<<1 | uint32(f.samples[(bit+n)/8]>>(7-(bit+n)%8)&1)
@@ -295,6 +311,11 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 	values, err := s.transform.evaluate(tint)
 	if err != nil {
 		return Paint{}, err
+	}
+	if s.alternate != "Lab" {
+		for i := range values {
+			values[i] = math.Max(0, math.Min(1, values[i]))
+		}
 	}
 	paint := Paint{}
 	switch s.alternate {

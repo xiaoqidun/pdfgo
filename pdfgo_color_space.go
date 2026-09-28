@@ -20,14 +20,14 @@ import (
 	"reflect"
 )
 
-// ColorSpace 保存设备或ICC颜色空间，不包含绘制或输出格式逻辑
-// Model为DeviceGray、DeviceRGB或DeviceCMYK，ICCBased保留对应模型与配置文件变换
+// ColorSpace 保存设备或校准颜色空间，不包含绘制或输出格式逻辑
+// Model为DeviceGray、DeviceRGB或DeviceCMYK，校准色保留对应模型与颜色变换
 type ColorSpace struct {
 	Model   Name
 	profile *iccColorSpace
 }
 
-// Calibrated 判断混合空间是否含ICC校准参数
+// Calibrated 判断混合空间是否含校准参数
 // 返回: bool 是否校准
 func (s *ColorSpace) Calibrated() bool { return s.profile != nil }
 
@@ -223,7 +223,7 @@ func (r *Reader) readBlendingSpace(value Object) (*ColorSpace, error) {
 	return s, nil
 }
 
-// readColorSpace 解析设备或ICC颜色空间，普通着色不要求逆变换
+// readColorSpace 解析设备、校准或ICC颜色空间，普通着色不要求逆变换
 // 入参: value 颜色空间定义
 // 返回: *ColorSpace 颜色空间, error 格式或能力错误
 func (r *Reader) readColorSpace(value Object) (*ColorSpace, error) {
@@ -236,6 +236,14 @@ func (r *Reader) readColorSpace(value Object) (*ColorSpace, error) {
 			return &ColorSpace{Model: name}, nil
 		}
 	}
+	if array, ok := value.(Array); ok && len(array) == 1 {
+		if name, ok := array[0].(Name); ok && (name == "DeviceGray" || name == "DeviceRGB" || name == "DeviceCMYK") {
+			return &ColorSpace{Model: name}, nil
+		}
+	}
+	if array, ok := value.(Array); ok && len(array) == 2 && (array[0] == Name("CalRGB") || array[0] == Name("CalGray")) {
+		return r.readCalibratedSpace(array)
+	}
 	if array, ok := value.(Array); ok && len(array) == 2 && array[0] == Name("ICCBased") {
 		profile, err := r.readICCColorSpace(array)
 		if err != nil {
@@ -245,4 +253,48 @@ func (r *Reader) readColorSpace(value Object) (*ColorSpace, error) {
 		return &ColorSpace{Model: model, profile: profile}, nil
 	}
 	return nil, &UnsupportedError{Feature: "color space"}
+}
+
+// readCalibratedSpace 将校准色转换为D50矩阵曲线，复用双向混合运算
+// 入参: array 校准颜色空间
+// 返回: *ColorSpace 颜色变换, error 参数错误
+func (r *Reader) readCalibratedSpace(array Array) (*ColorSpace, error) {
+	var calibrated *calRGBSpace
+	var err error
+	gray := array[0] == Name("CalGray")
+	if gray {
+		calibrated, err = r.readCalGray(array)
+	} else {
+		calibrated, err = r.readCalRGB(array)
+	}
+	if err != nil {
+		return nil, err
+	}
+	d65 := bradford([3]float64{.95047, 1, 1.08883})
+	d50 := bradford([3]float64{.9642, 1, .8249})
+	matrix := calRGBSpace{gamma: [3]float64{1, 1, 1}}
+	for i := range matrix.adapt {
+		matrix.adapt[i] = d65[i] / d50[i]
+	}
+	for c := 0; c < 3; c++ {
+		cone := bradford([3]float64(calibrated.matrix[c*3 : c*3+3]))
+		for i := range cone {
+			cone[i] *= calibrated.adapt[i] * d50[i] / d65[i]
+		}
+		matrix.matrix[c*3] = .9869929*cone[0] - .1470543*cone[1] + .1599627*cone[2]
+		matrix.matrix[c*3+1] = .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2]
+		matrix.matrix[c*3+2] = -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]
+	}
+	profile := &iccColorSpace{}
+	model := Name("DeviceRGB")
+	if gray {
+		profile.gray = &iccGraySpace{matrix: matrix, curve: iccToneCurve{parameters: []float64{calibrated.gamma[0]}}}
+		model = "DeviceGray"
+	} else {
+		profile.rgb = &iccRGBSpace{matrix: matrix}
+		for i, gamma := range calibrated.gamma {
+			profile.rgb.curves[i] = iccToneCurve{parameters: []float64{gamma}}
+		}
+	}
+	return &ColorSpace{Model: model, profile: profile}, nil
 }
