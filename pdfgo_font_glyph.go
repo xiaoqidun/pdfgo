@@ -41,7 +41,7 @@ var dingbatGlyphNames = sync.OnceValue(func() map[string]string {
 	return names
 })
 
-// loadGlyphNames 加载内置字形映射，缺失必要资源时报告构建错误
+// loadGlyphNames 加载内置字形映射
 // 入参: name 内置映射文件名
 // 返回: map[string]string 名称映射
 func loadGlyphNames(name string) map[string]string {
