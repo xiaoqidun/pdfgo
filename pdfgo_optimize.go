@@ -262,7 +262,7 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		}
 	}
 	refs = slices.DeleteFunc(refs, func(ref Reference) bool { return out.aliases[ref].Number != 0 })
-	fontUpdates, fontTags, err := r.optimizationFontUpdates(ctx, fontGlyphs)
+	fontUpdates, fontTags, err := r.optimizationFontUpdates(ctx, fontGlyphs, originalCache)
 	if err != nil {
 		return report, err
 	}

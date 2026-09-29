@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"maps"
 	"slices"
@@ -27,9 +28,9 @@ import (
 )
 
 // optimizationFontUpdates 准备更小的字体程序及稳定子集标识，限制累计输出缓存
-// 入参: ctx 取消上下文, glyphs 字体用字
+// 入参: ctx 取消上下文, glyphs 字体用字, cached 原有缓存
 // 返回: map[Reference]*Stream 字体输出, map[Reference]string 子集标识, error 读取错误
-func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Reference][]uint16) (map[Reference]*Stream, map[Reference]string, error) {
+func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Reference][]uint16, cached map[Reference]bool) (map[Reference]*Stream, map[Reference]string, error) {
 	updates := make(map[Reference]*Stream)
 	tags := make(map[Reference]string)
 	total := 0
@@ -42,7 +43,13 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 		}
 		return 0
 	}) {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		value, err := r.Object(ref)
+		if !cached[ref] {
+			delete(r.cache, ref)
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -137,6 +144,33 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 	used := make(map[Reference]map[uint16]bool)
 	unsafe := make(map[Reference]bool)
 	other := make(map[Reference]bool)
+	resolve := func(value Object, stream bool) (Object, error) {
+		seen := make(map[Reference]bool)
+		for {
+			ref, ok := value.(Reference)
+			if !ok {
+				return value, nil
+			}
+			if seen[ref] {
+				return nil, fmt.Errorf("cyclic indirect reference")
+			}
+			seen[ref] = true
+			if !stream {
+				if entry, ok := metadata[ref]; ok {
+					value = entry
+					continue
+				}
+			}
+			var err error
+			value, err = r.Object(ref)
+			if !cached[ref] {
+				delete(r.cache, ref)
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	var walk func(Object, int) error
 	walk = func(value Object, depth int) error {
 		if depth > 256 {
@@ -154,13 +188,13 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 		case *Stream:
 			return walk(v.Dictionary, depth+1)
 		case Dictionary:
-			if descriptor, err := r.Resolve(v["FontDescriptor"]); err == nil {
+			if descriptor, err := resolve(v["FontDescriptor"], false); err == nil {
 				if dict, ok := descriptor.(Dictionary); ok {
 					if ref, ok := dict["FontFile2"].(Reference); ok {
 						if used[ref] == nil {
 							used[ref] = map[uint16]bool{0: true}
 						}
-						mapping, err := r.Resolve(v["CIDToGIDMap"])
+						mapping, err := resolve(v["CIDToGIDMap"], true)
 						stream, ok := mapping.(*Stream)
 						if v["Subtype"] != Name("CIDFontType2") || err != nil || !ok {
 							unsafe[ref] = true
@@ -195,11 +229,6 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 		if err := walk(value, 0); err != nil {
 			return nil, err
 		}
-		for key := range r.cache {
-			if !cached[key] {
-				delete(r.cache, key)
-			}
-		}
 	}
 	result := make(map[Reference][]uint16)
 	for ref, glyphs := range used {
@@ -225,6 +254,9 @@ func compactTrueType(ctx context.Context, data []byte, glyphs []uint16) ([]byte,
 	tables := make(map[string][]byte, n)
 	for i := 0; i < n; i++ {
 		tag := string(data[12+i*16 : 16+i*16])
+		if _, exists := tables[tag]; exists {
+			return data, nil
+		}
 		switch tag {
 		case "cmap", "head", "hhea", "hmtx", "maxp", "OS/2", "post", "name", "glyf", "loca", "cvt ", "fpgm", "prep", "gasp", "kern", "vhea", "vmtx", "hdmx", "LTSH", "VDMX", "GDEF", "GPOS", "FFTM":
 		default:

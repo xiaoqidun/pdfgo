@@ -26,7 +26,7 @@ import (
 	"math"
 )
 
-// optimizationBuffer 限制候选编码的内存，超过原文大小时终止无收益的压缩
+// optimizationBuffer 限制候选编码缓冲，超过上限时终止当前编码
 type optimizationBuffer struct {
 	buffer   *bytes.Buffer
 	limit    int
@@ -58,7 +58,7 @@ func OptimizeImageResource(ctx context.Context, data []byte, options Compression
 	if err != nil || int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 {
 		return best, ctx.Err()
 	}
-	img, err := png.Decode(bytes.NewReader(data))
+	img, err := png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +70,12 @@ func OptimizeImageResource(ctx context.Context, data []byte, options Compression
 		return nil, err
 	}
 	var b bytes.Buffer
-	if err := jpeg.Encode(&b, img, &jpeg.Options{Quality: options.ImageQuality()}); err != nil {
+	limit := &optimizationBuffer{buffer: &b, limit: optimizationBufferLimit}
+	output := &pdfOutput{ctx: ctx, writer: limit}
+	if err := jpeg.Encode(output, img, &jpeg.Options{Quality: options.ImageQuality()}); err != nil {
+		if limit.exceeded {
+			return best, ctx.Err()
+		}
 		return nil, err
 	}
 	encoded, err := OptimizeJPEG(ctx, b.Bytes())
@@ -144,7 +149,7 @@ func compactPNG(ctx context.Context, data []byte, options CompressionOptions, si
 	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 || data[24] == 16 {
 		return data, nil
 	}
-	img, err := png.Decode(bytes.NewReader(data))
+	img, err := png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +187,12 @@ func compactPNG(ctx context.Context, data []byte, options CompressionOptions, si
 	encode := func(img image.Image) error {
 		var out bytes.Buffer
 		encoder := png.Encoder{CompressionLevel: png.BestCompression}
-		if err := encoder.Encode(&out, img); err != nil {
+		limit := &optimizationBuffer{buffer: &out, limit: min(len(best), optimizationBufferLimit)}
+		output := &pdfOutput{ctx: ctx, writer: limit}
+		if err := encoder.Encode(output, img); err != nil {
+			if limit.exceeded {
+				return ctx.Err()
+			}
 			return err
 		}
 		if out.Len() < len(best) {
@@ -196,6 +206,9 @@ func compactPNG(ctx context.Context, data []byte, options CompressionOptions, si
 	if gray {
 		g := image.NewGray(b)
 		for y := b.Min.Y; y < b.Max.Y; y++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			for x := b.Min.X; x < b.Max.X; x++ {
 				g.SetGray(x, y, color.Gray{Y: pixels.NRGBAAt(x, y).R})
 			}
