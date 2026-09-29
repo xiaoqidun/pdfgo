@@ -36,6 +36,14 @@ const optimizationBufferLimit = 64 << 20
 // 入参: ctx 取消上下文, data 图片数据, options 压缩配置
 // 返回: []byte 图片数据, error 编码错误
 func OptimizeImage(ctx context.Context, data []byte, options CompressionOptions) ([]byte, error) {
+	return OptimizeImageSize(ctx, data, options, image.Point{})
+}
+
+// OptimizeImageSize 优化图片编码，有损模式按两轴像素需求等比缩小，只采用更小的结果
+// 未知显示尺寸时传零值，不降采样；不会放大图片或修改输入数据
+// 入参: ctx 取消上下文, data 图片数据, options 压缩配置, size 像素需求
+// 返回: []byte 图片数据, error 编码错误
+func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
 	if err := options.Validate(); err != nil {
 		return nil, err
 	}
@@ -46,7 +54,7 @@ func OptimizeImage(ctx context.Context, data []byte, options CompressionOptions)
 		return data, nil
 	}
 	if bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
-		return optimizePNG(ctx, data, options)
+		return optimizePNG(ctx, data, options, size)
 	}
 	if !bytes.HasPrefix(data, []byte{255, 216}) {
 		return data, nil
@@ -78,6 +86,10 @@ func OptimizeImage(ctx context.Context, data []byte, options CompressionOptions)
 	}
 	if img.ColorModel() == color.CMYKModel {
 		return best, nil
+	}
+	img, err = ResizeImage(ctx, img, size)
+	if err != nil {
+		return nil, err
 	}
 	var encoded bytes.Buffer
 	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: options.ImageQuality()}); err != nil {
@@ -135,9 +147,9 @@ func jpegMetadata(data []byte) ([]byte, bool, error) {
 }
 
 // optimizePNG 保留块内容并重压缩IDAT，有损模式仅量化八位真彩色图片
-// 入参: ctx 取消上下文, data PNG数据, options 压缩配置
+// 入参: ctx 取消上下文, data PNG数据, options 压缩配置, size 像素上限
 // 返回: []byte 优化数据, error 编码错误
-func optimizePNG(ctx context.Context, data []byte, options CompressionOptions) ([]byte, error) {
+func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
 	type chunk struct {
 		kind string
 		data []byte
@@ -234,7 +246,7 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions) (
 	if candidate := assemble(encoded, nil, false); len(candidate) < len(best) {
 		best = candidate
 	}
-	if options.Mode == CompressionLossy && eligible && !unsafeMetadata && options.ImageQuality() < 100 {
+	if options.Mode == CompressionLossy && eligible && !unsafeMetadata && (options.ImageQuality() < 100 || size.X > 0 && size.Y > 0) {
 		config, err := png.DecodeConfig(bytes.NewReader(data))
 		if err != nil {
 			return nil, err
@@ -243,6 +255,10 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions) (
 			return best, nil
 		}
 		img, err := png.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		img, err = ResizeImage(ctx, img, size)
 		if err != nil {
 			return nil, err
 		}

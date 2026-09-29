@@ -145,7 +145,11 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 			}
 		case Dictionary:
 			if !protecting && options.Compression.Mode == CompressionLossy {
-				for _, key := range []Name{"SMask", "Mask"} {
+				keys := []Name{"SMask", "Mask"}
+				if options.Compression.ImageDPI() > 0 {
+					keys = append(keys, "AP", "Pattern", "CharProcs")
+				}
+				for _, key := range keys {
 					if v[key] != nil {
 						maskRoots = append(maskRoots, v[key])
 					}
@@ -218,6 +222,10 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		if !originalCache[maskRefs[i]] {
 			delete(r.cache, maskRefs[i])
 		}
+	}
+	imageSizes, err := r.imageOutputSizes(ctx, options.Compression.ImageDPI())
+	if err != nil {
+		return report, err
 	}
 	slices.SortFunc(refs, func(a, b Reference) int {
 		if a.Number < b.Number {
@@ -340,7 +348,7 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 			if lossless[ref] {
 				compression.Mode = CompressionLossless
 			}
-			value, err = r.optimizeStream(ctx, stream, compression)
+			value, err = r.optimizeStreamSize(ctx, stream, compression, imageSizes[ref])
 			if err != nil {
 				return report, err
 			}
@@ -599,16 +607,31 @@ func compressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
 	return result.Bytes(), nil
 }
 
-// optimizeStream 在保留过滤器语义的前提下选择更小的流编码
-// 入参: ctx 取消上下文, s 原始流, options 压缩配置
-// 返回: *Stream 输出流，不修改原始对象, error 优化错误
-func (r *Reader) optimizeStream(ctx context.Context, s *Stream, options CompressionOptions) (*Stream, error) {
+// optimizeStreamSize 优化流编码并按已知显示尺寸缩小图片
+// 入参: ctx 取消上下文, s 原始流, options 压缩配置, size 像素上限
+// 返回: *Stream 输出流, error 优化错误
+func (r *Reader) optimizeStreamSize(ctx context.Context, s *Stream, options CompressionOptions, size image.Point) (*Stream, error) {
 	if s.Dictionary["F"] != nil || len(s.Data) > optimizationBufferLimit {
 		return s, nil
 	}
 	filters, params, err := s.filterChain(r)
 	if err != nil {
 		return s, nil
+	}
+	if len(filters) > 1 && filters[len(filters)-1] == Name("DCTDecode") {
+		inner, err := r.unwrapImageStream(ctx, s, filters, params)
+		if err != nil {
+			return nil, err
+		}
+		if inner != nil {
+			optimized, err := r.optimizeStreamSize(ctx, inner, options, size)
+			if err != nil {
+				return nil, err
+			}
+			if len(optimized.Data)+40 < len(s.Data) {
+				return optimized, nil
+			}
+		}
 	}
 	result := *s
 	result.Dictionary = maps.Clone(s.Dictionary)
@@ -659,6 +682,10 @@ func (r *Reader) optimizeStream(ctx context.Context, s *Stream, options Compress
 					}
 					img = p
 				}
+				img, e = ResizeImage(ctx, img, size)
+				if e != nil {
+					return nil, e
+				}
 				var b bytes.Buffer
 				if e = jpeg.Encode(&b, img, &jpeg.Options{Quality: options.ImageQuality()}); e != nil {
 					return nil, e
@@ -669,6 +696,8 @@ func (r *Reader) optimizeStream(ctx context.Context, s *Stream, options Compress
 				}
 				if len(encoded)+40 < len(s.Data) {
 					replace(encoded, Name("DCTDecode"))
+					result.Dictionary["Width"] = Integer(img.Bounds().Dx())
+					result.Dictionary["Height"] = Integer(img.Bounds().Dy())
 					return &result, nil
 				}
 			}
@@ -681,7 +710,11 @@ func (r *Reader) optimizeStream(ctx context.Context, s *Stream, options Compress
 		if s.Dictionary["Subtype"] != Name("Image") || s.Dictionary["Decode"] != nil || s.Dictionary["Mask"] != nil || s.Dictionary["SMask"] != nil || parameters["ColorTransform"] != nil || (space != Name("DeviceRGB") && space != Name("DeviceGray")) {
 			imageOptions.Mode = CompressionLossless
 		}
-		data, err := OptimizeImage(ctx, s.Data, imageOptions)
+		config, configErr := jpeg.DecodeConfig(bytes.NewReader(s.Data))
+		if configErr != nil || Integer(config.Width) != s.Dictionary["Width"] || Integer(config.Height) != s.Dictionary["Height"] {
+			size = image.Point{}
+		}
+		data, err := OptimizeImageSize(ctx, s.Data, imageOptions, size)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -689,6 +722,11 @@ func (r *Reader) optimizeStream(ctx context.Context, s *Stream, options Compress
 			return s, nil
 		}
 		result.Data = data
+		if size.X > 0 && size.Y > 0 && imageOptions.Mode == CompressionLossy {
+			if config, err := jpeg.DecodeConfig(bytes.NewReader(data)); err == nil {
+				result.Dictionary["Width"], result.Dictionary["Height"] = Integer(config.Width), Integer(config.Height)
+			}
+		}
 		return &result, nil
 	}
 	if len(filters) > 0 && filters[0] == Name("FlateDecode") {
