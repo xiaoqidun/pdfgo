@@ -146,7 +146,7 @@ func jpegMetadata(data []byte) ([]byte, bool, error) {
 	return nil, false, fmt.Errorf("truncated JPEG header")
 }
 
-// optimizePNG 保留块内容并重压缩IDAT，有损模式仅量化八位真彩色图片
+// optimizePNG 流式重压缩IDAT，无附加块时比较精确颜色表示，有损模式可降采样
 // 入参: ctx 取消上下文, data PNG数据, options 压缩配置, size 像素上限
 // 返回: []byte 优化数据, error 编码错误
 func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
@@ -157,6 +157,7 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	var chunks []chunk
 	var compressed bytes.Buffer
 	eligible := false
+	plain := true
 	unsafeMetadata := false
 	ended := false
 	for pos := 8; pos < len(data); {
@@ -173,6 +174,9 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 			return nil, fmt.Errorf("invalid PNG checksum")
 		}
 		chunks = append(chunks, chunk{kind, raw})
+		if kind != "IHDR" && kind != "IDAT" && kind != "IEND" && kind != "PLTE" && kind != "tRNS" {
+			plain = false
+		}
 		switch kind {
 		case "IHDR", "IDAT", "IEND", "PLTE", "tRNS", "hIST", "sBIT", "cHRM", "gAMA", "iCCP", "sRGB", "cICP", "mDCV", "cLLI", "bKGD", "pHYs", "tIME", "tEXt", "zTXt", "iTXt", "eXIf":
 		default:
@@ -203,18 +207,25 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	if err != nil {
 		return nil, err
 	}
-	raw, err := io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1))
+	var packed bytes.Buffer
+	output := &optimizationBuffer{buffer: &packed, limit: min(len(data), optimizationBufferLimit)}
+	encoder, _ := zlib.NewWriterLevel(output, zlib.BestCompression)
+	n, err := io.Copy(encoder, io.LimitReader(&contextInput{ctx: ctx, reader: input}, 512<<20+1))
 	input.Close()
-	if err != nil {
-		return nil, err
+	closeErr := encoder.Close()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
-	if len(raw) > optimizationBufferLimit {
+	if n > 512<<20 {
 		return data, nil
 	}
-	encoded, err := compressPDFBytes(ctx, raw)
-	if err != nil {
+	if err != nil && !output.exceeded {
 		return nil, err
 	}
+	if closeErr != nil && !output.exceeded {
+		return nil, closeErr
+	}
+	encoded := packed.Bytes()
 	assemble := func(idat, header []byte, lossy bool) []byte {
 		var out bytes.Buffer
 		out.Write(data[:8])
@@ -243,10 +254,21 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		return out.Bytes()
 	}
 	best := data
-	if candidate := assemble(encoded, nil, false); len(candidate) < len(best) {
-		best = candidate
+	if !output.exceeded {
+		if candidate := assemble(encoded, nil, false); len(candidate) < len(best) {
+			best = candidate
+		}
 	}
-	if options.Mode == CompressionLossy && eligible && !unsafeMetadata && (options.ImageQuality() < 100 || size.X > 0 && size.Y > 0) {
+	if plain {
+		candidate, err := compactPNG(ctx, data, options, size)
+		if err != nil {
+			return nil, err
+		}
+		if len(candidate) < len(best) {
+			best = candidate
+		}
+	}
+	if !plain && options.Mode == CompressionLossy && eligible && !unsafeMetadata && (options.ImageQuality() < 100 || size.X > 0 && size.Y > 0) {
 		config, err := png.DecodeConfig(bytes.NewReader(data))
 		if err != nil {
 			return nil, err

@@ -60,6 +60,7 @@ type pdfOutput struct {
 	reader   *Reader
 	security *standardSecurity
 	encrypt  Reference
+	aliases  map[Reference]Reference
 	count    int64
 }
 
@@ -113,6 +114,7 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		delete(trailer, name)
 	}
 	seen := make(map[Reference]bool)
+	metadata := make(map[Reference]Object)
 	var refs []Reference
 	var maskRoots []Object
 	var maskRefs []Reference
@@ -195,6 +197,11 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		if err = collect(value, 0); err != nil {
 			return report, err
 		}
+		if stream, ok := value.(*Stream); ok {
+			metadata[refs[i]] = stream.Dictionary
+		} else {
+			metadata[refs[i]] = value
+		}
 		if !originalCache[refs[i]] {
 			delete(r.cache, refs[i])
 		}
@@ -224,6 +231,38 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		}
 	}
 	imageSizes, err := r.imageOutputSizes(ctx, options.Compression.ImageDPI())
+	if err != nil {
+		return report, err
+	}
+	fontGlyphs, err := r.optimizationFontGlyphs(ctx, metadata, originalCache)
+	if err != nil {
+		return report, err
+	}
+	out.aliases, err = r.optimizationAliases(ctx, refs, originalCache, metadata)
+	if err != nil {
+		return report, err
+	}
+	for ref, canonical := range out.aliases {
+		if len(fontGlyphs[canonical]) > 0 && len(fontGlyphs[ref]) > 0 {
+			fontGlyphs[canonical] = append(fontGlyphs[canonical], fontGlyphs[ref]...)
+			slices.Sort(fontGlyphs[canonical])
+			fontGlyphs[canonical] = slices.Compact(fontGlyphs[canonical])
+		} else {
+			delete(fontGlyphs, canonical)
+		}
+		delete(fontGlyphs, ref)
+		lossless[canonical] = lossless[canonical] || lossless[ref]
+		a, b := imageSizes[canonical], imageSizes[ref]
+		if imageSizes != nil {
+			if a.X == 0 || a.Y == 0 || b.X == 0 || b.Y == 0 {
+				imageSizes[canonical] = image.Point{}
+			} else {
+				imageSizes[canonical] = image.Pt(max(a.X, b.X), max(a.Y, b.Y))
+			}
+		}
+	}
+	refs = slices.DeleteFunc(refs, func(ref Reference) bool { return out.aliases[ref].Number != 0 })
+	fontUpdates, fontTags, err := r.optimizationFontUpdates(ctx, fontGlyphs)
 	if err != nil {
 		return report, err
 	}
@@ -344,6 +383,9 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 			}
 		}
 		if stream, ok := value.(*Stream); ok {
+			if optimized := fontUpdates[ref]; optimized != nil {
+				stream = optimized
+			}
 			compression := options.Compression
 			if lossless[ref] {
 				compression.Mode = CompressionLossless
@@ -354,6 +396,7 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 			}
 			report.Streams++
 		}
+		value = r.optimizedFontNames(value, fontTags, out.aliases, 0)
 		if _, stream := value.(*Stream); packed && !stream && ref.Generation == 0 && ref != out.encrypt {
 			var buffer bytes.Buffer
 			plain := *out
@@ -515,6 +558,9 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 		}
 		text = "<" + hex.EncodeToString(data) + ">"
 	case Reference:
+		if canonical, ok := w.aliases[v]; ok {
+			v = canonical
+		}
 		text = fmt.Sprintf("%d %d R", v.Number, v.Generation)
 	case Array:
 		if _, err := io.WriteString(w, "["); err != nil {
@@ -611,6 +657,33 @@ func compressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
 // 入参: ctx 取消上下文, s 原始流, options 压缩配置, size 像素上限
 // 返回: *Stream 输出流, error 优化错误
 func (r *Reader) optimizeStreamSize(ctx context.Context, s *Stream, options CompressionOptions, size image.Point) (*Stream, error) {
+	encoded, err := r.optimizeStreamEncoding(ctx, s, options, size)
+	if err != nil {
+		return nil, err
+	}
+	compacted, err := r.optimizeImagePixels(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	if compacted != s {
+		a, b := pdfOutput{ctx: ctx, writer: io.Discard}, pdfOutput{ctx: ctx, writer: io.Discard}
+		if err := a.object(compacted, Reference{}, 0, false); err != nil {
+			return nil, err
+		}
+		if err := b.object(encoded, Reference{}, 0, false); err != nil {
+			return nil, err
+		}
+		if a.count < b.count {
+			return compacted, nil
+		}
+	}
+	return encoded, nil
+}
+
+// optimizeStreamEncoding 优化通用流和有损图片编码，不修改输入对象
+// 入参: ctx 取消上下文, s 原始流, options 压缩配置, size 像素需求
+// 返回: *Stream 输出流, error 编码错误
+func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options CompressionOptions, size image.Point) (*Stream, error) {
 	if s.Dictionary["F"] != nil || len(s.Data) > optimizationBufferLimit {
 		return s, nil
 	}
@@ -647,7 +720,10 @@ func (r *Reader) optimizeStreamSize(ctx context.Context, s *Stream, options Comp
 			}
 		}
 	}
-	if options.Mode == CompressionLossy && s.Dictionary["Subtype"] == Name("Image") && s.Dictionary["BitsPerComponent"] == Integer(8) && s.Dictionary["Decode"] == nil && s.Dictionary["Mask"] == nil && s.Dictionary["SMask"] == nil && s.Dictionary["ImageMask"] != Boolean(true) {
+	if options.Mode == CompressionLossy && s.Dictionary["Subtype"] == Name("Image") && s.Dictionary["BitsPerComponent"] == Integer(8) && s.Dictionary["Decode"] == nil && s.Dictionary["Mask"] == nil && s.Dictionary["ImageMask"] != Boolean(true) {
+		if s.Dictionary["SMask"] != nil {
+			size = image.Point{}
+		}
 		space, _ := r.Resolve(s.Dictionary["ColorSpace"])
 		width, _ := s.Dictionary["Width"].(Integer)
 		height, _ := s.Dictionary["Height"].(Integer)
@@ -682,9 +758,20 @@ func (r *Reader) optimizeStreamSize(ctx context.Context, s *Stream, options Comp
 					}
 					img = p
 				}
+				photo := photographicImage(img)
 				img, e = ResizeImage(ctx, img, size)
 				if e != nil {
 					return nil, e
+				}
+				if !photo {
+					candidate, err := r.encodeLosslessPixels(ctx, s, img, int(channels))
+					if err != nil {
+						return nil, err
+					}
+					if len(candidate.Data)+100 < len(s.Data) {
+						return candidate, nil
+					}
+					return &result, ctx.Err()
 				}
 				var b bytes.Buffer
 				if e = jpeg.Encode(&b, img, &jpeg.Options{Quality: options.ImageQuality()}); e != nil {
