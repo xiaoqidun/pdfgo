@@ -68,21 +68,7 @@ func (s *Stream) Decode() ([]byte, error) {
 				data, err = decodeLZW(data, early)
 			}
 		case "ASCIIHexDecode":
-			end := bytes.IndexByte(data, '>')
-			if end < 0 {
-				return nil, fmt.Errorf("missing ASCIIHex terminator")
-			}
-			var digits []byte
-			for _, b := range data[:end] {
-				if !isSpace(b) {
-					digits = append(digits, b)
-				}
-			}
-			if len(digits)%2 != 0 {
-				digits = append(digits, '0')
-			}
-			data = make([]byte, len(digits)/2)
-			_, err = hex.Decode(data, digits)
+			data, err = decodeASCIIHex(data)
 		case "ASCII85Decode":
 			end := bytes.Index(data, []byte("~>"))
 			if end < 0 {
@@ -108,13 +94,52 @@ func (s *Stream) Decode() ([]byte, error) {
 			}
 		}
 	}
-	if len(filters) == 0 {
+	if len(filters) == 0 || len(filters) == 1 && filters[0] == Name("Crypt") {
 		return bytes.Clone(data), nil
 	}
 	return data, nil
 }
 
 func (*Stream) pdfObject() {}
+
+// decodeASCIIHex 解码十六进制流，忽略空白并为末尾单个半字节补零
+func decodeASCIIHex(data []byte) ([]byte, error) {
+	end := bytes.IndexByte(data, '>')
+	if end < 0 {
+		return nil, fmt.Errorf("missing ASCIIHex terminator")
+	}
+	data = data[:end]
+	count := 0
+	for _, b := range data {
+		if !isSpace(b) {
+			count++
+		}
+	}
+	out := make([]byte, count/2+count%2)
+	index := 0
+	for _, b := range data {
+		var value byte
+		switch {
+		case '0' <= b && b <= '9':
+			value = b - '0'
+		case 'a' <= b && b <= 'f':
+			value = b - 'a' + 10
+		case 'A' <= b && b <= 'F':
+			value = b - 'A' + 10
+		case isSpace(b):
+			continue
+		default:
+			return nil, hex.InvalidByteError(b)
+		}
+		if index%2 == 0 {
+			out[index/2] = value << 4
+		} else {
+			out[index/2] |= value
+		}
+		index++
+	}
+	return out, nil
+}
 
 // filterChain 解析过滤器及解码参数的间接引用，不修改源字典
 // 入参: reader 关联阅读器，nil表示不解析间接引用
