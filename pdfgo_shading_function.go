@@ -56,7 +56,7 @@ func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
 				if i > 0 && stops[i-1].Position < stop.Position {
 					previous := stops[i-1]
 					for _, mapped := range tint.linear([2]float64{previous.Values[0], stop.Values[0]}) {
-						mapped.Position = previous.Position + mapped.Position*(stop.Position-previous.Position)
+						mapped.Position = gradientPosition(previous.Position, stop.Position, mapped.Position)
 						result = append(result, mapped)
 					}
 				} else {
@@ -289,10 +289,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 				continue
 			}
 			for _, stop := range part.linear([2]float64{encode[2*i], encode[2*i+1]}) {
-				position := points[i] + stop.Position*(points[i+1]-points[i])
-				if stop.Position == 1 {
-					position = points[i+1]
-				}
+				position := gradientPosition(points[i], points[i+1], stop.Position)
 				stop.Position = (position - domain[0]) / (domain[1] - domain[0])
 				stops = append(stops, stop)
 			}

@@ -487,7 +487,7 @@ func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
 			}
 			slices.Sort(positions)
 			for _, t := range slices.Compact(positions) {
-				v := GradientStop{Position: a.Position + t*(stop.Position-a.Position)}
+				v := GradientStop{Position: gradientPosition(a.Position, stop.Position, t)}
 				for c := range v.Values {
 					v.Values[c] = a.Values[c] + t*(stop.Values[c]-a.Values[c])
 				}
@@ -527,6 +527,19 @@ func gradientUnitBounds(channels int) []float64 {
 		bounds[i*2+1] = 1
 	}
 	return bounds
+}
+
+// gradientPosition 映射单位位置到有序区间，精确保留端点并限制舍入误差
+// 入参: start 区间起点, end 区间终点, position 单位位置
+// 返回: float64 区间位置
+func gradientPosition(start, end, position float64) float64 {
+	if position == 0 {
+		return start
+	}
+	if position == 1 {
+		return end
+	}
+	return math.Max(start, math.Min(end, start+position*(end-start)))
 }
 
 // gradientInterval 截取或反向映射线性分段，保留定义域外常量和不连续边界
