@@ -22,11 +22,11 @@ const (
 	CompressionLossy
 )
 
-// CompressionMode 指定保持现有编码、无损优化或允许图像有损优化
+// CompressionMode 选择默认、无损或有损输出，不改变渲染分辨率
 type CompressionMode uint8
 
-// CompressionOptions 配置输出压缩，不改变页面尺寸和渲染分辨率
-// Quality仅用于有损图像编码，范围1至100，零值使用85；Mode零值保持现有处理策略
+// CompressionOptions 配置输出压缩，默认模式沿用现有输出策略，不额外优化
+// Mode零值CompressionUnchanged表示默认模式，Quality为有损质量1至100，0使用85
 type CompressionOptions struct {
 	Mode    CompressionMode `json:"mode"`
 	Quality int             `json:"quality,omitempty"`
