@@ -29,6 +29,8 @@ type Reader struct {
 	Trailer            Dictionary
 	source             io.ReaderAt
 	size               int64
+	originalSource     io.ReaderAt
+	originalSize       int64
 	closer             io.Closer
 	xref               map[int64]xrefEntry
 	cache              map[Reference]Object
@@ -141,6 +143,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		return nil, &UnsupportedError{Feature: "PDF version " + version}
 	}
 	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: map[Reference]Object{}, loading: map[Reference]bool{}}
+	r.originalSource, r.originalSize = source, size
 	var err error
 	for length := min(r.size, int64(4096)); ; length = min(r.size, length+min(length, r.size-length)) {
 		data, err = r.readRange(r.size-length, length)

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package pdfgo 原生、全平台、纯 Go 语言高性能 PDF 解析引擎
+// Package pdfgo 原生、全平台、纯 Go 语言高性能 PDF 处理引擎
 package pdfgo
 
 import "fmt"
