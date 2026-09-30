@@ -698,9 +698,18 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 			target.Space = palette.space
 		} else if deviceN != nil {
 			target.Space = deviceN.alternate
+		} else if separation != nil {
+			target.Space = separation.space
 		} else if profile != nil {
 			target.Space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
-		} else if calibrated == nil && lab == nil && separation == nil {
+		} else if calibrated != nil {
+			target.Space, err = i.reader.readCalibratedSpace(i.ColorSpace.(Array))
+			if err != nil {
+				return nil, err
+			}
+		} else if lab != nil {
+			target.Space = &ColorSpace{Model: "DeviceRGB"}
+		} else {
 			target.Space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components]}
 		}
 		if target.Space == nil {
@@ -790,6 +799,18 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				if palette != nil {
 					index := int(math.Max(0, math.Min(float64(len(palette.values)-1), math.Round(values[0]))))
 					values = palette.values[index]
+					alpha = uint16(uint32(alpha) * uint32(palette.colors[index].A) / 65535)
+				} else if lab != nil {
+					pixel := lab.color(values[0], values[1], values[2])
+					values = [4]float64{float64(pixel.R) / 65535, float64(pixel.G) / 65535, float64(pixel.B) / 65535}
+				} else if separation != nil {
+					values, err = separation.values(values[0])
+					if err != nil {
+						return nil, err
+					}
+					if separation.name == "None" {
+						alpha = 0
+					}
 				}
 				channels := target.Space.Components()
 				offset := (y*bounds.Dx() + x) * (channels + 1)
@@ -979,12 +1000,21 @@ func (i *Image) palette() (*imagePalette, error) {
 	}
 	palette := make([]color.NRGBA64, int(n+1))
 	result := &imagePalette{colors: palette, values: make([][4]float64, len(palette))}
-	if deviceN != nil {
+	if deviceN != nil || separation != nil {
 		result.tints = make([][4]float64, len(palette))
 	}
 	if deviceN != nil {
 		result.space = deviceN.alternate
-	} else if calibrated == nil && lab == nil && separation == nil {
+	} else if separation != nil {
+		result.space = separation.space
+	} else if calibrated != nil {
+		result.space, err = i.reader.readCalibratedSpace(base.(Array))
+		if err != nil {
+			return nil, err
+		}
+	} else if lab != nil {
+		result.space = &ColorSpace{Model: "DeviceRGB"}
+	} else {
 		result.space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
 	}
 	intent, err := i.renderingIntent()
@@ -997,6 +1027,7 @@ func (i *Image) palette() (*imagePalette, error) {
 			result.values[index][c] = float64(v[c]) / 255
 		}
 		if separation != nil {
+			result.tints[index] = result.values[index]
 			paint, err := separation.paint(result.values[index][0], intent)
 			if err != nil {
 				return nil, err
@@ -1004,10 +1035,10 @@ func (i *Image) palette() (*imagePalette, error) {
 			rgb := paint.RGB
 			if paint.CMYK != nil {
 				rgb = deviceCMYKRGB(paint.CMYK[:])
-				result.space = &ColorSpace{Model: "DeviceCMYK"}
-				result.values[index] = *paint.CMYK
-			} else if paint.Space != nil {
-				result.space, result.values[index] = paint.Space, paint.Values
+			}
+			result.values[index], err = separation.values(result.tints[index][0])
+			if err != nil {
+				return nil, err
 			}
 			alpha := uint16(65535)
 			if separation.name == "None" {
@@ -1018,8 +1049,9 @@ func (i *Image) palette() (*imagePalette, error) {
 		}
 		if lab != nil {
 			values := [4]float64{float64(v[0]) * 100 / 255, lab.rangeAB[0] + float64(v[1])*(lab.rangeAB[1]-lab.rangeAB[0])/255, lab.rangeAB[2] + float64(v[2])*(lab.rangeAB[3]-lab.rangeAB[2])/255}
-			result.values[index] = values
 			palette[index] = lab.color(values[0], values[1], values[2])
+			pixel := palette[index]
+			result.values[index] = [4]float64{float64(pixel.R) / 65535, float64(pixel.G) / 65535, float64(pixel.B) / 65535}
 			continue
 		}
 		if deviceN != nil {

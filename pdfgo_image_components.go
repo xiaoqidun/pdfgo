@@ -113,7 +113,7 @@ func (i *ImageComponents) ValuesAt(x, y int) ([4]float64, float64) {
 	return values, float64(i.Pix[offset+channels]) / 65535
 }
 
-// DecodeComponents 读取原始颜色空间的已映射分量，不经sRGB往返转换
+// DecodeComponents 读取已映射分量，专色保留备用空间及浓度，Lab映射为RGB
 // 返回: *ImageComponents 颜色分量及透明度, error 解码或不支持的源空间错误
 func (i *Image) DecodeComponents() (*ImageComponents, error) {
 	result := &ImageComponents{}

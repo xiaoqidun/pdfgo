@@ -185,6 +185,7 @@ type pageInterpreter struct {
 	bounds                 Rectangle
 	uncoloredPattern       bool
 	type3                  bool
+	uncoloredType3         bool
 }
 
 // Identity 返回单位矩阵
@@ -351,7 +352,23 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	interpreter := pageInterpreter{reader: r, resources: font.type3Resources, visitor: visitor, ctx: ctx, type3: true}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
+	if font.type3Bounds != nil {
+		interpreter.bounds = transformedBounds(*font.type3Bounds, interpreter.state.matrix)
+	}
 	return interpreter.run(data)
+}
+
+// transformedBounds 计算仿射变换后矩形的轴对齐边界
+// 入参: box 原始矩形, matrix 坐标变换
+// 返回: Rectangle 变换后的边界
+func transformedBounds(box Rectangle, matrix Matrix) Rectangle {
+	result := Rectangle{XMin: math.Inf(1), YMin: math.Inf(1), XMax: math.Inf(-1), YMax: math.Inf(-1)}
+	for _, point := range [4]Point{{box.XMin, box.YMin}, {box.XMax, box.YMin}, {box.XMax, box.YMax}, {box.XMin, box.YMax}} {
+		point = matrix.Apply(point)
+		result.XMin, result.YMin = math.Min(result.XMin, point.X), math.Min(result.YMin, point.Y)
+		result.XMax, result.YMax = math.Max(result.XMax, point.X), math.Max(result.YMax, point.Y)
+	}
+	return result
 }
 
 // run 解释单个页面或表单的完整内容
@@ -478,6 +495,12 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return err
 		}
 	}
+	if p.uncoloredType3 {
+		switch op.Operator {
+		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN":
+			return nil
+		}
+	}
 	point := func(x, y float64) Point { return p.state.matrix.Apply(Point{x, y}) }
 	add := func(name string, points ...Point) { p.path.Segments = append(p.path.Segments, Segment{name, points}) }
 	switch op.Operator {
@@ -491,6 +514,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 	case "d0", "d1":
 		if !p.type3 {
 			return &UnsupportedError{Feature: "Type3 glyph metrics outside character procedure"}
+		}
+		p.uncoloredType3 = op.Operator == "d1"
+		if op.Operator == "d1" {
+			p.bounds = transformedBounds(Rectangle{v[2], v[3], v[4], v[5]}, p.state.matrix)
 		}
 	case "q":
 		if len(p.stack) >= 256 {
@@ -1484,6 +1511,14 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		return err
 	}
 	m := child.state.matrix
+	child.bounds = transformedBounds(box, m)
+	if p.bounds.XMax > p.bounds.XMin && p.bounds.YMax > p.bounds.YMin {
+		child.bounds.XMin, child.bounds.YMin = math.Max(child.bounds.XMin, p.bounds.XMin), math.Max(child.bounds.YMin, p.bounds.YMin)
+		child.bounds.XMax, child.bounds.YMax = math.Min(child.bounds.XMax, p.bounds.XMax), math.Min(child.bounds.YMax, p.bounds.YMax)
+		if child.bounds.XMax <= child.bounds.XMin || child.bounds.YMax <= child.bounds.YMin {
+			return p.ctx.Err()
+		}
+	}
 	clip := Path{Segments: []Segment{{"M", []Point{m.Apply(Point{box.XMin, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMax})}}, {"L", []Point{m.Apply(Point{box.XMin, box.YMax})}}, {"C", nil}}}
 	child.state.style.Clips = append(append([]Path(nil), child.state.style.Clips...), clip)
 	child.patternMatrix = child.state.matrix

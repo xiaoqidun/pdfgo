@@ -50,6 +50,7 @@ type Font struct {
 	cffNames        map[uint32]string
 	differences     map[uint32]string
 	type3Matrix     Matrix
+	type3Bounds     *Rectangle
 	type3Procs      Dictionary
 	type3Resources  Dictionary
 }
@@ -288,6 +289,13 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 				return nil, err
 			}
 			font.type3Matrix = Matrix(numbers)
+			if dict["FontBBox"] != nil {
+				box, err := r.rectangle(dict["FontBBox"])
+				if err != nil {
+					return nil, err
+				}
+				font.type3Bounds = &box
+			}
 			procs, err := r.Resolve(dict["CharProcs"])
 			if err != nil {
 				return nil, err
