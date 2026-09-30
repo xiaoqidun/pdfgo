@@ -422,6 +422,12 @@ func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 		out := bytes.Clone(data)
 		for start := int64(0); start < int64(len(out)); start += row {
 			line := out[start : start+row]
+			if bits == 8 {
+				for x := int(colors); x < len(line); x++ {
+					line[x] += line[x-int(colors)]
+				}
+				continue
+			}
 			for x := int(colors); x < int(columns*colors); x++ {
 				value := packedSample(line, x, int(bits)) + packedSample(line, x-int(colors), int(bits))
 				setPackedSample(line, x, int(bits), value)
@@ -437,35 +443,54 @@ func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 	}
 	rows := int64(len(data)) / (row + 1)
 	out := make([]byte, rows*row)
+	var previous []byte
 	for y := int64(0); y < rows; y++ {
 		filter := data[y*(row+1)]
 		if filter > 4 {
 			return nil, fmt.Errorf("invalid PNG predictor")
 		}
-		for x := int64(0); x < row; x++ {
-			var left, up, corner byte
-			if x >= bpp {
-				left = out[y*row+x-bpp]
-			}
-			if y > 0 {
-				up = out[(y-1)*row+x]
-				if x >= bpp {
-					corner = out[(y-1)*row+x-bpp]
-				}
-			}
-			v := data[y*(row+1)+1+x]
+		line := out[y*row : (y+1)*row]
+		copy(line, data[y*(row+1)+1:(y+1)*(row+1)])
+		if y == 0 {
 			switch filter {
-			case 1:
-				v += left
 			case 2:
-				v += up
+				filter = 0
 			case 3:
-				v += byte((int(left) + int(up)) / 2)
+				for x := int(bpp); x < len(line); x++ {
+					line[x] += line[x-int(bpp)] / 2
+				}
+				filter = 0
 			case 4:
-				v += paeth(left, up, corner)
+				filter = 1
 			}
-			out[y*row+x] = v
 		}
+		switch filter {
+		case 1:
+			for x := int(bpp); x < len(line); x++ {
+				line[x] += line[x-int(bpp)]
+			}
+		case 2:
+			for x := range line {
+				line[x] += previous[x]
+			}
+		case 3:
+			for x := range line {
+				var left byte
+				if x >= int(bpp) {
+					left = line[x-int(bpp)]
+				}
+				line[x] += byte((int(left) + int(previous[x])) / 2)
+			}
+		case 4:
+			for x := range line {
+				var left, corner byte
+				if x >= int(bpp) {
+					left, corner = line[x-int(bpp)], previous[x-int(bpp)]
+				}
+				line[x] += paeth(left, previous[x], corner)
+			}
+		}
+		previous = line
 	}
 	return out, nil
 }
