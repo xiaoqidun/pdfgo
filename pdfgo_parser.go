@@ -20,12 +20,13 @@ import (
 	"strconv"
 )
 
-// objectParser 维护对象语法解析位置与嵌套深度
+// objectParser 维护解析位置、嵌套深度及试探读取的窗口耗尽状态
 type objectParser struct {
-	data  []byte
-	pos   int
-	base  int64
-	depth int
+	data      []byte
+	pos       int
+	base      int64
+	depth     int
+	exhausted bool
 }
 
 // isSpace 判断PDF空白字节
@@ -55,6 +56,7 @@ func (p *objectParser) skipSpace() {
 			return
 		}
 	}
+	p.exhausted = true
 }
 
 // fail 创建当前偏移位置的语法错误
@@ -68,6 +70,9 @@ func (p *objectParser) token() string {
 	start := p.pos
 	for p.pos < len(p.data) && !isDelimiter(p.data[p.pos]) {
 		p.pos++
+	}
+	if p.pos == len(p.data) {
+		p.exhausted = true
 	}
 	return string(p.data[start:p.pos])
 }

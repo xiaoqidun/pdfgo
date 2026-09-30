@@ -23,6 +23,9 @@ import (
 	"strconv"
 )
 
+// objectStreamCacheLimit 限制多个对象流的解码缓存，单个超限流仅保留最近一次
+const objectStreamCacheLimit = 16 << 20
+
 // Reader 读取PDF对象，方法不可并发调用，返回对象不可并发修改
 type Reader struct {
 	Version            string
@@ -39,7 +42,7 @@ type Reader struct {
 	legacyDestinations Dictionary
 	fonts              map[Reference]*Font
 	colorProfiles      map[[32]byte]*iccColorSpace
-	objectStream       *objectStream
+	objectStreams      [4]*objectStream
 	security           *standardSecurity
 	closed             bool
 }
@@ -52,12 +55,13 @@ type ReaderOptions struct {
 	Warning      func(Diagnostic)
 }
 
-// objectStream 保留最近访问的对象流索引和解码数据，避免逐对象重复解压
+// objectStream 保存对象流索引、解码数据及实际缓存字节数
 type objectStream struct {
 	reference Reference
 	data      []byte
 	ids       []int64
 	offsets   []int64
+	bytes     int64
 }
 
 // xrefEntry 保存交叉引用类型、文件偏移或对象流索引
@@ -359,7 +363,7 @@ func (r *Reader) parseAt(offset int64, parse func(*objectParser) error) error {
 	}
 	remaining := r.size - offset
 	var data []byte
-	for length := min(remaining, int64(4096)); ; length = min(remaining, length+min(length, remaining-length)) {
+	for length := min(remaining, int64(512)); ; length = min(remaining, length+min(length, remaining-length)) {
 		if uint64(length) > uint64(^uint(0)>>1) {
 			return fmt.Errorf("invalid file range")
 		}
@@ -372,7 +376,7 @@ func (r *Reader) parseAt(offset int64, parse func(*objectParser) error) error {
 		data = window
 		p := objectParser{data: data}
 		err := parse(&p)
-		if int64(p.pos) >= length-1 && length < remaining {
+		if (p.exhausted || int64(p.pos) >= length-1) && length < remaining {
 			continue
 		}
 		var syntax *SyntaxError
@@ -391,7 +395,7 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 	var keyword string
 	err := r.parseAt(offset, func(input *objectParser) error {
 		p = *input
-		defer func() { input.pos = p.pos }()
+		defer func() { input.pos, input.exhausted = p.pos, p.exhausted }()
 		number, e1 := strconv.ParseInt(p.token(), 10, 64)
 		generation, e2 := strconv.ParseInt(p.token(), 10, 64)
 		if e1 != nil || e2 != nil || number <= 0 || generation < 0 || generation > 65535 || p.token() != "obj" {
@@ -618,14 +622,34 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 		return nil, fmt.Errorf("invalid object stream reference")
 	}
 	container := Reference{entry.position, containerEntry.generation}
-	stream := r.objectStream
-	if stream == nil || stream.reference != container {
+	var stream *objectStream
+	for i, cached := range r.objectStreams {
+		if cached != nil && cached.reference == container {
+			stream = cached
+			copy(r.objectStreams[1:i+1], r.objectStreams[:i])
+			r.objectStreams[0] = stream
+			break
+		}
+	}
+	if stream == nil {
 		var err error
 		stream, err = r.readObjectStream(container)
 		if err != nil {
 			return nil, err
 		}
-		r.objectStream = stream
+		copy(r.objectStreams[1:], r.objectStreams[:len(r.objectStreams)-1])
+		r.objectStreams[0] = stream
+		used := stream.bytes
+		for i, cached := range r.objectStreams[1:] {
+			if cached == nil {
+				break
+			}
+			used += cached.bytes
+			if used > objectStreamCacheLimit {
+				clear(r.objectStreams[i+1:])
+				break
+			}
+		}
 	}
 	index := entry.generation
 	if index < 0 || index >= int64(len(stream.ids)) || stream.ids[index] != ref.Number {
@@ -681,5 +705,5 @@ func (r *Reader) readObjectStream(ref Reference) (*objectStream, error) {
 		return nil, fmt.Errorf("object stream index mismatch")
 	}
 	offsets[count] = int64(len(data)) - first
-	return &objectStream{reference: ref, data: data[first:], ids: ids, offsets: offsets}, nil
+	return &objectStream{reference: ref, data: data[first:], ids: ids, offsets: offsets, bytes: int64(cap(data)) + 8*(count*2+1)}, nil
 }

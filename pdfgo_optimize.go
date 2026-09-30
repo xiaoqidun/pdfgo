@@ -178,8 +178,8 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		return report, err
 	}
 	originalCache := make(map[Reference]bool, len(r.cache))
-	originalObjectStream := r.objectStream
-	defer func() { r.objectStream = originalObjectStream }()
+	originalObjectStreams := r.objectStreams
+	defer func() { r.objectStreams = originalObjectStreams }()
 	for ref := range r.cache {
 		originalCache[ref] = true
 	}
