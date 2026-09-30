@@ -242,10 +242,12 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	}
 	root, err := r.Resolve(r.Trailer["Root"])
 	if err != nil {
+		r.Close()
 		return nil, err
 	}
 	catalog, ok := root.(Dictionary)
 	if !ok || catalog["Type"] != Name("Catalog") {
+		r.Close()
 		return nil, fmt.Errorf("missing document catalog")
 	}
 	if v, ok := catalog["Version"].(Name); ok && string(v) > r.Version {

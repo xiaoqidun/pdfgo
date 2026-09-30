@@ -143,7 +143,9 @@ func (r *Reader) openSecurity(password []byte) error {
 			ownerKey = md5.Sum(ownerKey[:])
 		}
 	}
+	defer clear(ownerKey[:])
 	decoded := bytes.Clone(owner)
+	defer clear(decoded)
 	for i := 0; i == 0 || revision >= 3 && i < 20; i++ {
 		k := bytes.Clone(ownerKey[:n])
 		if revision >= 3 {
@@ -152,15 +154,22 @@ func (r *Reader) openSecurity(password []byte) error {
 			}
 		}
 		c, _ := rc4.NewCipher(k)
+		clear(k)
 		c.XORKeyStream(decoded, decoded)
 	}
 	if ownerKey := s.authenticateUser(decoded, owner, user, id, n); ownerKey != nil {
+		clear(key)
 		key, s.info.Owner = ownerKey, true
 	}
 	if key == nil {
 		return ErrPassword
 	}
 	s.key = key
+	defer func() {
+		if r.security != s {
+			clear(s.key)
+		}
+	}()
 	for _, name := range []Name{s.streamFilter, s.stringFilter, s.embeddedFilter} {
 		if _, err := s.cryptMethod(name); err != nil {
 			return err
@@ -215,9 +224,11 @@ func (s *standardSecurity) authenticateUser(password, owner, user, id []byte, n 
 			k[j] ^= byte(i)
 		}
 		c, _ := rc4.NewCipher(k)
+		clear(k)
 		c.XORKeyStream(check, check)
 	}
 	if subtle.ConstantTimeCompare(check, user[:len(check)]) != 1 {
+		clear(key)
 		return nil
 	}
 	return key

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sync/atomic"
 )
 
 // ColorSpace 保存设备或校准颜色空间，不包含绘制或输出格式逻辑
@@ -25,6 +26,7 @@ import (
 type ColorSpace struct {
 	Model   Name
 	profile *iccColorSpace
+	srgb    uint32
 }
 
 // Calibrated 判断混合空间是否含校准参数
@@ -47,6 +49,21 @@ func (s *ColorSpace) SRGBEquivalent() bool {
 	if s.profile == nil {
 		return true
 	}
+	if cached := atomic.LoadUint32(&s.srgb); cached != 0 {
+		return cached == 2
+	}
+	equivalent := s.srgbEquivalent()
+	cached := uint32(1)
+	if equivalent {
+		cached = 2
+	}
+	atomic.StoreUint32(&s.srgb, cached)
+	return equivalent
+}
+
+// srgbEquivalent 核对不可变校准变换的轴向与三维采样，不改变颜色分量
+// 返回: bool 是否在8位量化精度内等价
+func (s *ColorSpace) srgbEquivalent() bool {
 	if s.profile.rgb == nil {
 		return false
 	}

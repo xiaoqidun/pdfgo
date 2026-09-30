@@ -80,12 +80,16 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 	password = password[:min(len(password), 127)]
 	user, owner := values["U"], values["O"]
 	validation := aes256PasswordHash(password, owner[32:40], user, revision)
+	ownerValid := subtle.ConstantTimeCompare(validation, owner[:32]) == 1
+	clear(validation)
 	entry, encrypted, extra := owner, values["OE"], user
-	if subtle.ConstantTimeCompare(validation, owner[:32]) == 1 {
+	if ownerValid {
 		s.info.Owner = true
 	} else {
 		validation = aes256PasswordHash(password, user[32:40], nil, revision)
-		if subtle.ConstantTimeCompare(validation, user[:32]) != 1 {
+		userValid := subtle.ConstantTimeCompare(validation, user[:32]) == 1
+		clear(validation)
+		if !userValid {
 			return ErrPassword
 		}
 		entry, encrypted, extra = user, values["UE"], nil
