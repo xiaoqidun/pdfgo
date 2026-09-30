@@ -150,7 +150,11 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 	if !ok {
 		return nil, fmt.Errorf("invalid gradient function")
 	}
-	if dict["FunctionType"] == Integer(0) || dict["FunctionType"] == Integer(2) {
+	kind, err := r.Resolve(dict["FunctionType"])
+	if err != nil {
+		return nil, err
+	}
+	if kind == Integer(0) || kind == Integer(2) {
 		tint, err := r.readTintFunction(v, channels)
 		if err != nil {
 			return nil, err
@@ -179,7 +183,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		return nil, fmt.Errorf("invalid gradient function domain")
 	}
 	var limits []float64
-	if dict["Range"] != nil || dict["FunctionType"] == Integer(4) {
+	if dict["Range"] != nil || kind == Integer(4) {
 		limits, err = r.numberArray(dict["Range"], 2*channels)
 		if err != nil {
 			return nil, err
@@ -190,7 +194,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 			}
 		}
 	}
-	if dict["FunctionType"] == Integer(4) {
+	if kind == Integer(4) {
 		stream, ok := v.(*Stream)
 		if !ok {
 			return nil, fmt.Errorf("missing calculator function stream")
@@ -233,7 +237,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 			linear: func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) },
 		}, nil
 	}
-	if dict["FunctionType"] != Integer(3) {
+	if kind != Integer(3) {
 		return nil, &UnsupportedError{Feature: "gradient function type"}
 	}
 	v, err = r.Resolve(dict["Functions"])

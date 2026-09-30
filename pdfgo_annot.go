@@ -177,6 +177,12 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		value = Dictionary{"N": stream}
 	}
 	if value == nil && annotation.Subtype == "FreeText" {
+		text, err := r.ReadAnnotationText(annotation, "Contents", visitor.Warning)
+		if err != nil {
+			return err
+		}
+		annotation.Dictionary = maps.Clone(annotation.Dictionary)
+		annotation.Dictionary["Contents"] = String("\xef\xbb\xbf" + text)
 		stream, err := r.variableTextAppearance(ctx, page, annotation)
 		if err != nil {
 			return err

@@ -24,6 +24,7 @@ import (
 // Thresholds保持标准中的数组顺序，类型16使用高位优先的16位阈值
 type Halftone struct {
 	Type                           int
+	Name                           []byte
 	Dictionary                     Dictionary
 	Frequency, Angle               float64
 	SpotFunction                   Object
@@ -74,21 +75,36 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 	if !ok {
 		return nil, fmt.Errorf("invalid halftone dictionary")
 	}
+	h := &Halftone{Dictionary: dict}
+	value, err = r.Resolve(dict["HalftoneName"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		name, ok := value.(String)
+		if !ok {
+			return nil, fmt.Errorf("invalid halftone name")
+		}
+		h.Name = append([]byte{}, name...)
+	}
 	value, err = r.Resolve(dict["HalftoneType"])
 	if err != nil {
 		return nil, err
 	}
 	kind, ok := value.(Integer)
-	if !ok {
+	if !ok && !(value == nil && h.Name != nil) {
 		return nil, fmt.Errorf("invalid halftone type")
 	}
-	h := &Halftone{Type: int(kind), Dictionary: dict}
+	h.Type = int(kind)
 	value, err = r.Resolve(dict["Type"])
 	if err != nil {
 		return nil, err
 	}
 	if value != nil && value != Name("Halftone") {
 		return nil, fmt.Errorf("invalid halftone object type")
+	}
+	if !ok {
+		return h, nil
 	}
 	h.TransferFunction, err = r.Resolve(dict["TransferFunction"])
 	if err != nil {

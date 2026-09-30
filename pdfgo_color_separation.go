@@ -145,7 +145,11 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 		return nil, fmt.Errorf("invalid tint function domain")
 	}
 	f := &tintFunction{domain: domain, channels: channels}
-	switch dict["FunctionType"] {
+	kind, err := r.Resolve(dict["FunctionType"])
+	if err != nil {
+		return nil, err
+	}
+	switch kind {
 	case Integer(0):
 		if stream == nil {
 			return nil, fmt.Errorf("missing sampled tint data")
@@ -158,7 +162,11 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 		if err != nil || bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 12 && bits != 16 && bits != 24 && bits != 32 {
 			return nil, fmt.Errorf("invalid sampled tint depth")
 		}
-		if dict["Order"] != nil && dict["Order"] != Integer(1) {
+		order, err := r.Resolve(dict["Order"])
+		if err != nil {
+			return nil, err
+		}
+		if order != nil && order != Integer(1) {
 			return nil, &UnsupportedError{Feature: "cubic sampled tint function"}
 		}
 		f.decode, err = r.numberArray(dict["Decode"], 2*channels)

@@ -33,6 +33,43 @@ type annotationLetter struct {
 	word  bool
 }
 
+// ReadAnnotationText 读取注解文本字段，RC和RV允许文本流，其他字段要求文本字符串
+// 入参: annotation 注解, field 文本字段名, warning 异常字段警告，空值使用严格检查
+// 返回: string Unicode文本, error 引用、类型或编码错误
+func (r *Reader) ReadAnnotationText(annotation Annotation, field Name, warning func(Diagnostic)) (string, error) {
+	value, err := r.Resolve(annotation.Dictionary[field])
+	if err != nil || value == nil {
+		return "", err
+	}
+	var data String
+	switch value := value.(type) {
+	case String:
+		data = value
+	case *Stream:
+		if field != "RC" && field != "RV" {
+			err = fmt.Errorf("invalid annotation %s: expected text string", field)
+			break
+		}
+		var decoded []byte
+		decoded, err = value.Decode()
+		data = String(decoded)
+	default:
+		err = fmt.Errorf("invalid annotation %s: expected text string", field)
+	}
+	var text string
+	if err == nil {
+		text, err = DecodeTextString(data)
+	}
+	if err != nil {
+		if warning == nil {
+			return "", err
+		}
+		warning(Diagnostic{Message: fmt.Sprintf("invalid PDF annotation %s ignored; appearance retained", field)})
+		return "", nil
+	}
+	return text, nil
+}
+
 // formDefaults 读取表单默认属性，不要求文档必须包含交互表单
 // 返回: Dictionary 默认属性, error 目录或表单错误
 func (r *Reader) formDefaults() (Dictionary, error) {
