@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -43,6 +44,33 @@ type FileSpecification struct {
 	Name        string
 	Description string
 	Embedded    *Stream
+	FileSystem  Name
+	Dictionary  Dictionary
+}
+
+// FileResolver 由调用方读取外部文件，库不自动访问网络或本地路径
+type FileResolver func(context.Context, FileSpecification) ([]byte, error)
+
+// ReadFileData 读取内嵌文件或交给调用方解析外部文件，不改变文件编码
+// 入参: ctx 取消上下文, file 文件说明, resolver 外部文件读取器，可为空
+// 返回: []byte 文件数据, error 解码、取消或外部文件不可用
+func (r *Reader) ReadFileData(ctx context.Context, file FileSpecification, resolver FileResolver) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var data []byte
+	var err error
+	if file.Embedded != nil {
+		data, err = file.Embedded.Decode()
+	} else if resolver != nil {
+		data, err = resolver(ctx, file)
+	} else {
+		return nil, &UnsupportedError{Feature: "external file " + file.Name}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, ctx.Err()
 }
 
 // ReadMovie 读取视频字典，未声明尺寸时保留零值
@@ -185,6 +213,15 @@ func (r *Reader) ReadFileSpecification(object Object) (FileSpecification, error)
 	dict, ok := value.(Dictionary)
 	if !ok {
 		return result, fmt.Errorf("invalid file specification")
+	}
+	result.Dictionary = dict
+	if value, err := r.Resolve(dict["FS"]); err != nil {
+		return result, err
+	} else if value != nil {
+		result.FileSystem, ok = value.(Name)
+		if !ok {
+			return result, fmt.Errorf("invalid file system")
+		}
 	}
 	key := Name("UF")
 	name, err := r.Resolve(dict[key])

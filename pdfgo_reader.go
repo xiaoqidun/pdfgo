@@ -41,6 +41,7 @@ type Reader struct {
 	destinations       map[string]Object
 	legacyDestinations Dictionary
 	fonts              map[Reference]*Font
+	halftones          map[Reference]*Halftone
 	colorProfiles      map[[32]byte]*iccColorSpace
 	objectStreams      [4]*objectStream
 	security           *standardSecurity

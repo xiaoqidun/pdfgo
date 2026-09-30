@@ -80,6 +80,7 @@ type Style struct {
 	SoftMask        *SoftMask
 	Smoothness      *float64
 	Antialias       *bool
+	Halftone        *Halftone
 }
 
 // PathMark 表示一次路径绘制，路径及裁剪坐标始终位于页面用户空间
@@ -104,6 +105,7 @@ type TextMark struct {
 	Style                 Style
 	Mode                  int
 	Clip                  *TextClip
+	glyphStreams          []*Stream
 }
 
 // ImageMark 保存图像资源及单位方形到页面坐标的变换
@@ -186,6 +188,7 @@ type pageInterpreter struct {
 	uncoloredPattern       bool
 	type3                  bool
 	uncoloredType3         bool
+	glyphStreams           []*Stream
 }
 
 // Identity 返回单位矩阵
@@ -335,6 +338,14 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if !ok {
 		return fmt.Errorf("missing Type3 character procedure")
 	}
+	for _, active := range mark.glyphStreams {
+		if active == stream {
+			return fmt.Errorf("recursive Type3 character procedure %q", mark.Glyphs[index].Name)
+		}
+	}
+	if len(mark.glyphStreams) >= 64 {
+		return fmt.Errorf("Type3 character procedure depth exceeded")
+	}
 	if len(stream.Data) == 0 {
 		message := fmt.Sprintf("empty Type3 character procedure %q", mark.Glyphs[index].Name)
 		if visitor.Warning == nil {
@@ -350,6 +361,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	position := mark.Positions[index]
 	text := Matrix{mark.Size * mark.HorizontalScale, 0, 0, mark.Size, position.X, position.Y}
 	interpreter := pageInterpreter{reader: r, resources: font.type3Resources, visitor: visitor, ctx: ctx, type3: true}
+	interpreter.glyphStreams = append(append([]*Stream(nil), mark.glyphStreams...), stream)
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
 	if font.type3Bounds != nil {
@@ -1285,6 +1297,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 			return fmt.Errorf("text visitor missing")
 		}
 		mark := TextMark{Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: p.state.mode/4*4 + paintMode}
+		mark.glyphStreams = p.glyphStreams
 		if mark.Mode >= 4 {
 			mark.Clip = &TextClip{Font: mark.Font, Glyphs: glyphs, Positions: positions, Matrix: mark.Matrix, Size: mark.Size, HorizontalScale: mark.HorizontalScale}
 			p.textClips = append(p.textClips, mark.Clip)
@@ -1607,8 +1620,9 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				return &UnsupportedError{Feature: "non-knockout text"}
 			}
 		case "HT":
-			if value != Name("Default") {
-				return &UnsupportedError{Feature: "custom halftone"}
+			p.state.style.Halftone, err = p.reader.ReadHalftone(dict[key])
+			if err != nil {
+				return err
 			}
 		case "D":
 			values, ok := value.(Array)
