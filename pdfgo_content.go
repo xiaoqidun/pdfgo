@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"context"
 	"fmt"
+	"slices"
 )
 
 // Operation 保存内容流操作符及其操作数，不解释或执行操作
@@ -84,11 +85,16 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 			if err != nil {
 				return err
 			}
-			operands = []Object{stream}
+			operands = append(operands, stream)
 		}
-		if err := visit(Operation{Operator: op, Operands: operands, Offset: int64(start)}); err != nil {
+		var values []Object
+		if len(operands) != 0 {
+			values = slices.Clone(operands)
+		}
+		if err := visit(Operation{Operator: op, Operands: values, Offset: int64(start)}); err != nil {
 			return fmt.Errorf("content offset %d: %w", start, err)
 		}
-		operands = nil
+		clear(operands)
+		operands = operands[:0]
 	}
 }

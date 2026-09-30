@@ -31,6 +31,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"os"
 	"slices"
 	"strconv"
 	"unicode/utf16"
@@ -70,6 +71,9 @@ type pdfOutput struct {
 // 入参: ctx 取消上下文, writer 输出流, options 优化配置
 // 返回: OptimizeReport 优化结果, error 读写错误
 func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options OptimizeOptions) (report OptimizeReport, err error) {
+	if r.closed {
+		return report, os.ErrClosed
+	}
 	if err := options.Compression.Validate(); err != nil {
 		return report, err
 	}

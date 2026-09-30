@@ -41,6 +41,7 @@ type Reader struct {
 	colorProfiles      map[[32]byte]*iccColorSpace
 	objectStream       *objectStream
 	security           *standardSecurity
+	closed             bool
 }
 
 // ReaderOptions 设置密码编码及可恢复结构错误的诊断接收方式
@@ -249,21 +250,28 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	return r, nil
 }
 
-// Close 关闭Open持有的文件，不关闭NewReader的外部数据源
+// Close 释放源数据、对象缓存和解密密钥，关闭Open持有的文件
+// 不关闭NewReader的外部数据源；关闭后不可继续读取，重复关闭不产生错误
 // 返回: error 关闭错误
 func (r *Reader) Close() error {
-	if r.closer == nil {
-		return nil
+	closer := r.closer
+	if r.security != nil {
+		clear(r.security.key)
 	}
-	err := r.closer.Close()
-	r.closer = nil
-	return err
+	*r = Reader{closed: true}
+	if closer != nil {
+		return closer.Close()
+	}
+	return nil
 }
 
 // Resolve 解析间接引用，直接对象原样返回
 // 入参: object 待解析对象
 // 返回: Object 解析后的对象, error 错误信息
 func (r *Reader) Resolve(object Object) (Object, error) {
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	ref, ok := object.(Reference)
 	if !ok {
 		return object, nil
@@ -298,6 +306,9 @@ func (r *Reader) Resolve(object Object) (Object, error) {
 // 入参: ref 间接引用
 // 返回: Object 对象, error 错误信息
 func (r *Reader) Object(ref Reference) (Object, error) {
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	if value, ok := r.cache[ref]; ok {
 		return value, nil
 	}
