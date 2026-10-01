@@ -27,6 +27,7 @@ type iccLUT struct {
 	values        []float64
 	matrix        [9]float64
 	precision     int
+	pipeline      *iccPipeline
 }
 
 // iccLUTSpace 保存按渲染意图划分的设备与连接空间变换
@@ -74,7 +75,7 @@ func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error)
 				if s.pcs == "XYZ " && lut.precision == 8 {
 					return nil, &UnsupportedError{Feature: "8-bit ICC XYZ encoding"}
 				}
-				if direction.name[0] == 'A' || s.pcs != "XYZ " {
+				if lut.pipeline == nil && (direction.name[0] == 'A' || s.pcs != "XYZ ") {
 					if lut.matrix != [9]float64{1, 0, 0, 0, 1, 0, 0, 0, 1} {
 						return nil, fmt.Errorf("invalid ICC lookup matrix")
 					}
@@ -89,10 +90,13 @@ func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error)
 	return s, nil
 }
 
-// parseICCLUT 解析lut8Type和lut16Type，按实际数据长度校验维数
+// parseICCLUT 解析ICC查找表及多阶段变换，按实际数据长度校验维数
 // 入参: data 标签数据
 // 返回: *iccLUT 查找表, error 格式错误
 func parseICCLUT(data []byte) (*iccLUT, error) {
+	if len(data) >= 4 && (string(data[:4]) == "mAB " || string(data[:4]) == "mBA ") {
+		return parseICCPipeline(data)
+	}
 	if len(data) < 48 {
 		return nil, fmt.Errorf("invalid ICC lookup table header")
 	}
@@ -166,6 +170,9 @@ func iccLookupCurve(curve []float64, x float64) float64 {
 // 入参: values 单位输入分量
 // 返回: [4]float64 单位输出分量
 func (s *iccLUT) evaluate(values []float64) [4]float64 {
+	if s.pipeline != nil {
+		return s.pipeline.evaluate(values)
+	}
 	var input [4]float64
 	copy(input[:], values)
 	if len(s.input) == 3 {
@@ -236,7 +243,7 @@ func (s *iccLUTSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 		return [3]float64{v[0] * 65535 / 32768, v[1] * 65535 / 32768, v[2] * 65535 / 32768}, nil
 	}
 	scale := 1.0
-	if lut.precision == 16 {
+	if lut.precision == 16 && lut.pipeline == nil {
 		scale = 65535.0 / 65280
 	}
 	l, a, b := math.Min(100, v[0]*100*scale), v[1]*255*scale-128, v[2]*255*scale-128
@@ -279,7 +286,7 @@ func (s *iccLUTSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
 		}
 		x, y, z := f(xyz[0]/.9642), f(xyz[1]), f(xyz[2]/.8249)
 		pcs = [3]float64{(116*y - 16) / 100, (500*(x-y) + 128) / 255, (200*(y-z) + 128) / 255}
-		if lut.precision == 16 {
+		if lut.precision == 16 && lut.pipeline == nil {
 			for i := range pcs {
 				pcs[i] *= 65280.0 / 65535
 			}

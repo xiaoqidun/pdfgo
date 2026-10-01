@@ -57,6 +57,7 @@ type deviceSampleImage struct {
 	palette   *imagePalette
 	maximum   float64
 	byteExact bool
+	embedded  bool
 }
 
 // imagePalette 保存索引色的原始分量和显示颜色
@@ -298,6 +299,40 @@ func (s *deviceSampleImage) ColorModel() color.Model {
 // 返回: image.Rectangle 图像边界
 func (s *deviceSampleImage) Bounds() image.Rectangle { return s.source.Bounds() }
 
+// Opaque 对无透明度来源的图像直接返回结果，其余图像按覆盖率检查
+// 返回: bool 是否完全不透明
+func (s *deviceSampleImage) Opaque() bool {
+	if s.mask == nil {
+		opaque := !s.embedded
+		if s.embedded {
+			if source, ok := s.source.(interface{ Opaque() bool }); ok {
+				opaque = source.Opaque()
+			}
+		}
+		if opaque && s.palette != nil {
+			for _, pixel := range s.palette.colors {
+				if pixel.A != 65535 {
+					opaque = false
+					break
+				}
+			}
+		}
+		if opaque {
+			return true
+		}
+	}
+	bounds := s.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			_, _, _, alpha := s.At(x, y).RGBA()
+			if alpha != 65535 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // At 按原始采样精度返回非预乘颜色，边界外透明
 // 入参: x 横向坐标, y 纵向坐标
 // 返回: color.Color 像素颜色
@@ -306,10 +341,16 @@ func (s *deviceSampleImage) At(x, y int) color.Color {
 		return color.NRGBA64{}
 	}
 	pixel := imageNRGBASample(s.source.At(x, y))
-	pixel.A = 65535
+	if !s.embedded {
+		pixel.A = 65535
+	}
 	if s.palette != nil {
 		index := int(math.Max(0, math.Min(float64(len(s.palette.colors)-1), math.Round(float64(pixel.R)/65535*s.maximum))))
+		alpha := pixel.A
 		pixel = s.palette.colors[index]
+		if s.embedded {
+			pixel.A = uint16(uint32(pixel.A) * uint32(alpha) / 65535)
+		}
 	}
 	alpha := uint32(65535)
 	if s.mask != nil {
@@ -455,19 +496,7 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 			}
 			cmyk = profile.Dictionary["N"] == Integer(4)
 		}
-		if cmyk {
-			return i.jpxCMYKSamples(data)
-		}
-		if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-			data, err = jpxCodestream(data)
-			if err != nil {
-				return nil, err
-			}
-		}
-		result, _, err = image.Decode(bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
+		return i.jpxSamples(data, cmyk)
 	default:
 		return i.rawSamples(data)
 	}
@@ -613,12 +642,9 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if components == 0 {
 		return nil, &UnsupportedError{Feature: "image color space"}
 	}
-	embeddedMask, err := i.reader.Resolve(i.Stream.Dictionary["SMaskInData"])
+	embeddedMask, err := i.jpxMaskMode()
 	if err != nil {
 		return nil, err
-	}
-	if embeddedMask != nil && embeddedMask != Integer(0) {
-		return nil, &UnsupportedError{Feature: "image field SMaskInData"}
 	}
 	intent, err := i.renderingIntent()
 	if err != nil {
@@ -637,11 +663,21 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		ranges[1] = float64((uint32(1) << i.BitsPerComponent) - 1)
 	}
 	defaultDecode := true
-	if len(i.Decode) != 0 {
-		if len(i.Decode) != len(ranges) {
+	decode := i.Decode
+	if len(decode) != 0 && !i.ImageMask {
+		filters, _, err := i.Stream.filterChain(i.reader)
+		if err != nil {
+			return nil, err
+		}
+		if len(filters) != 0 && filters[len(filters)-1] == Name("JPXDecode") {
+			decode = nil
+		}
+	}
+	if len(decode) != 0 {
+		if len(decode) != len(ranges) {
 			return nil, fmt.Errorf("invalid image Decode array")
 		}
-		for n, value := range i.Decode {
+		for n, value := range decode {
 			v, err := i.reader.number(value)
 			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 				return nil, fmt.Errorf("invalid image Decode value")
@@ -654,9 +690,25 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	mask, keys, inverted, matte, err := i.decodeMask(components)
-	if err != nil {
-		return nil, err
+	var mask *imageResample
+	var keys, matte []float64
+	var inverted bool
+	if embeddedMask == 0 {
+		mask, keys, inverted, matte, err = i.decodeMask(components)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if embeddedMask != 0 {
+		if embeddedMask == 2 {
+			matte = make([]float64, components)
+			if value := i.Stream.Dictionary["Matte"]; value != nil {
+				matte, err = i.reader.numberArray(value, components)
+				if err != nil {
+					return nil, fmt.Errorf("invalid JPEG2000 Matte: %w", err)
+				}
+			}
+		}
 	}
 	bounds := samples.Bounds()
 	if mask != nil {
@@ -688,7 +740,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				}
 			}
 		}
-		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: float64((uint32(1) << i.BitsPerComponent) - 1), byteExact: byteExact}, nil
+		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: float64((uint32(1) << i.BitsPerComponent) - 1), byteExact: byteExact, embedded: embeddedMask != 0}, nil
 	}
 	var out *image.NRGBA64
 	if target == nil {
@@ -744,6 +796,10 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				alpha = uint16(value)
 			}
 			sampleColor := samples.At(x, y)
+			if embeddedMask != 0 {
+				_, _, _, value := sampleColor.RGBA()
+				alpha = uint16(value)
+			}
 			var values [4]float64
 			if components == 4 {
 				cmyk, ok := imageCMYKSample(sampleColor)
@@ -866,7 +922,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 			if transparent {
 				pixel.A = 0
 			}
-			if mask != nil {
+			if mask != nil || embeddedMask != 0 {
 				pixel.A = uint16(uint32(pixel.A) * uint32(alpha) / 65535)
 			}
 			out.SetNRGBA64(x, y, pixel)
@@ -889,6 +945,21 @@ func imageByteExact(source image.Image) bool {
 		return true
 	case *deviceSampleImage:
 		return s.byteExact
+	case *jpxSampleImage:
+		if s.ycc {
+			return false
+		}
+		for _, n := range s.channels {
+			bits := s.precision(n)
+			if bits != 1 && bits != 2 && bits != 4 && bits != 8 {
+				return false
+			}
+		}
+		if s.alpha >= 0 {
+			bits := s.precision(s.alpha)
+			return bits == 1 || bits == 2 || bits == 4 || bits == 8
+		}
+		return true
 	case *imageResample:
 		return (!s.interpolate || s.source.Bounds() == s.bounds) && imageByteExact(s.source)
 	default:
@@ -1172,7 +1243,7 @@ func (i *Image) decodeMask(components int) (*imageResample, []float64, bool, []f
 	return &imageResample{source: decoded, bounds: decoded.Bounds(), interpolate: mask.Interpolate}, nil, !soft, matte, nil
 }
 
-// ccittSamples 按PDF参数解码CCITT Group4样本，保留黑白映射及行边界
+// ccittSamples 按PDF参数解码CCITT传真样本，保留黑白映射及行边界
 // 入参: data 编码数据, params 解码参数
 // 返回: image.Image 样本图像, error 错误信息
 func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error) {
@@ -1187,9 +1258,13 @@ func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error
 	if stride > uint64(^uint(0)>>1)/uint64(i.Height) {
 		return nil, fmt.Errorf("CCITT sample size exceeds platform integer range")
 	}
-	samples := make([]byte, int(stride)*i.Height)
-	if _, err := io.ReadFull(reader, samples); err != nil {
+	expected := int(stride) * i.Height
+	samples, err := io.ReadAll(io.LimitReader(reader, int64(expected)))
+	if err != nil {
 		return nil, err
+	}
+	if len(samples) != expected {
+		return nil, io.ErrUnexpectedEOF
 	}
 	if endOfBlock {
 		var extra [1]byte
@@ -1211,9 +1286,6 @@ func ccittImageReader(source io.Reader, width, height int, params Dictionary) (i
 	k, err := integerDefault(params, "K", 0)
 	if err != nil {
 		return nil, false, err
-	}
-	if k >= 0 {
-		return nil, false, &UnsupportedError{Feature: "CCITT Group 3"}
 	}
 	columns, err := integerDefault(params, "Columns", 1728)
 	if err != nil {
@@ -1239,8 +1311,25 @@ func ccittImageReader(source io.Reader, width, height int, params Dictionary) (i
 			*flag.value = bool(boolean)
 		}
 	}
-	if endOfLine {
+	if endOfLine && k < 0 {
 		return nil, false, &UnsupportedError{Feature: "CCITT Group 4 end-of-line markers"}
+	}
+	if k >= 0 {
+		damage := int64(0)
+		if endOfLine {
+			damage, err = integerDefault(params, "DamagedRowsBeforeError", 0)
+			if err != nil || damage < 0 || uint64(damage) > uint64(^uint(0)>>1) {
+				return nil, false, fmt.Errorf("invalid CCITT DamagedRowsBeforeError")
+			}
+		}
+		if !endOfBlock && rows != 0 {
+			if uint64(rows) > uint64(^uint(0)>>1) {
+				return nil, false, fmt.Errorf("invalid CCITT Rows")
+			}
+			height = int(rows)
+		}
+		row := make([]byte, width/8+min(1, width%8))
+		return &faxGroup3Reader{source: source, width: width, height: height, row: row, previous: make([]byte, len(row)), offset: len(row), changes: []int{width}, mixed: k > 0, eol: endOfLine, align: align, invert: invert, eob: endOfBlock, allowDamage: int(damage)}, endOfBlock, nil
 	}
 	if !endOfBlock && rows != 0 && rows != int64(height) {
 		return nil, false, &UnsupportedError{Feature: "CCITT Rows differing from image height"}
@@ -1367,6 +1456,10 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 // 返回: color.NRGBA64 非预乘颜色
 func imageNRGBASample(pixel color.Color) color.NRGBA64 {
 	switch c := pixel.(type) {
+	case jpxSample:
+		if !c.cmyk {
+			return color.NRGBA64{R: c.values[0], G: c.values[1], B: c.values[2], A: c.alpha}
+		}
 	case color.NRGBA:
 		return color.NRGBA64{R: uint16(c.R) * 257, G: uint16(c.G) * 257, B: uint16(c.B) * 257, A: uint16(c.A) * 257}
 	case color.NRGBA64:
@@ -1379,6 +1472,9 @@ func imageNRGBASample(pixel color.Color) color.NRGBA64 {
 // 入参: pixel 样本颜色
 // 返回: cmykSample 四色分量, bool 是否为四色样本
 func imageCMYKSample(pixel color.Color) (cmykSample, bool) {
+	if sample, ok := pixel.(jpxSample); ok && sample.cmyk {
+		return sample.values, true
+	}
 	switch c := pixel.(type) {
 	case color.CMYK:
 		return cmykSample{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}, true

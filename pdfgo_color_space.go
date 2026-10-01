@@ -189,9 +189,10 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 			return math.Max(0, math.Min(1, xyz[1])), err
 		}
 		if p.gray != nil {
-			return p.gray.curve.evaluate(values[0]), nil
+			v := p.gray.curve.evaluate(values[0])
+			return math.Max(0, math.Min(1, p.gray.matrix.linearXYZ(v, v, v)[1])), nil
 		}
-		y := 0.0
+		y := p.rgb.matrix.offset[1]
 		for i, curve := range p.rgb.curves {
 			y += p.rgb.matrix.matrix[3*i+1] * curve.evaluate(values[i])
 		}
@@ -329,6 +330,11 @@ func (r *Reader) readCalibratedSpace(array Array) (*ColorSpace, error) {
 		matrix.matrix[c*3+1] = .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2]
 		matrix.matrix[c*3+2] = -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]
 	}
+	cone := bradford(calibrated.offset)
+	for i := range cone {
+		cone[i] *= calibrated.adapt[i] * d50[i] / d65[i]
+	}
+	matrix.offset = [3]float64{.9869929*cone[0] - .1470543*cone[1] + .1599627*cone[2], .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2], -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]}
 	profile := &iccColorSpace{}
 	model := Name("DeviceRGB")
 	if gray {

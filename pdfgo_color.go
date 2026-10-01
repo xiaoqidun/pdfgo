@@ -25,11 +25,13 @@ type calRGBSpace struct {
 	gamma  [3]float64
 	matrix [9]float64
 	adapt  [3]float64
+	offset [3]float64
 }
 
-// labSpace 保存Lab白点和分量范围
+// labSpace 保存Lab黑白点和分量范围
 type labSpace struct {
 	white   [3]float64
+	black   [3]float64
 	rangeAB [4]float64
 	adapt   [3]float64
 }
@@ -136,8 +138,14 @@ func (r *Reader) readLab(object Object) (*labSpace, error) {
 	}
 	if black != nil {
 		values, err := r.numberArray(black, 3)
-		if err != nil || values[0] != 0 || values[1] != 0 || values[2] != 0 {
-			return nil, &UnsupportedError{Feature: "Lab nonzero black point"}
+		if err != nil {
+			return nil, fmt.Errorf("invalid Lab black point")
+		}
+		for n, value := range values {
+			if value < 0 || value == s.white[n] {
+				return nil, fmt.Errorf("invalid Lab black point")
+			}
+			s.black[n] = value
 		}
 	}
 	source := bradford(s.white)
@@ -166,7 +174,13 @@ func (s *labSpace) color(lightness, a, b float64) color.NRGBA64 {
 		}
 		return 3 * (6.0 / 29) * (6.0 / 29) * (v - 4.0/29)
 	}
-	cone := bradford([3]float64{s.white[0] * inverse(fx), s.white[1] * inverse(fy), s.white[2] * inverse(fz)})
+	xyz := [3]float64{s.white[0] * inverse(fx), s.white[1] * inverse(fy), s.white[2] * inverse(fz)}
+	for n, black := range s.black {
+		if black != 0 {
+			xyz[n] = (xyz[n] - black) * s.white[n] / (s.white[n] - black)
+		}
+	}
+	cone := bradford(xyz)
 	for n := range cone {
 		cone[n] *= s.adapt[n]
 	}
@@ -220,19 +234,17 @@ func (r *Reader) readCalGray(object Object) (*calRGBSpace, error) {
 			if v < 0 {
 				return nil, fmt.Errorf("invalid CalGray black point")
 			}
-			if v != 0 {
-				return nil, &UnsupportedError{Feature: "CalGray nonzero black point"}
-			}
 		}
 	}
 	return r.readCalRGB(Array{Name("CalRGB"), Dictionary{
 		"WhitePoint": Array{Real(white[0]), Real(white[1]), Real(white[2])},
 		"Gamma":      Array{Real(gamma), Real(gamma), Real(gamma)},
 		"Matrix":     Array{Real(white[0]), Integer(0), Integer(0), Integer(0), Real(white[1]), Integer(0), Integer(0), Integer(0), Real(white[2])},
+		"BlackPoint": black,
 	}})
 }
 
-// readCalRGB 读取校准RGB参数，未支持的非零黑点不作近似处理
+// readCalRGB 读取校准RGB参数，将漫反射黑白点映射到输出动态范围
 // 入参: object CalRGB颜色空间数组
 // 返回: *calRGBSpace 颜色变换参数, error 错误信息
 func (r *Reader) readCalRGB(object Object) (*calRGBSpace, error) {
@@ -277,8 +289,17 @@ func (r *Reader) readCalRGB(object Object) (*calRGBSpace, error) {
 	if white[0] <= 0 || white[1] != 1 || white[2] <= 0 || s.gamma[0] <= 0 || s.gamma[1] <= 0 || s.gamma[2] <= 0 {
 		return nil, fmt.Errorf("invalid CalRGB white point or gamma")
 	}
-	if black != [3]float64{} {
-		return nil, &UnsupportedError{Feature: "CalRGB nonzero black point"}
+	for n, value := range black {
+		if value < 0 || value == white[n] {
+			return nil, fmt.Errorf("invalid CalRGB black point")
+		}
+		if value != 0 {
+			scale := white[n] / (white[n] - value)
+			for column := 0; column < 3; column++ {
+				s.matrix[3*column+n] *= scale
+			}
+			s.offset[n] = -value * scale
+		}
 	}
 	source := bradford(white)
 	target := bradford([3]float64{0.95047, 1, 1.08883})
@@ -303,8 +324,7 @@ func bradford(v [3]float64) [3]float64 {
 // 返回: color.NRGBA64 非预乘sRGB颜色
 func (s *calRGBSpace) color(a, b, c float64) color.NRGBA64 {
 	a, b, c = math.Pow(a, s.gamma[0]), math.Pow(b, s.gamma[1]), math.Pow(c, s.gamma[2])
-	m := s.matrix
-	cone := bradford([3]float64{m[0]*a + m[3]*b + m[6]*c, m[1]*a + m[4]*b + m[7]*c, m[2]*a + m[5]*b + m[8]*c})
+	cone := bradford(s.linearXYZ(a, b, c))
 	for n := range cone {
 		cone[n] *= s.adapt[n]
 	}
@@ -312,6 +332,14 @@ func (s *calRGBSpace) color(a, b, c float64) color.NRGBA64 {
 	y := 0.4323053*cone[0] + 0.5183603*cone[1] + 0.0492912*cone[2]
 	z := -0.0085287*cone[0] + 0.0400428*cone[1] + 0.9684867*cone[2]
 	return color.NRGBA64{R: srgbComponent(3.2404542*x - 1.5371385*y - 0.4985314*z), G: srgbComponent(-0.969266*x + 1.8760108*y + 0.041556*z), B: srgbComponent(0.0556434*x - 0.2040259*y + 1.0572252*z), A: 65535}
+}
+
+// linearXYZ 将已线性化分量变换为色度，保留黑点补偿的偏移
+// 入参: a 第一分量, b 第二分量, c 第三分量
+// 返回: [3]float64 色度分量
+func (s *calRGBSpace) linearXYZ(a, b, c float64) [3]float64 {
+	m := s.matrix
+	return [3]float64{m[0]*a + m[3]*b + m[6]*c + s.offset[0], m[1]*a + m[4]*b + m[7]*c + s.offset[1], m[2]*a + m[5]*b + m[8]*c + s.offset[2]}
 }
 
 // srgbComponent 将线性分量映射到sRGB编码范围

@@ -33,9 +33,9 @@ func (s *ColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 		}
 		if p.gray != nil {
 			y := p.gray.curve.evaluate(values[0])
-			return [3]float64{.9642 * y, y, .8249 * y}, nil
+			return p.gray.matrix.linearXYZ(y, y, y), nil
 		}
-		var xyz [3]float64
+		xyz := p.rgb.matrix.offset
 		for c, curve := range p.rgb.curves {
 			v := curve.evaluate(values[c])
 			for i := range xyz {
@@ -76,11 +76,19 @@ func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error)
 		return result, err
 	}
 	if s.gray != nil {
-		value, err := s.gray.curve.inverse(xyz[1])
+		m := s.gray.matrix
+		scale := m.matrix[1] + m.matrix[4] + m.matrix[7]
+		if scale == 0 {
+			return result, fmt.Errorf("singular ICC gray matrix")
+		}
+		value, err := s.gray.curve.inverse((xyz[1] - m.offset[1]) / scale)
 		result[0] = value
 		return result, err
 	}
 	m := s.rgb.matrix.matrix
+	for n := range xyz {
+		xyz[n] -= s.rgb.matrix.offset[n]
+	}
 	cofactor := [9]float64{m[4]*m[8] - m[5]*m[7], m[5]*m[6] - m[3]*m[8], m[3]*m[7] - m[4]*m[6], m[2]*m[7] - m[1]*m[8], m[0]*m[8] - m[2]*m[6], m[1]*m[6] - m[0]*m[7], m[1]*m[5] - m[2]*m[4], m[2]*m[3] - m[0]*m[5], m[0]*m[4] - m[1]*m[3]}
 	determinant := m[0]*cofactor[0] + m[1]*cofactor[1] + m[2]*cofactor[2]
 	if determinant == 0 {
@@ -141,15 +149,27 @@ func (c iccToneCurve) inverse(value float64) (float64, error) {
 		return math.Max(0, math.Min(1, v)), nil
 	}
 	if len(c.samples) > 1 {
-		v := value * 65535
-		i := sort.Search(len(c.samples), func(i int) bool { return float64(c.samples[i]) >= v })
+		direction := c.direction
+		if direction == 0 {
+			direction = iccCurveDirection(c.samples)
+		}
+		if direction == 2 {
+			return 0, fmt.Errorf("noninvertible ICC sampled curve")
+		}
+		sign := float64(direction)
+		v := value * 65535 * sign
+		i := sort.Search(len(c.samples), func(i int) bool { return float64(c.samples[i])*sign > v })
 		if i == 0 {
 			return 0, nil
 		}
 		if i == len(c.samples) {
+			if v == float64(c.samples[i-1])*sign {
+				i = sort.Search(len(c.samples), func(i int) bool { return float64(c.samples[i])*sign >= v })
+				return float64(i) / float64(len(c.samples)-1), nil
+			}
 			return 1, nil
 		}
-		fraction := (v - float64(c.samples[i-1])) / float64(c.samples[i]-c.samples[i-1])
+		fraction := (v - float64(c.samples[i-1])*sign) / ((float64(c.samples[i]) - float64(c.samples[i-1])) * sign)
 		return (float64(i-1) + fraction) / float64(len(c.samples)-1), nil
 	}
 	return math.Max(0, math.Min(1, value)), nil

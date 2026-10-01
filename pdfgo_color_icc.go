@@ -39,6 +39,7 @@ type iccToneCurve struct {
 	samples    []uint16
 	parameters []float64
 	function   uint16
+	direction  int8
 }
 
 // iccColorSpace 统一灰度、RGB与CMYK配置文件的绘制颜色变换
@@ -375,9 +376,6 @@ func iccCurve(data []byte) (iccToneCurve, error) {
 	curve := make([]uint16, int(n))
 	for j := range curve {
 		curve[j] = binary.BigEndian.Uint16(data[12+2*j:])
-		if j > 0 && curve[j] < curve[j-1] {
-			return iccToneCurve{}, fmt.Errorf("nonmonotonic ICC tone curve")
-		}
 	}
 	if n == 1 && curve[0] == 0 {
 		return iccToneCurve{}, fmt.Errorf("invalid ICC curve gamma")
@@ -385,7 +383,32 @@ func iccCurve(data []byte) (iccToneCurve, error) {
 	if n == 1 {
 		return iccToneCurve{parameters: []float64{float64(curve[0]) / 256}}, nil
 	}
-	return iccToneCurve{samples: curve}, nil
+	return iccToneCurve{samples: curve, direction: iccCurveDirection(curve)}, nil
+}
+
+// iccCurveDirection 检查采样曲线的单调方向，常量和非单调曲线不可反求
+// 入参: samples 曲线采样值
+// 返回: int8 递增为1、递减为-1、不可逆为2
+func iccCurveDirection(samples []uint16) int8 {
+	var direction int8
+	for n := 1; n < len(samples); n++ {
+		step := int8(0)
+		if samples[n] > samples[n-1] {
+			step = 1
+		} else if samples[n] < samples[n-1] {
+			step = -1
+		}
+		if step != 0 {
+			if direction != 0 && direction != step {
+				return 2
+			}
+			direction = step
+		}
+	}
+	if direction == 0 {
+		return 2
+	}
+	return direction
 }
 
 // parametric 按ICC函数类型求出未截断的曲线值
@@ -431,7 +454,7 @@ func (c iccToneCurve) evaluate(value float64) float64 {
 	if len(c.samples) > 1 {
 		position := v * float64(len(c.samples)-1)
 		index := min(int(position), len(c.samples)-2)
-		return (float64(c.samples[index]) + (position-float64(index))*float64(c.samples[index+1]-c.samples[index])) / 65535
+		return (float64(c.samples[index]) + (position-float64(index))*(float64(c.samples[index+1])-float64(c.samples[index]))) / 65535
 	}
 	return v
 }

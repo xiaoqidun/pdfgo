@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// ParseDate 按照ISO32000的7.9.4解析PDF日期，省略字段使用标准默认值
+// ParseDate 解析PDF日期，省略字段使用标准默认值，接受Adobe规范的结尾时区引号
 // 入参: value 已解码的PDF日期字符串
 // 返回: time.Time 保留当地时间和时区的日期, error 日期语法或取值错误
 func ParseDate(value string) (time.Time, error) {
@@ -65,6 +65,9 @@ func ParseDate(value string) (time.Time, error) {
 				}
 				value = value[1:]
 				if value != "" {
+					if len(value) == 3 && value[2] == '\'' {
+						value = value[:2]
+					}
 					if len(value) != 2 || value[0] < '0' || value[0] > '9' || value[1] < '0' || value[1] > '9' {
 						return invalid()
 					}
