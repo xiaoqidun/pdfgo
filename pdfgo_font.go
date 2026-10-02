@@ -453,7 +453,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		}
 	}
 	if cffProgram != nil {
-		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "StandardEncoding" {
+		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "MacExpertEncoding" && font.encoding != "StandardEncoding" {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
 		identity := font.composite && metrics["Subtype"] == Name("CIDFontType2") && font.glyphMap == nil
@@ -570,6 +570,8 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 					encoding = pdfWinAnsiNames
 				case Name("MacRomanEncoding"):
 					encoding = pdfMacRomanNames
+				case Name("MacExpertEncoding"):
+					encoding = pdfMacExpertNames[:]
 				case "", Name("StandardEncoding"):
 				default:
 					encoding = nil

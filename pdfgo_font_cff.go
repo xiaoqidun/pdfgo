@@ -157,51 +157,9 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 // 入参: data CFF数据, composite 是否为复合字体, encoding PDF基础编码, differences PDF编码差异, identity 是否允许非CID字形身份映射
 // 返回: map[uint32]uint16 字符码或CID到字形编号的映射, map[uint32]string 可用字形名称, error 错误信息
 func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool) (map[uint32]uint16, map[uint32]string, error) {
-	if len(data) < 4 || data[0] != 1 || data[2] < 4 {
-		return nil, nil, fmt.Errorf("invalid CFF header")
-	}
-	names, end, err := cffIndex(data, int(data[2]))
+	dict, stringsIndex, chars, err := cffFontData(data)
 	if err != nil {
 		return nil, nil, err
-	}
-	if len(names) != 1 {
-		return nil, nil, &UnsupportedError{Feature: "CFF font set"}
-	}
-	tops, end, err := cffIndex(data, end)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(tops) != 1 {
-		return nil, nil, fmt.Errorf("invalid CFF top dictionary count")
-	}
-	stringsIndex, _, err := cffIndex(data, end)
-	if err != nil {
-		return nil, nil, err
-	}
-	dict, err := cffDictionary(tops[0])
-	if err != nil {
-		return nil, nil, err
-	}
-	offset := func(op, fallback int) (int, error) {
-		v, ok := dict[op]
-		if !ok {
-			return fallback, nil
-		}
-		if len(v) != 1 || v[0] < 0 || v[0] > float64(len(data)) || v[0] != math.Trunc(v[0]) {
-			return 0, fmt.Errorf("invalid CFF offset")
-		}
-		return int(v[0]), nil
-	}
-	charOffset, err := offset(17, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	chars, _, err := cffIndex(data, charOffset)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(chars) == 0 {
-		return nil, nil, fmt.Errorf("empty CFF charstrings")
 	}
 	if composite && identity && len(dict[1230]) == 0 {
 		glyphs := make(map[uint32]uint16, len(chars))
@@ -210,64 +168,12 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 		}
 		return glyphs, nil, nil
 	}
-	charsetOffset, err := offset(15, 0)
+	charset, err := cffCharset(data, dict, len(chars))
 	if err != nil {
 		return nil, nil, err
 	}
-	charset := make([]uint16, len(chars))
-	if charsetOffset == 0 && !composite {
-		if len(chars) > 229 {
-			return nil, nil, fmt.Errorf("invalid ISOAdobe charset length")
-		}
-		for n := range charset {
-			charset[n] = uint16(n)
-		}
-	} else {
-		if charsetOffset <= 2 {
-			return nil, nil, &UnsupportedError{Feature: "predefined CFF charset"}
-		}
-		if charsetOffset >= len(data) {
-			return nil, nil, fmt.Errorf("invalid CFF charset offset")
-		}
-		format, pos := data[charsetOffset], charsetOffset+1
-		for gid := 1; gid < len(charset); {
-			if pos+2 > len(data) {
-				return nil, nil, fmt.Errorf("truncated CFF charset")
-			}
-			first := int(binary.BigEndian.Uint16(data[pos:]))
-			pos += 2
-			count := 1
-			switch format {
-			case 0:
-			case 1:
-				if pos == len(data) {
-					return nil, nil, fmt.Errorf("truncated CFF charset range")
-				}
-				count += int(data[pos])
-				pos++
-			case 2:
-				if pos+2 > len(data) {
-					return nil, nil, fmt.Errorf("truncated CFF charset range")
-				}
-				count += int(binary.BigEndian.Uint16(data[pos:]))
-				pos += 2
-			default:
-				return nil, nil, fmt.Errorf("invalid CFF charset format")
-			}
-			if count > len(charset)-gid || first+count > 65536 {
-				return nil, nil, fmt.Errorf("invalid CFF charset range")
-			}
-			for n := 0; n < count; n++ {
-				charset[gid] = uint16(first + n)
-				gid++
-			}
-		}
-	}
-	bySID := map[uint32]uint16{}
+	bySID := make(map[uint32]uint16, len(charset))
 	for gid, sid := range charset {
-		if _, exists := bySID[uint32(sid)]; exists {
-			return nil, nil, fmt.Errorf("duplicate CFF charset identifier")
-		}
 		bySID[uint32(sid)] = uint16(gid)
 	}
 	if composite {
@@ -276,18 +182,24 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 		}
 		return bySID, nil, nil
 	}
-	encodingOffset, err := offset(16, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	if encoding == "" && encodingOffset == 0 {
-		encoding = "StandardEncoding"
+	encodingOffset := 0
+	if encoding == "" {
+		encodingOffset, err = cffOffset(data, dict, 16, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		if encodingOffset == 0 {
+			encoding = "StandardEncoding"
+		}
 	}
 	mapping := map[uint32]uint16{}
-	if encoding == "" {
-		if encodingOffset <= 1 {
-			return nil, nil, &UnsupportedError{Feature: "predefined CFF encoding"}
+	if encoding == "" && encodingOffset == 1 {
+		for code, sid := range cffExpertEncoding {
+			if gid, ok := bySID[uint32(sid)]; ok && sid != 0 {
+				mapping[uint32(code)] = gid
+			}
 		}
+	} else if encoding == "" {
 		if encodingOffset+2 > len(data) {
 			return nil, nil, fmt.Errorf("truncated CFF encoding")
 		}
@@ -374,6 +286,8 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 				base = pdfWinAnsiNames
 			case "MacRomanEncoding":
 				base = pdfMacRomanNames
+			case "MacExpertEncoding":
+				base = pdfMacExpertNames[:]
 			case "StandardEncoding":
 				base = pdfStandardNames
 			default:
@@ -382,7 +296,7 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 			mapping = map[uint32]uint16{}
 			glyphNames = map[uint32]string{}
 			for code, name := range base {
-				if gid, ok := byName[name]; ok && name != ".notdef" {
+				if gid, ok := byName[name]; ok && name != "" && name != ".notdef" {
 					mapping[uint32(code)] = gid
 					glyphNames[uint32(code)] = name
 				}
@@ -400,4 +314,141 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 		}
 	}
 	return mapping, glyphNames, nil
+}
+
+// cffFontData 读取单字体CFF的顶层字典、字符串及字形程序
+// 入参: data CFF字体数据
+// 返回: map[int][]float64 顶层字典, [][]byte 字符串, [][]byte 字形程序, error 错误信息
+func cffFontData(data []byte) (map[int][]float64, [][]byte, [][]byte, error) {
+	if len(data) < 4 || data[0] != 1 || data[2] < 4 || data[3] < 1 || data[3] > 4 {
+		return nil, nil, nil, fmt.Errorf("invalid CFF header")
+	}
+	names, end, err := cffIndex(data, int(data[2]))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(names) != 1 {
+		return nil, nil, nil, &UnsupportedError{Feature: "CFF font set"}
+	}
+	tops, end, err := cffIndex(data, end)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(tops) != 1 {
+		return nil, nil, nil, fmt.Errorf("invalid CFF top dictionary count")
+	}
+	stringsIndex, _, err := cffIndex(data, end)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	dict, err := cffDictionary(tops[0])
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	charOffset, err := cffOffset(data, dict, 17, 0)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if charOffset == 0 {
+		return nil, nil, nil, fmt.Errorf("missing CFF charstrings")
+	}
+	chars, _, err := cffIndex(data, charOffset)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(chars) == 0 {
+		return nil, nil, nil, fmt.Errorf("empty CFF charstrings")
+	}
+	return dict, stringsIndex, chars, nil
+}
+
+// cffOffset 读取顶层字典的预定义值或数据偏移
+// 入参: data CFF数据, dict 顶层字典, op 操作符, fallback 默认值
+// 返回: int 偏移或预定义值, error 错误信息
+func cffOffset(data []byte, dict map[int][]float64, op, fallback int) (int, error) {
+	values, ok := dict[op]
+	if !ok {
+		return fallback, nil
+	}
+	if len(values) != 1 || values[0] < 0 || values[0] > float64(len(data)) || values[0] != math.Trunc(values[0]) {
+		return 0, fmt.Errorf("invalid CFF offset")
+	}
+	return int(values[0]), nil
+}
+
+// cffCharset 按CFF规范第13节及附录C读取字形标识
+// 入参: data CFF数据, dict 顶层字典, count 字形数
+// 返回: []uint16 SID或CID列表, error 错误信息
+func cffCharset(data []byte, dict map[int][]float64, count int) ([]uint16, error) {
+	offset, err := cffOffset(data, dict, 15, 0)
+	if err != nil {
+		return nil, err
+	}
+	if ros, ok := dict[1230]; ok && (len(ros) != 3 || offset <= 2) {
+		return nil, fmt.Errorf("invalid CID CFF charset")
+	}
+	charset := make([]uint16, count)
+	if offset <= 2 {
+		if offset == 0 {
+			if count > 229 {
+				return nil, fmt.Errorf("invalid ISOAdobe charset length")
+			}
+			for gid := range charset {
+				charset[gid] = uint16(gid)
+			}
+		} else {
+			predefined := cffExpertCharset[:]
+			if offset == 2 {
+				predefined = cffExpertSubsetCharset[:]
+			}
+			if count > len(predefined) {
+				return nil, fmt.Errorf("invalid predefined CFF charset length")
+			}
+			copy(charset, predefined)
+		}
+		return charset, nil
+	}
+	if offset >= len(data) {
+		return nil, fmt.Errorf("invalid CFF charset offset")
+	}
+	format, pos := data[offset], offset+1
+	if format > 2 {
+		return nil, fmt.Errorf("invalid CFF charset format")
+	}
+	seen := map[uint16]bool{0: true}
+	for gid := 1; gid < count; {
+		if pos+2 > len(data) {
+			return nil, fmt.Errorf("truncated CFF charset")
+		}
+		first := int(binary.BigEndian.Uint16(data[pos:]))
+		pos += 2
+		run := 1
+		switch format {
+		case 1:
+			if pos == len(data) {
+				return nil, fmt.Errorf("truncated CFF charset range")
+			}
+			run += int(data[pos])
+			pos++
+		case 2:
+			if pos+2 > len(data) {
+				return nil, fmt.Errorf("truncated CFF charset range")
+			}
+			run += int(binary.BigEndian.Uint16(data[pos:]))
+			pos += 2
+		}
+		if run > count-gid || first+run > 65536 {
+			return nil, fmt.Errorf("invalid CFF charset range")
+		}
+		for n := 0; n < run; n++ {
+			sid := uint16(first + n)
+			if seen[sid] {
+				return nil, fmt.Errorf("duplicate CFF charset identifier")
+			}
+			seen[sid] = true
+			charset[gid] = sid
+			gid++
+		}
+	}
+	return charset, nil
 }
