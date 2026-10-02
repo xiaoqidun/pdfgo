@@ -163,6 +163,13 @@ func (p *Page) Annotations() ([]Annotation, error) {
 // 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器
 // 返回: error 外观缺失、解析或访问错误
 func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annotation Annotation, visitor Visitor) error {
+	return r.walkAnnotationAppearance(ctx, page, annotation, visitor, nil)
+}
+
+// walkAnnotationAppearance 在页面或引用表单坐标中解释注解外观
+// 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器, parent 引用表单状态，可为空
+// 返回: error 外观或访问错误
+func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annotation Annotation, visitor Visitor, parent *pageInterpreter) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -311,7 +318,7 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 	}
 	stream, ok := value.(*Stream)
-	if !ok {
+	if !ok || stream == nil {
 		return &UnsupportedError{Feature: "annotation appearance stream"}
 	}
 	subtype, err := r.Resolve(stream.Dictionary["Subtype"])
@@ -370,6 +377,13 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
+	if parent != nil {
+		interpreter.state.matrix = parent.state.matrix.Mul(interpreter.state.matrix)
+		interpreter.state.style.Clips = append([]Path(nil), parent.state.style.Clips...)
+		interpreter.bounds = parent.bounds
+		interpreter.depth = parent.depth
+		interpreter.patternMatrix = parent.patternMatrix
+	}
 	return interpreter.form(stream)
 }
 

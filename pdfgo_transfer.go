@@ -128,7 +128,11 @@ func (r *Reader) DeviceTransfer(fallback *TransferFunction, halftone *Halftone, 
 		}
 		function, found := functions[part]
 		if !found {
-			value, err := r.Resolve(part.TransferFunction)
+			owner := r
+			if part.reader != nil {
+				owner = part.reader
+			}
+			value, err := owner.Resolve(part.TransferFunction)
 			if err != nil {
 				return nil, err
 			}
@@ -138,7 +142,7 @@ func (r *Reader) DeviceTransfer(fallback *TransferFunction, halftone *Halftone, 
 			if _, array := value.(Array); array {
 				return nil, fmt.Errorf("invalid halftone transfer function")
 			}
-			function, err = r.ReadTransferFunction(value)
+			function, err = owner.ReadTransferFunction(value)
 			if err != nil {
 				return nil, err
 			}

@@ -52,6 +52,9 @@ func (m *SoftMask) Transfer(value float64) (float64, error) {
 // 返回: error 解析或访问错误
 func (m *SoftMask) Walk(visitor Visitor) error {
 	p := m.interpreter
+	if visitor.Reference == nil {
+		visitor.Reference = p.visitor.Reference
+	}
 	p.visitor = visitor
 	return p.form(m.stream)
 }

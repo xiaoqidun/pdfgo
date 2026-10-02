@@ -34,6 +34,7 @@ type Halftone struct {
 	Xsquare, Ysquare               int
 	Thresholds                     []uint16
 	Components                     map[Name]*Halftone
+	reader                         *Reader
 }
 
 // ReadHalftone 读取类型1、5、6、10和16的网屏定义，Default返回空值
@@ -75,7 +76,7 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 	if !ok {
 		return nil, fmt.Errorf("invalid halftone dictionary")
 	}
-	h := &Halftone{Dictionary: dict}
+	h := &Halftone{Dictionary: dict, reader: r}
 	value, err = r.Resolve(dict["HalftoneName"])
 	if err != nil {
 		return nil, err

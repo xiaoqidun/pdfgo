@@ -158,6 +158,7 @@ type MarkedContentMark struct {
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
 // Warning非空时报告空Type3字形、缺失的ExtGState资源及未保留的内容语义，其他解析错误仍返回错误
 // OptionalContent可覆盖XObject的可选内容状态，缺省使用文档默认配置
+// Reference可提供引用表单的目标页面，缺省或返回nil时绘制代理内容
 type Visitor struct {
 	Path            func(PathMark) error
 	Text            func(TextMark) error
@@ -165,6 +166,7 @@ type Visitor struct {
 	Group           func(GroupMark, func(Visitor) error) error
 	MarkedContent   func(MarkedContentMark) error
 	OptionalContent func(Object) (bool, error)
+	Reference       ReferenceResolver
 	Warning         func(Diagnostic)
 }
 
@@ -342,6 +344,9 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	if (groupSpace != nil || knockout) && visitor.Group != nil {
 		return visitor.Group(GroupMark{Page: true, Alpha: 1, Isolated: true, Knockout: knockout, ColorSpace: groupSpace}, func(v Visitor) error {
 			child := interpreter
+			if v.Reference == nil {
+				v.Reference = visitor.Reference
+			}
 			child.visitor = v
 			return child.run(data)
 		})
@@ -359,6 +364,9 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	font := mark.Font
 	if font == nil || font.Subtype != Name("Type3") || index < 0 || index >= len(mark.Glyphs) || index >= len(mark.Positions) {
 		return fmt.Errorf("invalid Type3 glyph")
+	}
+	if font.reader != nil {
+		r = font.reader
 	}
 	if mark.Mode == 3 {
 		return nil
@@ -1541,14 +1549,53 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	if err != nil || !visible {
 		return err
 	}
-	if stream.Dictionary["Ref"] != nil {
-		return &UnsupportedError{Feature: "form field \"Ref\""}
+	var target *Page
+	ref, err := p.reader.Resolve(stream.Dictionary["Ref"])
+	if err != nil {
+		return err
+	}
+	if ref != nil {
+		reference, err := p.reader.ReadReferenceXObject(ref)
+		if err != nil {
+			return err
+		}
+		if p.visitor.Reference != nil {
+			target, err = p.visitor.Reference(p.ctx, p.reader, reference)
+			if err != nil {
+				return err
+			}
+			if err := p.ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if target != nil {
+			if target.reader == nil || target.reader.closed {
+				return fmt.Errorf("reference XObject target reader unavailable")
+			}
+			matches, err := target.reader.ReferenceIDMatches(reference)
+			if err != nil {
+				return err
+			}
+			if !matches && p.visitor.Warning != nil {
+				p.visitor.Warning(Diagnostic{Message: "reference XObject target file identifier changed"})
+			}
+		}
 	}
 	child := *p
 	var groupMark *GroupMark
 	var groupObject Object
+	groupReader := p.reader
+	targetGroup := false
 	if stream.Dictionary["Group"] != nil {
 		groupObject, err = p.reader.Resolve(stream.Dictionary["Group"])
+		if err != nil {
+			return err
+		}
+	}
+	if groupObject == nil && target != nil {
+		targetGroup = true
+		groupReader = target.reader
+		groupObject, err = groupReader.Resolve(target.Dictionary["Group"])
 		if err != nil {
 			return err
 		}
@@ -1558,7 +1605,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		if !ok {
 			return &UnsupportedError{Feature: "form transparency group"}
 		}
-		kind, err := p.reader.Resolve(group["S"])
+		kind, err := groupReader.Resolve(group["S"])
 		if err != nil {
 			return err
 		}
@@ -1570,7 +1617,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			name   Name
 			target *bool
 		}{{"I", &groupMark.Isolated}, {"K", &groupMark.Knockout}} {
-			value, err := p.reader.Resolve(group[flag.name])
+			value, err := groupReader.Resolve(group[flag.name])
 			if err != nil {
 				return err
 			}
@@ -1583,18 +1630,21 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			}
 			*flag.target = bool(boolean)
 		}
-		space, err := p.reader.Resolve(group["CS"])
-		if err != nil {
-			return err
+		var space Object
+		if !targetGroup || groupMark.Isolated {
+			space, err = groupReader.Resolve(group["CS"])
+			if err != nil {
+				return err
+			}
 		}
 		if space != nil {
-			groupMark.ColorSpace, err = p.reader.readBlendingSpace(space)
+			groupMark.ColorSpace, err = groupReader.readBlendingSpace(space)
 			if err != nil {
 				return err
 			}
 		}
 		if p.visitor.Group == nil && groupMark.ColorSpace != nil {
-			if err := p.reader.validateRGBGroupSpace(space); err != nil {
+			if err := groupReader.validateRGBGroupSpace(space); err != nil {
 				return err
 			}
 		}
@@ -1631,7 +1681,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		}
 		child.state.matrix = child.state.matrix.Mul(Matrix(m))
 	}
-	if stream.Dictionary["Resources"] != nil {
+	if target == nil && stream.Dictionary["Resources"] != nil {
 		resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
 		if err != nil {
 			return err
@@ -1659,18 +1709,32 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	child.state.style.Clips = append(append([]Path(nil), child.state.style.Clips...), clip)
 	child.patternMatrix = child.state.matrix
 	child.patternState = nil
-	data, err := stream.Decode()
-	if err != nil {
-		return err
+	var data []byte
+	if target == nil {
+		data, err = stream.Decode()
+		if err != nil {
+			return err
+		}
+	} else {
+		child.reader, child.resources = target.reader, target.Resources
+	}
+	walk := func(interpreter *pageInterpreter) error {
+		if target != nil {
+			return interpreter.referencePage(target)
+		}
+		return interpreter.run(data)
 	}
 	if groupMark != nil && p.visitor.Group != nil {
 		return p.visitor.Group(*groupMark, func(visitor Visitor) error {
 			group := child
+			if visitor.Reference == nil {
+				visitor.Reference = child.visitor.Reference
+			}
 			group.visitor = visitor
-			return group.run(data)
+			return walk(&group)
 		})
 	}
-	return child.run(data)
+	return walk(&child)
 }
 
 // extState 读取可表达的外部图形状态，不忽略未知绘制效果

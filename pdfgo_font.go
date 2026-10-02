@@ -54,6 +54,7 @@ type Font struct {
 	type3Bounds     *Rectangle
 	type3Procs      Dictionary
 	type3Resources  Dictionary
+	reader          *Reader
 }
 
 // Glyph 保存原始字符码、Unicode文本、字形名称、编号和千分之一字宽
@@ -96,7 +97,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing font subtype")
 	}
-	font := &Font{Dictionary: dict, Subtype: subtype, widths: map[uint32]float64{}}
+	font := &Font{Dictionary: dict, Subtype: subtype, widths: map[uint32]float64{}, reader: r}
 	value, err = r.Resolve(dict["BaseFont"])
 	if err != nil {
 		return nil, err

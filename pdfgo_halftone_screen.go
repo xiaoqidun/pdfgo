@@ -78,6 +78,9 @@ func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options Halft
 			h = named
 		}
 	}
+	if h.reader != nil {
+		r = h.reader
+	}
 	return r.compileHalftone(ctx, h, options)
 }
 

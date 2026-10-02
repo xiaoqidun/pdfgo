@@ -109,6 +109,91 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 	return ctx.Err()
 }
 
+// WalkNumberTree 按键递增访问数字树，值不预先解析
+// 入参: ctx 取消上下文, root 数字树根, visit 数字键和值的访问函数
+// 返回: error 结构、重复键、循环或访问错误
+func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int64, Object) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	value, err := r.Resolve(root)
+	if err != nil || value == nil {
+		return err
+	}
+	stack := []Object{root}
+	seen := make(map[Reference]bool)
+	var previous int64
+	hasPrevious := false
+	for len(stack) != 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		object := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if ref, ok := object.(Reference); ok {
+			if seen[ref] {
+				return fmt.Errorf("repeated number tree node")
+			}
+			seen[ref] = true
+		}
+		value, err := r.Resolve(object)
+		if err != nil {
+			return err
+		}
+		node, ok := value.(Dictionary)
+		if !ok {
+			return fmt.Errorf("invalid number tree node")
+		}
+		pairs, err := r.Resolve(node["Nums"])
+		if err != nil {
+			return err
+		}
+		kids, err := r.Resolve(node["Kids"])
+		if err != nil {
+			return err
+		}
+		if pairs != nil && kids != nil {
+			return fmt.Errorf("number tree node contains both pairs and children")
+		}
+		if pairs != nil {
+			array, ok := pairs.(Array)
+			if !ok || len(array)%2 != 0 {
+				return fmt.Errorf("invalid number tree pairs")
+			}
+			for i := 0; i < len(array); i += 2 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				value, err := r.Resolve(array[i])
+				if err != nil {
+					return err
+				}
+				key, ok := value.(Integer)
+				if !ok || hasPrevious && int64(key) <= previous {
+					return fmt.Errorf("invalid number tree key order")
+				}
+				previous, hasPrevious = int64(key), true
+				if err := visit(int64(key), array[i+1]); err != nil {
+					return err
+				}
+			}
+		}
+		if kids != nil {
+			array, ok := kids.(Array)
+			if !ok {
+				return fmt.Errorf("invalid number tree children")
+			}
+			for i := len(array) - 1; i >= 0; i-- {
+				if _, ok := array[i].(Reference); !ok {
+					return fmt.Errorf("number tree child is not indirect")
+				}
+				stack = append(stack, array[i])
+			}
+		}
+	}
+	return ctx.Err()
+}
+
 // WalkEmbeddedFiles 枚举文档名称树中的附件，不解码数据、不读取外部文件
 // 入参: ctx 取消上下文, visit 名称树原始键和文件说明的访问函数
 // 返回: error 名称树、文件说明或访问错误
