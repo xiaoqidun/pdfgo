@@ -95,7 +95,6 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 	output.Write(scan.header)
 	output.Write([]byte{0xff, 0xc4, byte((dht.Len() + 2) >> 8), byte(dht.Len() + 2)})
 	output.Write(dht.Bytes())
-	// SOS紧邻扫描数据；其余标记保持原始顺序和内容。
 	output.Write(data[scan.sos:scan.start])
 	_, err = scan.walk(ctx, data, func(table int, symbol byte, bits uint32, n uint) {
 		code := &tables[table]

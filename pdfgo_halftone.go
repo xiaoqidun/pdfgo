@@ -212,7 +212,6 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 	if kind == 10 {
 		count = uint64(h.Xsquare)*uint64(h.Xsquare) + uint64(h.Ysquare)*uint64(h.Ysquare)
 	}
-	// 先按数据长度约束尺寸，避免恶意尺寸乘积溢出后分配错误的数组
 	limit := uint64(len(data)) / width
 	for _, pair := range [][2]int{{h.Width, h.Height}, {h.Width2, h.Height2}, {h.Xsquare, h.Xsquare}, {h.Ysquare, h.Ysquare}} {
 		if pair[0] != 0 && uint64(pair[1]) > limit/uint64(pair[0]) {

@@ -155,13 +155,20 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 
 // cffFontMapping 读取CID或内置字符编码到字形编号的映射，不重新解释轮廓
 // 入参: data CFF数据, composite 是否为复合字体, encoding PDF基础编码, differences PDF编码差异, identity 是否允许非CID字形身份映射
-// 返回: map[uint32]uint16 字符码或CID到字形编号的映射, map[uint32]string 可用字形名称, error 错误信息
+// 返回: map[uint32]uint16 字符码或CID到字形编号的映射, map[uint32]string 字符码到字形名称的映射, error 错误信息
 func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool) (map[uint32]uint16, map[uint32]string, error) {
 	dict, stringsIndex, chars, err := cffFontData(data)
 	if err != nil {
 		return nil, nil, err
 	}
-	if composite && identity && len(dict[1230]) == 0 {
+	cidKeyed := false
+	for operator := 1230; operator <= 1238; operator++ {
+		if _, present := dict[operator]; present {
+			cidKeyed = true
+			break
+		}
+	}
+	if composite && identity && !cidKeyed {
 		glyphs := make(map[uint32]uint16, len(chars))
 		for gid := range chars {
 			glyphs[uint32(gid)] = uint16(gid)
@@ -257,6 +264,13 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 		}
 	}
 	glyphNames := map[uint32]string{}
+	if encoding == "" && encodingOffset == 1 {
+		for code, sid := range cffExpertEncoding {
+			if sid != 0 {
+				glyphNames[uint32(code)] = cffStandardNames[sid]
+			}
+		}
+	}
 	for code, gid := range mapping {
 		sid := int(charset[gid])
 		if sid < len(cffStandardNames) {
@@ -296,9 +310,11 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 			mapping = map[uint32]uint16{}
 			glyphNames = map[uint32]string{}
 			for code, name := range base {
+				if name != "" {
+					glyphNames[uint32(code)] = name
+				}
 				if gid, ok := byName[name]; ok && name != "" && name != ".notdef" {
 					mapping[uint32(code)] = gid
-					glyphNames[uint32(code)] = name
 				}
 			}
 		}

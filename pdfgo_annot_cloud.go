@@ -34,7 +34,6 @@ func writeAnnotationCloudFrame(content *strings.Builder, frame Rectangle, intens
 		writeAnnotationOperation(content, "re", frame.XMin, frame.YMin, w, h)
 		return nil
 	}
-	// 标准未规定云瓣尺寸，按强度选取幅度并限制在内框内。
 	radius := math.Min(3*intensity, math.Min(w, h)/4)
 	if radius == 0 {
 		writeAnnotationOperation(content, "re", frame.XMin, frame.YMin, w, h)

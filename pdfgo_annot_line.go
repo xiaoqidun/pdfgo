@@ -112,7 +112,6 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 	}
 	if leader[0] != 0 {
 		sign := math.Copysign(1, leader[0])
-		// LL从主线沿顺时针法向伸出，L端点位于引线外端
 		shift := leader[0] + sign*leader[2]
 		extension := shift + sign*leader[1]
 		if math.IsInf(extension, 0) {

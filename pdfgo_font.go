@@ -88,12 +88,24 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid font dictionary")
 	}
-	subtype, ok := dict["Subtype"].(Name)
+	value, err := r.Resolve(dict["Subtype"])
+	if err != nil {
+		return nil, err
+	}
+	subtype, ok := value.(Name)
 	if !ok {
 		return nil, fmt.Errorf("missing font subtype")
 	}
 	font := &Font{Dictionary: dict, Subtype: subtype, widths: map[uint32]float64{}}
-	if name, ok := dict["BaseFont"].(Name); ok {
+	value, err = r.Resolve(dict["BaseFont"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		name, ok := value.(Name)
+		if !ok {
+			return nil, fmt.Errorf("invalid base font name")
+		}
 		font.Name = string(name)
 	}
 	var descriptor Object
@@ -117,6 +129,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		}
 	}
 	metrics := dict
+	var cidSubtype Name
 	noEncoding := false
 	if subtype == Name("Type0") {
 		font.composite = true
@@ -146,7 +159,12 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid descendant font")
 		}
-		if metrics["Subtype"] != Name("CIDFontType2") && metrics["Subtype"] != Name("CIDFontType0") {
+		value, err := r.Resolve(metrics["Subtype"])
+		if err != nil {
+			return nil, err
+		}
+		cidSubtype, _ = value.(Name)
+		if cidSubtype != Name("CIDFontType2") && cidSubtype != Name("CIDFontType0") {
 			return nil, &UnsupportedError{Feature: "CID font subtype"}
 		}
 		font.defaultWidth = 1000
@@ -239,8 +257,12 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			case Name:
 				font.encoding = value
 			case Dictionary:
-				if value["BaseEncoding"] != nil {
-					name, ok := value["BaseEncoding"].(Name)
+				base, err := r.Resolve(value["BaseEncoding"])
+				if err != nil {
+					return nil, err
+				}
+				if base != nil {
+					name, ok := base.(Name)
 					if !ok {
 						return nil, fmt.Errorf("invalid font base encoding")
 					}
@@ -257,6 +279,10 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 				font.differences = map[uint32]string{}
 				code := 256
 				for _, entry := range entries {
+					entry, err := r.Resolve(entry)
+					if err != nil {
+						return nil, err
+					}
 					switch v := entry.(type) {
 					case Integer:
 						if v < 0 || v > 255 {
@@ -404,16 +430,23 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 				return nil, err
 			}
 			stream, ok := value.(*Stream)
-			if !ok {
+			if !ok || stream == nil {
 				return nil, fmt.Errorf("invalid font program")
+			}
+			font.ProgramType = key
+			if key == Name("FontFile3") {
+				value, err := r.Resolve(stream.Dictionary["Subtype"])
+				if err != nil {
+					return nil, err
+				}
+				font.ProgramType, ok = value.(Name)
+				if !ok {
+					return nil, fmt.Errorf("invalid font program subtype")
+				}
 			}
 			font.Program, err = stream.Decode()
 			if err != nil {
 				return nil, err
-			}
-			font.ProgramType = key
-			if key == Name("FontFile3") {
-				font.ProgramType, _ = stream.Dictionary["Subtype"].(Name)
 			}
 			break
 		}
@@ -424,11 +457,15 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			font.ProgramType = "CIDFontType0C"
 		}
 	}
-	if (subtype == Name("Type1") || subtype == Name("MMType1")) && font.ProgramType == "FontFile" && dict["Encoding"] == nil {
-		font.differences, err = type1BuiltInEncoding(font.Program)
+	if (subtype == Name("Type1") || subtype == Name("MMType1")) && font.ProgramType == "FontFile" && font.encoding == "" {
+		builtIn, err := type1BuiltInEncoding(font.Program)
 		if err != nil {
 			return nil, err
 		}
+		for code, name := range font.differences {
+			builtIn[code] = name
+		}
+		font.differences = builtIn
 	}
 	var cffProgram []byte
 	if font.ProgramType == "Type1C" || font.ProgramType == "CIDFontType0C" {
@@ -456,13 +493,13 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "MacExpertEncoding" && font.encoding != "StandardEncoding" {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
-		identity := font.composite && metrics["Subtype"] == Name("CIDFontType2") && font.glyphMap == nil
+		identity := font.composite && (cidSubtype == Name("CIDFontType0") || cidSubtype == Name("CIDFontType2") && font.glyphMap == nil)
 		font.cffGlyphs, font.cffNames, err = cffFontMapping(cffProgram, font.composite, font.encoding, font.differences, identity)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if font.composite && len(font.Program) != 0 && metrics["Subtype"] == Name("CIDFontType0") && font.cffGlyphs == nil {
+	if font.composite && len(font.Program) != 0 && cidSubtype == Name("CIDFontType0") && font.cffGlyphs == nil {
 		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without CFF program"}
 	}
 	if font.composite && metrics["CIDSystemInfo"] != nil {
@@ -543,11 +580,15 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		cid := code
 		if f.cidMap != nil {
 			cid = uint32(f.cidMap.lookup(raw, valid))
-			if len(f.Program) != 0 && !f.hasCIDGlyph(cid) {
+		}
+		if f.composite && len(f.Program) != 0 && !f.hasCIDGlyph(cid) {
+			if f.cidMap != nil {
 				cid = uint32(f.cidMap.undefined(raw))
-				if !f.hasCIDGlyph(cid) {
-					cid = 0
-				}
+			} else {
+				cid = 0
+			}
+			if !f.hasCIDGlyph(cid) {
+				cid = 0
 			}
 		}
 		text, ok := f.Unicode[string(raw)]
@@ -556,11 +597,15 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		}
 		name := ""
 		if !f.composite && !(f.simpleCmap != nil && f.symbolic) {
-			name = f.differences[code]
+			var mapped bool
+			name, mapped = f.differences[code]
 			if f.cffNames != nil {
-				name = f.cffNames[code]
+				name, mapped = f.cffNames[code]
 			}
-			if name == "" {
+			if !mapped && f.encoding == "" && (f.cffNames != nil || f.Subtype == "Type3") {
+				name, mapped = ".notdef", true
+			}
+			if !mapped {
 				encoding := pdfStandardNames
 				if core != nil && f.encoding == "" {
 					encoding = core.names[:]
@@ -579,6 +624,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 				if int(code) < len(encoding) {
 					name = encoding[code]
 				}
+				if name == "" {
+					name = ".notdef"
+				}
 			}
 		}
 		if !ok && valid && f.cidMap != nil {
@@ -591,13 +639,13 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 				} else {
 					text, ok = glyphNameUnicode(name)
 				}
-				if !ok && (f.Subtype == Name("Type1") || f.Subtype == Name("MMType1")) && len(f.Program) != 0 {
-					ok = true
-				}
 			}
 		}
 		if !ok && f.cffGlyphs != nil {
-			_, ok = f.cffGlyphs[cid]
+			ok = true
+		}
+		if !ok && (f.Subtype == "Type1" || f.Subtype == "MMType1") && len(f.Program) != 0 {
+			ok = true
 		}
 		if !ok && f.simpleCmap != nil {
 			ok = true
@@ -609,10 +657,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			if f.composite {
 				return nil, &UnsupportedError{Feature: "CID without Unicode mapping"}
 			}
-			if (f.Subtype == Name("Type1") || f.Subtype == Name("MMType1")) && len(f.Program) != 0 && name == ".notdef" {
-				return nil, &UnsupportedError{Feature: "undefined Type1 glyph"}
-			}
-			if f.Subtype == Name("Type3") && f.differences[code] != "" {
+			if f.Subtype == Name("Type3") {
 				text = ""
 			} else if f.encoding == Name("WinAnsiEncoding") {
 				text = string(charmap.Windows1252.DecodeByte(raw[0]))
@@ -653,10 +698,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			glyph.Name = name
 		}
 		if f.Subtype == Name("Type3") {
-			glyph.Name = f.differences[code]
-			if glyph.Name == "" {
-				return nil, &UnsupportedError{Feature: "Type3 character without glyph name"}
-			}
+			glyph.Name = name
 		}
 		if f.simpleCmap != nil {
 			id, err := f.simpleGlyph(code, name)
@@ -678,10 +720,11 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			}
 		}
 		if f.cffGlyphs != nil {
-			glyph.ID, glyph.HasID = f.cffGlyphs[cid]
-			glyph.Name = f.cffNames[cid]
-			if !glyph.HasID {
-				return nil, fmt.Errorf("missing CFF glyph for code %d", code)
+			glyph.ID, glyph.HasID = f.cffGlyphs[cid], true
+			if mapped, ok := f.cffNames[cid]; ok {
+				glyph.Name = mapped
+			} else if !f.composite {
+				glyph.Name = name
 			}
 		}
 		glyphs = append(glyphs, glyph)

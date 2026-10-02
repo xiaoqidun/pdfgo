@@ -57,7 +57,14 @@ func (r *Reader) ReadPopupAnnotation(object Object) (PopupAnnotation, error) {
 		return popup, err
 	}
 	dict, ok := value.(Dictionary)
-	if !ok || dict["Subtype"] != Name("Popup") {
+	if !ok {
+		return popup, fmt.Errorf("invalid popup annotation")
+	}
+	subtype, err := r.Resolve(dict["Subtype"])
+	if err != nil {
+		return popup, err
+	}
+	if subtype != Name("Popup") {
 		return popup, fmt.Errorf("invalid popup annotation")
 	}
 	popup.Reference, _ = object.(Reference)
@@ -89,10 +96,17 @@ func (r *Reader) ReadPopupAnnotation(object Object) (PopupAnnotation, error) {
 			return popup, nil
 		}
 		parentDict, ok := value.(Dictionary)
-		if !ok || parentDict["Subtype"] == Name("Popup") {
+		if !ok {
 			return popup, fmt.Errorf("invalid popup parent annotation")
 		}
-		if _, ok := parentDict["Subtype"].(Name); !ok {
+		subtype, err := r.Resolve(parentDict["Subtype"])
+		if err != nil {
+			return popup, err
+		}
+		if subtype == Name("Popup") {
+			return popup, fmt.Errorf("invalid popup parent annotation")
+		}
+		if _, ok := subtype.(Name); !ok {
 			return popup, fmt.Errorf("invalid popup parent subtype")
 		}
 		popup.Parent = parent
@@ -127,7 +141,11 @@ func (p *Page) Annotations() ([]Annotation, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid annotation dictionary")
 		}
-		subtype, ok := dict["Subtype"].(Name)
+		value, err = p.reader.Resolve(dict["Subtype"])
+		if err != nil {
+			return nil, err
+		}
+		subtype, ok := value.(Name)
 		if !ok {
 			return nil, fmt.Errorf("missing annotation subtype")
 		}
@@ -145,6 +163,9 @@ func (p *Page) Annotations() ([]Annotation, error) {
 // 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器
 // 返回: error 外观缺失、解析或访问错误
 func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annotation Annotation, visitor Visitor) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if object := annotation.Dictionary["OC"]; object != nil {
 		visible := visitor.OptionalContent
 		if visible == nil {
@@ -168,6 +189,14 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 	value, err := r.Resolve(annotation.Dictionary["AP"])
 	if err != nil {
 		return err
+	}
+	provided := value != nil
+	if value == nil && annotation.Subtype == "Stamp" {
+		stream, err := r.stampAppearance(annotation)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
 	}
 	if value == nil && annotation.Subtype == "Widget" {
 		stream, err := r.widgetAppearance(ctx, page, annotation)
@@ -282,8 +311,30 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 	}
 	stream, ok := value.(*Stream)
-	if !ok || stream.Dictionary["Subtype"] != Name("Form") {
+	if !ok {
 		return &UnsupportedError{Feature: "annotation appearance stream"}
+	}
+	subtype, err := r.Resolve(stream.Dictionary["Subtype"])
+	if err != nil {
+		return err
+	}
+	if subtype != Name("Form") {
+		if subtype != nil || visitor.Warning == nil {
+			return &UnsupportedError{Feature: "annotation appearance stream"}
+		}
+		visitor.Warning(Diagnostic{Message: "PDF annotation appearance missing Form subtype; form appearance retained"})
+	}
+	if provided && visitor.Group != nil {
+		group, err := r.Resolve(stream.Dictionary["Group"])
+		if err != nil {
+			return err
+		}
+		if group == nil {
+			copy := *stream
+			copy.Dictionary = maps.Clone(stream.Dictionary)
+			copy.Dictionary["Group"] = Dictionary{"S": Name("Transparency")}
+			stream = &copy
+		}
 	}
 	box, err := r.rectangle(stream.Dictionary["BBox"])
 	if err != nil {
@@ -318,7 +369,7 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
 	interpreter.patternMatrix = Identity()
-	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
+	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
 	return interpreter.form(stream)
 }
 
@@ -445,6 +496,16 @@ func (r *Reader) BaseURI() (string, error) {
 // 入参: object 目标数组、名称、字符串或引用
 // 返回: Destination 跳转目标, error 错误信息
 func (r *Reader) ReadDestination(object Object) (Destination, error) {
+	return r.readDestination(context.Background(), object)
+}
+
+// readDestination 按上下文解析当前文档目标，保留名称对象与名称树的区别
+// 入参: ctx 取消上下文, object 目标对象
+// 返回: Destination 跳转目标, error 错误信息
+func (r *Reader) readDestination(ctx context.Context, object Object) (Destination, error) {
+	if err := ctx.Err(); err != nil {
+		return Destination{}, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return Destination{}, err
@@ -460,7 +521,7 @@ func (r *Reader) ReadDestination(object Object) (Destination, error) {
 		named = true
 	}
 	if named {
-		if err := r.readDestinations(); err != nil {
+		if err := r.readDestinations(ctx); err != nil {
 			return Destination{}, err
 		}
 		target := r.destinations[name]
@@ -489,41 +550,53 @@ func (r *Reader) ReadDestination(object Object) (Destination, error) {
 	if !ok {
 		return Destination{}, fmt.Errorf("invalid destination page")
 	}
-	modeValue, err := r.Resolve(array[1])
+	mode, parameters, err := r.destinationParameters(array)
 	if err != nil {
 		return Destination{}, err
+	}
+	return Destination{Page: page, Mode: mode, Parameters: parameters}, nil
+}
+
+// destinationParameters 解析显式目标的显示模式与可空参数，不解释首项页标识
+// 入参: array 完整目标数组
+// 返回: Name 显示模式, Array 已解析参数, error 模式或参数错误
+func (r *Reader) destinationParameters(array Array) (Name, Array, error) {
+	modeValue, err := r.Resolve(array[1])
+	if err != nil {
+		return "", nil, err
 	}
 	mode, ok := modeValue.(Name)
 	counts := map[Name]int{"XYZ": 3, "Fit": 0, "FitH": 1, "FitV": 1, "FitR": 4, "FitB": 0, "FitBH": 1, "FitBV": 1}
 	count, known := counts[mode]
 	if !ok || !known || len(array) != count+2 {
-		return Destination{}, fmt.Errorf("invalid destination mode or parameters")
+		return "", nil, fmt.Errorf("invalid destination mode or parameters")
 	}
 	parameters := make(Array, count)
 	for n, v := range array[2:] {
 		parameters[n], err = r.Resolve(v)
 		if err != nil {
-			return Destination{}, err
+			return "", nil, err
 		}
 		if parameters[n] == nil && mode == "FitR" {
-			return Destination{}, fmt.Errorf("null rectangle destination parameter")
+			return "", nil, fmt.Errorf("null rectangle destination parameter")
 		}
 		if parameters[n] != nil {
 			value, err := r.number(parameters[n])
 			if err != nil {
-				return Destination{}, err
+				return "", nil, err
 			}
 			if math.IsNaN(value) || math.IsInf(value, 0) || mode == "XYZ" && n == 2 && value < 0 {
-				return Destination{}, fmt.Errorf("invalid destination parameter")
+				return "", nil, fmt.Errorf("invalid destination parameter")
 			}
 		}
 	}
-	return Destination{Page: page, Mode: mode, Parameters: parameters}, nil
+	return mode, parameters, nil
 }
 
 // readDestinations 缓存旧式目标字典和名称树，检测递归引用
+// 入参: ctx 取消上下文
 // 返回: error 错误信息
-func (r *Reader) readDestinations() error {
+func (r *Reader) readDestinations(ctx context.Context) error {
 	if r.destinations != nil {
 		return nil
 	}
@@ -557,7 +630,7 @@ func (r *Reader) readDestinations() error {
 		if !ok {
 			return fmt.Errorf("invalid names dictionary")
 		}
-		if err := r.WalkNameTree(context.Background(), dict["Dests"], func(name string, value Object) error {
+		if err := r.WalkNameTree(ctx, dict["Dests"], func(name string, value Object) error {
 			result[name] = value
 			return nil
 		}); err != nil {

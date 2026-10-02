@@ -61,15 +61,30 @@ func (m *SoftMask) Walk(visitor Visitor) error {
 // 返回: *SoftMask 蒙版信息, error 错误信息
 func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 	dict, ok := value.(Dictionary)
-	if !ok || dict["S"] != Name("Luminosity") && dict["S"] != Name("Alpha") {
+	if !ok {
 		return nil, &UnsupportedError{Feature: "soft mask subtype"}
 	}
-	v, err := p.reader.Resolve(dict["G"])
+	v, err := p.reader.Resolve(dict["S"])
+	if err != nil {
+		return nil, err
+	}
+	subtype, ok := v.(Name)
+	if !ok || subtype != Name("Luminosity") && subtype != Name("Alpha") {
+		return nil, &UnsupportedError{Feature: "soft mask subtype"}
+	}
+	v, err = p.reader.Resolve(dict["G"])
 	if err != nil {
 		return nil, err
 	}
 	stream, ok := v.(*Stream)
-	if !ok || stream.Dictionary["Subtype"] != Name("Form") {
+	if !ok || stream == nil {
+		return nil, fmt.Errorf("invalid soft mask group")
+	}
+	v, err = p.reader.Resolve(stream.Dictionary["Subtype"])
+	if err != nil {
+		return nil, err
+	}
+	if v != Name("Form") {
 		return nil, fmt.Errorf("invalid soft mask group")
 	}
 	v, err = p.reader.Resolve(stream.Dictionary["Group"])
@@ -77,12 +92,23 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		return nil, err
 	}
 	group, ok := v.(Dictionary)
-	if !ok || group["S"] != Name("Transparency") {
+	if !ok {
 		return nil, fmt.Errorf("invalid soft mask transparency group")
 	}
-	m := &SoftMask{Subtype: dict["S"].(Name), interpreter: *p, stream: stream}
-	if group["CS"] != nil {
-		m.ColorSpace, err = p.reader.readBlendingSpace(group["CS"])
+	v, err = p.reader.Resolve(group["S"])
+	if err != nil {
+		return nil, err
+	}
+	if v != Name("Transparency") {
+		return nil, fmt.Errorf("invalid soft mask transparency group")
+	}
+	m := &SoftMask{Subtype: subtype, interpreter: *p, stream: stream}
+	v, err = p.reader.Resolve(group["CS"])
+	if err != nil {
+		return nil, err
+	}
+	if v != nil {
+		m.ColorSpace, err = p.reader.readBlendingSpace(v)
 		if err != nil {
 			return nil, err
 		}
@@ -99,20 +125,21 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 	m.interpreter.state.style.BlendMode = "Normal"
 	m.interpreter.state.style.Clips = nil
 	m.interpreter.state.style.Fill.Alpha, m.interpreter.state.style.Stroke.Alpha = 1, 1
-	if dict["BC"] != nil && m.Subtype == "Luminosity" {
+	if m.Subtype == "Luminosity" {
 		v, err := p.reader.Resolve(dict["BC"])
 		if err != nil {
 			return nil, err
 		}
-		a, ok := v.(Array)
-		if !ok {
-			return nil, fmt.Errorf("invalid soft mask backdrop")
+		if v != nil {
+			n, err := p.reader.numberArray(v, m.ColorSpace.Components())
+			if err != nil {
+				return nil, err
+			}
+			if m.ColorSpace.validate(n) != nil {
+				return nil, fmt.Errorf("invalid soft mask backdrop")
+			}
+			m.Backdrop = n
 		}
-		n, err := numbers(a, m.ColorSpace.Components())
-		if err != nil || m.ColorSpace.validate(n) != nil {
-			return nil, fmt.Errorf("invalid soft mask backdrop")
-		}
-		m.Backdrop = n
 	}
 	transfer, err := p.reader.Resolve(dict["TR"])
 	if err != nil {

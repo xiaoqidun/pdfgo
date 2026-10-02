@@ -70,7 +70,14 @@ func (r *Reader) writeAnnotationPushButton(ctx context.Context, annotation Annot
 			}
 			var ok bool
 			icon, ok = value.(*Stream)
-			if !ok || icon.Dictionary["Subtype"] != Name("Form") {
+			if !ok || icon == nil {
+				return fmt.Errorf("invalid button icon form")
+			}
+			kind, err := r.Resolve(icon.Dictionary["Subtype"])
+			if err != nil {
+				return err
+			}
+			if kind != Name("Form") {
 				return fmt.Errorf("invalid button icon form")
 			}
 			fit, err = r.readAnnotationIconFit(mk["IF"])

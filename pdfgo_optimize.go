@@ -852,7 +852,6 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 		}
 		return &result, nil
 	}
-	// 图像、外部及未知过滤器保持原样；通用编码可等价替换为Flate。
 	decodedLimit := int64(len(s.Data))
 	for _, filter := range filters {
 		if filter != Name("LZWDecode") && filter != Name("ASCII85Decode") && filter != Name("ASCIIHexDecode") && filter != Name("RunLengthDecode") {

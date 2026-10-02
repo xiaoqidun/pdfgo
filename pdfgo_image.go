@@ -189,7 +189,14 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		return nil, err
 	}
 	stream, ok := resolved.(*Stream)
-	if !ok || stream.Dictionary["Subtype"] != Name("Image") {
+	if !ok || stream == nil {
+		return nil, fmt.Errorf("expected image XObject")
+	}
+	kind, err := r.Resolve(stream.Dictionary["Subtype"])
+	if err != nil {
+		return nil, err
+	}
+	if kind != Name("Image") {
 		return nil, fmt.Errorf("expected image XObject")
 	}
 	dict := stream.Dictionary

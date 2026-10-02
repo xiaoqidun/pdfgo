@@ -261,19 +261,29 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	}
 	var groupSpace *ColorSpace
 	var knockout bool
-	if page.Dictionary["Group"] != nil {
-		value, err := r.Resolve(page.Dictionary["Group"])
-		if err != nil {
-			return err
-		}
+	value, err := r.Resolve(page.Dictionary["Group"])
+	if err != nil {
+		return err
+	}
+	if value != nil {
 		group, ok := value.(Dictionary)
 		if !ok {
 			return fmt.Errorf("invalid page group")
+		}
+		kind, err := r.Resolve(group["S"])
+		if err != nil {
+			return err
+		}
+		if kind != Name("Transparency") {
+			return &UnsupportedError{Feature: "page group subtype"}
 		}
 		for key, value := range group {
 			value, err = r.Resolve(value)
 			if err != nil {
 				return err
+			}
+			if value == nil {
+				continue
 			}
 			switch key {
 			case "Type":
@@ -281,9 +291,6 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 					return &UnsupportedError{Feature: "page group type"}
 				}
 			case "S":
-				if value != Name("Transparency") {
-					return &UnsupportedError{Feature: "page group subtype"}
-				}
 			case "CS":
 				groupSpace, err = r.readBlendingSpace(value)
 				if err != nil {
@@ -356,9 +363,16 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if mark.Mode == 3 {
 		return nil
 	}
-	object, err := r.Resolve(font.type3Procs[Name(mark.Glyphs[index].Name)])
+	procedure, present := font.type3Procs[Name(mark.Glyphs[index].Name)]
+	if !present {
+		return nil
+	}
+	object, err := r.Resolve(procedure)
 	if err != nil {
 		return err
+	}
+	if object == nil {
+		return nil
 	}
 	stream, ok := object.(*Stream)
 	if !ok {
@@ -514,6 +528,9 @@ func numbers(operands []Object, count int) ([]float64, error) {
 			values[n] = float64(v)
 		default:
 			return nil, fmt.Errorf("nonnumeric operand")
+		}
+		if math.IsNaN(values[n]) || math.IsInf(values[n], 0) {
+			return nil, fmt.Errorf("nonfinite operand")
 		}
 	}
 	return values, nil
@@ -1149,9 +1166,6 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if err != nil {
 			return err
 		}
-		if size[0] <= 0 {
-			return &UnsupportedError{Feature: "nonpositive text font size"}
-		}
 		object, err := p.resource("Font", name)
 		if err != nil {
 			return err
@@ -1167,9 +1181,6 @@ func (p *pageInterpreter) operation(op Operation) error {
 	case "Tw":
 		p.state.wordSpacing = v[0]
 	case "Tz":
-		if v[0] <= 0 {
-			return &UnsupportedError{Feature: "nonpositive horizontal text scale"}
-		}
 		p.state.hscale = v[0] / 100
 	case "TL":
 		p.state.leading = v[0]
@@ -1435,13 +1446,17 @@ func (p *pageInterpreter) xobject(a []Object) error {
 		return err
 	}
 	stream, ok := value.(*Stream)
-	if !ok {
+	if !ok || stream == nil {
 		return fmt.Errorf("invalid XObject stream")
 	}
-	if stream.Dictionary["Subtype"] == Name("Image") {
+	kind, err := p.reader.Resolve(stream.Dictionary["Subtype"])
+	if err != nil {
+		return err
+	}
+	if kind == Name("Image") {
 		return p.image(stream)
 	}
-	if stream.Dictionary["Subtype"] != Name("Form") {
+	if kind != Name("Form") {
 		return &UnsupportedError{Feature: "XObject subtype"}
 	}
 	return p.form(stream)
@@ -1531,13 +1546,23 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	}
 	child := *p
 	var groupMark *GroupMark
+	var groupObject Object
 	if stream.Dictionary["Group"] != nil {
-		value, err := p.reader.Resolve(stream.Dictionary["Group"])
+		groupObject, err = p.reader.Resolve(stream.Dictionary["Group"])
 		if err != nil {
 			return err
 		}
-		group, ok := value.(Dictionary)
-		if !ok || group["S"] != Name("Transparency") {
+	}
+	if groupObject != nil {
+		group, ok := groupObject.(Dictionary)
+		if !ok {
+			return &UnsupportedError{Feature: "form transparency group"}
+		}
+		kind, err := p.reader.Resolve(group["S"])
+		if err != nil {
+			return err
+		}
+		if kind != Name("Transparency") {
 			return &UnsupportedError{Feature: "form transparency group"}
 		}
 		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, AlphaIsShape: p.state.style.AlphaIsShape, BlendMode: p.state.style.BlendMode, SoftMask: p.state.style.SoftMask, ColorConversion: p.state.style.ColorConversion, RenderingIntent: p.state.style.RenderingIntent}
@@ -1558,14 +1583,18 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			}
 			*flag.target = bool(boolean)
 		}
-		if group["CS"] != nil {
-			groupMark.ColorSpace, err = p.reader.readBlendingSpace(group["CS"])
+		space, err := p.reader.Resolve(group["CS"])
+		if err != nil {
+			return err
+		}
+		if space != nil {
+			groupMark.ColorSpace, err = p.reader.readBlendingSpace(space)
 			if err != nil {
 				return err
 			}
 		}
 		if p.visitor.Group == nil && groupMark.ColorSpace != nil {
-			if err := p.reader.validateRGBGroupSpace(group["CS"]); err != nil {
+			if err := p.reader.validateRGBGroupSpace(space); err != nil {
 				return err
 			}
 		}
@@ -1763,9 +1792,6 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 			}
 			if math.IsNaN(size) || math.IsInf(size, 0) {
 				return fmt.Errorf("invalid font size")
-			}
-			if size <= 0 {
-				return &UnsupportedError{Feature: "nonpositive text font size"}
 			}
 			font, err := p.reader.ReadFont(array[0])
 			if err != nil {

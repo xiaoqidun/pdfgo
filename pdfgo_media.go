@@ -124,7 +124,15 @@ func (r *Reader) ReadMovie(object Object) (Movie, error) {
 	switch movie.Poster.(type) {
 	case nil, Boolean:
 	case *Stream:
-		if movie.Poster.(*Stream).Dictionary["Subtype"] != Name("Image") {
+		poster := movie.Poster.(*Stream)
+		if poster == nil {
+			return movie, fmt.Errorf("invalid movie poster image")
+		}
+		kind, err := r.Resolve(poster.Dictionary["Subtype"])
+		if err != nil {
+			return movie, err
+		}
+		if kind != Name("Image") {
 			return movie, fmt.Errorf("invalid movie poster image")
 		}
 	default:
@@ -142,7 +150,7 @@ func (r *Reader) ReadSound(object Object) (Sound, error) {
 		return Sound{}, err
 	}
 	stream, ok := value.(*Stream)
-	if !ok {
+	if !ok || stream == nil {
 		return Sound{}, fmt.Errorf("invalid sound stream")
 	}
 	result := Sound{Stream: stream, Channels: 1, Bits: 8, Encoding: "Raw"}
