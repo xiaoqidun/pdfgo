@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"encoding/binary"
 	"fmt"
+	"unicode/utf8"
 )
 
 // fontTable 读取SFNT字体的指定表并校验目录与数据范围
@@ -87,10 +88,10 @@ func fontCmap(data []byte, symbolic bool) ([]byte, Name, error) {
 				priority = 1
 			}
 			if platform == 3 && encoding == 1 {
-				priority = 2
+				priority = 3
 			}
 			if platform == 3 && encoding == 10 {
-				priority = 3
+				priority = 2
 			}
 		}
 		if priority > score {
@@ -132,6 +133,60 @@ func fontCmap(data []byte, symbolic bool) ([]byte, Name, error) {
 		return nil, "", fmt.Errorf("invalid cmap length")
 	}
 	return table[:length], encodingName, nil
+}
+
+// simpleGlyph 按TrueType内嵌字符表选择字形，名称无法映射时使用post表
+// 入参: code 原始单字节字符码, name 非符号字体的编码名称
+// 返回: uint16 字形编号，未定义字符为零, error 字符表或名称表错误
+func (f *Font) simpleGlyph(code uint32, name string) (uint16, error) {
+	if f.symbolic {
+		id, err := cmapGlyph(f.simpleCmap, code)
+		if err != nil || f.cmapEncoding != "Symbol" {
+			return id, err
+		}
+		for _, base := range [...]uint32{0xF000, 0xF100, 0xF200} {
+			candidate, err := cmapGlyph(f.simpleCmap, base+code)
+			if err != nil {
+				return 0, err
+			}
+			if candidate != 0 {
+				if id != 0 && id != candidate {
+					return 0, fmt.Errorf("ambiguous symbol cmap")
+				}
+				id = candidate
+			}
+		}
+		return id, nil
+	}
+	if name == "" || name == ".notdef" {
+		return 0, nil
+	}
+	var codepoint uint32
+	mapped := false
+	if f.cmapEncoding == "MacRomanEncoding" {
+		for index, glyphName := range pdfMacRomanNames {
+			if index == 219 {
+				glyphName = "Euro"
+			}
+			if glyphName == name {
+				codepoint, mapped = uint32(index), true
+				break
+			}
+		}
+	} else {
+		text, found := glyphNameUnicode(name)
+		character, size := utf8.DecodeRuneInString(text)
+		if found && size == len(text) && size != 0 {
+			codepoint, mapped = uint32(character), true
+		}
+	}
+	if mapped {
+		id, err := cmapGlyph(f.simpleCmap, codepoint)
+		if err != nil || id != 0 {
+			return id, err
+		}
+	}
+	return f.post.lookup(name)
 }
 
 // cmapGlyph 从已选定的字符表查询字形编号

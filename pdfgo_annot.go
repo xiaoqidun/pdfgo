@@ -211,7 +211,14 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 		value = Dictionary{"N": stream}
 	}
 	if value == nil && annotation.Subtype == "Line" {
-		stream, err := r.lineAppearance(annotation)
+		stream, err := r.lineAppearance(ctx, page, annotation, visitor.Warning)
+		if err != nil {
+			return err
+		}
+		value = Dictionary{"N": stream}
+	}
+	if value == nil && annotation.Subtype == "Redact" {
+		stream, err := r.redactionAppearance(ctx, annotation)
 		if err != nil {
 			return err
 		}
@@ -311,7 +318,7 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
 	interpreter.patternMatrix = Identity()
-	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
+	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
 	return interpreter.form(stream)
 }
 
@@ -326,13 +333,27 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 	for key, value := range annotation.Dictionary {
 		result[key] = value
 	}
-	inherited := []Name{"FT", "Ff", "V", "DV", "DA", "Q", "Opt", "MaxLen", "I", "TI", "RV", "DS"}
+	inherited := []Name{"FT", "Ff", "V", "DV", "DA", "Q", "MaxLen"}
+	merged := annotation.Dictionary["Parent"] == nil
+	for _, key := range []Name{"FT", "Ff", "V", "DV", "DA", "Q", "MaxLen", "T", "TU", "TM", "RV", "DS", "Opt", "I", "TI"} {
+		merged = merged || annotation.Dictionary[key] != nil
+	}
 	for _, key := range inherited {
 		delete(result, key)
 	}
 	seen := map[Reference]bool{}
 	current := annotation.Dictionary
+	depth := 0
+	var options []Object
 	for current != nil {
+		if current["Opt"] != nil {
+			options = append(options, current["Opt"])
+		}
+		if !merged && depth == 1 {
+			for _, key := range []Name{"RV", "DS", "Opt", "I", "TI"} {
+				result[key] = current[key]
+			}
+		}
 		for _, key := range inherited {
 			if result[key] == nil {
 				value, err := r.Resolve(current[key])
@@ -358,6 +379,21 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 		current, ok = value.(Dictionary)
 		if !ok {
 			return nil, fmt.Errorf("invalid field parent")
+		}
+		depth++
+	}
+	flags, validFlags := result["Ff"].(Integer)
+	if result["FT"] == Name("Btn") && (result["Ff"] == nil || validFlags && flags&(1<<16) == 0) {
+		delete(result, "Opt")
+		for _, object := range options {
+			value, err := r.Resolve(object)
+			if err != nil {
+				return nil, err
+			}
+			if value != nil {
+				result["Opt"] = value
+				break
+			}
 		}
 	}
 	defaults, err := r.formDefaults()

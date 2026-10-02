@@ -25,6 +25,9 @@ import (
 // 返回: [3]float64 D50色度, error 变换错误
 func (s *ColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 	if p := s.profile; p != nil {
+		if xyz, used, err := p.processXYZ(values, intent); used || err != nil {
+			return xyz, err
+		}
 		if p.lut != nil {
 			return p.lut.xyz(values, intent)
 		}
@@ -68,6 +71,16 @@ func (s *ColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 // 入参: xyz D50色度, intent 渲染意图
 // 返回: [4]float64 设备分量, error 不可逆或未支持的变换
 func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
+	index, err := iccProcessIntentIndex(intent)
+	if err != nil {
+		return [4]float64{}, err
+	}
+	if transform := s.fromFloat[index]; transform != nil {
+		if s.processPCS == "Lab " {
+			xyz = iccFloatXYZLab(xyz)
+		}
+		return transform.evaluate(xyz[:])
+	}
 	if s.lut != nil {
 		return s.lut.fromXYZ(xyz, intent)
 	}
@@ -103,6 +116,67 @@ func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error)
 		result[i] = v
 	}
 	return result, nil
+}
+
+// iccProcessIntentIndex 选择浮点变换的渲染意图，绝对色度使用独立标签
+// 入参: intent 渲染意图
+// 返回: int 标签序号, error 未知意图
+func iccProcessIntentIndex(intent Name) (int, error) {
+	if intent == "AbsoluteColorimetric" {
+		return 3, nil
+	}
+	return iccIntentIndex(intent)
+}
+
+// processXYZ 按对应浮点标签取得连接空间色度，无标签时保留原变换
+// 入参: values 设备分量, intent 渲染意图
+// 返回: [3]float64 色度, bool 是否使用浮点标签, error 求值错误
+func (s *iccColorSpace) processXYZ(values []float64, intent Name) ([3]float64, bool, error) {
+	index, err := iccProcessIntentIndex(intent)
+	if err != nil {
+		return [3]float64{}, false, err
+	}
+	transform := s.toFloat[index]
+	if transform == nil {
+		return [3]float64{}, false, nil
+	}
+	v, err := transform.evaluate(values)
+	if err != nil {
+		return [3]float64{}, true, err
+	}
+	xyz := [3]float64{v[0], v[1], v[2]}
+	if s.processPCS == "Lab " {
+		xyz = iccFloatLabXYZ(xyz)
+	}
+	return xyz, true, nil
+}
+
+// iccFloatLabXYZ 将浮点Lab色度转换为D50的XYZ，不截断负值
+// 入参: lab Lab色度
+// 返回: [3]float64 XYZ色度
+func iccFloatLabXYZ(lab [3]float64) [3]float64 {
+	y := (lab[0] + 16) / 116
+	inverse := func(v float64) float64 {
+		if v > 6.0/29 {
+			return v * v * v
+		}
+		return 3 * (6.0 / 29) * (6.0 / 29) * (v - 4.0/29)
+	}
+	return [3]float64{.9642 * inverse(y+lab[1]/500), inverse(y), .8249 * inverse(y-lab[2]/200)}
+}
+
+// iccFloatXYZLab 将D50的XYZ转换为浮点Lab色度，不截断负值
+// 入参: xyz XYZ色度
+// 返回: [3]float64 Lab色度
+func iccFloatXYZLab(xyz [3]float64) [3]float64 {
+	f := func(v float64) float64 {
+		if v > (6.0/29)*(6.0/29)*(6.0/29) {
+			return math.Cbrt(v)
+		}
+		return v/(3*(6.0/29)*(6.0/29)) + 4.0/29
+	}
+	x, y, z := f(xyz[0]/.9642), f(xyz[1]), f(xyz[2]/.8249)
+	return [3]float64{116*y - 16, 500 * (x - y), 200 * (y - z)}
 }
 
 // inverse 反求单调ICC曲线，对超出曲线范围的值使用端点

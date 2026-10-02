@@ -49,6 +49,17 @@ type Image struct {
 	reader           *Reader
 }
 
+// HasSoftMask 判断显式及JPEG2000内嵌软遮罩，不将硬遮罩当作软遮罩
+// 返回: bool 是否具有软遮罩, error 引用或遮罩参数错误
+func (i *Image) HasSoftMask() (bool, error) {
+	mode, err := i.jpxMaskMode()
+	if err != nil || mode != 0 {
+		return mode != 0, err
+	}
+	value, err := i.reader.Resolve(i.SoftMask)
+	return value != nil, err
+}
+
 // deviceSampleImage 按需组合设备色或索引色样本与遮罩，不重复展开像素缓冲
 type deviceSampleImage struct {
 	source    image.Image
@@ -62,10 +73,11 @@ type deviceSampleImage struct {
 
 // imagePalette 保存索引色的原始分量和显示颜色
 type imagePalette struct {
-	space  *ColorSpace
-	values [][4]float64
-	tints  [][4]float64
-	colors []color.NRGBA64
+	space   *ColorSpace
+	process *ProcessColorants
+	values  [][4]float64
+	tints   [][]float64
+	colors  []color.NRGBA64
 }
 
 // imageResample 在统一图像坐标中采样，不缩减任一轴的原始采样数
@@ -92,6 +104,28 @@ type packedGrayImage struct {
 	stride int
 	depth  int
 }
+
+// emptySampleImage 保留None图像的声明边界，不分配无效颜色样本
+type emptySampleImage struct {
+	rect image.Rectangle
+}
+
+// ColorModel 返回透明图像的非预乘颜色模型
+// 返回: color.Model 颜色模型
+func (s *emptySampleImage) ColorModel() color.Model { return color.NRGBA64Model }
+
+// Bounds 返回声明的图像边界
+// 返回: image.Rectangle 图像边界
+func (s *emptySampleImage) Bounds() image.Rectangle { return s.rect }
+
+// At 返回None色料的零覆盖率
+// 入参: x 横坐标, y 纵坐标
+// 返回: color.Color 透明颜色
+func (s *emptySampleImage) At(x, y int) color.Color { return color.NRGBA64{} }
+
+// Opaque 返回图像没有不透明像素
+// 返回: bool 是否完全不透明
+func (s *emptySampleImage) Opaque() bool { return false }
 
 // JBIG2File 无损封装可直接复用的单页JBIG2图像及全局段
 // 不适合直接复用的图像返回nil，调用DecodeImage可得到已应用颜色与遮罩的像素
@@ -178,7 +212,7 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	if w <= 0 || h <= 0 || uint64(w) > uint64(^uint(0)>>1)/8/uint64(h) {
+	if w <= 0 || h <= 0 || uint64(w) > uint64(^uint(0)>>1) || uint64(h) > uint64(^uint(0)>>1) {
 		return nil, fmt.Errorf("invalid image dimensions or platform integer overflow")
 	}
 	maskObject, err := r.Resolve(dict["ImageMask"])
@@ -374,7 +408,7 @@ func (s *imageResample) ColorModel() color.Model { return s.source.ColorModel() 
 // 返回: image.Rectangle 采样边界
 func (s *imageResample) Bounds() image.Rectangle { return s.bounds }
 
-// At 按像素中心执行最近邻或双线性采样，保留原始CMYK分量
+// At 按像素中心执行最近邻或双线性采样，保留原始设备色和专色分量
 // 入参: x 横向坐标, y 纵向坐标
 // 返回: color.Color 采样颜色
 func (s *imageResample) At(x, y int) color.Color {
@@ -389,6 +423,24 @@ func (s *imageResample) At(x, y int) color.Color {
 	}
 	x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
 	fx, fy := sx-float64(x0), sy-float64(y0)
+	if _, ok := s.source.At(b.Min.X, b.Min.Y).(imageComponentSample); ok {
+		var sample resampledDeviceNSample
+		for dy := 0; dy < 2; dy++ {
+			for dx := 0; dx < 2; dx++ {
+				weightX, weightY := 1-fx, 1-fy
+				if dx == 1 {
+					weightX = fx
+				}
+				if dy == 1 {
+					weightY = fy
+				}
+				index := 2*dy + dx
+				sample.samples[index] = s.source.At(b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy))).(imageComponentSample)
+				sample.weights[index] = weightX * weightY
+			}
+		}
+		return sample
+	}
 	var values [4]float64
 	_, cmyk := imageCMYKSample(s.source.At(b.Min.X, b.Min.Y))
 	for dy := 0; dy < 2; dy++ {
@@ -422,6 +474,9 @@ func (s *imageResample) At(x, y int) color.Color {
 // CMYK图像还原DCT分量，取消通用JPEG解码器的Adobe反相处理
 // 返回: image.Image 样本图像, error 错误信息
 func (i *Image) DecodeSamples() (image.Image, error) {
+	if i.Width <= 0 || i.Height <= 0 {
+		return nil, fmt.Errorf("invalid image dimensions")
+	}
 	filters, parameters, err := i.Stream.filterChain(i.reader)
 	if err != nil {
 		return nil, err
@@ -459,6 +514,9 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 	case "JBIG2Decode":
 		if i.BitsPerComponent != 1 {
 			return nil, fmt.Errorf("invalid JBIG2 component depth")
+		}
+		if _, _, err := imageBufferSize(i.Width, i.Height, 1); err != nil {
+			return nil, err
 		}
 		var globals []byte
 		if terminalParams["JBIG2Globals"] != nil {
@@ -540,6 +598,13 @@ func (s *packedCMYKImage) At(x, y int) color.Color {
 	if !image.Pt(x, y).In(s.rect) {
 		return color.RGBA64{}
 	}
+	return s.sample(x, y)
+}
+
+// sample 读取已校验边界内的打包四色，供解码循环复用而不创建颜色接口
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: cmykSample 原始四色分量
+func (s *packedCMYKImage) sample(x, y int) cmykSample {
 	line := s.data[(y-s.rect.Min.Y)*s.stride:]
 	var sample cmykSample
 	for c := range sample {
@@ -573,6 +638,18 @@ func (s *packedGrayImage) At(x, y int) color.Color {
 // 入参: target 可选分量输出
 // 返回: image.Image 显示图像，分量模式下为空, error 解码错误
 func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
+	if i.Width <= 0 || i.Height <= 0 {
+		return nil, fmt.Errorf("invalid image dimensions")
+	}
+	if target == nil && !i.ImageMask {
+		none, err := i.reader.colorantNone(i.ColorSpace)
+		if err != nil {
+			return nil, err
+		}
+		if none {
+			return &emptySampleImage{rect: image.Rect(0, 0, i.Width, i.Height)}, nil
+		}
+	}
 	palette, err := i.palette()
 	if err != nil {
 		return nil, err
@@ -657,8 +734,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if lab != nil {
 		copy(ranges, []float64{0, 100, lab.rangeAB[0], lab.rangeAB[1], lab.rangeAB[2], lab.rangeAB[3]})
 	}
-	var limits [8]float64
-	copy(limits[:], ranges)
+	limits := append([]float64(nil), ranges...)
 	if palette != nil {
 		ranges[1] = float64((uint32(1) << i.BitsPerComponent) - 1)
 	}
@@ -714,8 +790,14 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if mask != nil {
 		bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
 	}
-	if uint64(bounds.Dx()) > uint64(^uint(0)>>1)/8/uint64(bounds.Dy()) {
-		return nil, fmt.Errorf("masked image dimensions exceed platform integer range")
+	if target == nil && i.ColorSpace == Name("DeviceGray") && !i.ImageMask && embeddedMask == 0 && mask == nil && len(keys) == 0 && len(matte) == 0 {
+		gray, err := decodeGrayImage(samples, ranges[0], ranges[1])
+		if err != nil {
+			return nil, err
+		}
+		if gray != nil {
+			return gray, nil
+		}
 	}
 	if samples.Bounds() != bounds {
 		switch samples.(type) {
@@ -744,12 +826,17 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	}
 	var out *image.NRGBA64
 	if target == nil {
+		if _, _, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 8); err != nil {
+			return nil, err
+		}
 		out = image.NewNRGBA64(bounds)
 	} else {
 		if palette != nil {
 			target.Space = palette.space
+			target.Process = palette.process
 		} else if deviceN != nil {
 			target.Space = deviceN.alternate
+			target.Process = deviceN.process
 		} else if separation != nil {
 			target.Space = separation.space
 		} else if profile != nil {
@@ -760,7 +847,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				return nil, err
 			}
 		} else if lab != nil {
-			target.Space = &ColorSpace{Model: "DeviceRGB"}
+			target.Space = &ColorSpace{Model: "DeviceRGB", mapped: true}
 		} else {
 			target.Space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components]}
 		}
@@ -772,19 +859,26 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		if err != nil {
 			return nil, err
 		}
-		if len(target.Colorants) > 0 {
-			if len(target.Colorants) > 4 || uint64(bounds.Dx()) > uint64(^uint(0)>>1)/uint64(2*len(target.Colorants))/uint64(bounds.Dy()) {
-				return nil, fmt.Errorf("image colorant dimensions exceed platform integer range")
-			}
-			target.Tints = make([]uint16, bounds.Dx()*bounds.Dy()*len(target.Colorants))
-		}
 		stride := target.Space.Components() + 1
-		if uint64(bounds.Dx()) > uint64(^uint(0)>>1)/uint64(2*stride)/uint64(bounds.Dy()) {
-			return nil, fmt.Errorf("image component dimensions exceed platform integer range")
+		_, size, err := imageSampleSize(bounds.Dx(), bounds.Dy(), stride, 16)
+		if err != nil {
+			return nil, err
 		}
-		target.Pix = make([]uint16, bounds.Dx()*bounds.Dy()*stride)
+		if len(target.Colorants) > 0 {
+			_, tintSize, err := imageSampleSize(bounds.Dx(), bounds.Dy(), len(target.Colorants), 16)
+			if err != nil {
+				return nil, err
+			}
+			target.Tints = make([]uint16, tintSize/2)
+		}
+		target.Pix = make([]uint16, size/2)
 	}
 	maximum := float64((uint32(1) << i.BitsPerComponent) - 1)
+	var componentBuffer [4]float64
+	inputs := componentBuffer[:min(components, len(componentBuffer))]
+	if components > len(componentBuffer) {
+		inputs = make([]float64, components)
+	}
 	for y := 0; y < bounds.Dy(); y++ {
 		for x := 0; x < bounds.Dx(); x++ {
 			alpha := uint16(65535)
@@ -795,14 +889,31 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				}
 				alpha = uint16(value)
 			}
-			sampleColor := samples.At(x, y)
+			var sampleColor color.Color
+			if components != 4 || embeddedMask != 0 {
+				sampleColor = samples.At(x, y)
+			}
 			if embeddedMask != 0 {
 				_, _, _, value := sampleColor.RGBA()
 				alpha = uint16(value)
 			}
 			var values [4]float64
-			if components == 4 {
-				cmyk, ok := imageCMYKSample(sampleColor)
+			if components > 4 {
+				sample, ok := sampleColor.(imageComponentSample)
+				if !ok {
+					return nil, fmt.Errorf("invalid DeviceN image samples")
+				}
+				for c := range inputs {
+					inputs[c] = float64(sample.component(c)) / 65535
+				}
+			} else if components == 4 {
+				var cmyk cmykSample
+				var ok bool
+				if embeddedMask == 0 {
+					cmyk, ok = imageCMYKAt(samples, x, y)
+				} else {
+					cmyk, ok = imageCMYKSample(sampleColor)
+				}
 				if !ok {
 					return nil, fmt.Errorf("invalid CMYK image samples")
 				}
@@ -813,29 +924,33 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				pixel := imageNRGBASample(sampleColor)
 				values = [4]float64{float64(pixel.R) / 65535, float64(pixel.G) / 65535, float64(pixel.B) / 65535}
 			}
+			if components <= 4 {
+				copy(inputs, values[:components])
+			}
 			transparent := len(keys) != 0
 			for c := 0; c < components; c++ {
 				if transparent {
-					sample := math.Round(values[c] * maximum)
+					sample := math.Round(inputs[c] * maximum)
 					transparent = sample >= keys[c*2] && sample <= keys[c*2+1]
 				}
-				values[c] = ranges[c*2] + values[c]*(ranges[c*2+1]-ranges[c*2])
+				inputs[c] = functionValue(inputs[c], ranges[c*2], ranges[c*2+1])
 				if palette == nil {
-					values[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], values[c]))
+					inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], inputs[c]))
 				}
 				if len(matte) != 0 {
 					if alpha == 0 {
-						values[c] = matte[c]
+						inputs[c] = matte[c]
 					} else {
-						values[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], matte[c]+(values[c]-matte[c])*65535/float64(alpha)))
+						inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], matte[c]+(inputs[c]-matte[c])*65535/float64(alpha)))
 					}
 				}
 			}
+			copy(values[:], inputs)
 			if components == 1 {
 				values[1], values[2] = values[0], values[0]
 			}
 			if target != nil && len(target.Colorants) > 0 {
-				tints := values
+				tints := inputs
 				if palette != nil {
 					index := int(math.Max(0, math.Min(float64(len(palette.tints)-1), math.Round(values[0]))))
 					tints = palette.tints[index]
@@ -846,7 +961,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				}
 			}
 			if deviceN != nil {
-				values, err = deviceN.values(values[:components]...)
+				values, err = deviceN.values(inputs...)
 				if err != nil {
 					return nil, err
 				}
@@ -873,7 +988,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				for c := 0; c < channels; c++ {
 					target.Pix[offset+c] = uint16(math.Round(values[c] * 65535))
 				}
-				if transparent {
+				if transparent || deviceN != nil && deviceN.none {
 					alpha = 0
 				}
 				target.Pix[offset+channels] = alpha
@@ -889,6 +1004,9 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 					return nil, err
 				}
 				pixel = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
+				if deviceN.none {
+					pixel.A = 0
+				}
 			} else if separation != nil {
 				paint, err := separation.paint(values[0], intent)
 				if err != nil {
@@ -1072,10 +1190,11 @@ func (i *Image) palette() (*imagePalette, error) {
 	palette := make([]color.NRGBA64, int(n+1))
 	result := &imagePalette{colors: palette, values: make([][4]float64, len(palette))}
 	if deviceN != nil || separation != nil {
-		result.tints = make([][4]float64, len(palette))
+		result.tints = make([][]float64, len(palette))
 	}
 	if deviceN != nil {
 		result.space = deviceN.alternate
+		result.process = deviceN.process
 	} else if separation != nil {
 		result.space = separation.space
 	} else if calibrated != nil {
@@ -1084,7 +1203,7 @@ func (i *Image) palette() (*imagePalette, error) {
 			return nil, err
 		}
 	} else if lab != nil {
-		result.space = &ColorSpace{Model: "DeviceRGB"}
+		result.space = &ColorSpace{Model: "DeviceRGB", mapped: true}
 	} else {
 		result.space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
 	}
@@ -1094,11 +1213,11 @@ func (i *Image) palette() (*imagePalette, error) {
 	}
 	for index := range palette {
 		v := data[index*components:]
-		for c := 0; c < components; c++ {
+		for c := 0; c < min(components, 4); c++ {
 			result.values[index][c] = float64(v[c]) / 255
 		}
 		if separation != nil {
-			result.tints[index] = result.values[index]
+			result.tints[index] = append([]float64(nil), result.values[index][:1]...)
 			paint, err := separation.paint(result.values[index][0], intent)
 			if err != nil {
 				return nil, err
@@ -1126,8 +1245,11 @@ func (i *Image) palette() (*imagePalette, error) {
 			continue
 		}
 		if deviceN != nil {
-			result.tints[index] = result.values[index]
-			values, err := deviceN.values(result.values[index][:components]...)
+			result.tints[index] = make([]float64, components)
+			for c := range result.tints[index] {
+				result.tints[index][c] = float64(v[c]) / 255
+			}
+			values, err := deviceN.values(result.tints[index]...)
 			if err != nil {
 				return nil, err
 			}
@@ -1137,6 +1259,9 @@ func (i *Image) palette() (*imagePalette, error) {
 				return nil, err
 			}
 			palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
+			if deviceN.none {
+				palette[index].A = 0
+			}
 			continue
 		}
 		if profile != nil {
@@ -1250,15 +1375,14 @@ func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error
 	if i.BitsPerComponent != 1 {
 		return nil, fmt.Errorf("invalid CCITT component depth")
 	}
+	_, expected, err := imageSampleSize(i.Width, i.Height, 1, 1)
+	if err != nil {
+		return nil, err
+	}
 	reader, endOfBlock, err := ccittImageReader(bytes.NewReader(data), i.Width, i.Height, params)
 	if err != nil {
 		return nil, err
 	}
-	stride := (uint64(i.Width) + 7) / 8
-	if stride > uint64(^uint(0)>>1)/uint64(i.Height) {
-		return nil, fmt.Errorf("CCITT sample size exceeds platform integer range")
-	}
-	expected := int(stride) * i.Height
 	samples, err := io.ReadAll(io.LimitReader(reader, int64(expected)))
 	if err != nil {
 		return nil, err
@@ -1394,25 +1518,28 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	if components == 0 {
 		return nil, &UnsupportedError{Feature: "raw image color space"}
 	}
-	rowBits := uint64(i.Width) * uint64(components) * uint64(i.BitsPerComponent)
-	rowBytes := (rowBits + 7) / 8
-	expected := rowBytes * uint64(i.Height)
-	if rowBytes > uint64(len(data))/uint64(i.Height) || expected > uint64(len(data)) {
+	stride, expected, err := imageSampleSize(i.Width, i.Height, components, i.BitsPerComponent)
+	if err != nil {
+		return nil, err
+	}
+	if expected > len(data) {
 		return nil, fmt.Errorf("image sample size mismatch")
 	}
-	if expected < uint64(len(data)) {
+	if expected < len(data) {
 		for _, value := range data[expected:] {
 			if value != 0 {
 				if i.Warning == nil {
 					return nil, fmt.Errorf("image sample size mismatch")
 				}
-				i.Warning(Diagnostic{Message: fmt.Sprintf("image has %d excess sample bytes; decoded using declared dimensions %dx%d", uint64(len(data))-expected, i.Width, i.Height)})
+				i.Warning(Diagnostic{Message: fmt.Sprintf("image has %d excess sample bytes; decoded using declared dimensions %dx%d", len(data)-expected, i.Width, i.Height)})
 				break
 			}
 		}
 		data = data[:expected]
 	}
-	stride := int(rowBytes)
+	if components > 4 {
+		return &packedDeviceNImage{data: bytes.Clone(data), rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent, channels: components}, nil
+	}
 	if components == 4 {
 		if i.BitsPerComponent != 8 {
 			return &packedCMYKImage{data: bytes.Clone(data), rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
@@ -1420,6 +1547,9 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 		return &image.CMYK{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 	}
 	if components == 3 && i.BitsPerComponent == 8 {
+		if _, _, err := imageBufferSize(i.Width, i.Height, 4); err != nil {
+			return nil, err
+		}
 		out := image.NewNRGBA(image.Rect(0, 0, i.Width, i.Height))
 		for n := 0; n < i.Width*i.Height; n++ {
 			copy(out.Pix[n*4:n*4+3], data[n*3:n*3+3])
@@ -1429,6 +1559,9 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 	}
 	maximum := (uint32(1) << i.BitsPerComponent) - 1
 	if components == 2 || components == 3 {
+		if _, _, err := imageBufferSize(i.Width, i.Height, 8); err != nil {
+			return nil, err
+		}
 		out := image.NewNRGBA64(image.Rect(0, 0, i.Width, i.Height))
 		for y := 0; y < i.Height; y++ {
 			line := data[y*stride : (y+1)*stride]
@@ -1482,4 +1615,54 @@ func imageCMYKSample(pixel color.Color) (cmykSample, bool) {
 		return c, true
 	}
 	return cmykSample{}, false
+}
+
+// imageCMYKAt 直接读取四色及重采样分量，保留原有最近邻和双线性舍入
+// 入参: source 样本图像, x 横向坐标, y 纵向坐标
+// 返回: cmykSample 四色分量, bool 是否为四色样本
+func imageCMYKAt(source image.Image, x, y int) (cmykSample, bool) {
+	switch s := source.(type) {
+	case *image.CMYK:
+		pixel := s.CMYKAt(x, y)
+		return cmykSample{uint16(pixel.C) * 257, uint16(pixel.M) * 257, uint16(pixel.Y) * 257, uint16(pixel.K) * 257}, true
+	case *packedCMYKImage:
+		if !image.Pt(x, y).In(s.rect) {
+			return cmykSample{}, false
+		}
+		return s.sample(x, y), true
+	case *imageResample:
+		b := s.source.Bounds()
+		if b == s.bounds {
+			return imageCMYKAt(s.source, x, y)
+		}
+		sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
+		sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
+		if !s.interpolate {
+			return imageCMYKAt(s.source, b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
+		}
+		x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
+		fx, fy := sx-float64(x0), sy-float64(y0)
+		var values [4]float64
+		for dy := 0; dy < 2; dy++ {
+			for dx := 0; dx < 2; dx++ {
+				pixel, ok := imageCMYKAt(s.source, b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy)))
+				if !ok {
+					return cmykSample{}, false
+				}
+				wx, wy := 1-fx, 1-fy
+				if dx == 1 {
+					wx = fx
+				}
+				if dy == 1 {
+					wy = fy
+				}
+				for c, value := range pixel {
+					values[c] += float64(value) * wx * wy
+				}
+			}
+		}
+		return cmykSample{uint16(math.Round(values[0])), uint16(math.Round(values[1])), uint16(math.Round(values[2])), uint16(math.Round(values[3]))}, true
+	default:
+		return imageCMYKSample(source.At(x, y))
+	}
 }

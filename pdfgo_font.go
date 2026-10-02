@@ -46,6 +46,7 @@ type Font struct {
 	simpleCmap      []byte
 	cmapEncoding    Name
 	symbolic        bool
+	post            *fontPostMapping
 	cffGlyphs       map[uint32]uint16
 	cffNames        map[uint32]string
 	differences     map[uint32]string
@@ -95,7 +96,28 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 	if name, ok := dict["BaseFont"].(Name); ok {
 		font.Name = string(name)
 	}
+	var descriptor Object
+	ignoreEncoding := false
+	if subtype == "TrueType" {
+		descriptor, err = r.Resolve(dict["FontDescriptor"])
+		if err != nil {
+			return nil, err
+		}
+		if descriptor != nil {
+			d, ok := descriptor.(Dictionary)
+			if !ok {
+				return nil, fmt.Errorf("invalid font descriptor")
+			}
+			flags, err := integerDefault(d, "Flags", 0)
+			if err != nil {
+				return nil, err
+			}
+			font.symbolic = flags&4 != 0
+			ignoreEncoding = font.symbolic && (d["FontFile2"] != nil || d["FontFile3"] != nil || d["FontFile"] != nil)
+		}
+	}
 	metrics := dict
+	noEncoding := false
 	if subtype == Name("Type0") {
 		font.composite = true
 		encoding, err := r.Resolve(dict["Encoding"])
@@ -204,10 +226,14 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			}
 		}
 	} else if subtype == Name("TrueType") || (subtype == Name("Type1") || subtype == Name("MMType1")) || subtype == Name("Type3") {
-		encoding, err := r.Resolve(dict["Encoding"])
-		if err != nil {
-			return nil, err
+		var encoding Object
+		if !ignoreEncoding {
+			encoding, err = r.Resolve(dict["Encoding"])
+			if err != nil {
+				return nil, err
+			}
 		}
+		noEncoding = encoding == nil
 		if encoding != nil {
 			switch value := encoding.(type) {
 			case Name:
@@ -324,20 +350,24 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, err
 		}
 	}
-	descriptor, err := r.Resolve(metrics["FontDescriptor"])
-	if err != nil {
-		return nil, err
+	if subtype != "TrueType" {
+		descriptor, err = r.Resolve(metrics["FontDescriptor"])
+		if err != nil {
+			return nil, err
+		}
 	}
 	if descriptor != nil {
 		d, ok := descriptor.(Dictionary)
 		if !ok {
 			return nil, fmt.Errorf("invalid font descriptor")
 		}
-		flags, err := integerDefault(d, "Flags", 0)
-		if err != nil {
-			return nil, err
+		if subtype != "TrueType" {
+			flags, err := integerDefault(d, "Flags", 0)
+			if err != nil {
+				return nil, err
+			}
+			font.symbolic = flags&4 != 0
 		}
-		font.symbolic = flags&4 != 0
 		if subtype != "Type3" && d["FontBBox"] != nil {
 			value, err := r.Resolve(d["FontBBox"])
 			if err != nil {
@@ -413,9 +443,13 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		}
 	}
 	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && cffProgram == nil {
+		font.symbolic = font.symbolic || noEncoding
 		font.simpleCmap, font.cmapEncoding, err = fontCmap(font.Program, font.symbolic)
 		if err != nil {
 			return nil, err
+		}
+		if !font.symbolic {
+			font.post = &fontPostMapping{program: font.Program}
 		}
 	}
 	if cffProgram != nil {
@@ -521,7 +555,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			text, ok = f.cidUnicode[string([]byte{byte(cid >> 8), byte(cid)})]
 		}
 		name := ""
-		if !f.composite {
+		if !f.composite && !(f.simpleCmap != nil && f.symbolic) {
 			name = f.differences[code]
 			if f.cffNames != nil {
 				name = f.cffNames[code]
@@ -562,6 +596,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		}
 		if !ok && f.cffGlyphs != nil {
 			_, ok = f.cffGlyphs[cid]
+		}
+		if !ok && f.simpleCmap != nil {
+			ok = true
 		}
 		if !ok && f.composite && len(f.Program) != 0 && f.cffGlyphs == nil {
 			ok = true
@@ -620,48 +657,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			}
 		}
 		if f.simpleCmap != nil {
-			lookup := code
-			mapped := true
-			if !f.symbolic {
-				if f.cmapEncoding == "MacRomanEncoding" {
-					mapped = false
-					for index, glyphName := range pdfMacRomanNames {
-						if name != "" && glyphName == name {
-							lookup = uint32(index)
-							mapped = true
-							break
-						}
-					}
-				} else {
-					mapped, ok := glyphNameUnicode(name)
-					characters := []rune(mapped)
-					if !ok || len(characters) != 1 {
-						return nil, &UnsupportedError{Feature: "TrueType character without Unicode glyph name"}
-					}
-					lookup = uint32(characters[0])
-				}
-			}
-			var id uint16
-			if mapped {
-				var err error
-				id, err = cmapGlyph(f.simpleCmap, lookup)
-				if err != nil {
-					return nil, err
-				}
-			}
-			if f.cmapEncoding == "Symbol" && id == 0 {
-				for _, base := range []uint32{0xF000, 0xF100, 0xF200} {
-					candidate, err := cmapGlyph(f.simpleCmap, base+code)
-					if err != nil {
-						return nil, err
-					}
-					if candidate != 0 {
-						if id != 0 && id != candidate {
-							return nil, fmt.Errorf("ambiguous symbol cmap")
-						}
-						id = candidate
-					}
-				}
+			id, err := f.simpleGlyph(code, name)
+			if err != nil {
+				return nil, err
 			}
 			glyph.ID = id
 			glyph.HasID = true

@@ -38,10 +38,11 @@ type labSpace struct {
 
 // graphicsColorSpace 保存页面着色使用的校准色或索引色参数
 type graphicsColorSpace struct {
-	lab     *labSpace
-	calRGB  *calRGBSpace
-	gray    bool
-	palette *imagePalette
+	lab          *labSpace
+	calRGB       *calRGBSpace
+	gray         bool
+	palette      *imagePalette
+	displaySpace ColorSpace
 }
 
 // normalizeRenderingIntent 将未识别的渲染意图按PDF规则映射为相对色度
@@ -75,18 +76,28 @@ func (s *graphicsColorSpace) paint(values []float64) (Paint, error) {
 	var c color.NRGBA64
 	paint := Paint{}
 	if s.palette != nil {
+		paint.SourceSpace = "Indexed"
 		index := int(math.Round(math.Max(0, math.Min(float64(len(s.palette.colors)-1), values[0]))))
 		c = s.palette.colors[index]
 		paint.Space, paint.Values = s.palette.space, s.palette.values[index]
+		paint.Process = s.palette.process
+		paint.None = c.A == 0
 	} else if s.lab != nil {
+		paint.SourceSpace = "Lab"
 		c = s.lab.color(values[0], values[1], values[2])
 	} else if s.gray {
+		paint.SourceSpace = "CalGray"
 		v := math.Max(0, math.Min(1, values[0]))
 		c = s.calRGB.color(v, v, v)
 	} else {
+		paint.SourceSpace = "CalRGB"
 		c = s.calRGB.color(math.Max(0, math.Min(1, values[0])), math.Max(0, math.Min(1, values[1])), math.Max(0, math.Min(1, values[2])))
 	}
 	paint.RGB = [3]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
+	if s.palette == nil {
+		paint.Space = &s.displaySpace
+		copy(paint.Values[:], paint.RGB[:])
+	}
 	return paint, nil
 }
 

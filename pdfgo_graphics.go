@@ -49,19 +49,27 @@ type TextClip struct {
 }
 
 // Paint 保存颜色及不透明度，CMYK保留设备四色，Space与Values保留ICC源分量
+// None表示丢弃着色输出，与零透明度不同，不参与挖空合成
+// Process保留原生过程通道，区分未指定通道和已指定的零分量
+// SourceSpace保留普通颜色的来源空间族，图案基色使用底层空间族，不以转换后的Space或CMYK代替
 type Paint struct {
-	RGB    [3]float64
-	CMYK   *[4]float64
-	Space  *ColorSpace
-	Values [4]float64
-	Alpha  float64
-	Axial  *AxialGradient
-	Radial *RadialGradient
-	Mesh   *MeshGradient
-	Tiling *TilingPattern
+	RGB         [3]float64
+	CMYK        *[4]float64
+	Space       *ColorSpace
+	SourceSpace Name
+	Process     *ProcessColorants
+	Values      [4]float64
+	Alpha       float64
+	None        bool
+	Axial       *AxialGradient
+	Radial      *RadialGradient
+	Function    *FunctionGradient
+	Mesh        *MeshGradient
+	Tiling      *TilingPattern
 }
 
 // Style 保存绘制状态及按顺序相交的裁剪路径
+// Transfer在最终设备颜色转换及透明合成后应用，不预先改变Fill和Stroke
 type Style struct {
 	Fill, Stroke    Paint
 	LineWidth       float64
@@ -81,6 +89,8 @@ type Style struct {
 	Smoothness      *float64
 	Antialias       *bool
 	Halftone        *Halftone
+	Transfer        *TransferFunction
+	ColorConversion ColorConversion
 }
 
 // PathMark 表示一次路径绘制，路径及裁剪坐标始终位于页面用户空间
@@ -95,7 +105,10 @@ type PathMark struct {
 // TextMark 保存文字字形及其相对于文字矩阵的基线位置
 // Positions始终使用字形横排原点，竖排位置已扣除竖排原点向量
 // StrokeMatrix保留图形状态坐标变换，描边参数不受文字矩阵和字号影响
+// Mode保留有效绘制模式，Type3除不可见模式3外均按0交付，不产生文字裁剪
+// Object只读共享同一BT与ET边界，不同文字对象使用不同实例
 type TextMark struct {
+	Object                *TextObject
 	Font                  *Font
 	Glyphs                []Glyph
 	Positions             []Point
@@ -108,6 +121,11 @@ type TextMark struct {
 	glyphStreams          []*Stream
 }
 
+// TextObject 保留文字对象身份，Knockout为真时整段挖空，为假时逐字合成
+type TextObject struct {
+	Knockout bool
+}
+
 // ImageMark 保存图像资源及单位方形到页面坐标的变换
 type ImageMark struct {
 	Image  *Image
@@ -118,14 +136,16 @@ type ImageMark struct {
 // GroupMark 保存透明度组的边界不透明度和隔离方式，组内绘制使用独立状态
 // Page区分页面初始组与内容流中的表单组
 type GroupMark struct {
-	Page         bool
-	Alpha        float64
-	AlphaIsShape bool
-	Isolated     bool
-	Knockout     bool
-	BlendMode    Name
-	SoftMask     *SoftMask
-	ColorSpace   *ColorSpace
+	Page            bool
+	Alpha           float64
+	AlphaIsShape    bool
+	Isolated        bool
+	Knockout        bool
+	BlendMode       Name
+	SoftMask        *SoftMask
+	ColorSpace      *ColorSpace
+	ColorConversion ColorConversion
+	RenderingIntent Name
 }
 
 // MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标记的标签
@@ -155,6 +175,7 @@ type graphicsState struct {
 	font                                                  *Font
 	fontSize, spacing, wordSpacing, hscale, leading, rise float64
 	mode                                                  int
+	nonKnockout                                           bool
 	fillSpace, strokeSpace                                Name
 	fillPatternBase, strokePatternBase                    *patternColorSpace
 	fillICC, strokeICC                                    *iccColorSpace
@@ -175,6 +196,7 @@ type pageInterpreter struct {
 	textClips              []*TextClip
 	textMatrix, lineMatrix Matrix
 	inText                 bool
+	textObject             *TextObject
 	path                   Path
 	current, start         Point
 	hasPoint               bool
@@ -184,6 +206,7 @@ type pageInterpreter struct {
 	compatibility          int
 	opaqueGroup            bool
 	patternMatrix          Matrix
+	patternState           *graphicsState
 	bounds                 Rectangle
 	uncoloredPattern       bool
 	type3                  bool
@@ -305,7 +328,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	}
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
 	interpreter.patternMatrix = Identity()
-	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
+	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
 	if knockout && visitor.Group == nil {
 		return &UnsupportedError{Feature: "page knockout visitor missing"}
 	}
@@ -329,6 +352,9 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	font := mark.Font
 	if font == nil || font.Subtype != Name("Type3") || index < 0 || index >= len(mark.Glyphs) || index >= len(mark.Positions) {
 		return fmt.Errorf("invalid Type3 glyph")
+	}
+	if mark.Mode == 3 {
+		return nil
 	}
 	object, err := r.Resolve(font.type3Procs[Name(mark.Glyphs[index].Name)])
 	if err != nil {
@@ -364,6 +390,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	interpreter.glyphStreams = append(append([]*Stream(nil), mark.glyphStreams...), stream)
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
+	interpreter.state.nonKnockout = mark.Object != nil && !mark.Object.Knockout
 	if font.type3Bounds != nil {
 		interpreter.bounds = transformedBounds(*font.type3Bounds, interpreter.state.matrix)
 	}
@@ -387,6 +414,10 @@ func transformedBounds(box Rectangle, matrix Matrix) Rectangle {
 // 入参: data 解码后的内容流
 // 返回: error 错误信息
 func (p *pageInterpreter) run(data []byte) error {
+	if p.patternState == nil && p.resources["Pattern"] != nil {
+		initial := p.state
+		p.patternState = &initial
+	}
 	err := walkOperations(p.ctx, data, p.operation, func(value Object) (Object, error) {
 		if name, ok := value.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
 			var err error
@@ -495,7 +526,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 	a := op.Operands
 	if p.uncoloredPattern {
 		switch op.Operator {
-		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN", "sh":
+		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN", "sh", "ri":
 			return fmt.Errorf("color operator in uncolored pattern")
 		}
 	}
@@ -706,9 +737,12 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.strokeSeparation = nil
 			p.state.strokeDeviceN = nil
 			p.state.style.Stroke.RGB = rgb
+			p.state.style.Stroke.None = false
 			p.state.style.Stroke.CMYK = cmyk
+			p.state.style.Stroke.Process = nil
 			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
 			p.state.style.Stroke.Axial = nil
+			p.state.style.Stroke.Function = nil
 			p.state.style.Stroke.Radial = nil
 			p.state.style.Stroke.Tiling = nil
 			p.state.strokePatternBase = nil
@@ -720,14 +754,18 @@ func (p *pageInterpreter) operation(op Operation) error {
 			} else {
 				p.state.strokeSpace = "DeviceRGB"
 			}
+			p.state.style.Stroke.SourceSpace = p.state.strokeSpace
 		} else {
 			p.state.style.Fill.RGB = rgb
+			p.state.style.Fill.None = false
 			p.state.fillICC = nil
 			p.state.fillSeparation = nil
 			p.state.fillDeviceN = nil
 			p.state.style.Fill.CMYK = cmyk
+			p.state.style.Fill.Process = nil
 			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
 			p.state.style.Fill.Axial = nil
+			p.state.style.Fill.Function = nil
 			p.state.style.Fill.Radial = nil
 			p.state.style.Fill.Tiling = nil
 			p.state.fillPatternBase = nil
@@ -739,6 +777,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			} else {
 				p.state.fillSpace = "DeviceRGB"
 			}
+			p.state.style.Fill.SourceSpace = p.state.fillSpace
 		}
 	case "cs", "CS":
 		if len(a) != 1 {
@@ -778,7 +817,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 				}
 				name = "Pattern"
 			} else if space[0] == Name("Lab") || space[0] == Name("CalRGB") || space[0] == Name("CalGray") || space[0] == Name("Indexed") {
-				calibrated = &graphicsColorSpace{}
+				calibrated = &graphicsColorSpace{displaySpace: ColorSpace{Model: "DeviceRGB", mapped: true}}
 				name = space[0].(Name)
 				switch name {
 				case "Lab":
@@ -825,9 +864,13 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.fillDeviceN = deviceN
 			p.state.fillColor = calibrated
 			p.state.style.Fill.RGB = [3]float64{}
+			p.state.style.Fill.SourceSpace = name
+			p.state.style.Fill.None = separation != nil && separation.name == "None"
 			p.state.style.Fill.CMYK = nil
+			p.state.style.Fill.Process = nil
 			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
 			p.state.style.Fill.Axial = nil
+			p.state.style.Fill.Function = nil
 			p.state.style.Fill.Radial = nil
 			p.state.style.Fill.Tiling = nil
 			p.state.style.Fill.Mesh = nil
@@ -842,9 +885,13 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.strokeDeviceN = deviceN
 			p.state.strokeColor = calibrated
 			p.state.style.Stroke.RGB = [3]float64{}
+			p.state.style.Stroke.SourceSpace = name
+			p.state.style.Stroke.None = separation != nil && separation.name == "None"
 			p.state.style.Stroke.CMYK = nil
+			p.state.style.Stroke.Process = nil
 			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
 			p.state.style.Stroke.Axial = nil
+			p.state.style.Stroke.Function = nil
 			p.state.style.Stroke.Radial = nil
 			p.state.style.Stroke.Tiling = nil
 			p.state.style.Stroke.Mesh = nil
@@ -888,6 +935,19 @@ func (p *pageInterpreter) operation(op Operation) error {
 				values[i] = 1
 			}
 			paint, err := deviceN.paint(values, p.state.style.RenderingIntent)
+			if err != nil {
+				return err
+			}
+			if op.Operator == "cs" {
+				paint.Alpha = p.state.style.Fill.Alpha
+				p.state.style.Fill = paint
+			} else {
+				paint.Alpha = p.state.style.Stroke.Alpha
+				p.state.style.Stroke = paint
+			}
+		}
+		if separation != nil {
+			paint, err := separation.paint(1, p.state.style.RenderingIntent)
 			if err != nil {
 				return err
 			}
@@ -1019,7 +1079,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 				if pattern.PaintType == 2 && patternBase == nil || pattern.PaintType == 1 && patternBase != nil {
 					return fmt.Errorf("pattern paint type does not match color space")
 				}
-				paint.Tiling, paint.Axial, paint.Radial, paint.Mesh = pattern, nil, nil, nil
+				paint.Tiling, paint.Axial, paint.Radial, paint.Mesh, paint.Function = pattern, nil, nil, nil, nil
 				if operator == "g" {
 					p.state.style.Fill = paint
 				} else {
@@ -1063,6 +1123,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("nested text object")
 		}
 		p.inText = true
+		p.textObject = &TextObject{Knockout: !p.state.nonKnockout}
 		p.textClips = nil
 		p.textMatrix = Identity()
 		p.lineMatrix = Identity()
@@ -1071,6 +1132,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return fmt.Errorf("unmatched operator %q", "ET")
 		}
 		p.inText = false
+		p.textObject = nil
 		if len(p.textClips) != 0 {
 			p.state.style.Clips = append(append([]Path(nil), p.state.style.Clips...), Path{Text: p.textClips})
 			p.textClips = nil
@@ -1258,20 +1320,28 @@ func (p *pageInterpreter) showText(data []byte) error {
 	if !p.inText || p.state.font == nil {
 		return fmt.Errorf("text without active font")
 	}
-	paintMode := p.state.mode % 4
-	fill, stroke := p.visiblePaint(paintMode == 0 || paintMode == 2, paintMode == 1 || paintMode == 2)
-	if err := p.validatePaint(fill, stroke); err != nil {
-		return err
-	}
-	switch {
-	case fill && stroke:
-		paintMode = 2
-	case fill:
-		paintMode = 0
-	case stroke:
-		paintMode = 1
-	default:
-		paintMode = 3
+	mode := p.state.mode
+	if p.state.font.Subtype == "Type3" {
+		if mode != 3 {
+			mode = 0
+		}
+	} else {
+		paintMode := mode % 4
+		fill, stroke := p.visiblePaint(paintMode == 0 || paintMode == 2, paintMode == 1 || paintMode == 2)
+		if err := p.validatePaint(fill, stroke); err != nil {
+			return err
+		}
+		switch {
+		case fill && stroke:
+			paintMode = 2
+		case fill:
+			paintMode = 0
+		case stroke:
+			paintMode = 1
+		default:
+			paintMode = 3
+		}
+		mode = mode/4*4 + paintMode
 	}
 	glyphs, err := p.state.font.Decode(data)
 	if err != nil {
@@ -1296,7 +1366,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 		if p.visitor.Text == nil {
 			return fmt.Errorf("text visitor missing")
 		}
-		mark := TextMark{Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: p.state.mode/4*4 + paintMode}
+		mark := TextMark{Object: p.textObject, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
 		mark.glyphStreams = p.glyphStreams
 		if mark.Mode >= 4 {
 			mark.Clip = &TextClip{Font: mark.Font, Glyphs: glyphs, Positions: positions, Matrix: mark.Matrix, Size: mark.Size, HorizontalScale: mark.HorizontalScale}
@@ -1314,6 +1384,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 // 入参: fill 填充标志, stroke 描边标志
 // 返回: bool 是否填充, bool 是否描边
 func (p *pageInterpreter) visiblePaint(fill, stroke bool) (bool, bool) {
+	fill, stroke = fill && !p.state.style.Fill.None, stroke && !p.state.style.Stroke.None
 	if s := p.state.fillPatternBase; p.state.fillSpace == "Pattern" && s != nil && s.invisible {
 		fill = false
 	}
@@ -1391,6 +1462,12 @@ func (p *pageInterpreter) image(stream *Stream) error {
 	if image.Intent == "" {
 		image.Intent = normalizeRenderingIntent(p.state.style.RenderingIntent)
 	}
+	if !image.ImageMask {
+		none, err := p.reader.colorantNone(image.ColorSpace)
+		if err != nil || none {
+			return err
+		}
+	}
 	if p.opaqueGroup && (image.Mask != nil || image.SoftMask != nil || image.ImageMask) {
 		return &UnsupportedError{Feature: "masked image in isolated group"}
 	}
@@ -1413,11 +1490,27 @@ func (p *pageInterpreter) image(stream *Stream) error {
 // 入参: fill 是否填充, stroke 是否描边
 // 返回: error 颜色状态错误
 func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
-	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil && p.state.style.Fill.Mesh == nil && p.state.style.Fill.Tiling == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil && p.state.style.Stroke.Mesh == nil && p.state.style.Stroke.Tiling == nil {
+	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil && p.state.style.Fill.Mesh == nil && p.state.style.Fill.Tiling == nil && p.state.style.Fill.Function == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil && p.state.style.Stroke.Mesh == nil && p.state.style.Stroke.Tiling == nil && p.state.style.Stroke.Function == nil {
 		return fmt.Errorf("missing pattern color")
 	}
-	if p.state.style.RenderingIntent == "AbsoluteColorimetric" && (fill && p.state.fillICC != nil || stroke && p.state.strokeICC != nil) {
-		return &UnsupportedError{Feature: "absolute colorimetric ICC transform"}
+	for _, target := range []struct {
+		used    bool
+		profile *iccColorSpace
+		paint   *Paint
+	}{{fill, p.state.fillICC, &p.state.style.Fill}, {stroke, p.state.strokeICC, &p.state.style.Stroke}} {
+		if !target.used || target.profile == nil {
+			continue
+		}
+		if p.state.style.RenderingIntent == "AbsoluteColorimetric" && target.profile.toFloat[3] == nil {
+			return &UnsupportedError{Feature: "absolute colorimetric ICC transform"}
+		}
+		if target.profile.toFloat != ([4]*iccProcessElements{}) {
+			rgb, err := target.profile.color(target.paint.Values[:target.profile.components()], p.state.style.RenderingIntent)
+			if err != nil {
+				return err
+			}
+			target.paint.RGB = rgb
+		}
 	}
 	return nil
 }
@@ -1447,7 +1540,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		if !ok || group["S"] != Name("Transparency") {
 			return &UnsupportedError{Feature: "form transparency group"}
 		}
-		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, AlphaIsShape: p.state.style.AlphaIsShape, BlendMode: p.state.style.BlendMode, SoftMask: p.state.style.SoftMask}
+		groupMark = &GroupMark{Alpha: p.state.style.Fill.Alpha, AlphaIsShape: p.state.style.AlphaIsShape, BlendMode: p.state.style.BlendMode, SoftMask: p.state.style.SoftMask, ColorConversion: p.state.style.ColorConversion, RenderingIntent: p.state.style.RenderingIntent}
 		for _, flag := range []struct {
 			name   Name
 			target *bool
@@ -1493,6 +1586,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	child.hasPoint = false
 	child.pendingClip = false
 	child.inText = false
+	child.textObject = nil
 	if stream.Dictionary["Matrix"] != nil {
 		value, err := p.reader.Resolve(stream.Dictionary["Matrix"])
 		if err != nil {
@@ -1535,6 +1629,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	clip := Path{Segments: []Segment{{"M", []Point{m.Apply(Point{box.XMin, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMax})}}, {"L", []Point{m.Apply(Point{box.XMin, box.YMax})}}, {"C", nil}}}
 	child.state.style.Clips = append(append([]Path(nil), child.state.style.Clips...), clip)
 	child.patternMatrix = child.state.matrix
+	child.patternState = nil
 	data, err := stream.Decode()
 	if err != nil {
 		return err
@@ -1585,6 +1680,13 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 	if !ok {
 		return fmt.Errorf("invalid external graphics state")
 	}
+	if p.uncoloredPattern || p.uncoloredType3 {
+		for _, key := range []Name{"TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT"} {
+			if dict[key] != nil {
+				return fmt.Errorf("color graphics state in uncolored content")
+			}
+		}
+	}
 	transfer, err := p.reader.Resolve(dict["TR2"])
 	if err != nil {
 		return err
@@ -1616,9 +1718,7 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 			if !ok || p.inText {
 				return fmt.Errorf("invalid text knockout state")
 			}
-			if !flag {
-				return &UnsupportedError{Feature: "non-knockout text"}
-			}
+			p.state.nonKnockout = !bool(flag)
 		case "HT":
 			p.state.style.Halftone, err = p.reader.ReadHalftone(dict[key])
 			if err != nil {
@@ -1645,14 +1745,12 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 			}
 		case "TR", "TR2":
 			if key == "TR2" && value == Name("Default") {
+				p.state.style.Transfer = nil
 				continue
 			}
-			identity, err := p.reader.identityTransfer(value)
+			p.state.style.Transfer, err = p.reader.ReadTransferFunction(value)
 			if err != nil {
 				return err
-			}
-			if !identity {
-				return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
 			}
 		case "Font":
 			array, ok := value.(Array)
@@ -1675,9 +1773,11 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 			}
 			p.state.font, p.state.fontSize = font, size
 		case "RI":
-			if err := p.operation(Operation{Operator: "ri", Operands: []Object{value}}); err != nil {
-				return err
+			intent, ok := value.(Name)
+			if !ok {
+				return fmt.Errorf("invalid rendering intent")
 			}
+			p.state.style.RenderingIntent = normalizeRenderingIntent(intent)
 		case "ca", "CA":
 			n, err := numbers([]Object{value}, 1)
 			if err != nil {
@@ -1755,9 +1855,18 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 			}
 			v := bool(flag)
 			p.state.style.Antialias = &v
-		case "BG2", "UCR2":
-			if value != Name("Default") {
-				return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
+		case "BG", "BG2", "UCR", "UCR2":
+			var function *ColorFunction
+			if (key != "BG2" && key != "UCR2") || value != Name("Default") {
+				function, err = p.reader.ReadColorFunction(value)
+				if err != nil {
+					return err
+				}
+			}
+			if key == "BG" || key == "BG2" {
+				p.state.style.ColorConversion.BlackGeneration = function
+			} else {
+				p.state.style.ColorConversion.UndercolorRemoval = function
 			}
 		default:
 			return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}

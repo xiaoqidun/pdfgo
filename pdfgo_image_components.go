@@ -23,8 +23,10 @@ import (
 // Pix逐行交错保存Space.Components()个颜色分量和一个透明度分量
 // 模板图像保留灰度样本，填充颜色及反向覆盖由调用方应用
 // Colorants和Tints保留专色名称及逐像素浓度，供支持相应色料的输出设备使用
+// Process保留原生过程通道，ValuesAt返回对应过程空间的颜色分量
 type ImageComponents struct {
 	Space     *ColorSpace
+	Process   *ProcessColorants
 	Rect      image.Rectangle
 	Pix       []uint16
 	Colorants []Name
@@ -34,13 +36,9 @@ type ImageComponents struct {
 // Colorants 读取图像或索引基础空间的专色名称，设备色返回空列表
 // 返回: []Name 色料名称, error 颜色空间格式错误
 func (i *Image) Colorants() ([]Name, error) {
-	object := i.ColorSpace
-	if a, ok := object.(Array); ok && len(a) == 4 && a[0] == Name("Indexed") {
-		var err error
-		object, err = i.reader.resolveColorSpace(a[1])
-		if err != nil {
-			return nil, err
-		}
+	object, err := i.colorantSpace()
+	if err != nil {
+		return nil, err
 	}
 	a, ok := object.(Array)
 	if !ok || len(a) == 0 {
@@ -60,30 +58,42 @@ func (i *Image) Colorants() ([]Name, error) {
 	if a[0] != Name("DeviceN") {
 		return nil, nil
 	}
-	if len(a) != 4 && len(a) != 5 {
-		return nil, fmt.Errorf("invalid DeviceN color space")
-	}
-	object, err := i.reader.Resolve(a[1])
+	names, _, err := i.reader.deviceNColorants(a)
+	return names, err
+}
+
+// ProcessColorants 读取图像或索引基础空间的原生过程通道
+// 返回: *ProcessColorants 只读过程映射，非原生映射为nil, error 颜色空间错误
+func (i *Image) ProcessColorants() (*ProcessColorants, error) {
+	object, err := i.colorantSpace()
 	if err != nil {
 		return nil, err
 	}
-	names, ok := object.(Array)
-	if !ok || len(names) == 0 {
-		return nil, fmt.Errorf("invalid DeviceN colorants")
+	a, ok := object.(Array)
+	if !ok || len(a) != 5 || a[0] != Name("DeviceN") {
+		return nil, nil
 	}
-	result := make([]Name, len(names))
-	for n, v := range names {
-		v, err = i.reader.Resolve(v)
+	tint, err := i.reader.readDeviceN(a)
+	if err != nil {
+		return nil, err
+	}
+	return tint.process, nil
+}
+
+// colorantSpace 读取图像的源色料空间，索引图像使用基础空间
+// 返回: Object 色料定义, error 颜色空间引用错误
+func (i *Image) colorantSpace() (Object, error) {
+	object, err := i.reader.resolveColorSpace(i.ColorSpace)
+	if err != nil {
+		return nil, err
+	}
+	if a, ok := object.(Array); ok && len(a) == 4 && a[0] == Name("Indexed") {
+		object, err = i.reader.resolveColorSpace(a[1])
 		if err != nil {
 			return nil, err
 		}
-		name, ok := v.(Name)
-		if !ok {
-			return nil, fmt.Errorf("invalid DeviceN colorant")
-		}
-		result[n] = name
 	}
-	return result, nil
+	return object, nil
 }
 
 // TintsAt 返回原始专色的已映射浓度，区域外或无专色时返回nil

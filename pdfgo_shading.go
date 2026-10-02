@@ -30,12 +30,16 @@ type GradientStop struct {
 
 // AxialGradient 保存页面坐标中的渐变轴及两端延伸方式
 // Stops仅在函数可精确展开为线性分段时提供，否则通过ValuesAt或ColorAt求值
+// Background及Bounds仅用于着色图案，Matrix将Bounds映射到页面
 type AxialGradient struct {
 	Start, End Point
+	Matrix     Matrix
 	Extend     [2]bool
 	Stops      []GradientStop
 	Space      *ColorSpace
 	Intent     Name
+	Background *[4]float64
+	Bounds     *Rectangle
 	function   *gradientFunction
 	domain     [2]float64
 }
@@ -43,6 +47,7 @@ type AxialGradient struct {
 // RadialGradient 保存双圆径向渐变及两端延伸方式，Matrix将渐变坐标映射到页面
 // Matrix为零值时使用单位矩阵
 // Stops仅在函数可精确展开为线性分段时提供，否则通过ValuesAt或ColorAt求值
+// Background及Bounds仅用于着色图案，Bounds使用渐变坐标
 type RadialGradient struct {
 	Matrix                 Matrix
 	Start, End             Point
@@ -51,6 +56,8 @@ type RadialGradient struct {
 	Stops                  []GradientStop
 	Space                  *ColorSpace
 	Intent                 Name
+	Background             *[4]float64
+	Bounds                 *Rectangle
 	function               *gradientFunction
 	domain                 [2]float64
 }
@@ -96,7 +103,7 @@ func gradientValues(stops []GradientStop, function *gradientFunction, domain [2]
 		return gradientValue(stops, position), nil
 	}
 	position = math.Max(0, math.Min(1, position))
-	values, err := function.evaluate(domain[0] + position*(domain[1]-domain[0]))
+	values, err := function.evaluate(functionValue(position, domain[0], domain[1]))
 	if err != nil {
 		return [4]float64{}, err
 	}
@@ -147,7 +154,7 @@ func (r *Reader) numberArray(object Object, count int) ([]float64, error) {
 	return values, nil
 }
 
-// shadingPattern 解析着色图案中的轴向或径向渐变
+// shadingPattern 解析着色图案的渐变、背景和边界
 // 入参: name 图案资源名
 // 返回: Paint 渐变画刷, error 不支持的图案或解析错误
 func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
@@ -160,9 +167,12 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		return Paint{}, err
 	}
 	dict, ok := v.(Dictionary)
-	if !ok || dict["PatternType"] != Integer(2) || dict["ExtGState"] != nil {
-		return Paint{}, &UnsupportedError{Feature: "shading pattern type or graphics state"}
+	if !ok || dict["PatternType"] != Integer(2) {
+		return Paint{}, &UnsupportedError{Feature: "shading pattern type"}
 	}
+	child := *p
+	child.state = p.patternInitialState()
+	p = &child
 	m := p.patternMatrix
 	if dict["Matrix"] != nil {
 		v, err := p.reader.numberArray(dict["Matrix"], 6)
@@ -175,17 +185,125 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if err != nil {
 		return Paint{}, err
 	}
-	if stream, ok := v.(*Stream); ok {
-		if stream.Dictionary["BBox"] != nil {
-			return Paint{}, &UnsupportedError{Feature: "bounded mesh shading pattern"}
-		}
-		return p.meshPaint(stream, m)
-	}
 	shading, ok := v.(Dictionary)
-	if !ok || shading["Background"] != nil || shading["BBox"] != nil {
+	if stream, streamOK := v.(*Stream); streamOK {
+		shading, ok = stream.Dictionary, true
+	}
+	if !ok {
 		return Paint{}, &UnsupportedError{Feature: "shading dictionary"}
 	}
-	return p.shadingPaint(shading, m)
+	space, err := p.shadingColorSpace(shading["ColorSpace"])
+	if err != nil {
+		return Paint{}, err
+	}
+	none, err := p.reader.colorantNone(space)
+	if err != nil {
+		return Paint{}, err
+	}
+	if none {
+		return Paint{None: true}, nil
+	}
+	if dict["ExtGState"] != nil {
+		return Paint{}, &UnsupportedError{Feature: "shading pattern graphics state"}
+	}
+	if stream, ok := v.(*Stream); ok {
+		paint, err := p.meshPaint(stream, m)
+		if err != nil {
+			return Paint{}, err
+		}
+		mesh := paint.Mesh
+		if paint.None {
+			return paint, nil
+		}
+		if stream.Dictionary["Background"] != nil {
+			components := mesh.Space.Components()
+			if mesh.tint != nil {
+				components = mesh.tint.components
+			}
+			values, err := p.reader.numberArray(stream.Dictionary["Background"], components)
+			if err != nil {
+				return Paint{}, err
+			}
+			background, err := mesh.colorValues(values)
+			if err != nil {
+				return Paint{}, err
+			}
+			mesh.Background = &background
+		}
+		if stream.Dictionary["BBox"] != nil {
+			box, err := p.reader.rectangle(stream.Dictionary["BBox"])
+			if err != nil {
+				return Paint{}, err
+			}
+			mesh.Bounds = &box
+		}
+		return paint, nil
+	}
+	paint, err := p.shadingPaint(shading, m)
+	if err != nil {
+		return Paint{}, err
+	}
+	var background *[4]float64
+	if paint.None {
+		return paint, nil
+	}
+	var bounds *Rectangle
+	if shading["Background"] != nil {
+		object, err := p.shadingColorSpace(shading["ColorSpace"])
+		if err != nil {
+			return Paint{}, err
+		}
+		base, err := p.reader.readPatternBase(object)
+		if err != nil {
+			return Paint{}, err
+		}
+		values, err := p.reader.numberArray(shading["Background"], base.components)
+		if err != nil {
+			return Paint{}, err
+		}
+		color, err := base.convert(values, p.state.style.RenderingIntent)
+		if err != nil {
+			return Paint{}, err
+		}
+		source := color.Space
+		var destination *ColorSpace
+		if paint.Axial != nil {
+			destination = paint.Axial.Space
+		} else if paint.Radial != nil {
+			destination = paint.Radial.Space
+		} else {
+			destination = paint.Function.Space
+		}
+		if source == nil {
+			if color.CMYK != nil {
+				source = &ColorSpace{Model: "DeviceCMYK"}
+				color.Values = *color.CMYK
+			} else {
+				source = &ColorSpace{Model: "DeviceRGB"}
+				copy(color.Values[:], color.RGB[:])
+			}
+		}
+		converted, err := destination.Convert(color.Values[:source.Components()], source, p.state.style.RenderingIntent)
+		if err != nil {
+			return Paint{}, err
+		}
+		background = &converted
+	}
+	if shading["BBox"] != nil {
+		box, err := p.reader.rectangle(shading["BBox"])
+		if err != nil {
+			return Paint{}, err
+		}
+		bounds = &box
+	}
+	if paint.Axial != nil {
+		paint.Axial.Background, paint.Axial.Bounds = background, bounds
+	} else if paint.Radial != nil {
+		paint.Radial.Background, paint.Radial.Bounds = background, bounds
+	} else {
+		paint.Function.Background, paint.Function.Bounds = background, bounds
+	}
+	return paint, nil
 }
 
 // shadingFill 按当前裁剪和图形状态直接绘制着色资源，不改变当前路径
@@ -219,6 +337,9 @@ func (p *pageInterpreter) shadingFill(operands []Object) error {
 	}
 	if err != nil {
 		return err
+	}
+	if paint.None {
+		return nil
 	}
 	style := p.state.style
 	paint.Alpha = style.Fill.Alpha
@@ -257,8 +378,22 @@ func shadingRectangle(box Rectangle, matrix Matrix) Path {
 // 入参: shading 着色字典, m 着色坐标到页面的变换
 // 返回: Paint 渐变画刷, error 解析错误
 func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, error) {
+	object, err := p.shadingColorSpace(shading["ColorSpace"])
+	if err != nil {
+		return Paint{}, err
+	}
+	none, err := p.reader.colorantNone(object)
+	if err != nil {
+		return Paint{}, err
+	}
+	if none {
+		return Paint{None: true}, nil
+	}
 	if _, ok := m.Inverse(); !ok {
 		return Paint{}, fmt.Errorf("singular shading transform")
+	}
+	if shading["ShadingType"] == Integer(1) {
+		return p.functionShading(shading, m)
 	}
 	domain := [2]float64{0, 1}
 	if shading["Domain"] != nil {
@@ -283,7 +418,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	}
 	start := Point{coords[0], coords[1]}
 	if count == 6 {
-		if coords[2] < 0 || coords[5] <= 0 {
+		if coords[2] < 0 || coords[5] < 0 {
 			return Paint{}, &UnsupportedError{Feature: "radial shading radius"}
 		}
 	}
@@ -301,7 +436,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		gx, gy := inverse[0]*dx+inverse[1]*dy, inverse[2]*dx+inverse[3]*dy
 		factor := (dx*dx + dy*dy) / (gx*gx + gy*gy)
 		start = m.Apply(start)
-		paint.Axial = &AxialGradient{Start: start, End: Point{start.X + gx*factor, start.Y + gy*factor}}
+		paint.Axial = &AxialGradient{Matrix: m, Start: start, End: Point{start.X + gx*factor, start.Y + gy*factor}}
 	} else {
 		end := Point{coords[3], coords[4]}
 		paint.Radial = &RadialGradient{Matrix: m, Start: start, End: end, StartRadius: coords[2], EndRadius: coords[5]}
@@ -347,6 +482,13 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		paint.Radial.Intent = p.state.style.RenderingIntent
 		paint.Radial.function, paint.Radial.domain = function, domain
 	}
+	if array, ok := object.(Array); ok && len(array) == 5 && array[0] == Name("DeviceN") {
+		tint, err := p.reader.readDeviceN(array)
+		if err != nil {
+			return Paint{}, err
+		}
+		paint.Process = tint.process
+	}
 	return paint, nil
 }
 
@@ -354,62 +496,30 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 // 入参: object 颜色空间, function 渐变函数, domain 输入区间
 // 返回: []GradientStop 分段, *ColorSpace 插值空间, *gradientFunction 原始函数, error 解析错误
 func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	object, err := p.reader.resolveColorSpace(object)
+	object, err := p.shadingColorSpace(object)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-	if name, ok := object.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
-		object, err = p.resource("ColorSpace", name)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		object, err = p.reader.resolveColorSpace(object)
-		if err != nil {
-			return nil, nil, nil, err
-		}
 	}
 	array, ok := object.(Array)
 	if ok && len(array) > 0 && array[0] == Name("DeviceN") {
 		return p.reader.deviceNGradient(array, function, domain)
 	}
 	if ok && len(array) > 0 && array[0] == Name("Separation") {
-		if len(array) != 4 {
-			return nil, nil, nil, fmt.Errorf("invalid Separation color space")
-		}
-		colorant, err := p.reader.Resolve(array[1])
+		separation, err := p.reader.readSeparation(array)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		name, ok := colorant.(Name)
-		if !ok {
-			return nil, nil, nil, fmt.Errorf("invalid Separation colorant")
-		}
-		if name == "None" {
+		if separation.name == "None" {
 			return nil, nil, nil, &UnsupportedError{Feature: "Separation None shading"}
 		}
-		space, lab, err := p.reader.readDeviceNAlternate(array[2])
-		if err != nil {
-			return nil, nil, nil, err
-		}
+		space, lab := separation.space, separation.lab
 		source, err := p.reader.readGradientFunction(function, 1, 0)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		tint, err := p.reader.readGradientFunction(array[3], space.Components(), 0)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		f := composeGradientFunction(source, tint)
+		f := composeGradientFunction(source, separation.transform)
 		if lab != nil {
-			composed := f
-			f = &gradientFunction{calculate: func(x float64) ([4]float64, error) {
-				values, err := composed.evaluate(x)
-				if err != nil {
-					return values, err
-				}
-				c := lab.color(values[0], values[1], values[2])
-				return [4]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}, nil
-			}}
+			f = labGradientFunction(f, lab)
 		}
 		var stops []GradientStop
 		if f.linear != nil {
@@ -417,19 +527,104 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 		}
 		return stops, space, f, nil
 	}
-	space, err := p.reader.readColorSpace(object)
+	space, _, lab, channels, err := p.reader.readShadingSpace(object)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	f, err := p.reader.readGradientFunction(function, space.Components(), 0)
+	f, err := p.reader.readGradientFunction(function, channels, 0)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if lab != nil {
+		f = labGradientFunction(f, lab)
 	}
 	var stops []GradientStop
 	if f.linear != nil {
 		stops = clipGradientValues(f.linear(domain), gradientUnitBounds(space.Components()))
 	}
 	return stops, space, f, nil
+}
+
+// shadingColorSpace 解析着色颜色空间及页面资源引用
+// 入参: object 颜色空间
+// 返回: Object 颜色空间定义, error 解析错误
+func (p *pageInterpreter) shadingColorSpace(object Object) (Object, error) {
+	object, err := p.reader.resolveColorSpace(object)
+	if err != nil {
+		return nil, err
+	}
+	if name, ok := object.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
+		object, err = p.resource("ColorSpace", name)
+		if err != nil {
+			return nil, err
+		}
+		return p.reader.resolveColorSpace(object)
+	}
+	return object, nil
+}
+
+// readShadingSpace 读取着色源颜色空间，专色及Lab保留各自的转换规则
+// 入参: object 已解析的颜色空间定义
+// 返回: *ColorSpace 输出空间, *deviceNSpace 专色变换, *labSpace Lab变换, int 源分量数, error 格式或能力错误
+func (r *Reader) readShadingSpace(object Object) (*ColorSpace, *deviceNSpace, *labSpace, int, error) {
+	if array, ok := object.(Array); ok && len(array) > 0 {
+		switch array[0] {
+		case Name("DeviceN"):
+			tint, err := r.readDeviceN(array)
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
+			return tint.alternate, tint, nil, tint.components, nil
+		case Name("Separation"):
+			separation, err := r.readSeparation(array)
+			if err != nil {
+				return nil, nil, nil, 0, err
+			}
+			if separation.name == "None" {
+				return nil, nil, nil, 0, &UnsupportedError{Feature: "Separation None shading"}
+			}
+			space, lab := separation.space, separation.lab
+			return space, &deviceNSpace{alternate: space, lab: lab, transform: separation.transform, components: 1}, nil, 1, nil
+		case Name("Lab"):
+			lab, err := r.readLab(array)
+			return &ColorSpace{Model: "DeviceRGB", mapped: true}, nil, lab, 3, err
+		}
+	}
+	space, err := r.readColorSpace(object)
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	return space, nil, nil, space.Components(), nil
+}
+
+// shadingColorValues 将源分量转换到备用空间，保留专色和Lab转换顺序
+// 入参: tint 专色变换, lab Lab变换, input 源颜色分量
+// 返回: [4]float64 输出分量, error 颜色错误
+func shadingColorValues(tint *deviceNSpace, lab *labSpace, input []float64) ([4]float64, error) {
+	var values [4]float64
+	if tint != nil {
+		var err error
+		values, err = tint.values(input...)
+		if err != nil {
+			return values, err
+		}
+	} else {
+		if len(input) > len(values) {
+			return values, fmt.Errorf("invalid shading output component count")
+		}
+		copy(values[:], input)
+	}
+	if lab != nil {
+		c := lab.color(values[0], values[1], values[2])
+		values = [4]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
+	}
+	for i, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return values, fmt.Errorf("nonfinite shading color")
+		}
+		values[i] = math.Max(0, math.Min(1, value))
+	}
+	return values, nil
 }
 
 // deviceNGradient 组合多色渐变与着色函数，仅为可精确表示的函数展开分段
@@ -439,6 +634,9 @@ func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64
 	tint, err := r.readDeviceN(space)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if tint.components > 4 {
+		return r.deviceNWideGradient(function, tint, domain)
 	}
 	source, err := r.readGradientFunction(function, tint.components, 0)
 	if err != nil {
@@ -539,7 +737,7 @@ func gradientPosition(start, end, position float64) float64 {
 	if position == 1 {
 		return end
 	}
-	return math.Max(start, math.Min(end, start+position*(end-start)))
+	return math.Max(start, math.Min(end, functionValue(position, start, end)))
 }
 
 // gradientInterval 截取或反向映射线性分段，保留定义域外常量和不连续边界

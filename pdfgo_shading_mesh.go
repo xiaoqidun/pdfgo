@@ -24,25 +24,28 @@ import (
 // Colors依次对应(0,0)、(0,1)、(1,1)、(1,0)，有着色函数时仅首分量为函数输入
 type MeshPatch struct {
 	Points [4][4]Point
-	Colors [4][4]float64
+	Colors [4][]float64
 }
 
 // MeshTriangle 保存Gouraud三角形顶点及对应颜色分量
 type MeshTriangle struct {
 	Points [3]Point
-	Colors [3][4]float64
+	Colors [3][]float64
 }
 
 // MeshGradient 保存曲面或三角网格，各切片保持绘制顺序，Matrix将网格坐标映射到页面
+// Background和Bounds仅用于着色图案，直接着色的边界由裁剪路径表达
 type MeshGradient struct {
-	Patches   []MeshPatch
-	Triangles []MeshTriangle
-	Matrix    Matrix
-	Space     *ColorSpace
-	Intent    Name
-	function  *gradientFunction
-	tint      *deviceNSpace
-	lab       *labSpace
+	Patches    []MeshPatch
+	Triangles  []MeshTriangle
+	Matrix     Matrix
+	Space      *ColorSpace
+	Intent     Name
+	Background *[4]float64
+	Bounds     *Rectangle
+	function   *gradientVector
+	tint       *deviceNSpace
+	lab        *labSpace
 }
 
 // meshBits 按高位优先读取曲面网格的紧凑数值
@@ -78,7 +81,7 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 		return [4]float64{}, fmt.Errorf("invalid mesh evaluation")
 	}
 	weights := [4]float64{(1 - u) * (1 - v), (1 - u) * v, u * v, u * (1 - v)}
-	var colors [4][4]float64
+	var colors [4][]float64
 	if patch < len(g.Patches) {
 		colors = g.Patches[patch].Colors
 	} else {
@@ -88,37 +91,73 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 		weights = [4]float64{math.Max(0, 1-u-v), u, v, 0}
 		copy(colors[:], g.Triangles[patch-len(g.Patches)].Colors[:])
 	}
-	var values [4]float64
-	for i, weight := range weights {
-		for c, value := range colors[i] {
-			values[c] += value * weight
-		}
+	components := len(colors[0])
+	if components == 0 {
+		return [4]float64{}, fmt.Errorf("missing mesh color components")
 	}
 	if g.function != nil {
-		var err error
-		values, err = g.function.evaluate(values[0])
-		if err != nil {
-			return values, err
+		if components != 1 {
+			return [4]float64{}, fmt.Errorf("invalid mesh function input count")
+		}
+		x := 0.0
+		for i, weight := range weights {
+			if weight == 0 {
+				continue
+			}
+			if len(colors[i]) != components {
+				return [4]float64{}, fmt.Errorf("inconsistent mesh color components")
+			}
+			x += colors[i][0] * weight
+		}
+		if g.function.scalar != nil {
+			values, err := g.function.scalar.evaluate(x)
+			if err != nil {
+				return values, err
+			}
+			return g.colorValues(values[:len(g.function.parts)])
+		}
+		return g.functionValues(x)
+	}
+	var buffer [32]float64
+	input := buffer[:min(components, len(buffer))]
+	if components > len(buffer) {
+		input = make([]float64, components)
+	}
+	for i, weight := range weights {
+		if weight == 0 {
+			continue
+		}
+		if len(colors[i]) != components {
+			return [4]float64{}, fmt.Errorf("inconsistent mesh color components")
+		}
+		for c, value := range colors[i] {
+			input[c] += value * weight
 		}
 	}
-	if g.tint != nil {
-		var err error
-		values, err = g.tint.values(values[:g.tint.components]...)
-		if err != nil {
-			return values, err
-		}
+	return g.colorValues(input)
+}
+
+// functionValues 求值高通道网格函数后转换备用空间，不影响常见分量的无分配路径
+// 入参: x 插值后的函数输入
+// 返回: [4]float64 备用空间分量, error 函数或颜色错误
+func (g *MeshGradient) functionValues(x float64) ([4]float64, error) {
+	components := len(g.function.parts)
+	var buffer [32]float64
+	input := buffer[:min(components, len(buffer))]
+	if components > len(buffer) {
+		input = make([]float64, components)
 	}
-	if g.lab != nil {
-		c := g.lab.color(values[0], values[1], values[2])
-		values = [4]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
+	if err := g.function.calculate(x, input); err != nil {
+		return [4]float64{}, err
 	}
-	for c, value := range values {
-		if math.IsNaN(value) || math.IsInf(value, 0) {
-			return values, fmt.Errorf("nonfinite mesh color")
-		}
-		values[c] = math.Max(0, math.Min(1, value))
-	}
-	return values, nil
+	return g.colorValues(input)
+}
+
+// colorValues 将插值后的源分量转换为备用空间，保持专色和Lab变换顺序
+// 入参: input 源空间颜色分量
+// 返回: [4]float64 备用空间分量, error 颜色错误
+func (g *MeshGradient) colorValues(input []float64) ([4]float64, error) {
+	return shadingColorValues(g.tint, g.lab, input)
 }
 
 // meshBernstein 计算三次伯恩斯坦基函数
@@ -153,10 +192,18 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	if !ok || kind < 4 || kind > 7 {
 		return Paint{}, &UnsupportedError{Feature: "mesh shading type"}
 	}
-	if d["Background"] != nil {
-		return Paint{}, &UnsupportedError{Feature: "mesh shading background"}
-	}
 	depths := [3]int{}
+	object, err := p.shadingColorSpace(d["ColorSpace"])
+	if err != nil {
+		return Paint{}, err
+	}
+	none, err := p.reader.colorantNone(object)
+	if err != nil {
+		return Paint{}, err
+	}
+	if none {
+		return Paint{None: true}, nil
+	}
 	for i, key := range []Name{"BitsPerCoordinate", "BitsPerComponent", "BitsPerFlag"} {
 		if kind == 5 && i == 2 {
 			continue
@@ -175,64 +222,14 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		}
 		depths[i] = int(n)
 	}
-	object, err := p.reader.Resolve(d["ColorSpace"])
-	if err != nil {
-		return Paint{}, err
-	}
-	if name, ok := object.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
-		object, err = p.resource("ColorSpace", name)
-		if err != nil {
-			return Paint{}, err
-		}
-		object, err = p.reader.Resolve(object)
-		if err != nil {
-			return Paint{}, err
-		}
-	}
 	g := &MeshGradient{Intent: p.state.style.RenderingIntent, Matrix: matrix}
-	object, err = p.reader.resolveColorSpace(object)
+	var components int
+	g.Space, g.tint, g.lab, components, err = p.reader.readShadingSpace(object)
 	if err != nil {
 		return Paint{}, err
-	}
-	components := 0
-	if array, ok := object.(Array); ok && len(array) > 0 && array[0] == Name("DeviceN") {
-		g.tint, err = p.reader.readDeviceN(array)
-		if err != nil {
-			return Paint{}, err
-		}
-		g.Space, components = g.tint.alternate, g.tint.components
-	} else if array, ok := object.(Array); ok && len(array) > 0 && array[0] == Name("Separation") {
-		separation, err := p.reader.readSeparation(array)
-		if err != nil {
-			return Paint{}, err
-		}
-		if separation.name == "None" {
-			return Paint{}, &UnsupportedError{Feature: "Separation None mesh"}
-		}
-		alternate, lab, err := p.reader.readDeviceNAlternate(array[2])
-		if err != nil {
-			return Paint{}, err
-		}
-		g.tint = &deviceNSpace{alternate: alternate, lab: lab, transform: separation.transform, components: 1}
-		g.Space, components = alternate, 1
-	} else if array, ok := object.(Array); ok && len(array) > 0 && array[0] == Name("Lab") {
-		g.lab, err = p.reader.readLab(array)
-		if err != nil {
-			return Paint{}, err
-		}
-		g.Space, components = &ColorSpace{Model: "DeviceRGB"}, 3
-	} else {
-		g.Space, err = p.reader.readColorSpace(object)
-		if err != nil {
-			return Paint{}, err
-		}
-		components = g.Space.Components()
-	}
-	if components > 4 {
-		return Paint{}, &UnsupportedError{Feature: "mesh color component count"}
 	}
 	if d["Function"] != nil {
-		g.function, err = p.reader.readGradientFunction(d["Function"], components, 0)
+		g.function, err = p.reader.readGradientVector(d["Function"], components, 0)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -251,7 +248,11 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		if err != nil {
 			return Paint{}, err
 		}
-		return Paint{Mesh: g}, nil
+		paint := Paint{Mesh: g}
+		if g.tint != nil {
+			paint.Process = g.tint.process
+		}
+		return paint, nil
 	}
 	bits := meshBits{data: data}
 	pointCount := 12
@@ -259,7 +260,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		pointCount = 16
 	}
 	var previous [16]Point
-	var colors [4][4]float64
+	var colors [4][]float64
 	decode := func(depth, index int) (float64, error) {
 		value, err := bits.read(depth)
 		return ranges[index] + float64(value)/float64(uint64(1)<<uint(depth)-1)*(ranges[index+1]-ranges[index]), err
@@ -296,6 +297,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 			}
 		}
 		for i := startColor; i < 4; i++ {
+			colors[i] = make([]float64, components)
 			for c := 0; c < components; c++ {
 				colors[i][c], err = decode(depths[1], 4+2*c)
 				if err != nil {
@@ -320,7 +322,11 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	if len(g.Patches) == 0 {
 		return Paint{}, fmt.Errorf("empty mesh shading")
 	}
-	return Paint{Mesh: g}, nil
+	paint := Paint{Mesh: g}
+	if g.tint != nil {
+		paint.Process = g.tint.process
+	}
+	return paint, nil
 }
 
 // meshTriangleData 按边标志或格点行顺序解码三角网格，保留绘制顺序
@@ -329,7 +335,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths [3]int, ranges []float64, components int, lattice bool) ([]MeshTriangle, error) {
 	type vertex struct {
 		point Point
-		color [4]float64
+		color []float64
 	}
 	stride := (depths[2] + depths[0]*2 + depths[1]*components + 7) / 8
 	if len(data)%stride != 0 {
@@ -338,7 +344,7 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 	count := len(data) / stride
 	bits := meshBits{data: data}
 	read := func() (vertex, uint32, error) {
-		var v vertex
+		v := vertex{color: make([]float64, components)}
 		flag, err := bits.read(depths[2])
 		if err != nil {
 			return v, 0, err
@@ -367,7 +373,7 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 	}
 	var result []MeshTriangle
 	appendTriangle := func(a, b, c vertex) {
-		result = append(result, MeshTriangle{Points: [3]Point{a.point, b.point, c.point}, Colors: [3][4]float64{a.color, b.color, c.color}})
+		result = append(result, MeshTriangle{Points: [3]Point{a.point, b.point, c.point}, Colors: [3][]float64{a.color, b.color, c.color}})
 	}
 	if lattice {
 		value, err := p.reader.Resolve(dict["VerticesPerRow"])

@@ -27,6 +27,13 @@ type ColorSpace struct {
 	Model   Name
 	profile *iccColorSpace
 	srgb    uint32
+	mapped  bool
+}
+
+// Device 判断分量是否属于原始设备空间，不将校准色的RGB显示结果视为设备源色
+// 返回: bool 是否原始设备空间
+func (s *ColorSpace) Device() bool {
+	return s != nil && s.profile == nil && !s.mapped && s.Components() != 0
 }
 
 // Calibrated 判断混合空间是否含校准参数
@@ -140,6 +147,13 @@ func (s *ColorSpace) RGB(values []float64, intent Name) ([3]float64, error) {
 // 入参: values 源分量, source 源空间, intent 渲染意图
 // 返回: [4]float64 目标分量, error 无效分量或未支持的目标变换
 func (s *ColorSpace) Convert(values []float64, source *ColorSpace, intent Name) ([4]float64, error) {
+	return s.ConvertWith(values, source, intent, ColorConversion{})
+}
+
+// ConvertWith 在设备RGB转设备四色时应用指定函数，不改变灰度、校准色及同空间转换
+// 入参: values 源分量, source 源空间, intent 渲染意图, conversion 设备转换函数
+// 返回: [4]float64 目标分量, error 无效分量或变换错误
+func (s *ColorSpace) ConvertWith(values []float64, source *ColorSpace, intent Name, conversion ColorConversion) ([4]float64, error) {
 	var result [4]float64
 	if err := source.validate(values); err != nil {
 		return result, err
@@ -165,6 +179,9 @@ func (s *ColorSpace) Convert(values []float64, source *ColorSpace, intent Name) 
 	case "DeviceRGB":
 		copy(result[:], rgb[:])
 	case "DeviceCMYK":
+		if source.Model == "DeviceRGB" && source.Device() {
+			return conversion.RGBToCMYK(rgb)
+		}
 		black := 1 - math.Max(rgb[0], math.Max(rgb[1], rgb[2]))
 		for c := range rgb {
 			result[c] = math.Max(0, 1-rgb[c]-black)
@@ -184,19 +201,8 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 		return 0, err
 	}
 	if p := s.profile; p != nil {
-		if p.lut != nil {
-			xyz, err := p.lut.xyz(values, intent)
-			return math.Max(0, math.Min(1, xyz[1])), err
-		}
-		if p.gray != nil {
-			v := p.gray.curve.evaluate(values[0])
-			return math.Max(0, math.Min(1, p.gray.matrix.linearXYZ(v, v, v)[1])), nil
-		}
-		y := p.rgb.matrix.offset[1]
-		for i, curve := range p.rgb.curves {
-			y += p.rgb.matrix.matrix[3*i+1] * curve.evaluate(values[i])
-		}
-		return math.Max(0, math.Min(1, y)), nil
+		xyz, err := s.xyz(values, intent)
+		return math.Max(0, math.Min(1, xyz[1])), err
 	}
 	if s.Model == "DeviceCMYK" {
 		return (.3*(1-values[0]) + .59*(1-values[1]) + .11*(1-values[2])) * (1 - values[3]), nil
@@ -235,7 +241,7 @@ func (r *Reader) readBlendingSpace(value Object) (*ColorSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.profile != nil && s.profile.lut != nil && s.profile.lut.fromPCS[0] == nil {
+	if s.profile != nil && s.profile.lut != nil && s.profile.lut.fromPCS[0] == nil && s.profile.fromFloat == ([4]*iccProcessElements{}) {
 		return nil, fmt.Errorf("missing ICC B2A0 blending transform")
 	}
 	return s, nil

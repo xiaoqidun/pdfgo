@@ -52,13 +52,13 @@ func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
 				paint, err := space.paint(values, intent)
 				paint.Alpha = 1
 				return paint, err
-			}, false}, nil
+			}, space.none}, nil
 		case Name("Lab"):
 			lab, err := r.readLab(array)
 			if err != nil {
 				return nil, err
 			}
-			space := &graphicsColorSpace{lab: lab}
+			space := &graphicsColorSpace{lab: lab, displaySpace: ColorSpace{Model: "DeviceRGB", mapped: true}}
 			return &patternColorSpace{3, func(values []float64, _ Name) (Paint, error) {
 				paint, err := space.paint(values)
 				paint.Alpha = 1
@@ -73,7 +73,7 @@ func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
 			return &patternColorSpace{1, func(values []float64, intent Name) (Paint, error) {
 				index := int(math.Round(math.Max(0, math.Min(float64(len(palette.colors)-1), values[0]))))
 				color := palette.colors[index]
-				paint := Paint{RGB: [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}, Alpha: float64(color.A) / 65535, Space: palette.space, Values: palette.values[index]}
+				paint := Paint{SourceSpace: "Indexed", RGB: [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}, Alpha: float64(color.A) / 65535, None: color.A == 0, Space: palette.space, Values: palette.values[index], Process: palette.process}
 				if palette.space != nil {
 					var err error
 					paint.RGB, err = palette.space.RGB(paint.Values[:palette.space.Components()], intent)
@@ -87,8 +87,12 @@ func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
 	if err != nil {
 		return nil, err
 	}
+	source := space.Model
+	if array, ok := object.(Array); ok && len(array) != 0 {
+		source, _ = array[0].(Name)
+	}
 	return &patternColorSpace{space.Components(), func(values []float64, intent Name) (Paint, error) {
-		paint := Paint{Space: space, Alpha: 1}
+		paint := Paint{SourceSpace: source, Space: space, Alpha: 1}
 		for i, value := range values {
 			paint.Values[i] = math.Max(0, math.Min(1, value))
 		}

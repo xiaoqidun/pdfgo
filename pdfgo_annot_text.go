@@ -20,6 +20,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -134,8 +135,10 @@ func (r *Reader) widgetAppearance(ctx context.Context, page *Page, annotation An
 // 入参: ctx 取消上下文, page 页面, annotation 注解或控件
 // 返回: *Stream 外观流, error 不支持的布局或资源错误
 func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotation Annotation) (*Stream, error) {
+	if annotation.Subtype == "FreeText" {
+		return r.freeTextAppearance(ctx, page, annotation)
+	}
 	dict := annotation.Dictionary
-	free := annotation.Subtype == "FreeText"
 	flags := Integer(0)
 	if value, err := r.Resolve(dict["Ff"]); err != nil {
 		return nil, err
@@ -144,13 +147,6 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 		flags, ok = value.(Integer)
 		if !ok || flags < 0 {
 			return nil, fmt.Errorf("invalid field flags")
-		}
-	}
-	for _, key := range []Name{"RV", "RC", "CL", "BE"} {
-		if value, err := r.Resolve(dict[key]); err != nil {
-			return nil, err
-		} else if value != nil {
-			return nil, &UnsupportedError{Feature: "generated annotation " + string(key)}
 		}
 	}
 	value, err := r.Resolve(dict["MK"])
@@ -181,37 +177,13 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 		return nil, fmt.Errorf("invalid variable text bounds")
 	}
 	frame := Rectangle{0, 0, w, h}
-	if free && dict["RD"] != nil {
-		rd, err := r.numberArray(dict["RD"], 4)
-		if err != nil {
-			return nil, err
-		}
-		for _, n := range rd {
-			if n < 0 {
-				return nil, fmt.Errorf("invalid free text rectangle differences")
-			}
-		}
-		frame = Rectangle{rd[0], rd[3], w - rd[2], h - rd[1]}
-		if frame.XMax <= frame.XMin || frame.YMax <= frame.YMin {
-			return nil, fmt.Errorf("empty free text rectangle")
-		}
-	}
 	fw, fh := frame.XMax-frame.XMin, frame.YMax-frame.YMin
 	borderAnnotation := annotation
 	borderAnnotation.Dictionary = maps.Clone(dict)
 	background := mk["BG"]
-	if free {
-		background = dict["C"]
-		color, err := r.annotationDefaultColor(ctx, dict["DA"])
-		if err != nil {
-			return nil, err
-		}
-		borderAnnotation.Dictionary["C"] = color
-	} else {
-		borderAnnotation.Dictionary["C"] = mk["BC"]
-		if mk["BC"] == nil {
-			borderAnnotation.Dictionary["C"] = Array{}
-		}
+	borderAnnotation.Dictionary["C"] = mk["BC"]
+	if mk["BC"] == nil {
+		borderAnnotation.Dictionary["C"] = Array{}
 	}
 	border, err := r.readAnnotationBorder(borderAnnotation)
 	if err != nil {
@@ -246,6 +218,10 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 			fmt.Fprintf(&content, "%g %g %g %g re S\n", frame.XMin+inset, frame.YMin+inset, fw-2*inset, fh-2*inset)
 		case "U":
 			fmt.Fprintf(&content, "%g %g m %g %g l S\n", frame.XMin, frame.YMin+inset, frame.XMax, frame.YMin+inset)
+		case "B", "I":
+			if err := r.writeAnnotationRelief(&content, border, frame); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, &UnsupportedError{Feature: "generated widget border style " + string(border.style)}
 		}
@@ -264,54 +240,76 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 			return nil, fmt.Errorf("invalid form default resources")
 		}
 	}
-	if free {
-		resources = page.Resources
-	}
+	resources = maps.Clone(resources)
 	stream := &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Real(w), Real(h)}, "Matrix": Array{Real(matrix[0]), Real(matrix[1]), Real(matrix[2]), Real(matrix[3]), Real(matrix[4]), Real(matrix[5])}, "Resources": resources}, reader: r}
-	if free && dict["CA"] != nil {
-		alpha, err := r.number(dict["CA"])
-		if err != nil || alpha < 0 || alpha > 1 {
-			return nil, fmt.Errorf("invalid annotation opacity")
-		}
-		resources = maps.Clone(resources)
-		if resources == nil {
-			resources = Dictionary{}
-		}
-		state, err := r.Resolve(resources["ExtGState"])
-		if err != nil {
-			return nil, err
-		}
-		states, ok := state.(Dictionary)
-		if state != nil && !ok {
-			return nil, fmt.Errorf("invalid appearance graphics states")
-		}
-		states = maps.Clone(states)
-		if states == nil {
-			states = Dictionary{}
-		}
-		name := Name("AnnotationOpacity")
-		for states[name] != nil {
-			name += "_"
-		}
-		states[name] = Dictionary{"ca": Real(alpha), "CA": Real(alpha)}
-		resources["ExtGState"] = states
-		stream.Dictionary["Resources"] = resources
-		prefix := fmt.Sprintf("/%s gs\n", name) + content.String()
-		content.Reset()
-		content.WriteString(prefix)
-	}
-	if !free && dict["FT"] == Name("Btn") && flags&(1<<16) == 0 {
-		if err := r.annotationButton(&content, dict, mk, flags, w, h, stroke); err != nil {
+	if dict["FT"] == Name("Btn") && flags&(1<<16) == 0 {
+		if err := r.writeAnnotationToggleButton(ctx, annotation, mk, flags, frame, border, resources, &content, stroke); err != nil {
 			return nil, err
 		}
 		stream.Data = []byte(content.String())
 		return stream, nil
 	}
-	if err := r.writeAnnotationText(ctx, annotation, mk, flags, frame, border, resources, &content); err != nil {
+	if dict["FT"] == Name("Btn") {
+		err = r.writeAnnotationPushButton(ctx, annotation, mk, frame, border, resources, &content)
+	} else {
+		err = r.writeAnnotationText(ctx, annotation, mk, flags, frame, border, resources, &content)
+	}
+	if err != nil {
 		return nil, err
 	}
 	stream.Data = []byte(content.String())
 	return stream, nil
+}
+
+// annotationCaptionFont 选择可编码标题的横排字体，不修改源资源
+// 入参: ctx 取消上下文, resources 可用资源, text 标题文字
+// 返回: *Font 字体, []annotationLetter 编码, Object 字体资源, error 字体或编码错误
+func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary, text string) (*Font, []annotationLetter, Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	standard := Dictionary{"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica"), "Encoding": Name("WinAnsiEncoding")}
+	font, err := r.ReadFont(standard)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	letters, encodingErr := annotationLetters(ctx, font, text)
+	if encodingErr == nil {
+		return font, letters, standard, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	value, err := r.Resolve(resources["Font"])
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	fonts, ok := value.(Dictionary)
+	if value != nil && !ok {
+		return nil, nil, nil, fmt.Errorf("invalid caption font resources")
+	}
+	names := make([]Name, 0, len(fonts))
+	for name := range fonts {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		font, err := r.ReadFont(fonts[name])
+		if err != nil || font.Vertical {
+			continue
+		}
+		letters, err := annotationLetters(ctx, font, text)
+		if err == nil {
+			return font, letters, fonts[name], nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	return nil, nil, nil, encodingErr
 }
 
 // writeAnnotationText 按字段值和默认外观生成裁剪后的文字内容
@@ -320,12 +318,25 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation, mk Dictionary, flags Integer, frame Rectangle, border *annotationBorder, resources Dictionary, content *strings.Builder) error {
 	dict := annotation.Dictionary
 	free := annotation.Subtype == "FreeText"
+	richField := Name("RC")
+	if !free {
+		richField = "RV"
+	}
+	if free || dict["FT"] == Name("Tx") && flags&(1<<25) != 0 {
+		rich, err := r.Resolve(dict[richField])
+		if err != nil {
+			return err
+		}
+		if rich != nil {
+			return r.writeAnnotationRichText(ctx, annotation, rich, flags, frame, border, resources, content)
+		}
+	}
 	textObject := dict["V"]
 	var choice *ChoiceField
-	if dict["FT"] == Name("Sig") && textObject == nil {
+	if !free && dict["FT"] == Name("Sig") && textObject == nil {
 		return nil
 	}
-	if dict["FT"] == Name("Ch") {
+	if !free && dict["FT"] == Name("Ch") {
 		value, err := r.readChoiceField(dict)
 		if err != nil {
 			return err
@@ -335,9 +346,6 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if free {
 		textObject = dict["Contents"]
 	} else if dict["FT"] == Name("Btn") {
-		if mk["I"] != nil {
-			return &UnsupportedError{Feature: "generated button icon"}
-		}
 		textObject = mk["CA"]
 	} else if dict["FT"] != Name("Tx") && choice == nil {
 		return &UnsupportedError{Feature: "generated field type"}
@@ -369,9 +377,6 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if text == "" && !(choice != nil && !choice.Combo && len(choice.Options) > choice.TopIndex) {
 		return nil
 	}
-	if flags&(1<<25) != 0 {
-		return &UnsupportedError{Feature: "generated rich text field"}
-	}
 	if flags&(1<<13) != 0 {
 		text = strings.Repeat("*", utf8.RuneCountInString(text))
 	}
@@ -380,50 +385,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if !multiline {
 		text = strings.ReplaceAll(text, "\n", " ")
 	}
-	da, err := r.Resolve(dict["DA"])
-	if err != nil {
-		return err
-	}
-	appearance, ok := da.(String)
-	if !ok {
-		return fmt.Errorf("missing variable text default appearance")
-	}
-	p := pageInterpreter{reader: r, resources: resources, ctx: ctx, inText: true, textMatrix: Identity(), lineMatrix: Identity()}
-	p.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{Alpha: 1}, Stroke: Paint{Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
-	var fontName Name
-	var stateContent strings.Builder
-	err = WalkOperations(ctx, appearance, func(op Operation) error {
-		auto := false
-		switch op.Operator {
-		case "Tf":
-			if len(op.Operands) == 2 {
-				fontName, _ = op.Operands[0].(Name)
-				if size, err := numbers(op.Operands[1:], 1); err == nil && size[0] == 0 {
-					auto = true
-					op.Operands = []Object{op.Operands[0], Integer(1)}
-				}
-			}
-		case "Tc", "Tw", "Tz", "TL", "Tr", "Ts", "Tm", "g", "G", "rg", "RG", "k", "K", "w", "J", "j", "M", "d", "ri", "cs", "CS", "sc", "SC", "scn", "SCN":
-		default:
-			return &UnsupportedError{Feature: "default appearance operator " + op.Operator}
-		}
-		if err := p.operation(op); err != nil {
-			return err
-		}
-		if auto {
-			p.state.fontSize = 0
-		}
-		if op.Operator != "Tf" && op.Operator != "Tm" {
-			for _, value := range op.Operands {
-				if err := writeAnnotationOperand(&stateContent, value); err != nil {
-					return err
-				}
-				stateContent.WriteByte(' ')
-			}
-			stateContent.WriteString(op.Operator + "\n")
-		}
-		return nil
-	})
+	p, fontName, stateContent, err := r.annotationTextState(ctx, dict["DA"], resources)
 	if err != nil {
 		return err
 	}
@@ -433,41 +395,31 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if p.state.font.Vertical || p.textMatrix[0] != 1 || p.textMatrix[1] != 0 || p.textMatrix[2] != 0 || p.textMatrix[3] != 1 {
 		return &UnsupportedError{Feature: "generated transformed text"}
 	}
+	w, h := frame.XMax-frame.XMin, frame.YMax-frame.YMin
+	inset := math.Min(math.Max(1, border.width)+1, math.Min(w, h)/2)
+	x, y, width, height := frame.XMin+inset, frame.YMin+inset, w-2*inset, h-2*inset
+	if width <= 0 || height <= 0 {
+		return nil
+	}
 	letters, err := annotationLetters(ctx, p.state.font, text)
 	if err != nil {
 		return err
 	}
 	align := Integer(0)
-	if value, err := r.Resolve(dict["Q"]); err != nil {
+	if !free && dict["FT"] == Name("Btn") {
+		align = 1
+	} else if value, err := r.Resolve(dict["Q"]); err != nil {
 		return err
 	} else if value != nil {
+		var ok bool
 		align, ok = value.(Integer)
 		if !ok || align < 0 || align > 2 {
 			return fmt.Errorf("invalid field justification")
 		}
 	}
-	if dict["FT"] == Name("Btn") {
-		align = 1
-	}
-	w, h := frame.XMax-frame.XMin, frame.YMax-frame.YMin
-	inset := math.Min(math.Max(1, border.width)+1, math.Min(w, h)/2)
-	x, y, width, height := frame.XMin+inset, frame.YMin+inset, w-2*inset, h-2*inset
-	if width <= 0 || height <= 0 {
-		return fmt.Errorf("empty variable text interior")
-	}
-	comb := 0
-	if flags&(1<<24) != 0 && flags&((1<<12)|(1<<13)|(1<<20)) == 0 {
-		value, err := r.Resolve(dict["MaxLen"])
-		if err != nil {
-			return err
-		}
-		if value != nil {
-			n, ok := value.(Integer)
-			if !ok || n <= 0 || int64(int(n)) != int64(n) {
-				return fmt.Errorf("invalid field maximum length")
-			}
-			comb = int(n)
-		}
+	comb, err := r.annotationComb(dict, flags)
+	if err != nil {
+		return err
 	}
 	if comb > 0 && len(letters) > comb {
 		return fmt.Errorf("field value exceeds comb length")
@@ -526,7 +478,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if !free {
 		content.WriteString("/Tx BMC\n")
 	}
-	fmt.Fprintf(content, "BT\n%s\n/%s %g Tf\n", stateContent.String(), escapeAnnotationName(fontName), size)
+	fmt.Fprintf(content, "BT\n%s\n/%s %g Tf\n", stateContent, escapeAnnotationName(fontName), size)
 	lineWidth := width
 	if list {
 		lineWidth = math.Inf(1)
@@ -553,7 +505,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 				if float64(i)*leading >= height {
 					break
 				}
-				content.WriteString("0 g\n" + stateContent.String())
+				content.WriteString("0 g\n" + stateContent)
 				if _, selected := slices.BinarySearch(choice.Selected, choice.TopIndex+i); selected {
 					content.WriteString("1 g\n")
 				}
@@ -574,6 +526,83 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	return nil
 }
 
+// annotationComb 读取文本字段有效的分格数量，忽略不适用的标志
+// 入参: dict 字段, flags 字段标志
+// 返回: int 分格数量, error 最大长度错误
+func (r *Reader) annotationComb(dict Dictionary, flags Integer) (int, error) {
+	if dict["FT"] != Name("Tx") || flags&(1<<24) == 0 || flags&((1<<12)|(1<<13)|(1<<20)) != 0 {
+		return 0, nil
+	}
+	value, err := r.Resolve(dict["MaxLen"])
+	if err != nil || value == nil {
+		return 0, err
+	}
+	n, ok := value.(Integer)
+	if !ok || n <= 0 || int64(int(n)) != int64(n) {
+		return 0, fmt.Errorf("invalid field maximum length")
+	}
+	return int(n), nil
+}
+
+// annotationTextState 解析默认外观的字体和文字状态，保留合法绘图操作
+// 入参: ctx 取消上下文, object 默认外观, resources 外观资源
+// 返回: *pageInterpreter 文字状态, Name 字体名, string 状态操作, error 操作或资源错误
+func (r *Reader) annotationTextState(ctx context.Context, object Object, resources Dictionary) (*pageInterpreter, Name, string, error) {
+	value, err := r.Resolve(object)
+	if err != nil {
+		return nil, "", "", err
+	}
+	appearance, ok := value.(String)
+	if !ok {
+		return nil, "", "", fmt.Errorf("missing variable text default appearance")
+	}
+	p := &pageInterpreter{reader: r, resources: resources, ctx: ctx, inText: true, textMatrix: Identity(), lineMatrix: Identity()}
+	p.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{
+		Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10,
+	}}
+	var fontName Name
+	var stateContent strings.Builder
+	matrices := 0
+	err = WalkOperations(ctx, appearance, func(op Operation) error {
+		auto := false
+		switch op.Operator {
+		case "Tf":
+			if len(op.Operands) == 2 {
+				fontName, _ = op.Operands[0].(Name)
+				if size, err := numbers(op.Operands[1:], 1); err == nil && size[0] == 0 {
+					auto = true
+					op.Operands = []Object{op.Operands[0], Integer(1)}
+				}
+			}
+		case "Tm":
+			matrices++
+			if matrices > 1 {
+				return fmt.Errorf("multiple default appearance text matrices")
+			}
+		case "Tc", "Tw", "Tz", "TL", "Tr", "Ts", "g", "G", "rg", "RG", "k", "K", "w", "J", "j", "M", "d", "ri", "cs", "CS", "sc", "SC", "scn", "SCN":
+		default:
+			return &UnsupportedError{Feature: "default appearance operator " + op.Operator}
+		}
+		if err := p.operation(op); err != nil {
+			return err
+		}
+		if auto {
+			p.state.fontSize = 0
+		}
+		if op.Operator != "Tf" && op.Operator != "Tm" {
+			for _, operand := range op.Operands {
+				if err := writeAnnotationOperand(&stateContent, operand); err != nil {
+					return err
+				}
+				stateContent.WriteByte(' ')
+			}
+			stateContent.WriteString(op.Operator + "\n")
+		}
+		return nil
+	})
+	return p, fontName, stateContent.String(), err
+}
+
 // annotationLetters 将Unicode文本映射回原字体字符码，不替换缺失字形
 // 入参: ctx 取消上下文, font 字体, text 文本
 // 返回: []annotationLetter 编码与度量, error 缺字或字体错误
@@ -585,6 +614,29 @@ func annotationLetters(ctx context.Context, font *Font, text string) ([]annotati
 		}
 		wanted[c] = true
 	}
+	lookup, err := annotationLetterLookup(ctx, font, wanted)
+	if err != nil {
+		return nil, err
+	}
+	letters := make([]annotationLetter, 0, utf8.RuneCountInString(text))
+	for _, c := range text {
+		if c == '\n' {
+			letters = append(letters, annotationLetter{text: c})
+			continue
+		}
+		letter, ok := lookup[c]
+		if !ok {
+			return nil, &UnsupportedError{Feature: fmt.Sprintf("field font has no encoding for U+%04X", c)}
+		}
+		letters = append(letters, letter)
+	}
+	return letters, nil
+}
+
+// annotationLetterLookup 收集所需Unicode字符对应的原字体编码和度量
+// 入参: ctx 取消上下文, font 字体, wanted 所需字符
+// 返回: map[rune]annotationLetter 字符编码, error 取消错误
+func annotationLetterLookup(ctx context.Context, font *Font, wanted map[rune]bool) (map[rune]annotationLetter, error) {
 	codes := make([]string, 0, len(wanted)+256)
 	for code, value := range font.Unicode {
 		if err := ctx.Err(); err != nil {
@@ -612,23 +664,14 @@ func annotationLetters(ctx context.Context, font *Font, text string) ([]annotati
 		}
 		glyph := glyphs[0]
 		letter, _ := utf8.DecodeRuneInString(glyph.Text)
-		if _, ok := lookup[letter]; !ok {
+		if wanted['\u00a0'] && !font.composite && font.encoding == "WinAnsiEncoding" && code == "\xa0" && glyph.Name == "space" && glyph.Text == " " && font.Unicode[code] == "" {
+			lookup['\u00a0'] = annotationLetter{'\u00a0', code, glyph.Width, glyph.WordSpace}
+		}
+		if _, ok := lookup[letter]; !ok && wanted[letter] {
 			lookup[letter] = annotationLetter{letter, code, glyph.Width, glyph.WordSpace}
 		}
 	}
-	letters := make([]annotationLetter, 0, utf8.RuneCountInString(text))
-	for _, c := range text {
-		if c == '\n' {
-			letters = append(letters, annotationLetter{text: c})
-			continue
-		}
-		letter, ok := lookup[c]
-		if !ok {
-			return nil, &UnsupportedError{Feature: fmt.Sprintf("field font has no encoding for U+%04X", c)}
-		}
-		letters = append(letters, letter)
-	}
-	return letters, nil
+	return lookup, nil
 }
 
 // annotationDefaultColor 读取自由文本默认外观的边框颜色
@@ -745,7 +788,7 @@ func writeAnnotationOperand(content *strings.Builder, value Object) error {
 	case Integer:
 		fmt.Fprintf(content, "%d", value)
 	case Real:
-		fmt.Fprintf(content, "%g", value)
+		content.WriteString(strconv.FormatFloat(float64(value), 'f', -1, 64))
 	case Array:
 		content.WriteByte('[')
 		for _, item := range value {
@@ -759,62 +802,4 @@ func writeAnnotationOperand(content *strings.Builder, value Object) error {
 		return fmt.Errorf("invalid default appearance operand")
 	}
 	return nil
-}
-
-// annotationButton 绘制复选框或单选框默认标记，显式AS优先于字段值
-// 入参: content 外观内容, field 字段, mk 外观属性, flags 标志, w 宽度, h 高度, bordered 是否已有边框
-// 返回: error 状态或未支持的标记错误
-func (r *Reader) annotationButton(content *strings.Builder, field, mk Dictionary, flags Integer, w, h float64, bordered bool) error {
-	if mk["CA"] != nil {
-		return &UnsupportedError{Feature: "generated button caption"}
-	}
-	value, err := r.Resolve(field["AS"])
-	if err != nil {
-		return err
-	}
-	if value == nil {
-		if flags&(1<<15) != 0 && field["Parent"] != nil {
-			return &UnsupportedError{Feature: "radio widget without appearance state"}
-		}
-		value, err = r.Resolve(field["V"])
-		if err != nil {
-			return err
-		}
-	}
-	state, ok := value.(Name)
-	if value != nil && !ok {
-		return fmt.Errorf("invalid button appearance state")
-	}
-	on := state != "" && state != "Off"
-	defaultBorder := mk["BC"] == nil && field["BS"] == nil && field["Border"] == nil
-	if flags&(1<<15) != 0 {
-		radius := math.Max(0, math.Min(w, h)/2-1)
-		if bordered || defaultBorder {
-			if defaultBorder {
-				content.WriteString("0 G 1 w\n")
-			}
-			writeAnnotationCircle(content, w/2, h/2, radius)
-			content.WriteString("S\n")
-		}
-		if on {
-			content.WriteString("0 g\n")
-			writeAnnotationCircle(content, w/2, h/2, radius*.5)
-			content.WriteString("f\n")
-		}
-	} else {
-		if defaultBorder {
-			fmt.Fprintf(content, "0 G 1 w .5 .5 %g %g re S\n", math.Max(0, w-1), math.Max(0, h-1))
-		}
-		if on {
-			fmt.Fprintf(content, "0 G %g w 1 J 1 j %g %g m %g %g l %g %g l S\n", math.Max(1, math.Min(w, h)*.08), w*.2, h*.5, w*.43, h*.25, w*.8, h*.78)
-		}
-	}
-	return nil
-}
-
-// writeAnnotationCircle 写入圆形闭合路径，不改变绘图样式
-// 入参: content 内容, x 横坐标, y 纵坐标, radius 半径
-func writeAnnotationCircle(content *strings.Builder, x, y, radius float64) {
-	k := radius * 4 * (math.Sqrt2 - 1) / 3
-	fmt.Fprintf(content, "%g %g m %g %g %g %g %g %g c %g %g %g %g %g %g c %g %g %g %g %g %g c %g %g %g %g %g %g c h\n", x+radius, y, x+radius, y+k, x+k, y+radius, x, y+radius, x-k, y+radius, x-radius, y+k, x-radius, y, x-radius, y-k, x-k, y-radius, x, y-radius, x+k, y-radius, x+radius, y-k, x+radius, y)
 }

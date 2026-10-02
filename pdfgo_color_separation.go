@@ -36,7 +36,7 @@ type separationSpace struct {
 type tintFunction struct {
 	domain, values, decode, outputRange []float64
 	samples                             []byte
-	size, bits, channels                int
+	size, bits, channels, order         int
 	exponent                            float64
 	encoded                             [2]float64
 	sampled                             bool
@@ -56,6 +56,21 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	name, ok := colorant.(Name)
 	if !ok {
 		return nil, fmt.Errorf("invalid Separation colorant")
+	}
+	if name == "All" || name == "None" {
+		if err := r.ignoredTintSpace(space); err != nil {
+			return nil, err
+		}
+		model := Name("DeviceRGB")
+		var transform *gradientFunction
+		if name == "All" {
+			model = "DeviceCMYK"
+			transform, err = r.readGradientFunction(Dictionary{"FunctionType": Integer(2), "Domain": Array{Integer(0), Integer(1)}, "C0": Array{Integer(0), Integer(0), Integer(0), Integer(0)}, "C1": Array{Integer(1), Integer(1), Integer(1), Integer(1)}, "N": Integer(1)}, 4, 0)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &separationSpace{name: name, alternate: model, space: &ColorSpace{Model: model}, transform: transform}, nil
 	}
 	object, err := r.resolveColorSpace(space[2])
 	if err != nil {
@@ -114,11 +129,6 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	if name == "All" {
-		source = &ColorSpace{Model: "DeviceCMYK"}
-	} else if name == "None" {
-		source = &ColorSpace{Model: "DeviceRGB"}
-	}
 	return &separationSpace{name: name, alternate: alternate, space: source, lab: lab, icc: icc, calRGB: calibrated, gray: gray, transform: transform}, nil
 }
 
@@ -141,7 +151,7 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 		return nil, fmt.Errorf("invalid tint function")
 	}
 	domain, err := r.numberArray(dict["Domain"], 2)
-	if err != nil || domain[0] >= domain[1] {
+	if err != nil || domain[0] > domain[1] {
 		return nil, fmt.Errorf("invalid tint function domain")
 	}
 	f := &tintFunction{domain: domain, channels: channels}
@@ -154,53 +164,14 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 		if stream == nil {
 			return nil, fmt.Errorf("missing sampled tint data")
 		}
-		size, err := r.numberArray(dict["Size"], 1)
-		if err != nil || size[0] < 1 || size[0] > float64(int(^uint(0)>>1)) || math.Trunc(size[0]) != size[0] {
-			return nil, fmt.Errorf("invalid sampled tint size")
-		}
-		bits, err := r.number(dict["BitsPerSample"])
-		if err != nil || bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 12 && bits != 16 && bits != 24 && bits != 32 {
-			return nil, fmt.Errorf("invalid sampled tint depth")
-		}
-		order, err := r.Resolve(dict["Order"])
+		sampled, err := r.readSampledFunction(stream, 1, channels)
 		if err != nil {
 			return nil, err
 		}
-		if order != nil && order != Integer(1) {
-			return nil, &UnsupportedError{Feature: "cubic sampled tint function"}
-		}
-		f.decode, err = r.numberArray(dict["Decode"], 2*channels)
-		if dict["Decode"] == nil {
-			f.decode, err = r.numberArray(dict["Range"], 2*channels)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("invalid sampled tint decode: %w", err)
-		}
-		f.values, err = r.numberArray(dict["Range"], 2*channels)
-		if err != nil {
-			return nil, fmt.Errorf("invalid sampled tint range: %w", err)
-		}
-		for n := 0; n < channels; n++ {
-			if f.values[2*n] > f.values[2*n+1] {
-				return nil, fmt.Errorf("invalid sampled tint range")
-			}
-		}
-		f.encoded = [2]float64{0, size[0] - 1}
-		if dict["Encode"] != nil {
-			encode, err := r.numberArray(dict["Encode"], 2)
-			if err != nil {
-				return nil, err
-			}
-			copy(f.encoded[:], encode)
-		}
-		f.samples, err = stream.Decode()
-		if err != nil {
-			return nil, err
-		}
-		f.size, f.bits, f.sampled = int(size[0]), int(bits), true
-		if uint64(f.size) > uint64(len(f.samples))*8/uint64(channels*f.bits) {
-			return nil, fmt.Errorf("truncated sampled tint data")
-		}
+		f.domain, f.decode, f.values = sampled.domain, sampled.decode, sampled.bounds
+		f.encoded = [2]float64{sampled.encode[0], sampled.encode[1]}
+		f.size, f.bits, f.samples = sampled.sizes[0], sampled.table.bits, sampled.table.samples
+		f.order, f.sampled = sampled.order, true
 	case Integer(2):
 		f.exponent, err = r.number(dict["N"])
 		if err != nil || math.IsNaN(f.exponent) || math.IsInf(f.exponent, 0) {
@@ -271,8 +242,22 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 		}
 		return
 	}
-	position := f.encoded[0] + (tint-f.domain[0])/(f.domain[1]-f.domain[0])*(f.encoded[1]-f.encoded[0])
+	position := functionValue(functionPosition(tint, f.domain[0], f.domain[1]), f.encoded[0], f.encoded[1])
 	position = math.Max(0, math.Min(float64(f.size-1), position))
+	if f.order == 3 && f.size >= 4 {
+		indices, weights := sampledSplineSpan(position, f.size)
+		for n := range out {
+			var value float64
+			for i, weight := range weights {
+				if weight != 0 {
+					value += weight * f.sample(indices[i]*f.channels+n)
+				}
+			}
+			value = functionValue(value/(math.Exp2(float64(f.bits))-1), f.decode[2*n], f.decode[2*n+1])
+			out[n] = math.Max(f.values[2*n], math.Min(f.values[2*n+1], value))
+		}
+		return
+	}
 	low := int(math.Floor(position))
 	high := min(low+1, f.size-1)
 	weight := position - float64(low)
@@ -280,7 +265,7 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 		a := f.sample(low*f.channels + n)
 		b := f.sample(high*f.channels + n)
 		v := a + weight*(b-a)
-		v = f.decode[2*n] + v/(math.Exp2(float64(f.bits))-1)*(f.decode[2*n+1]-f.decode[2*n])
+		v = functionValue(v/(math.Exp2(float64(f.bits))-1), f.decode[2*n], f.decode[2*n+1])
 		out[n] = math.Max(f.values[2*n], math.Min(f.values[2*n+1], v))
 	}
 }
@@ -321,12 +306,12 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 		return Paint{}, err
 	}
 	if s.name == "None" {
-		return Paint{RGB: [3]float64{1, 1, 1}, Alpha: 0}, nil
+		return Paint{SourceSpace: "Separation", None: true}, nil
 	}
 	if s.name == "All" {
-		return Paint{CMYK: &values}, nil
+		return Paint{SourceSpace: "Separation", CMYK: &values}, nil
 	}
-	paint := Paint{}
+	paint := Paint{SourceSpace: "Separation", Space: s.space, Values: values}
 	switch s.alternate {
 	case "DeviceGray":
 		paint.RGB = [3]float64{values[0], values[0], values[0]}
@@ -337,7 +322,11 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 	case "Lab":
 		copy(paint.RGB[:], values[:])
 	case "ICCBased":
-		return s.icc.paint(values[:s.icc.components()], intent)
+		paint, err = s.icc.paint(values[:s.icc.components()], intent)
+		if err != nil {
+			return Paint{}, err
+		}
+		paint.SourceSpace = "Separation"
 	case "CalRGB", "CalGray":
 		if s.gray {
 			values[1], values[2] = values[0], values[0]

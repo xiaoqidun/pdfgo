@@ -22,9 +22,11 @@ import (
 // deviceNSpace 保存专色分量、备用空间及着色函数
 type deviceNSpace struct {
 	alternate     *ColorSpace
+	process       *ProcessColorants
 	lab           *labSpace
 	transform     *gradientFunction
 	components    int
+	none          bool
 	input, output []float64
 	expressions   []affineValue
 	program       []calculatorInstruction
@@ -35,6 +37,10 @@ type deviceNSpace struct {
 // 入参: tints 各分量专色浓度, intent 渲染意图
 // 返回: Paint 颜色, error 颜色转换错误
 func (s *deviceNSpace) paint(tints []float64, intent Name) (Paint, error) {
+	if s.none {
+		_, err := s.values(tints...)
+		return Paint{SourceSpace: "DeviceN", None: true}, err
+	}
 	values, err := s.values(tints...)
 	if err != nil {
 		return Paint{}, err
@@ -43,7 +49,7 @@ func (s *deviceNSpace) paint(tints []float64, intent Name) (Paint, error) {
 	if err != nil {
 		return Paint{}, err
 	}
-	paint := Paint{RGB: rgb, Space: s.alternate, Values: values}
+	paint := Paint{SourceSpace: "DeviceN", RGB: rgb, Space: s.alternate, Values: values, Process: s.process}
 	if s.alternate.Model == "DeviceCMYK" && !s.alternate.Calibrated() {
 		paint.CMYK = &values
 	}
@@ -63,12 +69,19 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 			return values, fmt.Errorf("invalid DeviceN tint")
 		}
 	}
+	if s.none {
+		return values, nil
+	}
 	if s.sampled != nil {
-		var input [4]float64
+		var buffer [32]float64
+		input := buffer[:min(s.components, len(buffer))]
+		if s.components > len(buffer) {
+			input = make([]float64, s.components)
+		}
 		for i, tint := range tints {
 			input[i] = math.Max(0, math.Min(1, tint))
 		}
-		s.sampled.evaluate(input[:s.components], values[:s.alternate.Components()])
+		s.sampled.evaluate(input, values[:s.alternate.Components()])
 	} else if s.transform != nil {
 		var err error
 		values, err = s.transform.evaluate(math.Max(0, math.Min(1, tints[0])))
@@ -76,11 +89,15 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 			return values, err
 		}
 	} else if s.program != nil {
-		var input [4]float64
+		var buffer [32]float64
+		input := buffer[:min(s.components, len(buffer))]
+		if s.components > len(buffer) {
+			input = make([]float64, s.components)
+		}
 		for i, value := range tints {
 			input[i] = math.Max(s.input[2*i], math.Min(s.input[2*i+1], math.Max(0, math.Min(1, value))))
 		}
-		if err := evaluateCalculator(s.program, input[:s.components], values[:s.alternate.Components()]); err != nil {
+		if err := evaluateCalculator(s.program, input, values[:s.alternate.Components()]); err != nil {
 			return values, err
 		}
 		values = clipGradientValue(values, s.output)
@@ -108,30 +125,18 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 // 入参: space 颜色空间数组
 // 返回: *deviceNSpace 着色定义, error 解析或未支持的分量错误
 func (r *Reader) readSingleDeviceN(space Array) (*deviceNSpace, error) {
-	if len(space) != 4 && len(space) != 5 {
-		return nil, fmt.Errorf("invalid DeviceN color space")
-	}
-	object, err := r.Resolve(space[1])
+	names, none, err := r.deviceNColorants(space)
 	if err != nil {
 		return nil, err
-	}
-	names, ok := object.(Array)
-	if !ok || len(names) == 0 {
-		return nil, fmt.Errorf("invalid DeviceN colorants")
 	}
 	if len(names) != 1 {
 		return nil, &UnsupportedError{Feature: "DeviceN component count"}
 	}
-	colorant, err := r.Resolve(names[0])
-	if err != nil {
-		return nil, err
-	}
-	name, ok := colorant.(Name)
-	if !ok || name == "All" {
-		return nil, fmt.Errorf("invalid DeviceN colorant")
-	}
-	if name == "None" {
-		return nil, &UnsupportedError{Feature: "DeviceN None colorant"}
+	if none {
+		if err := r.ignoredTintSpace(space); err != nil {
+			return nil, err
+		}
+		return &deviceNSpace{alternate: &ColorSpace{Model: "DeviceRGB"}, components: 1, none: true}, nil
 	}
 	alternate, lab, err := r.readDeviceNAlternate(space[2])
 	if err != nil {
@@ -155,67 +160,40 @@ func (r *Reader) readDeviceN(space Array) (*deviceNSpace, error) {
 	if err != nil {
 		return nil, err
 	}
+	var result *deviceNSpace
 	if names, ok := object.(Array); ok && len(names) == 1 {
-		return r.readSingleDeviceN(space)
+		result, err = r.readSingleDeviceN(space)
+	} else {
+		result, err = r.readMultiDeviceN(space)
 	}
-	return r.readMultiDeviceN(space)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.applyNChannelProcess(space, result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // readMultiDeviceN 读取多分量专色的备用空间、区间和着色函数
 // 入参: space 多色定义
 // 返回: *deviceNSpace 专色变换, error 解析错误
 func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
-	if len(space) != 4 && len(space) != 5 {
-		return nil, fmt.Errorf("invalid DeviceN color space")
-	}
-	value, err := r.Resolve(space[1])
+	names, none, err := r.deviceNColorants(space)
 	if err != nil {
 		return nil, err
 	}
-	names, ok := value.(Array)
-	if !ok || len(names) == 0 {
-		return nil, fmt.Errorf("invalid DeviceN colorants")
-	}
-	if len(names) > 4 {
-		return nil, &UnsupportedError{Feature: "DeviceN component count"}
-	}
-	seen := map[Name]bool{}
-	for _, value := range names {
-		value, err = r.Resolve(value)
-		if err != nil {
+	if none {
+		if err := r.ignoredTintSpace(space); err != nil {
 			return nil, err
 		}
-		name, ok := value.(Name)
-		if !ok || seen[name] && name != "None" || name == "All" {
-			return nil, fmt.Errorf("invalid DeviceN colorant")
-		}
-		seen[name] = true
-	}
-	if seen["None"] {
-		if len(seen) == 1 {
-			return nil, &UnsupportedError{Feature: "DeviceN all None colorants"}
-		}
-		if len(space) == 5 {
-			attrs, err := r.Resolve(space[4])
-			if err != nil {
-				return nil, err
-			}
-			if dict, ok := attrs.(Dictionary); ok {
-				subtype, err := r.Resolve(dict["Subtype"])
-				if err != nil {
-					return nil, err
-				}
-				if subtype == Name("NChannel") {
-					return nil, fmt.Errorf("invalid NChannel None colorant")
-				}
-			}
-		}
+		return &deviceNSpace{alternate: &ColorSpace{Model: "DeviceRGB"}, components: len(names), none: true}, nil
 	}
 	alternate, lab, err := r.readDeviceNAlternate(space[2])
 	if err != nil {
 		return nil, err
 	}
-	value, err = r.Resolve(space[3])
+	value, err := r.Resolve(space[3])
 	if err != nil {
 		return nil, err
 	}
@@ -245,9 +223,9 @@ func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	for index, bounds := range [][]float64{input, output} {
+	for _, bounds := range [][]float64{input, output} {
 		for i := 0; i < len(bounds); i += 2 {
-			if bounds[i] > bounds[i+1] || index == 0 && bounds[i] == bounds[i+1] {
+			if bounds[i] > bounds[i+1] {
 				return nil, fmt.Errorf("invalid DeviceN tint bounds")
 			}
 		}
@@ -264,14 +242,14 @@ func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
 	s.expressions, err = affineCalculator(data, len(names), alternate.Components())
 	if err != nil {
 		s.program = program
-	} else {
-		var inputs, outputs [4]float64
-		for i := range names {
-			inputs[i] = input[2*i]
-		}
-		if err := evaluateCalculator(program, inputs[:len(names)], outputs[:alternate.Components()]); err != nil {
-			return nil, err
-		}
+	}
+	inputs := make([]float64, len(names))
+	var outputs [4]float64
+	for i := range names {
+		inputs[i] = input[2*i]
+	}
+	if err := evaluateCalculator(program, inputs, outputs[:alternate.Components()]); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -286,7 +264,7 @@ func (r *Reader) readDeviceNAlternate(object Object) (*ColorSpace, *labSpace, er
 	}
 	if array, ok := object.(Array); ok && len(array) == 2 && array[0] == Name("Lab") {
 		lab, err := r.readLab(array)
-		return &ColorSpace{Model: "DeviceRGB"}, lab, err
+		return &ColorSpace{Model: "DeviceRGB", mapped: true}, lab, err
 	}
 	space, err := r.readColorSpace(object)
 	return space, nil, err

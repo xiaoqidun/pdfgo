@@ -24,9 +24,10 @@ type sampledFunction struct {
 	domain, encode, decode, bounds []float64
 	sizes, strides                 []int
 	table                          tintFunction
+	order                          int
 }
 
-// readSampledFunction 读取线性插值采样函数并验证数据范围
+// readSampledFunction 读取线性或三次插值采样函数并验证数据范围
 // 入参: stream 函数数据流, inputs 输入数量, outputs 输出数量
 // 返回: *sampledFunction 函数, error 格式或能力错误
 func (r *Reader) readSampledFunction(stream *Stream, inputs, outputs int) (*sampledFunction, error) {
@@ -41,9 +42,9 @@ func (r *Reader) readSampledFunction(stream *Stream, inputs, outputs int) (*samp
 	if err != nil {
 		return nil, err
 	}
-	for index, ranges := range [][]float64{f.domain, f.bounds} {
+	for _, ranges := range [][]float64{f.domain, f.bounds} {
 		for i := 0; i < len(ranges); i += 2 {
-			if ranges[i] > ranges[i+1] || index == 0 && ranges[i] == ranges[i+1] {
+			if ranges[i] > ranges[i+1] {
 				return nil, fmt.Errorf("invalid sampled function bounds")
 			}
 		}
@@ -60,8 +61,11 @@ func (r *Reader) readSampledFunction(stream *Stream, inputs, outputs int) (*samp
 	if err != nil {
 		return nil, err
 	}
-	if order != nil && order != Integer(1) {
-		return nil, &UnsupportedError{Feature: "cubic sampled function"}
+	if order != nil && order != Integer(1) && order != Integer(3) {
+		return nil, fmt.Errorf("invalid sampled function order")
+	}
+	if order == Integer(3) {
+		f.order = 3
 	}
 	data, err := stream.Decode()
 	if err != nil {
@@ -95,41 +99,112 @@ func (r *Reader) readSampledFunction(stream *Stream, inputs, outputs int) (*samp
 	return f, nil
 }
 
-// evaluate 按第一维最快变化的采样顺序进行多线性插值
+// evaluate 按第一维最快变化的采样顺序进行插值
 // 入参: inputs 输入分量, outputs 输出缓冲区
 func (f *sampledFunction) evaluate(inputs, outputs []float64) {
-	var lower, upper [4]int
-	var weights [4]float64
+	if f.order == 3 {
+		f.evaluateCubic(inputs, outputs)
+		return
+	}
+	var lowerBuffer, upperBuffer [32]int
+	var weightBuffer [32]float64
+	lower, upper, weights := lowerBuffer[:min(len(inputs), 32)], upperBuffer[:min(len(inputs), 32)], weightBuffer[:min(len(inputs), 32)]
+	if len(inputs) > 32 {
+		lower, upper, weights = make([]int, len(inputs)), make([]int, len(inputs)), make([]float64, len(inputs))
+	}
 	for i, value := range inputs {
 		value = math.Max(f.domain[2*i], math.Min(f.domain[2*i+1], value))
-		value = f.encode[2*i] + (value-f.domain[2*i])/(f.domain[2*i+1]-f.domain[2*i])*(f.encode[2*i+1]-f.encode[2*i])
+		value = functionValue(functionPosition(value, f.domain[2*i], f.domain[2*i+1]), f.encode[2*i], f.encode[2*i+1])
 		value = math.Max(0, math.Min(float64(f.sizes[i]-1), value))
 		lower[i] = int(value)
 		upper[i] = min(lower[i]+1, f.sizes[i]-1)
 		weights[i] = value - float64(lower[i])
 	}
 	clear(outputs)
-	for corner := 0; corner < 1<<len(inputs); corner++ {
-		index, weight := 0, 1.0
-		for i := range inputs {
-			if corner&(1<<i) == 0 {
-				index += lower[i] * f.strides[i]
-				weight *= 1 - weights[i]
-			} else {
-				index += upper[i] * f.strides[i]
-				weight *= weights[i]
+	var accumulate func(int, int, float64)
+	accumulate = func(dimension, index int, weight float64) {
+		if dimension == len(inputs) {
+			for c := range outputs {
+				outputs[c] += weight * f.table.sample(index+c)
 			}
+			return
 		}
-		if weight == 0 {
-			continue
+		if weights[dimension] != 1 {
+			accumulate(dimension+1, index+lower[dimension]*f.strides[dimension], weight*(1-weights[dimension]))
 		}
-		for c := range outputs {
-			outputs[c] += weight * f.table.sample(index+c)
+		if weights[dimension] != 0 {
+			accumulate(dimension+1, index+upper[dimension]*f.strides[dimension], weight*weights[dimension])
 		}
 	}
+	accumulate(0, 0, 1)
 	maxSample := math.Exp2(float64(f.table.bits)) - 1
 	for c, value := range outputs {
-		value = f.decode[2*c] + value/maxSample*(f.decode[2*c+1]-f.decode[2*c])
+		value = functionValue(value/maxSample, f.decode[2*c], f.decode[2*c+1])
 		outputs[c] = math.Max(f.bounds[2*c], math.Min(f.bounds[2*c+1], value))
 	}
+}
+
+// evaluateCubic 使用张量积三次样条，少于四个样本的维度使用线性插值
+// 入参: inputs 输入分量, outputs 输出缓冲区
+func (f *sampledFunction) evaluateCubic(inputs, outputs []float64) {
+	var indexBuffer [32][4]int
+	var weightBuffer [32][4]float64
+	indices, weights := indexBuffer[:min(len(inputs), 32)], weightBuffer[:min(len(inputs), 32)]
+	if len(inputs) > 32 {
+		indices, weights = make([][4]int, len(inputs)), make([][4]float64, len(inputs))
+	}
+	for i, value := range inputs {
+		value = math.Max(f.domain[2*i], math.Min(f.domain[2*i+1], value))
+		value = functionValue(functionPosition(value, f.domain[2*i], f.domain[2*i+1]), f.encode[2*i], f.encode[2*i+1])
+		indices[i], weights[i] = sampledSplineSpan(value, f.sizes[i])
+	}
+	clear(outputs)
+	var accumulate func(int, int, float64)
+	accumulate = func(dimension, index int, weight float64) {
+		if dimension == len(inputs) {
+			for c := range outputs {
+				outputs[c] += weight * f.table.sample(index+c)
+			}
+			return
+		}
+		for i, factor := range weights[dimension] {
+			if factor != 0 {
+				accumulate(dimension+1, index+indices[dimension][i]*f.strides[dimension], weight*factor)
+			}
+		}
+	}
+	accumulate(0, 0, 1)
+	maxSample := math.Exp2(float64(f.table.bits)) - 1
+	for c, value := range outputs {
+		value = functionValue(value/maxSample, f.decode[2*c], f.decode[2*c+1])
+		outputs[c] = math.Max(f.bounds[2*c], math.Min(f.bounds[2*c+1], value))
+	}
+}
+
+// sampledSplineSpan 计算Catmull-Rom样条权重，边界使用线性外推的虚拟样本
+// 入参: position 采样位置, size 样本数量
+// 返回: [4]int 样本索引, [4]float64 插值权重
+func sampledSplineSpan(position float64, size int) ([4]int, [4]float64) {
+	position = math.Max(0, math.Min(float64(size-1), position))
+	lower := int(position)
+	t := position - float64(lower)
+	if size < 4 {
+		return [4]int{lower, min(lower+1, size-1)}, [4]float64{1 - t, t}
+	}
+	t2, t3 := t*t, t*t*t
+	indices := [4]int{lower - 1, lower, lower + 1, lower + 2}
+	weights := [4]float64{-.5*t + t2 - .5*t3, 1 - 2.5*t2 + 1.5*t3, .5*t + 2*t2 - 1.5*t3, -.5*t2 + .5*t3}
+	if lower == 0 {
+		indices[0] = 0
+		weights[1] += 2 * weights[0]
+		weights[2] -= weights[0]
+		weights[0] = 0
+	}
+	if lower >= size-2 {
+		indices[2], indices[3] = min(indices[2], size-1), size-1
+		weights[2] += 2 * weights[3]
+		weights[1] -= weights[3]
+		weights[3] = 0
+	}
+	return indices, weights
 }

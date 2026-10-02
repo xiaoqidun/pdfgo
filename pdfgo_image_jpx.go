@@ -114,6 +114,9 @@ func (s *jpxSampleImage) At(x, y int) color.Color {
 	if !image.Pt(x, y).In(s.bounds) {
 		return jpxSample{}
 	}
+	if len(s.channels) > 4 {
+		return jpxDeviceNSample{source: s, x: x, y: y}
+	}
 	pixel := jpxSample{alpha: 65535, cmyk: s.cmyk}
 	for c, index := range s.channels {
 		pixel.values[c] = s.sample(index, x, y)
@@ -538,7 +541,8 @@ func jpxChannels(data []byte, planes, colors int, masked bool) ([]int, int, erro
 	for c := range channels {
 		channels[c] = c
 	}
-	alpha, defined, coverage := -1, false, 0
+	alpha, defined := -1, false
+	coverage := make([]bool, colors)
 	if len(data) >= 2 && data[0] == 0xff && data[1] == 0x4f {
 		if planes == colors+1 {
 			alpha = colors
@@ -576,9 +580,11 @@ func jpxChannels(data []byte, planes, colors int, masked bool) ([]int, int, erro
 						}
 						alpha = channel
 						if association == 0 {
-							coverage = 1<<colors - 1
+							for c := range coverage {
+								coverage[c] = true
+							}
 						} else if association <= colors {
-							coverage |= 1 << (association - 1)
+							coverage[association-1] = true
 						} else {
 							return fmt.Errorf("invalid JPEG2000 opacity association")
 						}
@@ -596,7 +602,9 @@ func jpxChannels(data []byte, planes, colors int, masked bool) ([]int, int, erro
 	}
 	if !defined && planes == colors+1 {
 		alpha = colors
-		coverage = 1<<colors - 1
+		for c := range coverage {
+			coverage[c] = true
+		}
 	}
 	for _, c := range channels {
 		if c < 0 || c >= planes || masked && c == alpha {
@@ -606,8 +614,12 @@ func jpxChannels(data []byte, planes, colors int, masked bool) ([]int, int, erro
 	if masked && alpha < 0 {
 		return nil, -1, fmt.Errorf("missing JPEG2000 opacity channel")
 	}
-	if masked && coverage != 1<<colors-1 {
-		return nil, -1, fmt.Errorf("JPEG2000 soft mask must cover all color channels")
+	if masked {
+		for _, covered := range coverage {
+			if !covered {
+				return nil, -1, fmt.Errorf("JPEG2000 soft mask must cover all color channels")
+			}
+		}
 	}
 	if !masked {
 		alpha = -1

@@ -53,11 +53,6 @@ func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error)
 	default:
 		return nil, &UnsupportedError{Feature: "ICC lookup table color model"}
 	}
-	for _, tag := range []string{"D2B0", "D2B1", "D2B2", "D2B3"} {
-		if tags[tag] != nil {
-			return nil, &UnsupportedError{Feature: "ICC multi-process transform"}
-		}
-	}
 	for i := range s.toPCS {
 		for _, direction := range []struct {
 			name       string

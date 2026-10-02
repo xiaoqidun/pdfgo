@@ -99,12 +99,12 @@ func (r *Reader) iconAppearance(annotation Annotation) (*Stream, error) {
 	}
 	if annotation.Subtype == "Caret" {
 		if !visible {
-			return r.annotationAppearance(annotation, "")
+			return r.annotationAppearance(annotation, "", nil)
 		}
 		if _, err := r.writeAnnotationColor(&content, border.color, true); err != nil {
 			return nil, err
 		}
 	}
 	content.WriteString(path)
-	return r.annotationAppearance(annotation, content.String())
+	return r.annotationAppearance(annotation, content.String(), nil)
 }

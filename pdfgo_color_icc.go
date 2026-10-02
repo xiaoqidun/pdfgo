@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image/color"
 	"math"
@@ -44,9 +45,11 @@ type iccToneCurve struct {
 
 // iccColorSpace 统一灰度、RGB与CMYK配置文件的绘制颜色变换
 type iccColorSpace struct {
-	rgb  *iccRGBSpace
-	gray *iccGraySpace
-	lut  *iccLUTSpace
+	rgb                *iccRGBSpace
+	gray               *iccGraySpace
+	lut                *iccLUTSpace
+	toFloat, fromFloat [4]*iccProcessElements
+	processPCS         string
 }
 
 // readICCColorSpace 读取内容流使用的ICC颜色空间
@@ -94,6 +97,29 @@ func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
 	if err != nil {
 		return nil, err
 	}
+	space.processPCS = string(data[20:24])
+	for n := range space.toFloat {
+		for _, direction := range []struct {
+			name       string
+			input, out int
+			target     **iccProcessElements
+		}{{fmt.Sprintf("D2B%d", n), int(count), 3, &space.toFloat[n]}, {fmt.Sprintf("B2D%d", n), 3, int(count), &space.fromFloat[n]}} {
+			if tag := tags[direction.name]; tag != nil {
+				transform, err := parseICCProcessElements(tag)
+				var unsupported *UnsupportedError
+				if errors.As(err, &unsupported) {
+					continue
+				}
+				if err != nil {
+					return nil, fmt.Errorf("ICC %s: %w", direction.name, err)
+				}
+				if transform.input != direction.input || transform.output != direction.out {
+					return nil, fmt.Errorf("invalid ICC %s channels", direction.name)
+				}
+				*direction.target = transform
+			}
+		}
+	}
 	if r.colorProfiles == nil {
 		r.colorProfiles = make(map[[32]byte]*iccColorSpace)
 	}
@@ -118,7 +144,7 @@ func (s *iccColorSpace) components() int {
 // 返回: Paint 原始与显示颜色, error 颜色变换错误
 func (s *iccColorSpace) paint(values []float64, intent Name) (Paint, error) {
 	model := map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[s.components()]
-	paint := Paint{Space: &ColorSpace{Model: model, profile: s}}
+	paint := Paint{SourceSpace: "ICCBased", Space: &ColorSpace{Model: model, profile: s}}
 	for i, value := range values {
 		paint.Values[i] = math.Max(0, math.Min(1, value))
 	}
@@ -131,6 +157,9 @@ func (s *iccColorSpace) paint(values []float64, intent Name) (Paint, error) {
 // 入参: values 编码分量, intent 渲染意图
 // 返回: [3]float64 sRGB分量, error 不支持的变换
 func (s *iccColorSpace) color(values []float64, intent Name) ([3]float64, error) {
+	if xyz, used, err := s.processXYZ(values, intent); used || err != nil {
+		return iccXYZRGB(xyz), err
+	}
 	if s.lut != nil {
 		xyz, err := s.lut.xyz(values, intent)
 		if err != nil {
@@ -290,7 +319,7 @@ func iccTags(data []byte, model string) (map[string][]byte, error) {
 	if string(data[20:24]) != "XYZ " {
 		return nil, &UnsupportedError{Feature: "ICC profile connection space"}
 	}
-	for _, name := range []string{"A2B0", "A2B1", "A2B2", "D2B0", "D2B1", "D2B2", "D2B3"} {
+	for _, name := range []string{"A2B0", "A2B1", "A2B2"} {
 		if tags[name] != nil {
 			return nil, &UnsupportedError{Feature: "ICC lookup table transform"}
 		}

@@ -32,6 +32,7 @@ type TilingPattern struct {
 	data         []byte
 	depth        int
 	glyphStreams []*Stream
+	initial      graphicsState
 }
 
 // Walk 独立解释图案单元内容，保留图案边界与无色图案的基色
@@ -41,15 +42,39 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	if p.depth > 64 {
 		return &UnsupportedError{Feature: "nested pattern depth"}
 	}
-	base.Tiling, base.Axial, base.Radial = nil, nil, nil
-	base.Alpha = 1
 	box := p.BBox
 	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
-	style := Style{Fill: base, Stroke: base, LineWidth: 1, MiterLimit: 10, Clips: []Path{clip}}
 	child := pageInterpreter{reader: p.reader, resources: p.resources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
 	child.glyphStreams = p.glyphStreams
-	child.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: style}
+	child.state = p.initial
+	child.state.matrix = Identity()
+	child.state.style.Clips = []Path{clip}
+	if p.PaintType == 2 {
+		base.Tiling, base.Axial, base.Radial, base.Mesh, base.Function = nil, nil, nil, nil, nil
+		base.Alpha = 1
+		child.state.style.Fill, child.state.style.Stroke = base, base
+		child.state.fillSpace, child.state.strokeSpace = "DeviceRGB", "DeviceRGB"
+		child.state.fillICC, child.state.strokeICC = nil, nil
+		child.state.fillSeparation, child.state.strokeSeparation = nil, nil
+		child.state.fillDeviceN, child.state.strokeDeviceN = nil, nil
+		child.state.fillColor, child.state.strokeColor = nil, nil
+		child.state.fillPatternBase, child.state.strokePatternBase = nil, nil
+	}
 	return child.run(p.data)
+}
+
+// patternInitialState 继承父内容流初始状态，透明参数使用组默认值
+// 返回: graphicsState 图案初始状态
+func (p *pageInterpreter) patternInitialState() graphicsState {
+	state := graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
+	if p.patternState != nil {
+		state = *p.patternState
+	}
+	state.style.Fill.Alpha, state.style.Stroke.Alpha = 1, 1
+	state.style.BlendMode = "Normal"
+	state.style.SoftMask = nil
+	state.style.AlphaIsShape = false
+	return state
 }
 
 // tilingPattern 读取平铺图案，着色图案交由shadingPattern处理
@@ -124,7 +149,7 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams}, nil
+	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState()}, nil
 }
 
 // patternBaseColor 按底层颜色空间解释无色图案的颜色分量

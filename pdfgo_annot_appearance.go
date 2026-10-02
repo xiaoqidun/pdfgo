@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -58,6 +59,11 @@ func (r *Reader) readAnnotationBorder(annotation Annotation) (*annotationBorder,
 			if !ok {
 				return nil, fmt.Errorf("invalid annotation border style name")
 			}
+		}
+		switch style {
+		case "S", "D", "B", "I", "U":
+		default:
+			style = "S"
 		}
 		if style == "D" {
 			dash = Array{Integer(3)}
@@ -120,6 +126,20 @@ func (r *Reader) readAnnotationBorder(annotation Annotation) (*annotationBorder,
 	return &annotationBorder{width: width, rx: rx, ry: ry, style: style, dash: dash, color: color}, nil
 }
 
+// writeAnnotationOperation 以PDF十进制数字编码外观操作，避免科学计数法
+// 入参: content 外观内容, operator 操作符, values 数值
+func writeAnnotationOperation(content *strings.Builder, operator string, values ...float64) {
+	var buffer [256]byte
+	data := buffer[:0]
+	for _, value := range values {
+		data = strconv.AppendFloat(data, value, 'f', -1, 64)
+		data = append(data, ' ')
+	}
+	data = append(data, operator...)
+	data = append(data, '\n')
+	content.Write(data)
+}
+
 // writeAnnotationStroke 写入共享笔画参数，不生成路径
 // 入参: content 外观内容, border 笔画样式
 // 返回: bool 是否绘制笔画, error 样式错误
@@ -130,16 +150,30 @@ func (r *Reader) writeAnnotationStroke(content *strings.Builder, border *annotat
 	if _, err := r.writeAnnotationColor(content, border.color, true); err != nil {
 		return false, err
 	}
-	fmt.Fprintf(content, "%g w [", border.width)
-	for _, component := range border.dash {
+	content.WriteString(strconv.FormatFloat(border.width, 'f', -1, 64))
+	content.WriteString(" w ")
+	if err := r.writeAnnotationDash(content, border.dash, 0); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// writeAnnotationDash 写入虚线数组及沿路径推进的相位
+// 入参: content 外观内容, dash 虚线数组, phase 起始相位
+// 返回: error 虚线分量错误
+func (r *Reader) writeAnnotationDash(content *strings.Builder, dash Array, phase float64) error {
+	content.WriteByte('[')
+	for _, component := range dash {
 		n, err := r.number(component)
 		if err != nil || n < 0 || math.IsNaN(n) || math.IsInf(n, 0) {
-			return false, fmt.Errorf("invalid annotation dash component")
+			return fmt.Errorf("invalid annotation dash component")
 		}
-		fmt.Fprintf(content, "%g ", n)
+		content.WriteString(strconv.FormatFloat(n, 'f', -1, 64))
+		content.WriteByte(' ')
 	}
-	content.WriteString("] 0 d\n")
-	return true, nil
+	content.WriteString("] ")
+	writeAnnotationOperation(content, "d", phase)
+	return nil
 }
 
 // writeAnnotationColor 写入设备颜色，空数组表示透明
@@ -149,21 +183,29 @@ func (r *Reader) writeAnnotationColor(content *strings.Builder, values Array, st
 	if len(values) == 0 {
 		return false, nil
 	}
-	op := map[int]string{1: "g", 3: "rg", 4: "k"}[len(values)]
-	if op == "" {
+	var op string
+	switch len(values) {
+	case 1:
+		op = "g"
+	case 3:
+		op = "rg"
+	case 4:
+		op = "k"
+	default:
 		return false, fmt.Errorf("invalid annotation color components")
 	}
 	if stroke {
 		op = strings.ToUpper(op)
 	}
-	for _, component := range values {
+	var numbers [4]float64
+	for i, component := range values {
 		n, err := r.number(component)
 		if err != nil || n < 0 || n > 1 || math.IsNaN(n) {
 			return false, fmt.Errorf("invalid annotation color component")
 		}
-		fmt.Fprintf(content, "%g ", n)
+		numbers[i] = n
 	}
-	fmt.Fprintf(content, "%s\n", op)
+	writeAnnotationOperation(content, op, numbers[:len(values)]...)
 	return true, nil
 }
 
@@ -190,7 +232,9 @@ func (r *Reader) linkAppearance(annotation Annotation) (*Stream, error) {
 		x1, y1 := w-x0, h-y0
 		switch style {
 		case "B", "I":
-			return nil, &UnsupportedError{Feature: "beveled or inset link border"}
+			if err := r.writeAnnotationRelief(&content, border, Rectangle{0, 0, w, h}); err != nil {
+				return nil, err
+			}
 		case "U":
 			fmt.Fprintf(&content, "%g %g m %g %g l S\n", x0, y0, x1, y0)
 		default:
@@ -302,14 +346,12 @@ func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
 		for j := range points {
 			points[j] = Point{values[i+j*2], values[i+j*2+1]}
 		}
+		points, err = annotationQuadrilateral(points)
+		if err != nil {
+			return nil, err
+		}
 		a, b, c, d := points[0], points[1], points[2], points[3]
 		cross := func(a, b, c Point) float64 { return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X) }
-		if cross(a, b, c) < 0 && cross(b, c, d) > 0 {
-			a, b, c, d = c, d, b, a
-		}
-		if cross(a, b, c) <= 0 || cross(b, c, d) <= 0 || cross(c, d, a) <= 0 || cross(d, a, b) <= 0 {
-			return nil, fmt.Errorf("invalid text markup quadrilateral")
-		}
 		dx, dy := b.X-a.X, b.Y-a.Y
 		length := math.Hypot(dx, dy)
 		height := (cross(a, b, c) + cross(a, b, d)) / (2 * length)
@@ -342,61 +384,7 @@ func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
 		}
 		fmt.Fprintf(&content, "%g %g l S\n", b.X, b.Y)
 	}
-	return r.annotationAppearance(annotation, content.String())
-}
-
-// lineAppearance 按原始端点和笔画属性生成直线注解外观
-// 入参: annotation 直线注解
-// 返回: *Stream 外观流, error 属性错误或未支持的附加效果
-func (r *Reader) lineAppearance(annotation Annotation) (*Stream, error) {
-	points, err := r.numberArray(annotation.Dictionary["L"], 4)
-	if err != nil {
-		return nil, err
-	}
-	border, err := r.readAnnotationBorder(annotation)
-	if err != nil {
-		return nil, err
-	}
-	if border.style == "B" || border.style == "I" || border.style == "U" {
-		return nil, &UnsupportedError{Feature: "line border style " + string(border.style)}
-	}
-	for _, key := range []Name{"LL", "LLE", "LLO"} {
-		if annotation.Dictionary[key] == nil {
-			continue
-		}
-		n, err := r.number(annotation.Dictionary[key])
-		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || (key != "LL" && n < 0) {
-			return nil, fmt.Errorf("invalid annotation leader length")
-		}
-		if n != 0 {
-			return nil, &UnsupportedError{Feature: "annotation leader line"}
-		}
-	}
-	value, err := r.Resolve(annotation.Dictionary["Cap"])
-	if err != nil {
-		return nil, err
-	}
-	if value != nil {
-		caption, ok := value.(Boolean)
-		if !ok {
-			return nil, fmt.Errorf("invalid annotation caption flag")
-		}
-		if caption {
-			return nil, &UnsupportedError{Feature: "annotation line caption"}
-		}
-	}
-	var content strings.Builder
-	stroke, err := r.writeAnnotationStroke(&content, border)
-	if err != nil {
-		return nil, err
-	}
-	if stroke {
-		fmt.Fprintf(&content, "%g %g m %g %g l S\n", points[0], points[1], points[2], points[3])
-	}
-	if err := r.writeAnnotationEndings(&content, annotation, border, points, stroke); err != nil {
-		return nil, err
-	}
-	return r.annotationAppearance(annotation, content.String())
+	return r.annotationAppearance(annotation, content.String(), nil)
 }
 
 // shapeAppearance 按图形边界或顶点、笔画和内部颜色生成外观
@@ -407,25 +395,15 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	if border.style == "B" || border.style == "I" || border.style == "U" {
-		return nil, &UnsupportedError{Feature: "shape border style " + string(border.style)}
-	}
-	value, err := r.Resolve(annotation.Dictionary["BE"])
-	if err != nil {
-		return nil, err
-	}
-	if value != nil {
-		effect, ok := value.(Dictionary)
-		if !ok {
-			return nil, fmt.Errorf("invalid annotation border effect")
-		}
-		style, err := r.Resolve(effect["S"])
+	cloud := 0.0
+	if annotation.Subtype != "PolyLine" {
+		cloud, err = r.annotationBorderEffect(annotation.Dictionary["BE"])
 		if err != nil {
 			return nil, err
 		}
-		if style != nil && style != Name("S") {
-			return nil, &UnsupportedError{Feature: "annotation border effect"}
-		}
+	}
+	if cloud == 0 && (border.style == "B" || border.style == "I" || border.style == "U") {
+		return nil, &UnsupportedError{Feature: "shape border style " + string(border.style)}
 	}
 	box := annotation.Rect
 	inner := box
@@ -443,7 +421,7 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	value, err = r.Resolve(annotation.Dictionary["IC"])
+	value, err := r.Resolve(annotation.Dictionary["IC"])
 	if err != nil {
 		return nil, err
 	}
@@ -487,14 +465,24 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 		if annotation.Dictionary["Path"] != nil {
 			return nil, &UnsupportedError{Feature: "annotation curved path"}
 		}
-		fmt.Fprintf(&content, "%g %g m\n", vertices[0], vertices[1])
-		for j := 2; j < len(vertices); j += 2 {
-			fmt.Fprintf(&content, "%g %g l\n", vertices[j], vertices[j+1])
-		}
-		if annotation.Subtype == "Polygon" {
-			content.WriteString("h\n")
+		if cloud > 0 {
+			if err := writeAnnotationCloud(&content, vertices, 3*cloud); err != nil {
+				return nil, err
+			}
 		} else {
-			fill = false
+			fmt.Fprintf(&content, "%g %g m\n", vertices[0], vertices[1])
+			for j := 2; j < len(vertices); j += 2 {
+				fmt.Fprintf(&content, "%g %g l\n", vertices[j], vertices[j+1])
+			}
+			if annotation.Subtype == "Polygon" {
+				content.WriteString("h\n")
+			} else {
+				fill = false
+			}
+		}
+	} else if cloud > 0 {
+		if err := writeAnnotationCloudFrame(&content, inner, cloud, annotation.Subtype == "Circle"); err != nil {
+			return nil, err
 		}
 	} else if annotation.Subtype == "Square" {
 		fmt.Fprintf(&content, "%g %g %g %g re\n", x0, y0, x1-x0, y1-y0)
@@ -522,7 +510,44 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 			return nil, err
 		}
 	}
-	return r.annotationAppearance(annotation, content.String())
+	return r.annotationAppearance(annotation, content.String(), nil)
+}
+
+// annotationBorderEffect 读取云线强度，普通效果忽略强度字段
+// 入参: object 边框效果字典或引用
+// 返回: float64 云线强度, error 属性错误
+func (r *Reader) annotationBorderEffect(object Object) (float64, error) {
+	value, err := r.Resolve(object)
+	if err != nil || value == nil {
+		return 0, err
+	}
+	dict, ok := value.(Dictionary)
+	if !ok {
+		return 0, fmt.Errorf("invalid annotation border effect")
+	}
+	value, err = r.Resolve(dict["S"])
+	if err != nil {
+		return 0, err
+	}
+	switch value {
+	case nil, Name("S"):
+		return 0, nil
+	case Name("C"):
+		intensity := 0.0
+		value, err := r.Resolve(dict["I"])
+		if err != nil {
+			return 0, err
+		}
+		if value != nil {
+			intensity, err = r.number(value)
+			if err != nil || math.IsNaN(intensity) || intensity < 0 || intensity > 2 {
+				return 0, fmt.Errorf("invalid annotation border intensity")
+			}
+		}
+		return intensity, nil
+	default:
+		return 0, fmt.Errorf("invalid annotation border effect style")
+	}
 }
 
 // writeAnnotationEndings 按端点切线方向绘制标准线端样式，闭合样式使用IC内部颜色
@@ -656,12 +681,15 @@ func (r *Reader) annotationContentBounds(annotation Annotation) (Rectangle, erro
 }
 
 // annotationAppearance 将组合图形的不透明度应用一次，避免填充和描边重叠变暗
-// 入参: annotation 注解, content 外观绘制内容
+// 入参: annotation 注解, content 外观绘制内容, resources 外观资源
 // 返回: *Stream 外观流, error 不透明度错误
-func (r *Reader) annotationAppearance(annotation Annotation, content string) (*Stream, error) {
+func (r *Reader) annotationAppearance(annotation Annotation, content string, resources Dictionary) (*Stream, error) {
 	box := annotation.Rect
 	bbox := Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}
 	body := &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox}, Data: []byte(content), reader: r}
+	if resources != nil {
+		body.Dictionary["Resources"] = resources
+	}
 	if annotation.Dictionary["CA"] == nil && annotation.Subtype != "Highlight" {
 		return body, nil
 	}
@@ -681,6 +709,6 @@ func (r *Reader) annotationAppearance(annotation Annotation, content string) (*S
 	if annotation.Subtype == "Highlight" {
 		state["BM"] = Name("Multiply")
 	}
-	resources := Dictionary{"XObject": Dictionary{"Shape": body}, "ExtGState": Dictionary{"Opacity": state}}
+	resources = Dictionary{"XObject": Dictionary{"Shape": body}, "ExtGState": Dictionary{"Opacity": state}}
 	return &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox, "Resources": resources}, Data: []byte("/Opacity gs /Shape Do"), reader: r}, nil
 }
