@@ -71,6 +71,13 @@ type pdfOutput struct {
 // 入参: ctx 取消上下文, writer 输出流, options 优化配置
 // 返回: OptimizeReport 优化结果, error 读写错误
 func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options OptimizeOptions) (report OptimizeReport, err error) {
+	return r.rewriteTo(ctx, writer, options, nil)
+}
+
+// rewriteTo 写出资源替换与可选优化，保持原阅读器的对象和安全配置
+// 入参: ctx 取消上下文, writer 输出流, options 优化配置, replacements 替换对象
+// 返回: OptimizeReport 写出结果, error 读写错误
+func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options OptimizeOptions, replacements map[Reference]Object) (report OptimizeReport, err error) {
 	if r.closed {
 		return report, os.ErrClosed
 	}
@@ -110,8 +117,14 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		}
 		return progress("write", 1, 1)
 	}
-	if options.Compression.Mode == CompressionUnchanged {
+	if options.Compression.Mode == CompressionUnchanged && len(replacements) == 0 {
 		return report, copySource()
+	}
+	object := func(ref Reference) (Object, error) {
+		if value, ok := replacements[ref]; ok {
+			return value, nil
+		}
+		return r.Object(ref)
 	}
 	trailer := maps.Clone(r.Trailer)
 	for _, name := range []Name{"Prev", "XRefStm", "Type", "W", "Index", "Length", "Filter", "DecodeParms"} {
@@ -150,6 +163,11 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 				}
 			}
 		case Dictionary:
+			if ref, ok := v["SMask"].(Reference); ok && replacements[ref] != nil {
+				if _, original := r.xref[ref.Number]; original {
+					return fmt.Errorf("cannot replace a soft-mask image")
+				}
+			}
 			if !protecting && options.Compression.Mode == CompressionLossy {
 				keys := []Name{"SMask", "Mask"}
 				if options.Compression.ImageDPI() > 0 {
@@ -194,7 +212,7 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		if err := progress("scan", i, len(refs)); err != nil {
 			return report, err
 		}
-		value, err := r.Object(refs[i])
+		value, err := object(refs[i])
 		if err != nil {
 			return report, err
 		}
@@ -210,7 +228,15 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 			delete(r.cache, refs[i])
 		}
 		if signed {
+			if len(replacements) != 0 {
+				return report, fmt.Errorf("cannot replace images in a signed PDF")
+			}
 			return report, copySource()
+		}
+	}
+	for ref := range replacements {
+		if !seen[ref] {
+			return report, fmt.Errorf("replacement object %d is not reachable", ref.Number)
 		}
 	}
 	protecting = true
@@ -223,7 +249,7 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		if err := progress("scan", i, len(maskRefs)); err != nil {
 			return report, err
 		}
-		value, err := r.Object(maskRefs[i])
+		value, err := object(maskRefs[i])
 		if err != nil {
 			return report, err
 		}
@@ -234,17 +260,21 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 			delete(r.cache, maskRefs[i])
 		}
 	}
-	imageSizes, err := r.imageOutputSizes(ctx, options.Compression.ImageDPI())
-	if err != nil {
-		return report, err
-	}
-	fontGlyphs, err := r.optimizationFontGlyphs(ctx, metadata, originalCache)
-	if err != nil {
-		return report, err
-	}
-	out.aliases, err = r.optimizationAliases(ctx, refs, originalCache, metadata)
-	if err != nil {
-		return report, err
+	var imageSizes map[Reference]image.Point
+	var fontGlyphs map[Reference][]uint16
+	if options.Compression.Mode != CompressionUnchanged {
+		imageSizes, err = r.imageOutputSizes(ctx, options.Compression.ImageDPI())
+		if err != nil {
+			return report, err
+		}
+		fontGlyphs, err = r.optimizationFontGlyphs(ctx, metadata, originalCache)
+		if err != nil {
+			return report, err
+		}
+		out.aliases, err = r.optimizationAliases(ctx, refs, originalCache, metadata)
+		if err != nil {
+			return report, err
+		}
 	}
 	for ref, canonical := range out.aliases {
 		if len(fontGlyphs[canonical]) > 0 && len(fontGlyphs[ref]) > 0 {
@@ -266,9 +296,13 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		}
 	}
 	refs = slices.DeleteFunc(refs, func(ref Reference) bool { return out.aliases[ref].Number != 0 })
-	fontUpdates, fontTags, err := r.optimizationFontUpdates(ctx, fontGlyphs, originalCache)
-	if err != nil {
-		return report, err
+	var fontUpdates map[Reference]*Stream
+	var fontTags map[Reference]string
+	if options.Compression.Mode != CompressionUnchanged {
+		fontUpdates, fontTags, err = r.optimizationFontUpdates(ctx, fontGlyphs, originalCache)
+		if err != nil {
+			return report, err
+		}
 	}
 	slices.SortFunc(refs, func(a, b Reference) int {
 		if a.Number < b.Number {
@@ -322,7 +356,18 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 			trailer["Info"] = infoRef
 		}
 	}
-	if _, err := fmt.Fprintf(out, "%%PDF-%s\n%%\xE2\xE3\xCF\xD3\n", r.Version); err != nil {
+	version := r.Version
+	for _, value := range replacements {
+		if stream, ok := value.(*Stream); ok {
+			if stream.Dictionary["SMask"] != nil && version < "1.4" {
+				version = "1.4"
+			}
+			if stream.Dictionary["BitsPerComponent"] == Integer(16) && version < "1.5" {
+				version = "1.5"
+			}
+		}
+	}
+	if _, err := fmt.Fprintf(out, "%%PDF-%s\n%%\xE2\xE3\xCF\xD3\n", version); err != nil {
 		return report, err
 	}
 	type entry struct {
@@ -331,7 +376,7 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		generation int64
 	}
 	entries := map[int64]entry{0: {0, 0, 65535}}
-	packed := r.Version >= "1.5" && (r.security == nil || r.security.stringFilter == r.security.streamFilter)
+	packed := version >= "1.5" && (r.security == nil || r.security.stringFilter == r.security.streamFilter)
 	var group []Reference
 	var values [][]byte
 	groupSize := 0
@@ -381,7 +426,7 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 		if ref == infoRef && newInfo != nil {
 			value = newInfo
 		} else {
-			value, err = r.Object(ref)
+			value, err = object(ref)
 			if err != nil {
 				return report, err
 			}
@@ -394,9 +439,12 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 			if lossless[ref] {
 				compression.Mode = CompressionLossless
 			}
-			value, err = r.optimizeStreamSize(ctx, stream, compression, imageSizes[ref])
-			if err != nil {
-				return report, err
+			value = stream
+			if options.Compression.Mode != CompressionUnchanged {
+				value, err = r.optimizeStreamSize(ctx, stream, compression, imageSizes[ref])
+				if err != nil {
+					return report, err
+				}
 			}
 			report.Streams++
 		}

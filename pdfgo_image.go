@@ -595,17 +595,6 @@ func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
 		}
 	case "JPXDecode":
 		cmyk := i.ColorSpace == Name("DeviceCMYK")
-		if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-			object, err := i.reader.Resolve(space[1])
-			if err != nil {
-				return nil, err
-			}
-			profile, ok := object.(*Stream)
-			if !ok {
-				return nil, fmt.Errorf("invalid ICC profile stream")
-			}
-			cmyk = profile.Dictionary["N"] == Integer(4)
-		}
 		result, err = i.jpxSamples(data, cmyk)
 	default:
 		result, err = i.rawSamples(ctx, data)

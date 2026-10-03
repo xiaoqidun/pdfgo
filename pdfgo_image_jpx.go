@@ -375,18 +375,6 @@ func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
 	if config.Width != i.Width || config.Height != i.Height {
 		return nil, fmt.Errorf("JPEG2000 dimensions differ from image dictionary")
 	}
-	components, err := j2k.DecodeComponents(bytes.NewReader(stream), j2k.Options{})
-	if err != nil {
-		return nil, err
-	}
-	for _, c := range components {
-		if c.Precision < 1 || c.Precision > 31 || c.W <= 0 || c.H <= 0 || c.XRsiz <= 0 || c.YRsiz <= 0 || len(c.Samples)/c.W != c.H {
-			return nil, fmt.Errorf("invalid JPEG2000 component plane")
-		}
-	}
-	if i.ImageMask && (len(components) != 1 || components[0].Precision != 1) {
-		return nil, fmt.Errorf("JPEG2000 stencil requires one one-bit channel")
-	}
 	count := 3
 	if cmyk {
 		count = 4
@@ -403,20 +391,9 @@ func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
 			}
 			count = definition.components
 		case Name("ICCBased"):
-			if len(space) != 2 {
-				return nil, fmt.Errorf("invalid ICC color space")
-			}
-			value, err := i.reader.Resolve(space[1])
+			_, n, err := i.reader.iccProfileStream(space)
 			if err != nil {
 				return nil, err
-			}
-			profile, ok := value.(*Stream)
-			if !ok {
-				return nil, fmt.Errorf("invalid ICC profile stream")
-			}
-			n, err := integerDefault(profile.Dictionary, "N", 0)
-			if err != nil || n != 1 && n != 3 && n != 4 {
-				return nil, fmt.Errorf("invalid JPEG2000 color component count")
 			}
 			count = int(n)
 		}
@@ -424,6 +401,18 @@ func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
 	mode, err := i.jpxMaskMode()
 	if err != nil {
 		return nil, err
+	}
+	components, err := j2k.DecodeComponents(bytes.NewReader(stream), j2k.Options{})
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range components {
+		if c.Precision < 1 || c.Precision > 31 || c.W <= 0 || c.H <= 0 || c.XRsiz <= 0 || c.YRsiz <= 0 || len(c.Samples)/c.W != c.H {
+			return nil, fmt.Errorf("invalid JPEG2000 component plane")
+		}
+	}
+	if i.ImageMask && (len(components) != 1 || components[0].Precision != 1) {
+		return nil, fmt.Errorf("JPEG2000 stencil requires one one-bit channel")
 	}
 	channelData, planeCount := data, len(components)
 	var mapping []jpxMapping

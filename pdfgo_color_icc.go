@@ -58,28 +58,39 @@ type iccColorSpace struct {
 	signature          *[32]byte
 }
 
+// iccProfileStream 解析ICC配置流及必需的分量数，支持间接引用
+// 入参: object ICCBased颜色空间数组
+// 返回: *Stream 配置流, Integer 分量数, error 解析或类型错误
+func (r *Reader) iccProfileStream(object Array) (*Stream, Integer, error) {
+	if len(object) != 2 || object[0] != Name("ICCBased") {
+		return nil, 0, fmt.Errorf("invalid ICCBased color space")
+	}
+	value, err := r.Resolve(object[1])
+	if err != nil {
+		return nil, 0, err
+	}
+	stream, ok := value.(*Stream)
+	if !ok || stream == nil {
+		return nil, 0, fmt.Errorf("invalid ICC profile stream")
+	}
+	value, err = r.Resolve(stream.Dictionary["N"])
+	if err != nil {
+		return nil, 0, err
+	}
+	count, ok := value.(Integer)
+	if !ok || count != 1 && count != 3 && count != 4 {
+		return nil, 0, fmt.Errorf("invalid ICC component count")
+	}
+	return stream, count, nil
+}
+
 // readICCColorSpace 读取内容流使用的ICC颜色空间
 // 入参: object ICCBased颜色空间数组
 // 返回: *iccColorSpace 颜色变换, error 解析错误
 func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
-	if len(object) != 2 || object[0] != Name("ICCBased") {
-		return nil, fmt.Errorf("invalid ICCBased color space")
-	}
-	value, err := r.Resolve(object[1])
+	stream, count, err := r.iccProfileStream(object)
 	if err != nil {
 		return nil, err
-	}
-	stream, ok := value.(*Stream)
-	if !ok || stream == nil {
-		return nil, fmt.Errorf("invalid ICC profile stream")
-	}
-	value, err = r.Resolve(stream.Dictionary["N"])
-	if err != nil {
-		return nil, err
-	}
-	count, ok := value.(Integer)
-	if !ok || count != 1 && count != 3 && count != 4 {
-		return nil, fmt.Errorf("invalid ICC component count")
 	}
 	ranges, err := r.iccRanges(stream.Dictionary["Range"], int(count))
 	if err != nil {
