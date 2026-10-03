@@ -549,22 +549,11 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 	return stops, space, f, nil
 }
 
-// shadingColorSpace 解析着色颜色空间及页面资源引用
+// shadingColorSpace 解析着色颜色空间、资源引用及默认设备色
 // 入参: object 颜色空间
 // 返回: Object 颜色空间定义, error 解析错误
 func (p *pageInterpreter) shadingColorSpace(object Object) (Object, error) {
-	object, err := p.reader.resolveColorSpace(object)
-	if err != nil {
-		return nil, err
-	}
-	if name, ok := object.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
-		object, err = p.resource("ColorSpace", name)
-		if err != nil {
-			return nil, err
-		}
-		return p.reader.resolveColorSpace(object)
-	}
-	return object, nil
+	return p.reader.resourceColorSpace(object, p.resources)
 }
 
 // readShadingSpace 读取着色源颜色空间，专色及Lab保留各自的转换规则

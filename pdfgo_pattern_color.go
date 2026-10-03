@@ -27,7 +27,7 @@ type patternColorSpace struct {
 // 入参: object 底层颜色空间
 // 返回: *patternColorSpace 颜色变换, error 解析错误
 func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
-	object, err := r.Resolve(object)
+	object, err := r.resolveColorSpace(object)
 	if err != nil {
 		return nil, err
 	}

@@ -300,6 +300,21 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Intent: intent, Decode: decode, ImageMask: mask, Interpolate: interpolate == Boolean(true), Mask: dict["Mask"], SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
 }
 
+// ReadImageWithResources 读取图像并按当前资源解析颜色空间及默认设备色
+// 入参: object 图像对象或引用, resources 当前资源字典
+// 返回: *Image 图像描述, error 图像或颜色空间错误
+func (r *Reader) ReadImageWithResources(object Object, resources Dictionary) (*Image, error) {
+	image, err := r.ReadImage(object)
+	if err != nil || image.ImageMask {
+		return image, err
+	}
+	image.ColorSpace, err = r.resourceColorSpace(image.ColorSpace, resources)
+	if err != nil {
+		return nil, err
+	}
+	return image, nil
+}
+
 // renderingIntent 取得图像有效渲染意图，支持直接构造的图像及间接字典值
 // 返回: Name 渲染意图, error 解析或类型错误
 func (i *Image) renderingIntent() (Name, error) {

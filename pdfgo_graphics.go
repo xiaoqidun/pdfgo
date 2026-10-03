@@ -295,7 +295,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 				}
 			case "S":
 			case "CS":
-				groupSpace, err = r.readBlendingSpace(value)
+				groupSpace, err = r.resourceBlendingSpace(value, page.Resources)
 				if err != nil {
 					return err
 				}
@@ -339,6 +339,11 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
+	for _, operator := range []string{"g", "G"} {
+		if err := interpreter.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
+			return err
+		}
+	}
 	if knockout && visitor.Group == nil {
 		return &UnsupportedError{Feature: "page knockout visitor missing"}
 	}
@@ -746,65 +751,33 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.hasPoint = false
 		p.pendingClip = false
 	case "g", "G", "rg", "RG", "k", "K":
-		rgb := [3]float64{}
-		var cmyk *[4]float64
 		for n := range v {
 			v[n] = math.Max(0, math.Min(1, v[n]))
 		}
-		if len(v) == 1 {
-			rgb = [3]float64{v[0], v[0], v[0]}
-		} else if len(v) == 3 {
-			copy(rgb[:], v)
-		} else {
-			cmyk = &[4]float64{v[0], v[1], v[2], v[3]}
+		name := map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[len(v)]
+		fill := op.Operator == "g" || op.Operator == "rg" || op.Operator == "k"
+		if p.resources["ColorSpace"] == nil {
+			return p.setDeviceColor(v, name, fill)
 		}
-		if op.Operator == "G" || op.Operator == "RG" || op.Operator == "K" {
-			p.state.strokeICC = nil
-			p.state.strokeSeparation = nil
-			p.state.strokeDeviceN = nil
-			p.state.style.Stroke.RGB = rgb
-			p.state.style.Stroke.None = false
-			p.state.style.Stroke.CMYK = cmyk
-			p.state.style.Stroke.Process = nil
-			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
-			p.state.style.Stroke.Axial = nil
-			p.state.style.Stroke.Function = nil
-			p.state.style.Stroke.Radial = nil
-			p.state.style.Stroke.Tiling = nil
-			p.state.strokePatternBase = nil
-			p.state.style.Stroke.Mesh = nil
-			if len(v) == 1 {
-				p.state.strokeSpace = "DeviceGray"
-			} else if cmyk != nil {
-				p.state.strokeSpace = "DeviceCMYK"
-			} else {
-				p.state.strokeSpace = "DeviceRGB"
-			}
-			p.state.style.Stroke.SourceSpace = p.state.strokeSpace
-		} else {
-			p.state.style.Fill.RGB = rgb
-			p.state.style.Fill.None = false
-			p.state.fillICC = nil
-			p.state.fillSeparation = nil
-			p.state.fillDeviceN = nil
-			p.state.style.Fill.CMYK = cmyk
-			p.state.style.Fill.Process = nil
-			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
-			p.state.style.Fill.Axial = nil
-			p.state.style.Fill.Function = nil
-			p.state.style.Fill.Radial = nil
-			p.state.style.Fill.Tiling = nil
-			p.state.fillPatternBase = nil
-			p.state.style.Fill.Mesh = nil
-			if len(v) == 1 {
-				p.state.fillSpace = "DeviceGray"
-			} else if cmyk != nil {
-				p.state.fillSpace = "DeviceCMYK"
-			} else {
-				p.state.fillSpace = "DeviceRGB"
-			}
-			p.state.style.Fill.SourceSpace = p.state.fillSpace
+		object, err := p.reader.resourceColorSpace(name, p.resources)
+		if err != nil {
+			return err
 		}
+		if model, ok := object.(Name); ok && (model == "DeviceGray" || model == "DeviceRGB" || model == "DeviceCMYK") {
+			return p.setDeviceColor(v, model, fill)
+		}
+		if err := p.selectColorSpace(object, fill); err != nil {
+			return err
+		}
+		operands := make([]Object, len(v))
+		for i, value := range v {
+			operands[i] = Real(value)
+		}
+		operator := "scn"
+		if !fill {
+			operator = "SCN"
+		}
+		return p.operation(Operation{Operator: operator, Operands: operands})
 	case "cs", "CS":
 		if len(a) != 1 {
 			return fmt.Errorf("invalid color space")
@@ -813,177 +786,31 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if !ok {
 			return fmt.Errorf("invalid color space name")
 		}
-		var profile *iccColorSpace
-		var separation *separationSpace
-		var deviceN *deviceNSpace
-		var patternBase *patternColorSpace
-		var calibrated *graphicsColorSpace
-		if name != "DeviceRGB" && name != "DeviceGray" && name != "DeviceCMYK" && name != "Pattern" {
-			object, err := p.resource("ColorSpace", name)
-			if err != nil {
-				return err
-			}
-			object, err = p.reader.resolveColorSpace(object)
-			if err != nil {
-				return err
-			}
-			if predefined, ok := object.(Name); ok {
-				object = Array{predefined}
-			}
-			space, ok := object.(Array)
-			if !ok || len(space) == 0 {
-				return &UnsupportedError{Feature: "non-device color space"}
-			}
-			if len(space) == 1 && (space[0] == Name("Pattern") || space[0] == Name("DeviceRGB") || space[0] == Name("DeviceGray") || space[0] == Name("DeviceCMYK")) {
-				name = space[0].(Name)
-			} else if len(space) == 2 && space[0] == Name("Pattern") {
-				patternBase, err = p.reader.readPatternBase(space[1])
-				if err != nil {
-					return err
-				}
-				name = "Pattern"
-			} else if space[0] == Name("Lab") || space[0] == Name("CalRGB") || space[0] == Name("CalGray") || space[0] == Name("Indexed") {
-				calibrated = &graphicsColorSpace{displaySpace: ColorSpace{Model: "DeviceRGB", mapped: true}}
-				name = space[0].(Name)
-				switch name {
-				case "Lab":
-					calibrated.lab, err = p.reader.readLab(space)
-				case "CalRGB":
-					calibrated.calRGB, err = p.reader.readCalRGB(space)
-				case "CalGray":
-					calibrated.gray = true
-					calibrated.calRGB, err = p.reader.readCalGray(space)
-				case "Indexed":
-					image := &Image{reader: p.reader, ColorSpace: space, Stream: &Stream{Dictionary: Dictionary{"Intent": p.state.style.RenderingIntent}}}
-					calibrated.palette, err = image.palette()
-				}
-				if err != nil {
-					return err
-				}
-			} else if space[0] == Name("DeviceN") {
-				deviceN, err = p.reader.readDeviceN(space)
-				if err != nil {
-					return err
-				}
-				name = "DeviceN"
-			} else if space[0] == Name("Separation") {
-				separation, err = p.reader.readSeparation(space)
-				if err != nil {
-					return err
-				}
-				name = "Separation"
-			} else if space[0] == Name("ICCBased") {
-				profile, err = p.reader.readICCColorSpace(space)
-				if err != nil {
-					return err
-				}
-				name = "ICCBased"
-			} else {
-				return &UnsupportedError{Feature: "color space " + fmt.Sprint(space[0])}
-			}
+		original, err := p.reader.remapColorSpace(name, p.resources, false, 0)
+		if err != nil {
+			return err
 		}
-		if op.Operator == "cs" {
-			p.state.fillSpace = name
-			p.state.fillPatternBase = patternBase
-			p.state.fillICC = profile
-			p.state.fillSeparation = separation
-			p.state.fillDeviceN = deviceN
-			p.state.fillColor = calibrated
-			p.state.style.Fill.RGB = [3]float64{}
-			p.state.style.Fill.SourceSpace = name
-			p.state.style.Fill.None = separation != nil && separation.name == "None"
-			p.state.style.Fill.CMYK = nil
-			p.state.style.Fill.Process = nil
-			p.state.style.Fill.Space, p.state.style.Fill.Values = nil, [4]float64{}
-			p.state.style.Fill.Axial = nil
-			p.state.style.Fill.Function = nil
-			p.state.style.Fill.Radial = nil
-			p.state.style.Fill.Tiling = nil
-			p.state.style.Fill.Mesh = nil
-			if name == "DeviceCMYK" {
-				p.state.style.Fill.CMYK = &[4]float64{0, 0, 0, 1}
-			}
-		} else {
-			p.state.strokeSpace = name
-			p.state.strokePatternBase = patternBase
-			p.state.strokeICC = profile
-			p.state.strokeSeparation = separation
-			p.state.strokeDeviceN = deviceN
-			p.state.strokeColor = calibrated
-			p.state.style.Stroke.RGB = [3]float64{}
-			p.state.style.Stroke.SourceSpace = name
-			p.state.style.Stroke.None = separation != nil && separation.name == "None"
-			p.state.style.Stroke.CMYK = nil
-			p.state.style.Stroke.Process = nil
-			p.state.style.Stroke.Space, p.state.style.Stroke.Values = nil, [4]float64{}
-			p.state.style.Stroke.Axial = nil
-			p.state.style.Stroke.Function = nil
-			p.state.style.Stroke.Radial = nil
-			p.state.style.Stroke.Tiling = nil
-			p.state.style.Stroke.Mesh = nil
-			if name == "DeviceCMYK" {
-				p.state.style.Stroke.CMYK = &[4]float64{0, 0, 0, 1}
-			}
+		object, err := p.reader.resourceColorSpace(original, p.resources)
+		if err != nil {
+			return err
 		}
-		if calibrated != nil {
-			values := []float64{0, 0, 0}
-			if calibrated.palette != nil || calibrated.gray {
-				values = values[:1]
-			}
-			paint, err := calibrated.paint(values)
-			if err != nil {
-				return err
-			}
-			if op.Operator == "cs" {
-				paint.Alpha = p.state.style.Fill.Alpha
-				p.state.style.Fill = paint
-			} else {
-				paint.Alpha = p.state.style.Stroke.Alpha
-				p.state.style.Stroke = paint
-			}
+		fill := op.Operator == "cs"
+		if err := p.selectColorSpace(object, fill); err != nil {
+			return err
 		}
-		if profile != nil {
-			paint, err := profile.paint(make([]float64, profile.components()), p.state.style.RenderingIntent)
-			if err != nil {
-				return err
+		if model := colorSpaceFamily(original); model == "DeviceGray" || model == "DeviceRGB" || model == "DeviceCMYK" {
+			operands := make([]Object, (&ColorSpace{Model: model}).Components())
+			for i := range operands {
+				operands[i] = Integer(0)
 			}
-			if op.Operator == "cs" {
-				paint.Alpha = p.state.style.Fill.Alpha
-				p.state.style.Fill = paint
-			} else {
-				paint.Alpha = p.state.style.Stroke.Alpha
-				p.state.style.Stroke = paint
+			if model == "DeviceCMYK" {
+				operands[3] = Integer(1)
 			}
-		}
-		if deviceN != nil {
-			values := make([]float64, deviceN.components)
-			for i := range values {
-				values[i] = 1
+			operator := "scn"
+			if !fill {
+				operator = "SCN"
 			}
-			paint, err := deviceN.paint(values, p.state.style.RenderingIntent)
-			if err != nil {
-				return err
-			}
-			if op.Operator == "cs" {
-				paint.Alpha = p.state.style.Fill.Alpha
-				p.state.style.Fill = paint
-			} else {
-				paint.Alpha = p.state.style.Stroke.Alpha
-				p.state.style.Stroke = paint
-			}
-		}
-		if separation != nil {
-			paint, err := separation.paint(1, p.state.style.RenderingIntent)
-			if err != nil {
-				return err
-			}
-			if op.Operator == "cs" {
-				paint.Alpha = p.state.style.Fill.Alpha
-				p.state.style.Fill = paint
-			} else {
-				paint.Alpha = p.state.style.Stroke.Alpha
-				p.state.style.Stroke = paint
-			}
+			return p.operation(Operation{Operator: operator, Operands: operands})
 		}
 	case "sc", "scn", "SC", "SCN":
 		space := p.state.fillSpace
@@ -1129,21 +956,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 			return nil
 		}
-		if space == "DeviceRGB" {
-			if operator == "g" {
-				operator = "rg"
-			} else {
-				operator = "RG"
-			}
-		}
-		if space == "DeviceCMYK" {
-			if operator == "g" {
-				operator = "k"
-			} else {
-				operator = "K"
-			}
-		}
-		return p.operation(Operation{Operator: operator, Operands: a})
+		return p.deviceColor(a, operator == "g")
 	case "BT":
 		if p.inText {
 			return fmt.Errorf("nested text object")
@@ -1479,7 +1292,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 	if err != nil || !visible {
 		return err
 	}
-	image, err := p.reader.ReadImage(stream)
+	image, err := p.reader.ReadImageWithResources(stream, p.resources)
 	if err != nil {
 		return err
 	}
@@ -1585,9 +1398,21 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		}
 	}
 	child := *p
+	if target == nil && stream.Dictionary["Resources"] != nil {
+		resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
+		if err != nil {
+			return err
+		}
+		var ok bool
+		child.resources, ok = resources.(Dictionary)
+		if !ok {
+			return fmt.Errorf("invalid form resources")
+		}
+	}
 	var groupMark *GroupMark
 	var groupObject Object
 	groupReader := p.reader
+	groupResources := child.resources
 	if stream.Dictionary["Group"] != nil {
 		groupObject, err = p.reader.Resolve(stream.Dictionary["Group"])
 		if err != nil {
@@ -1596,6 +1421,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	}
 	if groupObject == nil && target != nil {
 		groupReader = target.reader
+		groupResources = target.Resources
 		groupObject, err = groupReader.Resolve(target.Dictionary["Group"])
 		if err != nil {
 			return err
@@ -1639,6 +1465,10 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			}
 		}
 		if space != nil {
+			space, err = groupReader.resourceColorSpace(space, groupResources)
+			if err != nil {
+				return err
+			}
 			groupMark.ColorSpace, err = groupReader.readBlendingSpace(space)
 			if err != nil {
 				return err
@@ -1681,17 +1511,6 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			return err
 		}
 		child.state.matrix = child.state.matrix.Mul(Matrix(m))
-	}
-	if target == nil && stream.Dictionary["Resources"] != nil {
-		resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
-		if err != nil {
-			return err
-		}
-		var ok bool
-		child.resources, ok = resources.(Dictionary)
-		if !ok {
-			return fmt.Errorf("invalid form resources")
-		}
 	}
 	box, err := p.reader.rectangle(stream.Dictionary["BBox"])
 	if err != nil {

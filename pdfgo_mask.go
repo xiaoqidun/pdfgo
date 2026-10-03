@@ -112,7 +112,19 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		return nil, err
 	}
 	if v != nil {
-		m.ColorSpace, err = p.reader.readBlendingSpace(v)
+		resources := p.resources
+		if stream.Dictionary["Resources"] != nil {
+			object, err := p.reader.Resolve(stream.Dictionary["Resources"])
+			if err != nil {
+				return nil, err
+			}
+			var ok bool
+			resources, ok = object.(Dictionary)
+			if !ok {
+				return nil, fmt.Errorf("invalid soft mask resources")
+			}
+		}
+		m.ColorSpace, err = p.reader.resourceBlendingSpace(v, resources)
 		if err != nil {
 			return nil, err
 		}
