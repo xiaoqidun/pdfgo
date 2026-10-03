@@ -43,7 +43,7 @@ func (r *Reader) ReadSpotFunction(object Object) (*SpotFunction, error) {
 		return &SpotFunction{value: func(x, y float64) (float64, error) { return function(x, y), nil }}, nil
 	}
 	stream, ok := value.(*Stream)
-	if !ok {
+	if !ok || stream == nil {
 		return nil, fmt.Errorf("invalid spot function stream")
 	}
 	kind, err := r.Resolve(stream.Dictionary["FunctionType"])
@@ -97,6 +97,9 @@ func (r *Reader) ReadSpotFunction(object Object) (*SpotFunction, error) {
 // 入参: x 横向网点坐标, y 纵向网点坐标
 // 返回: float64 网点排序值, error 非有限值或计算错误
 func (f *SpotFunction) Evaluate(x, y float64) (float64, error) {
+	if f == nil || f.value == nil {
+		return 0, fmt.Errorf("missing spot function")
+	}
 	if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
 		return 0, fmt.Errorf("nonfinite spot coordinates")
 	}

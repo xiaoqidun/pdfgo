@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
 )
 
 // Halftone 保存设备空间半色调定义，连续色调显示不需要网屏化
@@ -70,7 +71,7 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 	}
 	dict, ok := value.(Dictionary)
 	stream, isStream := value.(*Stream)
-	if isStream {
+	if isStream && stream != nil {
 		dict, ok = stream.Dictionary, true
 	}
 	if !ok {
@@ -234,23 +235,65 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 }
 
 // IdentityTransfer 判断网屏中是否仅使用恒等传递函数，分量网屏逐项检查
-// 入参: reader 所属PDF阅读器
+// 入参: reader 无所属阅读器时使用的PDF阅读器
 // 返回: bool 是否恒等, error 函数解析错误
 func (h *Halftone) IdentityTransfer(reader *Reader) (bool, error) {
+	return h.identityTransfer(reader, 0)
+}
+
+// identityTransfer 按所属阅读器检查网屏函数，限制手工定义的递归深度
+// 入参: reader 备用阅读器, depth 嵌套深度
+// 返回: bool 是否恒等, error 引用或递归错误
+func (h *Halftone) identityTransfer(reader *Reader, depth int) (bool, error) {
 	if h == nil {
 		return true, nil
 	}
+	if depth >= 32 {
+		return false, fmt.Errorf("halftone recursion limit exceeded")
+	}
+	if h.reader != nil {
+		reader = h.reader
+	}
+	if reader == nil {
+		return false, fmt.Errorf("missing halftone reader")
+	}
+	if reader.closed {
+		return false, os.ErrClosed
+	}
 	if h.TransferFunction != nil {
-		identity, err := reader.identityTransfer(h.TransferFunction)
-		if err != nil || !identity {
-			return identity, err
+		function, _, err := reader.halftoneTransfer(h)
+		if err != nil {
+			return false, err
+		}
+		if function != nil {
+			return false, nil
 		}
 	}
 	for _, part := range h.Components {
-		identity, err := part.IdentityTransfer(reader)
+		identity, err := part.identityTransfer(reader, depth+1)
 		if err != nil || !identity {
 			return identity, err
 		}
 	}
 	return true, nil
+}
+
+// component 选择原生分量网屏，缺省使用Default且禁止嵌套类型5
+// 入参: colorant 原生分量名称
+// 返回: *Halftone 分量网屏, error 定义错误
+func (h *Halftone) component(colorant Name) (*Halftone, error) {
+	if h == nil || h.Type != 5 {
+		return h, nil
+	}
+	if h.Components["Default"] == nil || h.Components["Default"].Type == 5 {
+		return nil, fmt.Errorf("invalid default halftone component")
+	}
+	part := h.Components[colorant]
+	if part == nil {
+		part = h.Components["Default"]
+	}
+	if part == nil || part.Type == 5 {
+		return nil, fmt.Errorf("invalid halftone component")
+	}
+	return part, nil
 }

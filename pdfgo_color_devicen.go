@@ -23,6 +23,7 @@ import (
 type deviceNSpace struct {
 	alternate     *ColorSpace
 	process       *ProcessColorants
+	colorants     *ColorantSpace
 	lab           *labSpace
 	transform     *gradientFunction
 	components    int
@@ -47,6 +48,17 @@ func (s *deviceNSpace) outputComponents() int {
 // 入参: tints 各分量专色浓度, intent 渲染意图
 // 返回: Paint 颜色, error 颜色转换错误
 func (s *deviceNSpace) paint(tints []float64, intent Name) (Paint, error) {
+	paint, err := s.alternatePaint(tints, intent)
+	if err == nil && s.colorants != nil && !s.colorants.none {
+		paint.Colorant = newColorantPaint(s.colorants, tints)
+	}
+	return paint, err
+}
+
+// alternatePaint 求值备用色而不创建源浓度快照，保留原生过程分量映射
+// 入参: tints 色料浓度, intent 渲染意图
+// 返回: Paint 备用空间画刷, error 颜色错误
+func (s *deviceNSpace) alternatePaint(tints []float64, intent Name) (Paint, error) {
 	if s.none {
 		_, err := s.values(tints...)
 		return Paint{SourceSpace: "DeviceN", None: true}, err
@@ -61,7 +73,8 @@ func (s *deviceNSpace) paint(tints []float64, intent Name) (Paint, error) {
 	}
 	paint := Paint{SourceSpace: "DeviceN", RGB: rgb, Space: s.alternate, Values: values, Process: s.process}
 	if s.alternate.Model == "DeviceCMYK" && !s.alternate.Calibrated() {
-		paint.CMYK = &values
+		cmyk := values
+		paint.CMYK = &cmyk
 	}
 	return paint, nil
 }
@@ -199,7 +212,13 @@ func (r *Reader) readDeviceNSpace(space Array, effective bool, depth int) (*devi
 	if err != nil {
 		return nil, err
 	}
-	if err := r.applyNChannelProcess(space, result); err != nil {
+	names, none, err := r.deviceNColorants(space)
+	if err != nil {
+		return nil, err
+	}
+	fallback := *result
+	result.colorants = &ColorantSpace{Names: names, tint: &fallback, none: none}
+	if err := r.applyNChannelProcess(space, result, effective, depth); err != nil {
 		return nil, err
 	}
 	return result, nil

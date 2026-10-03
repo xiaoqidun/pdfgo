@@ -82,6 +82,9 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 				index := int(math.Round(math.Max(0, math.Min(float64(len(palette.colors)-1), values[0]))))
 				color := palette.colors[index]
 				paint := Paint{SourceSpace: "Indexed", RGB: [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}, Alpha: float64(color.A) / 65535, None: color.A == 0, Space: palette.space, Values: palette.values[index], Process: palette.process}
+				if palette.colorants != nil {
+					paint.Colorant = newColorantPaint(palette.colorants, palette.tints[index])
+				}
 				if palette.space != nil {
 					var err error
 					paint.RGB, err = palette.space.RGB(paint.Values[:palette.space.Components()], intent)

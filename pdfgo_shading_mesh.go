@@ -17,7 +17,6 @@ package pdfgo
 import (
 	"fmt"
 	"io"
-	"math"
 )
 
 // MeshPatch 保存双三次曲面控制点及四角分量，Points按u、v索引
@@ -79,37 +78,15 @@ func (p MeshPatch) PointAt(u, v float64) Point {
 // 入参: patch 网格序号, u 横向参数或第二顶点权重, v 纵向参数或第三顶点权重
 // 返回: [4]float64 Space颜色空间分量, error 参数或颜色错误
 func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
-	if patch < 0 || patch >= len(g.Patches)+len(g.Triangles) || math.IsNaN(u) || math.IsNaN(v) || u < 0 || u > 1 || v < 0 || v > 1 {
-		return [4]float64{}, fmt.Errorf("invalid mesh evaluation")
-	}
-	weights := [4]float64{(1 - u) * (1 - v), (1 - u) * v, u * v, u * (1 - v)}
-	var colors [4][]float64
-	if patch < len(g.Patches) {
-		colors = g.Patches[patch].Colors
-	} else {
-		if u+v > 1+1e-12 {
-			return [4]float64{}, fmt.Errorf("invalid triangle evaluation")
-		}
-		weights = [4]float64{math.Max(0, 1-u-v), u, v, 0}
-		copy(colors[:], g.Triangles[patch-len(g.Patches)].Colors[:])
+	weights, colors, err := g.sourceColorsAt(patch, u, v)
+	if err != nil {
+		return [4]float64{}, err
 	}
 	components := len(colors[0])
-	if components == 0 {
-		return [4]float64{}, fmt.Errorf("missing mesh color components")
-	}
 	if g.function != nil {
-		if components != 1 {
-			return [4]float64{}, fmt.Errorf("invalid mesh function input count")
-		}
-		x := 0.0
-		for i, weight := range weights {
-			if weight == 0 {
-				continue
-			}
-			if len(colors[i]) != components {
-				return [4]float64{}, fmt.Errorf("inconsistent mesh color components")
-			}
-			x += colors[i][0] * weight
+		x, err := meshFunctionInput(weights, colors)
+		if err != nil {
+			return [4]float64{}, err
 		}
 		if g.function.scalar != nil {
 			values, err := g.function.scalar.evaluate(x)
@@ -125,21 +102,11 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 	if components > len(buffer) {
 		input = make([]float64, components)
 	}
-	for i, weight := range weights {
-		if weight == 0 {
-			continue
-		}
-		if len(colors[i]) != components {
-			return [4]float64{}, fmt.Errorf("inconsistent mesh color components")
-		}
-		for c, value := range colors[i] {
-			input[c] += value * weight
-		}
-	}
+	meshInterpolate(weights, colors, input)
 	return g.colorValues(input)
 }
 
-// functionValues 求值高通道网格函数后转换备用空间，不影响常见分量的无分配路径
+// functionValues 求值高通道网格函数，普通分量使用独立无分配路径
 // 入参: x 插值后的函数输入
 // 返回: [4]float64 备用空间分量, error 函数或颜色错误
 func (g *MeshGradient) functionValues(x float64) ([4]float64, error) {
@@ -199,11 +166,11 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	if err != nil {
 		return Paint{}, err
 	}
-	none, err := p.reader.colorSpaceNone(object, true)
+	visible, err := p.colorSpaceVisible(object)
 	if err != nil {
 		return Paint{}, err
 	}
-	if none {
+	if !visible {
 		return Paint{None: true}, nil
 	}
 	for i, key := range []Name{"BitsPerCoordinate", "BitsPerComponent", "BitsPerFlag"} {

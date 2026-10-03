@@ -25,6 +25,8 @@ type gradientFunction struct {
 	value     func(float64) [4]float64
 	calculate func(float64) ([4]float64, error)
 	linear    func([2]float64) []GradientStop
+	colorants *ColorantSpace
+	colorant  func(float64, []float64) error
 }
 
 // evaluate 计算颜色函数并传递运行时算术错误
@@ -214,7 +216,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		return f, nil
 	}
 	dict, ok := v.(Dictionary)
-	if stream, streamOK := v.(*Stream); streamOK {
+	if stream, streamOK := v.(*Stream); streamOK && stream != nil {
 		dict, ok = stream.Dictionary, true
 	}
 	if !ok {

@@ -196,11 +196,11 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if err != nil {
 		return Paint{}, err
 	}
-	none, err := p.reader.colorSpaceNone(space, true)
+	visible, err := p.colorSpaceVisible(space)
 	if err != nil {
 		return Paint{}, err
 	}
-	if none {
+	if !visible {
 		return Paint{None: true}, nil
 	}
 	if dict["ExtGState"] != nil {
@@ -382,11 +382,11 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	if err != nil {
 		return Paint{}, err
 	}
-	none, err := p.reader.colorSpaceNone(object, true)
+	visible, err := p.colorSpaceVisible(object)
 	if err != nil {
 		return Paint{}, err
 	}
-	if none {
+	if !visible {
 		return Paint{None: true}, nil
 	}
 	if _, ok := m.Inverse(); !ok {
@@ -509,7 +509,7 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		if separation.name == "None" || separation.none {
+		if separation.name == "None" {
 			return nil, nil, nil, &UnsupportedError{Feature: "Separation None shading"}
 		}
 		space, lab := separation.space, separation.lab
@@ -525,6 +525,7 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 				}
 				return separation.values(values[0])
 			}}
+			f.colorants, f.colorant = separation.colorants, gradientColorantFunction(source, 1)
 			return nil, space, f, nil
 		}
 		f := composeGradientFunction(source, separation.transform)
@@ -533,6 +534,7 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 		} else {
 			f = iccGradientFunction(f, space.profile)
 		}
+		f.colorants, f.colorant = separation.colorants, gradientColorantFunction(source, 1)
 		var stops []GradientStop
 		if f.linear != nil {
 			stops = clipGradientValues(f.linear(domain), gradientUnitBounds(space.Components()))
@@ -590,11 +592,11 @@ func (r *Reader) readShadingColorSpace(object Object, effective bool) (*ColorSpa
 			if err != nil {
 				return nil, nil, nil, 0, err
 			}
-			if separation.name == "None" || separation.none {
+			if separation.name == "None" {
 				return nil, nil, nil, 0, &UnsupportedError{Feature: "Separation None shading"}
 			}
 			space, lab := separation.space, separation.lab
-			return space, &deviceNSpace{alternate: space, lab: lab, transform: separation.transform, nested: separation.nested, components: 1}, nil, 1, nil
+			return space, &deviceNSpace{alternate: space, lab: lab, transform: separation.transform, nested: separation.nested, components: 1, colorants: separation.colorants, none: separation.none}, nil, 1, nil
 		case Name("Lab"):
 			lab, err := r.readLab(array)
 			return &ColorSpace{Model: "DeviceRGB", mapped: true}, nil, lab, 3, err
@@ -681,6 +683,7 @@ func (r *Reader) readDeviceNGradient(space Array, function Object, domain [2]flo
 		composed := iccGradientFunction(composeGradientFunction(source, tint.transform), tint.alternate.profile)
 		mapped.linear = composed.linear
 	}
+	mapped.colorants, mapped.colorant = tint.colorants, gradientColorantFunction(source, tint.components)
 	var stops []GradientStop
 	if mapped.linear != nil {
 		stops = clipGradientValues(mapped.linear(domain), gradientUnitBounds(tint.alternate.Components()))

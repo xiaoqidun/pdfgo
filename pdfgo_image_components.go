@@ -25,13 +25,54 @@ import (
 // 模板图像保留灰度样本，填充颜色及反向覆盖由调用方应用
 // Colorants和Tints保留专色名称及逐像素浓度，供支持相应色料的输出设备使用
 // Process保留原生过程通道，ValuesAt返回对应过程空间的颜色分量
+// ColorantAlpha仅在备用色None时保存源遮罩，nil时复用Pix透明度，避免重复缓冲
 type ImageComponents struct {
-	Space     *ColorSpace
-	Process   *ProcessColorants
-	Rect      image.Rectangle
-	Pix       []uint16
-	Colorants []Name
-	Tints     []uint16
+	Space         *ColorSpace
+	Process       *ProcessColorants
+	ColorantSpace *ColorantSpace
+	Rect          image.Rectangle
+	Pix           []uint16
+	Colorants     []Name
+	Tints         []uint16
+	ColorantAlpha []uint16
+}
+
+// ColorantSpace 读取图像或索引基础空间的只读色料定义及独立专色变换
+// 返回: *ColorantSpace 色料定义，非色料空间为nil, error 颜色空间错误
+func (i *Image) ColorantSpace() (*ColorantSpace, error) {
+	object, err := i.colorantSpace()
+	if err != nil {
+		return nil, err
+	}
+	return i.reader.readColorantSpace(object, i.effectiveColorSpace)
+}
+
+// ResolveColorantsAt 按输出设备求值像素的源色料，透明度使用源遮罩而非备用色覆盖
+// 入参: x 横坐标, y 纵坐标, device 输出设备, intent 渲染意图, softMask 是否用于软蒙版组
+// 返回: ColorantResult 原生和备用色料, float64 源透明度, error 色料或变换错误
+func (i *ImageComponents) ResolveColorantsAt(x, y int, device *ColorantDevice, intent Name, softMask bool) (ColorantResult, float64, error) {
+	if i.ColorantSpace == nil || !(image.Point{X: x, Y: y}).In(i.Rect) {
+		return ColorantResult{}, 0, nil
+	}
+	samples := i.TintsAt(x, y)
+	var buffer [32]float64
+	tints := buffer[:min(len(samples), len(buffer))]
+	if len(samples) > len(buffer) {
+		tints = make([]float64, len(samples))
+	}
+	for c, sample := range samples {
+		tints[c] = float64(sample) / 65535
+	}
+	result, err := i.ColorantSpace.Resolve(tints, device, intent, softMask)
+	if err != nil || result.Process == nil && result.Spots == nil && len(result.Alternates) == 0 {
+		return result, 0, err
+	}
+	offset := (y-i.Rect.Min.Y)*i.Rect.Dx() + x - i.Rect.Min.X
+	alpha := i.Pix[offset*(i.Space.Components()+1)+i.Space.Components()]
+	if i.ColorantAlpha != nil {
+		alpha = i.ColorantAlpha[offset]
+	}
+	return result, float64(alpha) / 65535, nil
 }
 
 // Colorants 读取图像或索引基础空间的专色名称，设备色返回空列表

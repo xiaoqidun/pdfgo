@@ -51,6 +51,8 @@ type TextClip struct {
 // Paint 保存颜色及不透明度，CMYK保留设备四色，Space与Values保留ICC源分量
 // None表示丢弃着色输出，与零透明度不同，不参与挖空合成
 // Process保留原生过程通道，区分未指定通道和已指定的零分量
+// Colorant保留专色定义和源浓度快照，不随后续图形状态变化
+// ColorantDevice访问器可接收备用色为None但原生色料可用的画刷，None仅描述其备用显示
 // SourceSpace保留普通颜色的来源空间族，图案基色使用底层空间族，不以转换后的Space或CMYK代替
 type Paint struct {
 	RGB         [3]float64
@@ -58,6 +60,7 @@ type Paint struct {
 	Space       *ColorSpace
 	SourceSpace Name
 	Process     *ProcessColorants
+	Colorant    *ColorantPaint
 	Values      [4]float64
 	Alpha       float64
 	None        bool
@@ -159,6 +162,7 @@ type MarkedContentMark struct {
 // Warning非空时报告空Type3字形、缺失的ExtGState资源及未保留的内容语义，其他解析错误仍返回错误
 // OptionalContent可覆盖XObject的可选内容状态，缺省使用文档默认配置
 // Reference可提供引用表单的目标页面，缺省或返回nil时绘制代理内容
+// ColorantDevice声明输出设备，保留其可用色料，实际分色求值与合成由访问器完成
 type Visitor struct {
 	Path            func(PathMark) error
 	Text            func(TextMark) error
@@ -167,6 +171,7 @@ type Visitor struct {
 	MarkedContent   func(MarkedContentMark) error
 	OptionalContent func(Object) (bool, error)
 	Reference       ReferenceResolver
+	ColorantDevice  *ColorantDevice
 	Warning         func(Diagnostic)
 }
 
@@ -216,6 +221,7 @@ type pageInterpreter struct {
 	uncoloredType3         bool
 	glyphStreams           []*Stream
 	maskGroup              *Stream
+	blendingSpace          *ColorSpace
 }
 
 // Identity 返回单位矩阵
@@ -338,6 +344,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 		return err
 	}
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
+	interpreter.blendingSpace = groupSpace
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
 	for _, operator := range []string{"g", "G"} {
@@ -353,6 +360,9 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			child := interpreter
 			if v.Reference == nil {
 				v.Reference = visitor.Reference
+			}
+			if v.ColorantDevice == nil {
+				v.ColorantDevice = visitor.ColorantDevice
 			}
 			child.visitor = v
 			return child.run(data)
@@ -1220,12 +1230,12 @@ func (p *pageInterpreter) showText(data []byte) error {
 // 入参: fill 填充标志, stroke 描边标志
 // 返回: bool 是否填充, bool 是否描边
 func (p *pageInterpreter) visiblePaint(fill, stroke bool) (bool, bool) {
-	fill, stroke = fill && !p.state.style.Fill.None, stroke && !p.state.style.Stroke.None
+	fill, stroke = fill && p.paintVisible(p.state.style.Fill), stroke && p.paintVisible(p.state.style.Stroke)
 	if s := p.state.fillPatternBase; p.state.fillSpace == "Pattern" && s != nil && s.invisible {
-		fill = false
+		fill = fill && p.state.style.Fill.Colorant != nil && p.paintVisible(p.state.style.Fill)
 	}
 	if s := p.state.strokePatternBase; p.state.strokeSpace == "Pattern" && s != nil && s.invisible {
-		stroke = false
+		stroke = stroke && p.state.style.Stroke.Colorant != nil && p.paintVisible(p.state.style.Stroke)
 	}
 	if s := p.state.fillSeparation; p.state.fillSpace == "Separation" && s != nil && s.name == "None" {
 		fill = false
@@ -1303,8 +1313,8 @@ func (p *pageInterpreter) image(stream *Stream) error {
 		image.Intent = normalizeRenderingIntent(p.state.style.RenderingIntent)
 	}
 	if !image.ImageMask {
-		none, err := p.reader.colorSpaceNone(image.ColorSpace, true)
-		if err != nil || none {
+		visible, err := p.colorSpaceVisible(image.ColorSpace)
+		if err != nil || !visible {
 			return err
 		}
 	}
@@ -1500,6 +1510,9 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		child.state.style.AlphaIsShape = false
 		child.state.style.BlendMode = "Normal"
 		child.opaqueGroup = p.visitor.Group == nil
+		if groupMark.ColorSpace != nil {
+			child.blendingSpace = groupMark.ColorSpace
+		}
 	}
 	child.depth++
 	child.stack = nil
@@ -1562,6 +1575,9 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			group := child
 			if visitor.Reference == nil {
 				visitor.Reference = child.visitor.Reference
+			}
+			if visitor.ColorantDevice == nil {
+				visitor.ColorantDevice = child.visitor.ColorantDevice
 			}
 			group.visitor = visitor
 			return walk(&group)

@@ -22,17 +22,19 @@ import (
 
 // TilingPattern 保存平铺图案的单元几何及独立内容流
 type TilingPattern struct {
-	BBox         Rectangle
-	Matrix       Matrix
-	XStep        float64
-	YStep        float64
-	PaintType    int
-	reader       *Reader
-	resources    Dictionary
-	data         []byte
-	depth        int
-	glyphStreams []*Stream
-	initial      graphicsState
+	BBox          Rectangle
+	Matrix        Matrix
+	XStep         float64
+	YStep         float64
+	PaintType     int
+	reader        *Reader
+	resources     Dictionary
+	data          []byte
+	depth         int
+	glyphStreams  []*Stream
+	initial       graphicsState
+	blendingSpace *ColorSpace
+	maskGroup     *Stream
 }
 
 // Walk 独立解释图案单元内容，保留图案边界与无色图案的基色
@@ -46,6 +48,7 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
 	child := pageInterpreter{reader: p.reader, resources: p.resources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
 	child.glyphStreams = p.glyphStreams
+	child.blendingSpace, child.maskGroup = p.blendingSpace, p.maskGroup
 	child.state = p.initial
 	child.state.matrix = Identity()
 	child.state.style.Clips = []Path{clip}
@@ -149,7 +152,7 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState()}, nil
+	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup}, nil
 }
 
 // patternBaseColor 按底层颜色空间解释无色图案的颜色分量

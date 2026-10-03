@@ -75,11 +75,12 @@ type deviceSampleImage struct {
 
 // imagePalette 保存索引色的原始分量和显示颜色
 type imagePalette struct {
-	space   *ColorSpace
-	process *ProcessColorants
-	values  [][4]float64
-	tints   [][]float64
-	colors  []color.NRGBA64
+	space     *ColorSpace
+	process   *ProcessColorants
+	colorants *ColorantSpace
+	values    [][4]float64
+	tints     [][]float64
+	colors    []color.NRGBA64
 }
 
 // imageResample 在统一图像坐标中采样，不缩减任一轴的原始采样数
@@ -908,11 +909,14 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 		if palette != nil {
 			target.Space = palette.space
 			target.Process = palette.process
+			target.ColorantSpace = palette.colorants
 		} else if deviceN != nil {
 			target.Space = deviceN.alternate
 			target.Process = deviceN.process
+			target.ColorantSpace = deviceN.colorants
 		} else if separation != nil {
 			target.Space = separation.space
+			target.ColorantSpace = separation.colorants
 		} else if profile != nil {
 			target.Space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
 			if profile.alternate != nil {
@@ -954,6 +958,9 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 				return nil, err
 			}
 			target.Tints = make([]uint16, tintSize/2)
+			if palette != nil && palette.colors[0].A == 0 || deviceN != nil && deviceN.none || separation != nil && separation.none {
+				target.ColorantAlpha = make([]uint16, bounds.Dx()*bounds.Dy())
+			}
 		}
 		target.Pix = make([]uint16, size/2)
 	}
@@ -1049,6 +1056,13 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 				for c := range target.Colorants {
 					target.Tints[offset+c] = uint16(math.Round(math.Max(0, math.Min(1, tints[c])) * 65535))
 				}
+				if target.ColorantAlpha != nil {
+					coverage := alpha
+					if transparent {
+						coverage = 0
+					}
+					target.ColorantAlpha[y*bounds.Dx()+x] = coverage
+				}
 			}
 			if deviceN != nil {
 				values, err = deviceN.values(inputs...)
@@ -1111,7 +1125,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 					pixel.A = 0
 				}
 			} else if separation != nil {
-				paint, err := separation.paint(values[0], intent)
+				paint, err := separation.alternatePaint(values[0], intent)
 				if err != nil {
 					return nil, err
 				}
@@ -1305,8 +1319,10 @@ func (i *Image) palette() (*imagePalette, error) {
 	if deviceN != nil {
 		result.space = deviceN.alternate
 		result.process = deviceN.process
+		result.colorants = deviceN.colorants
 	} else if separation != nil {
 		result.space = separation.space
+		result.colorants = separation.colorants
 	} else if calibrated != nil {
 		result.space, err = i.reader.readCalibratedSpace(base.(Array))
 		if err != nil {
@@ -1338,7 +1354,7 @@ func (i *Image) palette() (*imagePalette, error) {
 		}
 		if separation != nil {
 			result.tints[index] = append([]float64(nil), result.values[index][:1]...)
-			paint, err := separation.paint(result.values[index][0], intent)
+			paint, err := separation.alternatePaint(result.values[index][0], intent)
 			if err != nil {
 				return nil, err
 			}

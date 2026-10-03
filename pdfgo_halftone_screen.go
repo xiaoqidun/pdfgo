@@ -65,29 +65,41 @@ func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options Halft
 	if h.Type == 0 {
 		return nil, nil
 	}
-	if h.Type == 5 {
-		component := h.Components[options.Colorant]
-		if component == nil {
-			component = h.Components["Default"]
+	compound := h.Type == 5
+	_, primary := transferChannel(options.Colorant)
+	requireTransfer := compound && !primary && options.Colorant != ""
+	if requireTransfer {
+		if err := r.defaultColorantTransfer(h, options.Named); err != nil {
+			return nil, err
 		}
-		if component == nil || component.Type == 5 {
-			return nil, fmt.Errorf("invalid halftone component")
-		}
-		h = component
+	}
+	var err error
+	h, err = h.component(options.Colorant)
+	if err != nil {
+		return nil, err
+	}
+	if compound {
 		if named := options.Named[string(h.Name)]; h.Name != nil && named != nil {
 			h = named
 		}
 	}
+	if requireTransfer && h.Type != 0 && h.TransferFunction == nil {
+		return nil, fmt.Errorf("missing nonprimary halftone transfer function")
+	}
+	transferReader := r
 	if h.reader != nil {
 		r = h.reader
 	}
-	return r.compileHalftone(ctx, h, options)
+	if r.closed {
+		return nil, os.ErrClosed
+	}
+	return r.compileHalftone(ctx, h, options, transferReader, requireTransfer)
 }
 
 // compileHalftone 编译单分量阈值及传递函数，不保留阅读器或函数数据流
-// 入参: ctx 取消上下文, h 单分量网屏, options 设备参数
+// 入参: ctx 取消上下文, h 单分量网屏, options 设备参数, transferReader 图形状态函数所属阅读器, requireTransfer 是否必需传递函数
 // 返回: *HalftoneScreen 网屏, error 定义或计算错误
-func (r *Reader) compileHalftone(ctx context.Context, h *Halftone, options HalftoneOptions) (*HalftoneScreen, error) {
+func (r *Reader) compileHalftone(ctx context.Context, h *Halftone, options HalftoneOptions, transferReader *Reader, requireTransfer bool) (*HalftoneScreen, error) {
 	if h == nil || h.Type == 0 {
 		return nil, nil
 	}
@@ -155,37 +167,54 @@ func (r *Reader) compileHalftone(ctx context.Context, h *Halftone, options Halft
 		}
 		s.thresholds = nil
 	}
-	transfer := options.Transfer
+	var value Object
+	var err error
+	overridden := false
 	if h.TransferFunction != nil {
-		transfer = h.TransferFunction
+		value, err = r.Resolve(h.TransferFunction)
+		if err != nil {
+			return nil, err
+		}
+		overridden = value != nil
 	}
-	value, err := r.Resolve(transfer)
-	if err != nil {
-		return nil, err
+	if !overridden && requireTransfer {
+		return nil, fmt.Errorf("missing nonprimary halftone transfer function")
 	}
-	if functions, ok := value.(Array); ok && h.TransferFunction == nil {
+	if overridden {
+		transferReader = r
+	} else {
+		value, err = transferReader.Resolve(options.Transfer)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if functions, ok := value.(Array); ok {
+		if overridden {
+			return nil, fmt.Errorf("invalid halftone transfer function")
+		}
 		if len(functions) != 4 {
 			return nil, fmt.Errorf("invalid transfer function count")
 		}
-		channel := 3
-		switch options.Colorant {
-		case "Red", "Cyan":
-			channel = 0
-		case "Green", "Magenta":
-			channel = 1
-		case "Blue", "Yellow":
-			channel = 2
-		}
-		value, err = r.Resolve(functions[channel])
+		channel, _ := transferChannel(options.Colorant)
+		value, err = transferReader.Resolve(functions[channel])
 		if err != nil {
 			return nil, err
+		}
+		if value == nil || value == Name("Default") {
+			return nil, fmt.Errorf("invalid transfer function component")
+		}
+		if _, ok := value.(Array); ok {
+			return nil, fmt.Errorf("invalid transfer function component")
 		}
 	}
-	if value != nil && value != Name("Identity") && value != Name("Default") {
-		function, err := r.readGradientFunction(value, 1, 0)
-		if err != nil {
-			return nil, err
-		}
+	if value == Name("Default") && !overridden {
+		value = nil
+	}
+	function, err := transferReader.ReadTransferFunction(value)
+	if err != nil {
+		return nil, err
+	}
+	if function != nil {
 		s.transfer = make([]uint16, 1<<16)
 		for i := range s.transfer {
 			if i%256 == 0 {
@@ -193,11 +222,11 @@ func (r *Reader) compileHalftone(ctx context.Context, h *Halftone, options Halft
 					return nil, err
 				}
 			}
-			value, err := function.evaluate(float64(i) / 65535)
-			if err != nil || math.IsNaN(value[0]) || math.IsInf(value[0], 0) {
+			value, err := function.Evaluate(float64(i)/65535, 0)
+			if err != nil {
 				return nil, fmt.Errorf("invalid halftone transfer result: %v", err)
 			}
-			s.transfer[i] = uint16(math.Round(math.Max(0, math.Min(1, value[0])) * 65535))
+			s.transfer[i] = uint16(math.Round(value * 65535))
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -263,9 +292,6 @@ func halftoneProduct(a, b, modulus uint64) uint64 {
 // 入参: value 黑零白满的分量值, x 横向设备坐标, y 纵向设备坐标
 // 返回: uint16 归一化后的设备分量值
 func (s *HalftoneScreen) Quantize(value uint16, x, y int) uint16 {
-	if s.transfer != nil {
-		value = s.transfer[value]
-	}
 	if s.xsign < 0 {
 		x = ^x
 	}
@@ -279,12 +305,75 @@ func (s *HalftoneScreen) Quantize(value uint16, x, y int) uint16 {
 		xm, ym := halftoneModulo(x, uint64(s.width)), halftoneModulo(y, uint64(s.height))
 		threshold = s.thresholds[int(ym)*s.width+int(xm)]
 	}
+	return s.quantize(value, threshold)
+}
+
+// quantize 应用传递函数并按指定阈值选择设备等级
+// 入参: value 加色分量, threshold 设备像素阈值
+// 返回: uint16 归一化设备分量
+func (s *HalftoneScreen) quantize(value, threshold uint16) uint16 {
+	if s.transfer != nil {
+		value = s.transfer[value]
+	}
 	scaled := uint64(value) * s.levels
 	level, fraction := scaled/65535, scaled%65535
 	if fraction >= uint64(threshold) {
 		level++
 	}
 	return uint16((level*65535 + s.levels/2) / s.levels)
+}
+
+// QuantizeRow 量化一行加色分量，支持重叠缓冲区且不分配像素内存
+// 入参: ctx 取消上下文, out 输出分量, values 源分量, x 起始设备横坐标, y 设备纵坐标
+// 返回: error 取消、尺寸或坐标错误，取消时输出可能已部分更新
+func (s *HalftoneScreen) QuantizeRow(ctx context.Context, out, values []uint16, x, y int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s == nil || s.levels == 0 {
+		return fmt.Errorf("missing halftone screen")
+	}
+	if len(out) != len(values) {
+		return fmt.Errorf("invalid halftone row length")
+	}
+	if len(out) > 0 && x > math.MaxInt-(len(out)-1) {
+		return fmt.Errorf("halftone row coordinate overflow")
+	}
+	copy(out, values)
+	if s.tiled != nil {
+		for i, value := range out {
+			if i%256 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			out[i] = s.Quantize(value, x+i, y)
+		}
+		return ctx.Err()
+	}
+	if s.xsign < 0 {
+		x = ^x
+	}
+	if s.ysign < 0 {
+		y = ^y
+	}
+	xm, ym := int(halftoneModulo(x, uint64(s.width))), int(halftoneModulo(y, uint64(s.height)))
+	row := s.thresholds[ym*s.width : (ym+1)*s.width]
+	for i, value := range out {
+		if i%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		out[i] = s.quantize(value, row[xm])
+		xm += s.xsign
+		if xm < 0 {
+			xm = s.width - 1
+		} else if xm == s.width {
+			xm = 0
+		}
+	}
+	return ctx.Err()
 }
 
 // Apply 对单个加色分量进行网屏化，保持原始设备坐标及子图边界
@@ -296,6 +385,16 @@ func (s *HalftoneScreen) Apply(ctx context.Context, source *image.Gray16) (*imag
 	}
 	if source == nil {
 		return nil, fmt.Errorf("missing halftone source")
+	}
+	if s == nil || s.levels == 0 {
+		return nil, fmt.Errorf("missing halftone screen")
+	}
+	width, height := source.Rect.Dx(), source.Rect.Dy()
+	if source.Rect.Max.X < source.Rect.Min.X || source.Rect.Max.Y < source.Rect.Min.Y || width < 0 || height < 0 || width > math.MaxInt/2 || source.Stride < 0 || source.Stride < width*2 {
+		return nil, fmt.Errorf("invalid halftone source layout")
+	}
+	if width > 0 && height > 0 && (len(source.Pix) < width*2 || height-1 > (len(source.Pix)-width*2)/source.Stride) {
+		return nil, fmt.Errorf("truncated halftone source pixels")
 	}
 	result := image.NewGray16(source.Bounds())
 	for y := source.Rect.Min.Y; y < source.Rect.Max.Y; y++ {

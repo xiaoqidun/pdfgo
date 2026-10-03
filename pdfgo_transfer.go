@@ -102,61 +102,170 @@ func (r *Reader) DeviceTransfer(fallback *TransferFunction, halftone *Halftone, 
 		return nil, fmt.Errorf("invalid transfer device space %q", model)
 	}
 	if halftone == nil || halftone.Type == 0 {
-		return fallback, nil
+		return fallback.deviceChannels(colorants), nil
 	}
-	var result TransferFunction
-	if fallback != nil {
-		result = *fallback
-	}
+	var result *TransferFunction
 	functions := make(map[*Halftone]*TransferFunction)
 	for channel, colorant := range colorants {
 		if colorant == "" {
 			continue
 		}
-		part := halftone
-		if part.Type == 5 {
-			part = part.Components[colorant]
-			if part == nil {
-				part = halftone.Components["Default"]
-			}
-			if part == nil || part.Type == 5 {
-				return nil, fmt.Errorf("invalid halftone component")
-			}
+		part, err := halftone.component(colorant)
+		if err != nil {
+			return nil, err
 		}
 		if part.Type == 0 || part.TransferFunction == nil {
 			continue
 		}
 		function, found := functions[part]
 		if !found {
-			owner := r
-			if part.reader != nil {
-				owner = part.reader
-			}
-			value, err := owner.Resolve(part.TransferFunction)
+			var defined bool
+			function, defined, err = r.halftoneTransfer(part)
 			if err != nil {
 				return nil, err
 			}
-			if value == nil {
+			if !defined {
 				continue
 			}
-			if _, array := value.(Array); array {
-				return nil, fmt.Errorf("invalid halftone transfer function")
-			}
-			function, err = owner.ReadTransferFunction(value)
-			if err != nil {
-				return nil, err
-			}
 			functions[part] = function
+		}
+		if result == nil {
+			result = &TransferFunction{}
+			if fallback != nil {
+				*result = *fallback
+			}
 		}
 		result.functions[channel] = nil
 		if function != nil {
 			result.functions[channel] = function.functions[0]
 		}
 	}
-	if result.functions == ([4]*ColorFunction{}) {
+	if result == nil {
+		result = fallback
+	}
+	return result.deviceChannels(colorants), nil
+}
+
+// deviceChannels 排除设备未使用的传递通道，有效函数保持原对象
+// 入参: colorants 标准设备分量及对应通道
+// 返回: *TransferFunction 有效设备函数，空值为恒等
+func (f *TransferFunction) deviceChannels(colorants [4]Name) *TransferFunction {
+	if f != nil {
+		for channel, colorant := range colorants {
+			if colorant != "" && f.functions[channel] != nil {
+				return f
+			}
+		}
+	}
+	return nil
+}
+
+// ColorantTransfer 选择原生色料的传递函数，非主色使用灰度回退
+// 分量按加色形式求值，专色浓度在求值前后取补值
+// 入参: fallback 图形状态函数, halftone 网屏定义, colorant 原生分量名称
+// 返回: *TransferFunction 各通道相同的独立函数，空值为恒等, error 分量或函数错误
+func (r *Reader) ColorantTransfer(fallback *TransferFunction, halftone *Halftone, colorant Name) (*TransferFunction, error) {
+	if r.closed {
+		return nil, os.ErrClosed
+	}
+	if colorant == "" || colorant == "All" || colorant == "None" || colorant == "Default" {
+		return nil, fmt.Errorf("invalid transfer colorant %q", colorant)
+	}
+	channel, primary := transferChannel(colorant)
+	part, err := halftone.component(colorant)
+	if err != nil {
+		return nil, err
+	}
+	if part != nil && part.Type != 0 {
+		if halftone.Type == 5 && !primary {
+			if err := r.defaultColorantTransfer(halftone, nil); err != nil {
+				return nil, err
+			}
+		}
+		function, defined, err := r.halftoneTransfer(part)
+		if err != nil {
+			return nil, err
+		}
+		if halftone.Type == 5 && !primary && !defined {
+			return nil, fmt.Errorf("missing nonprimary halftone transfer function")
+		}
+		if defined {
+			return function, nil
+		}
+	}
+	if fallback == nil {
 		return nil, nil
 	}
-	return &result, nil
+	function := fallback.functions[channel]
+	if function == nil {
+		return nil, nil
+	}
+	return &TransferFunction{functions: [4]*ColorFunction{function, function, function, function}}, nil
+}
+
+// defaultColorantTransfer 检查非主色设备必需的类型5默认传递函数
+// 入参: h 分量网屏, named 设备命名网屏
+// 返回: error 默认网屏或函数错误
+func (r *Reader) defaultColorantTransfer(h *Halftone, named map[string]*Halftone) error {
+	part := h.Components["Default"]
+	if part == nil {
+		return fmt.Errorf("missing default halftone component")
+	}
+	if replacement := named[string(part.Name)]; part.Name != nil && replacement != nil {
+		part = replacement
+	}
+	if part.Type == 5 {
+		return fmt.Errorf("invalid default halftone component")
+	}
+	if part.Type == 0 {
+		return nil
+	}
+	_, defined, err := r.halftoneTransfer(part)
+	if err != nil {
+		return err
+	}
+	if !defined {
+		return fmt.Errorf("missing nonprimary default transfer function")
+	}
+	return nil
+}
+
+// halftoneTransfer 读取网屏的单通道覆盖函数，不接受图形状态的函数数组
+// 入参: h 网屏定义
+// 返回: *TransferFunction 覆盖函数, bool 是否显式定义, error 引用或函数错误
+func (r *Reader) halftoneTransfer(h *Halftone) (*TransferFunction, bool, error) {
+	if h == nil || h.Type == 0 || h.TransferFunction == nil {
+		return nil, false, nil
+	}
+	if h.reader != nil {
+		r = h.reader
+	}
+	value, err := r.Resolve(h.TransferFunction)
+	if err != nil || value == nil {
+		return nil, false, err
+	}
+	if _, array := value.(Array); array {
+		return nil, false, fmt.Errorf("invalid halftone transfer function")
+	}
+	function, err := r.ReadTransferFunction(value)
+	return function, true, err
+}
+
+// transferChannel 区分标准主色通道及非主色的灰度回退
+// 入参: colorant 原生分量名称
+// 返回: int 传递通道, bool 是否标准主色
+func transferChannel(colorant Name) (int, bool) {
+	switch colorant {
+	case "Red", "Cyan":
+		return 0, true
+	case "Green", "Magenta":
+		return 1, true
+	case "Blue", "Yellow":
+		return 2, true
+	case "Gray", "Black":
+		return 3, true
+	}
+	return 3, false
 }
 
 // Evaluate 计算指定通道的加色分量，输出裁切至单位范围

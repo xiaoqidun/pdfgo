@@ -81,6 +81,9 @@ func (s *graphicsColorSpace) paint(values []float64) (Paint, error) {
 		c = s.palette.colors[index]
 		paint.Space, paint.Values = s.palette.space, s.palette.values[index]
 		paint.Process = s.palette.process
+		if s.palette.colorants != nil {
+			paint.Colorant = newColorantPaint(s.palette.colorants, s.palette.tints[index])
+		}
 		paint.None = c.A == 0
 	} else if s.lab != nil {
 		paint.SourceSpace = "Lab"
