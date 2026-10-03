@@ -114,7 +114,7 @@ func (r *Reader) readSeparationSpace(space Array, effective bool, depth int) (*s
 			lab, err = r.readLab(array)
 			alternate = "Lab"
 		case Name("ICCBased"):
-			icc, err = r.readICCColorSpace(array)
+			icc, err = r.readICCSourceSpace(array, effective)
 			alternate = "ICCBased"
 		case Name("CalRGB"):
 			calibrated, err = r.readCalRGB(array)
@@ -148,11 +148,11 @@ func (r *Reader) readSeparationSpace(space Array, effective bool, depth int) (*s
 	if err != nil {
 		return nil, err
 	}
-	source, _, err := r.readDeviceNAlternate(object)
+	source, _, err := r.readDeviceNAlternateSpace(object, effective)
 	if err != nil {
 		return nil, err
 	}
-	return &separationSpace{name: name, alternate: alternate, space: source, lab: lab, icc: icc, calRGB: calibrated, gray: gray, transform: transform}, nil
+	return &separationSpace{name: name, alternate: alternate, space: source, lab: lab, icc: icc, calRGB: calibrated, gray: gray, transform: transform, none: icc != nil && icc.alternate != nil && icc.alternate.invisible}, nil
 }
 
 // readTintFunction 读取一维采样或指数着色函数

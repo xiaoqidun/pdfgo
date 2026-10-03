@@ -757,7 +757,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-		profile, err = i.reader.readICCColorSpace(space)
+		profile, err = i.reader.readICCSourceSpace(space, i.effectiveColorSpace)
 		if err != nil {
 			return nil, err
 		}
@@ -915,6 +915,16 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 			target.Space = separation.space
 		} else if profile != nil {
 			target.Space = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
+			if profile.alternate != nil {
+				paint, err := profile.paint(make([]float64, components), intent)
+				if err != nil {
+					return nil, err
+				}
+				target.Space = paint.Space
+				if target.Space == nil {
+					target.Space = &ColorSpace{Model: "DeviceRGB", mapped: true}
+				}
+			}
 		} else if calibrated != nil {
 			target.Space, err = i.reader.readCalibratedSpace(i.ColorSpace.(Array))
 			if err != nil {
@@ -1047,6 +1057,19 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 				}
 			}
 			if target != nil {
+				if profile != nil && profile.alternate != nil {
+					paint, err := profile.paint(inputs, intent)
+					if err != nil {
+						return nil, err
+					}
+					values = paint.Values
+					if paint.Space == nil {
+						copy(values[:], paint.RGB[:])
+					}
+					if paint.None {
+						alpha = 0
+					}
+				}
 				if palette != nil {
 					index := int(math.Max(0, math.Min(float64(len(palette.values)-1), math.Round(values[0]))))
 					values = palette.values[index]
@@ -1107,6 +1130,9 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 					return nil, err
 				}
 				pixel = color.NRGBA64{R: uint16(math.Round(converted[0] * 65535)), G: uint16(math.Round(converted[1] * 65535)), B: uint16(math.Round(converted[2] * 65535)), A: 65535}
+				if profile.alternate != nil && profile.alternate.invisible {
+					pixel.A = 0
+				}
 			} else if calibrated != nil {
 				pixel = calibrated.color(values[0], values[1], values[2])
 			} else if lab != nil {
@@ -1219,7 +1245,7 @@ func (i *Image) palette() (*imagePalette, error) {
 			}
 			components = deviceN.components
 		} else if space, ok := base.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-			profile, err = i.reader.readICCColorSpace(space)
+			profile, err = i.reader.readICCSourceSpace(space, i.effectiveColorSpace)
 			if err != nil {
 				return nil, err
 			}
@@ -1295,6 +1321,16 @@ func (i *Image) palette() (*imagePalette, error) {
 	if err != nil {
 		return nil, err
 	}
+	if profile != nil && profile.alternate != nil {
+		paint, err := profile.paint(make([]float64, components), intent)
+		if err != nil {
+			return nil, err
+		}
+		result.space = paint.Space
+		if result.space == nil {
+			result.space = &ColorSpace{Model: "DeviceRGB", mapped: true}
+		}
+	}
 	for index := range palette {
 		v := data[index*components:]
 		for c := 0; c < min(components, 4); c++ {
@@ -1350,6 +1386,23 @@ func (i *Image) palette() (*imagePalette, error) {
 		}
 		if profile != nil {
 			values := result.values[index]
+			if profile.alternate != nil {
+				device := profile.deviceValues(values[:components])
+				paint, err := profile.paint(device[:components], intent)
+				if err != nil {
+					return nil, err
+				}
+				result.values[index] = paint.Values
+				if paint.Space == nil {
+					copy(result.values[index][:], paint.RGB[:])
+				}
+				alpha := uint16(65535)
+				if paint.None {
+					alpha = 0
+				}
+				palette[index] = color.NRGBA64{R: uint16(math.Round(paint.RGB[0] * 65535)), G: uint16(math.Round(paint.RGB[1] * 65535)), B: uint16(math.Round(paint.RGB[2] * 65535)), A: alpha}
+				continue
+			}
 			rgb, err := profile.color(values[:components], intent)
 			if err != nil {
 				return nil, err

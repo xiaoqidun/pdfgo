@@ -600,7 +600,7 @@ func (r *Reader) readShadingColorSpace(object Object, effective bool) (*ColorSpa
 			return &ColorSpace{Model: "DeviceRGB", mapped: true}, nil, lab, 3, err
 		}
 	}
-	space, err := r.readColorSpace(object)
+	space, err := r.readEffectiveColorSpace(object, effective)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}

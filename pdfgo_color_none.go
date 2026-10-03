@@ -129,6 +129,24 @@ func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 		}
 	}
 	switch array[0] {
+	case Name("ICCBased"):
+		stream, _, err := r.iccProfileStream(array)
+		if err != nil {
+			return false, err
+		}
+		alternate, err := r.Resolve(stream.Dictionary["Alternate"])
+		if err != nil {
+			return false, err
+		}
+		family := colorSpaceFamily(alternate)
+		if alternate == nil || family == "DeviceGray" || family == "DeviceRGB" || family == "DeviceCMYK" || family == "CalGray" || family == "CalRGB" || family == "Lab" {
+			return false, nil
+		}
+		space, err := r.readICCSourceSpace(array, effective)
+		if err != nil {
+			return false, err
+		}
+		return space.alternate != nil && space.alternate.invisible, nil
 	case Name("Separation"):
 		if len(array) != 4 {
 			return false, fmt.Errorf("invalid Separation color space")
@@ -140,8 +158,8 @@ func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 		if value == Name("None") {
 			return true, r.ignoredTintSpace(array)
 		}
-		if family := colorSpaceFamily(array[2]); effective && (family == "Separation" || family == "DeviceN") {
-			space, err := r.readSeparationSpace(array, true, 0)
+		if family := colorSpaceFamily(array[2]); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
+			space, err := r.readSeparationSpace(array, effective, 0)
 			if err != nil {
 				return false, err
 			}
@@ -155,8 +173,8 @@ func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 		if none {
 			return true, r.ignoredTintSpace(array)
 		}
-		if family := colorSpaceFamily(array[2]); effective && (family == "Separation" || family == "DeviceN") {
-			space, err := r.readDeviceNSpace(array, true, 0)
+		if family := colorSpaceFamily(array[2]); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
+			space, err := r.readDeviceNSpace(array, effective, 0)
 			if err != nil {
 				return false, err
 			}

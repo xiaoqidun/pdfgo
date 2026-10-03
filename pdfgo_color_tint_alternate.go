@@ -59,11 +59,12 @@ func (r *Reader) readTintAlternate(object Object, effective bool, depth int) (*t
 		}
 		return result, err
 	}
-	result.space, result.lab, err = r.readDeviceNAlternate(object)
+	result.space, result.lab, err = r.readDeviceNAlternateSpace(object, effective)
 	if err != nil {
 		return nil, err
 	}
 	result.components = result.space.Components()
+	result.none = result.space.profile != nil && result.space.profile.alternate != nil && result.space.profile.alternate.invisible
 	return result, nil
 }
 

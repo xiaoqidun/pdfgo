@@ -65,6 +65,18 @@ func sameICCTag(first, second []byte) bool {
 // validateBlending 按PDF第11.3.4节排除明度色度空间，并检查全部基础意图的逆向变换
 // 返回: error 无效混合空间或不可逆的配置
 func (s *iccColorSpace) validateBlending() error {
+	if s.ranges != nil {
+		return fmt.Errorf("invalid ICC blending component range")
+	}
+	if s.alternate != nil {
+		if s.alternateBlending == nil {
+			return fmt.Errorf("invalid ICC alternate blending space")
+		}
+		if s.alternateBlending.profile != nil {
+			return s.alternateBlending.profile.validateBlending()
+		}
+		return nil
+	}
 	if s.lab {
 		return fmt.Errorf("invalid ICC lightness-chromaticity blending space")
 	}

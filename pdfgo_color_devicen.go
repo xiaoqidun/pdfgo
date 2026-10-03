@@ -162,7 +162,7 @@ func (r *Reader) readSingleDeviceN(space Array, effective bool, depth int) (*dev
 	if err != nil {
 		return nil, err
 	}
-	result := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, transform: transform, components: 1}
+	result := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, transform: transform, components: 1, none: alternate.none}
 	if alternate.separation != nil || alternate.deviceN != nil {
 		result.nested, result.none = alternate, alternate.none
 	}
@@ -243,7 +243,7 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 		if err != nil {
 			return nil, err
 		}
-		result := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), sampled: function}
+		result := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), sampled: function, none: alternate.none}
 		if alternate.separation != nil || alternate.deviceN != nil {
 			result.nested, result.none = alternate, alternate.none
 		}
@@ -275,7 +275,7 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 	if err != nil {
 		return nil, err
 	}
-	s := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), input: input, output: output}
+	s := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), input: input, output: output, none: alternate.none}
 	if alternate.separation != nil || alternate.deviceN != nil {
 		s.nested, s.none = alternate, alternate.none
 	}
@@ -298,6 +298,13 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 // 入参: object 备用颜色空间
 // 返回: *ColorSpace 输出空间, *labSpace Lab变换, error 解析错误
 func (r *Reader) readDeviceNAlternate(object Object) (*ColorSpace, *labSpace, error) {
+	return r.readDeviceNAlternateSpace(object, false)
+}
+
+// readDeviceNAlternateSpace 读取原始或已按资源校验的专色备用空间
+// 入参: object 备用定义, effective 是否已按资源校验并替换
+// 返回: *ColorSpace 输出空间, *labSpace Lab变换, error 定义错误
+func (r *Reader) readDeviceNAlternateSpace(object Object, effective bool) (*ColorSpace, *labSpace, error) {
 	object, err := r.resolveColorSpace(object)
 	if err != nil {
 		return nil, nil, err
@@ -306,6 +313,6 @@ func (r *Reader) readDeviceNAlternate(object Object) (*ColorSpace, *labSpace, er
 		lab, err := r.readLab(array)
 		return &ColorSpace{Model: "DeviceRGB", mapped: true}, lab, err
 	}
-	space, err := r.readColorSpace(object)
+	space, err := r.readEffectiveColorSpace(object, effective)
 	return space, nil, err
 }

@@ -181,6 +181,7 @@ type graphicsState struct {
 	fillSpace, strokeSpace                                Name
 	fillPatternBase, strokePatternBase                    *patternColorSpace
 	fillICC, strokeICC                                    *iccColorSpace
+	fillICCValues, strokeICCValues                        [4]float64
 	fillSeparation, strokeSeparation                      *separationSpace
 	fillDeviceN, strokeDeviceN                            *deviceNSpace
 	fillColor, strokeColor                                *graphicsColorSpace
@@ -897,9 +898,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 				return err
 			}
 			if operator == "g" {
+				copy(p.state.fillICCValues[:], values)
 				paint.Alpha = p.state.style.Fill.Alpha
 				p.state.style.Fill = paint
 			} else {
+				copy(p.state.strokeICCValues[:], values)
 				paint.Alpha = p.state.style.Stroke.Alpha
 				p.state.style.Stroke = paint
 			}
@@ -1334,7 +1337,8 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 		used    bool
 		profile *iccColorSpace
 		paint   *Paint
-	}{{fill, p.state.fillICC, &p.state.style.Fill}, {stroke, p.state.strokeICC, &p.state.style.Stroke}} {
+		values  [4]float64
+	}{{fill, p.state.fillICC, &p.state.style.Fill, p.state.fillICCValues}, {stroke, p.state.strokeICC, &p.state.style.Stroke, p.state.strokeICCValues}} {
 		if !target.used || target.paint.None || target.paint.Axial != nil || target.paint.Radial != nil || target.paint.Function != nil || target.paint.Mesh != nil || target.paint.Tiling != nil {
 			continue
 		}
@@ -1343,6 +1347,15 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 			profile = target.paint.Space.profile
 		}
 		if profile == nil {
+			continue
+		}
+		if target.profile != nil && profile.alternate != nil {
+			paint, err := profile.paint(target.values[:profile.components()], p.state.style.RenderingIntent)
+			if err != nil {
+				return err
+			}
+			paint.Alpha = target.paint.Alpha
+			*target.paint = paint
 			continue
 		}
 		rgb, err := profile.color(target.paint.Values[:profile.components()], p.state.style.RenderingIntent)

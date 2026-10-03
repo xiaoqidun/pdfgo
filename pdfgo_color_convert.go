@@ -51,6 +51,11 @@ func (s *ColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 // 入参: values 单位分量, intent 渲染意图
 // 返回: [3]float64 色度, error 变换错误
 func (s *iccColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
+	if s.alternate != nil {
+		var input [4]float64
+		copy(input[:], values)
+		return s.alternateXYZ(input, intent)
+	}
 	device := s.deviceValues(values)
 	values = device[:len(values)]
 	if xyz, used, err := s.processXYZ(values, intent); used || err != nil {
@@ -119,6 +124,9 @@ func (s *iccColorSpace) absoluteXYZ(xyz [3]float64, inverse bool) ([3]float64, e
 // 入参: xyz D50色度, intent 渲染意图
 // 返回: [4]float64 合成分量, error 不可逆或未支持的变换
 func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
+	if s.alternate != nil {
+		return s.alternateFromXYZ(xyz, intent)
+	}
 	values, err := s.fromDeviceXYZ(xyz, intent)
 	if err != nil || s.ranges == nil && !s.lab {
 		return values, err

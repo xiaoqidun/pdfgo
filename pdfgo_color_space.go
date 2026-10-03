@@ -251,10 +251,15 @@ func (r *Reader) readBlendingSpace(value Object) (*ColorSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.profile != nil {
+	for s.profile != nil {
 		if err := s.profile.validateBlending(); err != nil {
 			return nil, err
 		}
+		if s.profile.alternate != nil {
+			s = s.profile.alternateBlending
+			continue
+		}
+		break
 	}
 	return s, nil
 }
@@ -290,6 +295,13 @@ func (r *Reader) resolveColorSpace(value Object) (Object, error) {
 // 入参: value 颜色空间定义
 // 返回: *ColorSpace 颜色空间, error 格式或能力错误
 func (r *Reader) readColorSpace(value Object) (*ColorSpace, error) {
+	return r.readEffectiveColorSpace(value, false)
+}
+
+// readEffectiveColorSpace 读取原始或已按资源校验的设备及校准空间
+// 入参: value 颜色定义, effective 是否已按资源校验并替换
+// 返回: *ColorSpace 源空间, error 定义或配置错误
+func (r *Reader) readEffectiveColorSpace(value Object, effective bool) (*ColorSpace, error) {
 	value, err := r.resolveColorSpace(value)
 	if err != nil {
 		return nil, err
@@ -308,7 +320,7 @@ func (r *Reader) readColorSpace(value Object) (*ColorSpace, error) {
 		return r.readCalibratedSpace(array)
 	}
 	if array, ok := value.(Array); ok && len(array) == 2 && array[0] == Name("ICCBased") {
-		profile, err := r.readICCColorSpace(array)
+		profile, err := r.readICCSourceSpace(array, effective)
 		if err != nil {
 			return nil, err
 		}

@@ -61,7 +61,7 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 	case "Separation":
 		separation, err = p.reader.readSeparationSpace(array, true, 0)
 	case "ICCBased":
-		profile, err = p.reader.readICCColorSpace(array)
+		profile, err = p.reader.readICCSourceSpace(array, true)
 	default:
 		return &UnsupportedError{Feature: "color space " + string(name)}
 	}
@@ -95,11 +95,13 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 	if fill {
 		paint.Alpha = p.state.style.Fill.Alpha
 		p.state.fillSpace, p.state.fillPatternBase, p.state.fillICC = name, patternBase, profile
+		p.state.fillICCValues = [4]float64{}
 		p.state.fillSeparation, p.state.fillDeviceN, p.state.fillColor = separation, deviceN, calibrated
 		p.state.style.Fill = paint
 	} else {
 		paint.Alpha = p.state.style.Stroke.Alpha
 		p.state.strokeSpace, p.state.strokePatternBase, p.state.strokeICC = name, patternBase, profile
+		p.state.strokeICCValues = [4]float64{}
 		p.state.strokeSeparation, p.state.strokeDeviceN, p.state.strokeColor = separation, deviceN, calibrated
 		p.state.style.Stroke = paint
 	}

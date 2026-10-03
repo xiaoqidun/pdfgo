@@ -56,6 +56,9 @@ type iccColorSpace struct {
 	lab                bool
 	inverse            *iccInverseSpace
 	signature          *[32]byte
+	alternate          *patternColorSpace
+	alternateBlending  *ColorSpace
+	alternateCount     int
 }
 
 // iccProfileStream 解析ICC配置流及必需的分量数，支持间接引用
@@ -88,6 +91,18 @@ func (r *Reader) iccProfileStream(object Array) (*Stream, Integer, error) {
 // 入参: object ICCBased颜色空间数组
 // 返回: *iccColorSpace 颜色变换, error 解析错误
 func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
+	return r.readICCSourceSpace(object, false)
+}
+
+// readICCSourceSpace 读取原始或已按资源校验的ICC源空间，后来版本使用标准备用空间
+// 入参: object ICCBased数组, effective 是否已按资源校验并替换
+// 返回: *iccColorSpace 源颜色变换, error 配置或备用定义错误
+func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpace, error) {
+	if r.colorProfileDepth >= 64 {
+		return nil, fmt.Errorf("color space recursion limit exceeded")
+	}
+	r.colorProfileDepth++
+	defer func() { r.colorProfileDepth-- }()
 	stream, count, err := r.iccProfileStream(object)
 	if err != nil {
 		return nil, err
@@ -100,10 +115,19 @@ func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateICCSourceHeader(data, int(count)); err != nil {
+		return nil, err
+	}
+	if data[8] > 4 {
+		if _, err := iccProfileDirectory(data, string(data[16:20])); err != nil {
+			return nil, err
+		}
+		return r.readICCAlternate(stream, int(count), ranges, effective)
+	}
 	key := sha256.Sum256(data)
 	if cached := r.colorProfiles[key]; cached != nil {
 		if cached.components() != int(count) {
-			return nil, &UnsupportedError{Feature: "ICC profile model"}
+			return nil, fmt.Errorf("invalid ICC component count")
 		}
 		return cached.withRanges(ranges), nil
 	}
@@ -114,11 +138,6 @@ func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
 	tags, err := iccProfileTags(data, model)
 	if err != nil {
 		return nil, err
-	}
-	switch string(data[12:16]) {
-	case "scnr", "mntr", "prtr", "spac":
-	default:
-		return nil, fmt.Errorf("invalid ICC source profile class")
 	}
 	signature := key
 	space := &iccColorSpace{absoluteScale: iccAbsoluteScale(tags["wtpt"]), lab: model == "Lab ", signature: &signature}
@@ -242,6 +261,9 @@ func (s *iccColorSpace) deviceValues(values []float64) [4]float64 {
 // components 返回配置文件的颜色分量数
 // 返回: int 分量数
 func (s *iccColorSpace) components() int {
+	if s.alternate != nil {
+		return s.alternateCount
+	}
 	if s.lut != nil {
 		return s.lut.components
 	}
@@ -255,6 +277,14 @@ func (s *iccColorSpace) components() int {
 // 入参: values PDF源分量, intent 渲染意图
 // 返回: Paint 源空间与显示颜色, error 颜色变换错误
 func (s *iccColorSpace) paint(values []float64, intent Name) (Paint, error) {
+	if s.alternate != nil {
+		if len(values) != s.components() {
+			return Paint{}, fmt.Errorf("invalid ICC alternate input count")
+		}
+		var input [4]float64
+		copy(input[:], values)
+		return s.alternatePaint(input, intent)
+	}
 	model := map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[s.components()]
 	paint := Paint{SourceSpace: "ICCBased", Space: &ColorSpace{Model: model, profile: s}}
 	paint.Values = s.normalize(values)
@@ -267,6 +297,11 @@ func (s *iccColorSpace) paint(values []float64, intent Name) (Paint, error) {
 // 入参: values 单位分量, intent 渲染意图
 // 返回: [3]float64 sRGB分量, error 不支持的变换
 func (s *iccColorSpace) color(values []float64, intent Name) ([3]float64, error) {
+	if s.alternate != nil {
+		var input [4]float64
+		copy(input[:], values)
+		return s.alternateColor(input, intent)
+	}
 	xyz, err := s.xyz(values, intent)
 	return iccXYZRGB(xyz), err
 }
@@ -378,11 +413,25 @@ func iccTags(data []byte, model string) (map[string][]byte, error) {
 // 入参: data 配置文件数据, model 颜色模型
 // 返回: map[string][]byte 标签数据, error 格式错误
 func iccProfileTags(data []byte, model string) (map[string][]byte, error) {
+	tags, err := iccProfileDirectory(data, model)
+	if err != nil {
+		return nil, err
+	}
+	if data[8] != 2 && data[8] != 4 {
+		return nil, &UnsupportedError{Feature: "ICC profile version"}
+	}
+	return tags, nil
+}
+
+// iccProfileDirectory 校验ICC头和标签目录，不将未知版本与格式损坏混为一类
+// 入参: data 配置数据, model 预期源模型
+// 返回: map[string][]byte 标签数据, error 头或目录错误
+func iccProfileDirectory(data []byte, model string) (map[string][]byte, error) {
 	if len(data) < 132 || string(data[36:40]) != "acsp" || uint64(binary.BigEndian.Uint32(data)) != uint64(len(data)) {
 		return nil, fmt.Errorf("invalid ICC profile header")
 	}
-	if string(data[16:20]) != model || string(data[20:24]) != "XYZ " && string(data[20:24]) != "Lab " || data[8] != 2 && data[8] != 4 {
-		return nil, &UnsupportedError{Feature: "ICC profile model"}
+	if string(data[16:20]) != model || string(data[20:24]) != "XYZ " && string(data[20:24]) != "Lab " {
+		return nil, fmt.Errorf("invalid ICC profile model")
 	}
 	count := uint64(binary.BigEndian.Uint32(data[128:]))
 	if count > uint64(len(data)-132)/12 {

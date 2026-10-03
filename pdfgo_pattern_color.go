@@ -21,6 +21,7 @@ type patternColorSpace struct {
 	components int
 	convert    func([]float64, Name) (Paint, error)
 	invisible  bool
+	blending   *ColorSpace
 }
 
 // readPatternBase 读取无色图案的设备、校准、索引或专色空间
@@ -49,7 +50,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 				paint, err := space.paint(values[0], intent)
 				paint.Alpha = 1
 				return paint, err
-			}, space.name == "None" || space.none}, nil
+			}, space.name == "None" || space.none, nil}, nil
 		case Name("DeviceN"):
 			space, err := r.readDeviceNSpace(array, effective, 0)
 			if err != nil {
@@ -59,7 +60,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 				paint, err := space.paint(values, intent)
 				paint.Alpha = 1
 				return paint, err
-			}, space.none}, nil
+			}, space.none, nil}, nil
 		case Name("Lab"):
 			lab, err := r.readLab(array)
 			if err != nil {
@@ -70,7 +71,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 				paint, err := space.paint(values)
 				paint.Alpha = 1
 				return paint, err
-			}, false}, nil
+			}, false, nil}, nil
 		case Name("Indexed"):
 			image := &Image{reader: r, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{}}, effectiveColorSpace: effective}
 			palette, err := image.palette()
@@ -87,10 +88,10 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 					return paint, err
 				}
 				return paint, nil
-			}, palette.colors[0].A == 0}, nil
+			}, palette.colors[0].A == 0, nil}, nil
 		}
 	}
-	space, err := r.readColorSpace(object)
+	space, err := r.readEffectiveColorSpace(object, effective)
 	if err != nil {
 		return nil, err
 	}
@@ -99,6 +100,11 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 		source, _ = array[0].(Name)
 	}
 	return &patternColorSpace{space.Components(), func(values []float64, intent Name) (Paint, error) {
+		if space.profile != nil && space.profile.alternate != nil {
+			paint, err := space.profile.paint(values, intent)
+			paint.Alpha = 1
+			return paint, err
+		}
 		paint := Paint{SourceSpace: source, Space: space, Alpha: 1}
 		if space.profile != nil {
 			paint.Values = space.profile.normalize(values)
@@ -114,5 +120,5 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 			paint.CMYK = &values
 		}
 		return paint, err
-	}, false}, nil
+	}, space.profile != nil && space.profile.alternate != nil && space.profile.alternate.invisible, space}, nil
 }

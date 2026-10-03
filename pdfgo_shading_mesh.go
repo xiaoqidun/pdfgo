@@ -57,7 +57,7 @@ type meshBits struct {
 // UsesFunction 判断颜色分量是否需在插值后经过函数变换
 // 返回: bool 是否使用颜色函数
 func (g *MeshGradient) UsesFunction() bool {
-	return g.function != nil || g.tint != nil || g.lab != nil || g.Space != nil && g.Space.profile != nil && g.Space.profile.ranges != nil
+	return g.function != nil || g.tint != nil || g.lab != nil || g.Space != nil && g.Space.profile != nil && (g.Space.profile.ranges != nil || g.Space.profile.alternate != nil)
 }
 
 // PointAt 计算单位参数域内的双三次曲面坐标

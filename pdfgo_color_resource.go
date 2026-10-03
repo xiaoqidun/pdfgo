@@ -96,6 +96,9 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 	if !indexed || len(array) == 0 {
 		return value, nil
 	}
+	if array[0] == Name("ICCBased") {
+		return r.remapICCAlternate(array, resources, remap, depth)
+	}
 	base := -1
 	switch array[0] {
 	case Name("Pattern"):
