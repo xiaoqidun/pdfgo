@@ -38,7 +38,7 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 		}
 	case "Pattern":
 		if len(array) == 2 {
-			patternBase, err = p.reader.readPatternBase(array[1])
+			patternBase, err = p.reader.readPatternColorSpace(array[1], true)
 		} else if array != nil && len(array) != 1 {
 			return fmt.Errorf("invalid Pattern color space")
 		}
@@ -53,13 +53,13 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 			calibrated.gray = true
 			calibrated.calRGB, err = p.reader.readCalGray(array)
 		case "Indexed":
-			image := &Image{reader: p.reader, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{"Intent": p.state.style.RenderingIntent}}}
+			image := &Image{reader: p.reader, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{"Intent": p.state.style.RenderingIntent}}, effectiveColorSpace: true}
 			calibrated.palette, err = image.palette()
 		}
 	case "DeviceN":
-		deviceN, err = p.reader.readDeviceN(array)
+		deviceN, err = p.reader.readDeviceNSpace(array, true, 0)
 	case "Separation":
-		separation, err = p.reader.readSeparation(array)
+		separation, err = p.reader.readSeparationSpace(array, true, 0)
 	case "ICCBased":
 		profile, err = p.reader.readICCColorSpace(array)
 	default:

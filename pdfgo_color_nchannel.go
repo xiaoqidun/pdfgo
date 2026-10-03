@@ -144,6 +144,7 @@ func (r *Reader) applyNChannelProcess(space Array, tint *deviceNSpace) error {
 		return nil
 	}
 	tint.alternate, tint.lab = output, nil
+	tint.nested, tint.none = nil, false
 	tint.process = &ProcessColorants{Space: output, Channels: make([]int, tint.components)}
 	tint.input, tint.output = gradientUnitBounds(tint.components), gradientUnitBounds(output.Components())
 	tint.transform, tint.sampled, tint.program = nil, nil, nil

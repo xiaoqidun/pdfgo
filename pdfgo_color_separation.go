@@ -20,7 +20,7 @@ import (
 	"math"
 )
 
-// separationSpace 保存分色名、备用设备空间及着色变换
+// separationSpace 保存分色名、备用空间及着色变换
 type separationSpace struct {
 	name      Name
 	alternate Name
@@ -30,6 +30,8 @@ type separationSpace struct {
 	calRGB    *calRGBSpace
 	gray      bool
 	transform *gradientFunction
+	nested    *tintAlternate
+	none      bool
 }
 
 // tintFunction 保存单输入函数的定义及采样数据
@@ -46,6 +48,16 @@ type tintFunction struct {
 // 入参: space 分色颜色空间数组
 // 返回: *separationSpace 分色定义, error 错误信息
 func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
+	return r.readSeparationSpace(space, false, 0)
+}
+
+// readSeparationSpace 读取原始分色或已校验的默认空间替换，限制嵌套深度
+// 入参: space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: *separationSpace 分色变换, error 定义或函数错误
+func (r *Reader) readSeparationSpace(space Array, effective bool, depth int) (*separationSpace, error) {
+	if depth >= 64 {
+		return nil, fmt.Errorf("color space recursion limit exceeded")
+	}
 	if len(space) != 4 || space[0] != Name("Separation") {
 		return nil, fmt.Errorf("invalid Separation color space")
 	}
@@ -75,6 +87,17 @@ func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
 	object, err := r.resolveColorSpace(space[2])
 	if err != nil {
 		return nil, err
+	}
+	if family := colorSpaceFamily(object); family == "Separation" || family == "DeviceN" {
+		nested, err := r.readTintAlternate(object, effective, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		transform, err := r.readGradientFunction(space[3], nested.components, 0)
+		if err != nil {
+			return nil, err
+		}
+		return &separationSpace{name: name, space: nested.space, nested: nested, transform: transform, none: nested.none}, nil
 	}
 	alternate, ok := object.(Name)
 	var lab *labSpace
@@ -305,13 +328,20 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 	if err != nil {
 		return Paint{}, err
 	}
-	if s.name == "None" {
+	if s.name == "None" || s.none {
 		return Paint{SourceSpace: "Separation", None: true}, nil
 	}
 	if s.name == "All" {
 		return Paint{SourceSpace: "Separation", CMYK: &values}, nil
 	}
 	paint := Paint{SourceSpace: "Separation", Space: s.space, Values: values}
+	if s.nested != nil {
+		paint.RGB, err = s.space.RGB(values[:s.space.Components()], intent)
+		if s.space.Device() && s.space.Model == "DeviceCMYK" {
+			paint.CMYK = &values
+		}
+		return paint, err
+	}
 	switch s.alternate {
 	case "DeviceGray":
 		paint.RGB = [3]float64{values[0], values[0], values[0]}
@@ -353,6 +383,9 @@ func (s *separationSpace) values(tint float64) ([4]float64, error) {
 	values, err := s.transform.evaluate(tint)
 	if err != nil {
 		return [4]float64{}, err
+	}
+	if s.nested != nil {
+		return s.nested.values(values[:s.nested.components])
 	}
 	if s.lab != nil {
 		pixel := s.lab.color(values[0], values[1], values[2])

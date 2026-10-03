@@ -74,7 +74,7 @@ func (i *Image) ProcessColorants() (*ProcessColorants, error) {
 	if !ok || len(a) != 5 || a[0] != Name("DeviceN") {
 		return nil, nil
 	}
-	tint, err := i.reader.readDeviceN(a)
+	tint, err := i.reader.readDeviceNSpace(a, i.effectiveColorSpace, 0)
 	if err != nil {
 		return nil, err
 	}

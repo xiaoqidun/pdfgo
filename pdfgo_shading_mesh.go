@@ -199,7 +199,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	if err != nil {
 		return Paint{}, err
 	}
-	none, err := p.reader.colorantNone(object)
+	none, err := p.reader.colorSpaceNone(object, true)
 	if err != nil {
 		return Paint{}, err
 	}
@@ -226,7 +226,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	}
 	g := &MeshGradient{Intent: p.state.style.RenderingIntent, Matrix: matrix}
 	var components int
-	g.Space, g.tint, g.lab, components, err = p.reader.readShadingSpace(object)
+	g.Space, g.tint, g.lab, components, err = p.reader.readShadingColorSpace(object, true)
 	if err != nil {
 		return Paint{}, err
 	}

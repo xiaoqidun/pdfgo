@@ -103,6 +103,13 @@ func (r *Reader) ignoredTintSpace(space Array) error {
 // 入参: object 颜色空间
 // 返回: bool 是否不产生输出, error 色料定义错误
 func (r *Reader) colorantNone(object Object) (bool, error) {
+	return r.colorSpaceNone(object, false)
+}
+
+// colorSpaceNone 判断原始或已按资源校验的空间是否完全不绘制
+// 入参: object 颜色空间, effective 是否已按资源校验并替换
+// 返回: bool 是否不产生输出, error 色料或变换错误
+func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 	object, err := r.resolveColorSpace(object)
 	if err != nil {
 		return false, err
@@ -133,6 +140,13 @@ func (r *Reader) colorantNone(object Object) (bool, error) {
 		if value == Name("None") {
 			return true, r.ignoredTintSpace(array)
 		}
+		if family := colorSpaceFamily(array[2]); effective && (family == "Separation" || family == "DeviceN") {
+			space, err := r.readSeparationSpace(array, true, 0)
+			if err != nil {
+				return false, err
+			}
+			return space.none, nil
+		}
 	case Name("DeviceN"):
 		_, none, err := r.deviceNColorants(array)
 		if err != nil {
@@ -140,6 +154,13 @@ func (r *Reader) colorantNone(object Object) (bool, error) {
 		}
 		if none {
 			return true, r.ignoredTintSpace(array)
+		}
+		if family := colorSpaceFamily(array[2]); effective && (family == "Separation" || family == "DeviceN") {
+			space, err := r.readDeviceNSpace(array, true, 0)
+			if err != nil {
+				return false, err
+			}
+			return space.none, nil
 		}
 	}
 	return false, nil

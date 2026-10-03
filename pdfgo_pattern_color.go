@@ -27,6 +27,13 @@ type patternColorSpace struct {
 // 入参: object 底层颜色空间
 // 返回: *patternColorSpace 颜色变换, error 解析错误
 func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
+	return r.readPatternColorSpace(object, false)
+}
+
+// readPatternColorSpace 读取原始或已按资源校验的图案基础空间
+// 入参: object 基础空间, effective 是否已按资源校验并替换
+// 返回: *patternColorSpace 分量数及颜色变换, error 颜色空间错误
+func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternColorSpace, error) {
 	object, err := r.resolveColorSpace(object)
 	if err != nil {
 		return nil, err
@@ -34,7 +41,7 @@ func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
 	if array, ok := object.(Array); ok && len(array) > 0 {
 		switch array[0] {
 		case Name("Separation"):
-			space, err := r.readSeparation(array)
+			space, err := r.readSeparationSpace(array, effective, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -42,9 +49,9 @@ func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
 				paint, err := space.paint(values[0], intent)
 				paint.Alpha = 1
 				return paint, err
-			}, space.name == "None"}, nil
+			}, space.name == "None" || space.none}, nil
 		case Name("DeviceN"):
-			space, err := r.readDeviceN(array)
+			space, err := r.readDeviceNSpace(array, effective, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -65,7 +72,7 @@ func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
 				return paint, err
 			}, false}, nil
 		case Name("Indexed"):
-			image := &Image{reader: r, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{}}}
+			image := &Image{reader: r, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{}}, effectiveColorSpace: effective}
 			palette, err := image.palette()
 			if err != nil {
 				return nil, err

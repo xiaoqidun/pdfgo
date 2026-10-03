@@ -298,7 +298,7 @@ func (r *Reader) deviceNWideGradient(function Object, tint *deviceNSpace, domain
 		}
 		return tint.values(values...)
 	}}
-	linear := tint.expressions != nil && tint.lab == nil
+	linear := tint.expressions != nil && tint.lab == nil && tint.nested == nil
 	for _, part := range source.parts {
 		linear = linear && part.linear != nil
 	}

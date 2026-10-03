@@ -35,19 +35,20 @@ var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 // Warning非空时允许按声明尺寸读取含多余样本的图像，并报告恢复原因
 // Intent为空时继承绘图状态，单独解码使用相对色度
 type Image struct {
-	Width            int
-	Height           int
-	BitsPerComponent int
-	ColorSpace       Object
-	Intent           Name
-	Decode           Array
-	ImageMask        bool
-	Interpolate      bool
-	Mask             Object
-	SoftMask         Object
-	Stream           *Stream
-	Warning          func(Diagnostic)
-	reader           *Reader
+	Width               int
+	Height              int
+	BitsPerComponent    int
+	ColorSpace          Object
+	Intent              Name
+	Decode              Array
+	ImageMask           bool
+	Interpolate         bool
+	Mask                Object
+	SoftMask            Object
+	Stream              *Stream
+	Warning             func(Diagnostic)
+	reader              *Reader
+	effectiveColorSpace bool
 }
 
 // HasSoftMask 判断显式及JPEG2000内嵌软遮罩，不将硬遮罩当作软遮罩
@@ -312,6 +313,7 @@ func (r *Reader) ReadImageWithResources(object Object, resources Dictionary) (*I
 	if err != nil {
 		return nil, err
 	}
+	image.effectiveColorSpace = true
 	return image, nil
 }
 
@@ -707,7 +709,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 		return nil, fmt.Errorf("invalid image dimensions")
 	}
 	if target == nil && !i.ImageMask {
-		none, err := i.reader.colorantNone(i.ColorSpace)
+		none, err := i.reader.colorSpaceNone(i.ColorSpace, i.effectiveColorSpace)
 		if err != nil {
 			return nil, err
 		}
@@ -762,7 +764,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 		components = profile.components()
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Separation") {
-		separation, err = i.reader.readSeparation(space)
+		separation, err = i.reader.readSeparationSpace(space, i.effectiveColorSpace, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -772,7 +774,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
-		deviceN, err = i.reader.readDeviceN(space)
+		deviceN, err = i.reader.readDeviceNSpace(space, i.effectiveColorSpace, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -1057,7 +1059,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 					if err != nil {
 						return nil, err
 					}
-					if separation.name == "None" {
+					if separation.name == "None" || separation.none {
 						alpha = 0
 					}
 				}
@@ -1096,7 +1098,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 				} else {
 					pixel = color.NRGBA64{R: uint16(math.Round(paint.RGB[0] * 65535)), G: uint16(math.Round(paint.RGB[1] * 65535)), B: uint16(math.Round(paint.RGB[2] * 65535)), A: 65535}
 				}
-				if separation.name == "None" {
+				if separation.name == "None" || separation.none {
 					pixel.A = 0
 				}
 			} else if profile != nil {
@@ -1205,13 +1207,13 @@ func (i *Image) palette() (*imagePalette, error) {
 		components = 4
 	default:
 		if space, ok := base.(Array); ok && len(space) > 0 && space[0] == Name("Separation") {
-			separation, err = i.reader.readSeparation(space)
+			separation, err = i.reader.readSeparationSpace(space, i.effectiveColorSpace, 0)
 			if err != nil {
 				return nil, err
 			}
 			components = 1
 		} else if space, ok := base.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
-			deviceN, err = i.reader.readDeviceN(space)
+			deviceN, err = i.reader.readDeviceNSpace(space, i.effectiveColorSpace, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -1313,7 +1315,7 @@ func (i *Image) palette() (*imagePalette, error) {
 				return nil, err
 			}
 			alpha := uint16(65535)
-			if separation.name == "None" {
+			if separation.name == "None" || separation.none {
 				alpha = 0
 			}
 			palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: alpha}
@@ -1566,7 +1568,7 @@ func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error
 	}
 	components := 0
 	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
-		deviceN, err := i.reader.readDeviceN(space)
+		deviceN, err := i.reader.readDeviceNSpace(space, i.effectiveColorSpace, 0)
 		if err != nil {
 			return nil, err
 		}

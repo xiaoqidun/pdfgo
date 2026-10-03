@@ -196,7 +196,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if err != nil {
 		return Paint{}, err
 	}
-	none, err := p.reader.colorantNone(space)
+	none, err := p.reader.colorSpaceNone(space, true)
 	if err != nil {
 		return Paint{}, err
 	}
@@ -253,7 +253,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		if err != nil {
 			return Paint{}, err
 		}
-		base, err := p.reader.readPatternBase(object)
+		base, err := p.reader.readPatternColorSpace(object, true)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -382,7 +382,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	if err != nil {
 		return Paint{}, err
 	}
-	none, err := p.reader.colorantNone(object)
+	none, err := p.reader.colorSpaceNone(object, true)
 	if err != nil {
 		return Paint{}, err
 	}
@@ -483,7 +483,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		paint.Radial.function, paint.Radial.domain = function, domain
 	}
 	if array, ok := object.(Array); ok && len(array) == 5 && array[0] == Name("DeviceN") {
-		tint, err := p.reader.readDeviceN(array)
+		tint, err := p.reader.readDeviceNSpace(array, true, 0)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -502,20 +502,30 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 	}
 	array, ok := object.(Array)
 	if ok && len(array) > 0 && array[0] == Name("DeviceN") {
-		return p.reader.deviceNGradient(array, function, domain)
+		return p.reader.readDeviceNGradient(array, function, domain, true)
 	}
 	if ok && len(array) > 0 && array[0] == Name("Separation") {
-		separation, err := p.reader.readSeparation(array)
+		separation, err := p.reader.readSeparationSpace(array, true, 0)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		if separation.name == "None" {
+		if separation.name == "None" || separation.none {
 			return nil, nil, nil, &UnsupportedError{Feature: "Separation None shading"}
 		}
 		space, lab := separation.space, separation.lab
 		source, err := p.reader.readGradientFunction(function, 1, 0)
 		if err != nil {
 			return nil, nil, nil, err
+		}
+		if separation.nested != nil {
+			f := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+				values, err := source.evaluate(x)
+				if err != nil {
+					return values, err
+				}
+				return separation.values(values[0])
+			}}
+			return nil, space, f, nil
 		}
 		f := composeGradientFunction(source, separation.transform)
 		if lab != nil {
@@ -529,7 +539,7 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 		}
 		return stops, space, f, nil
 	}
-	space, _, lab, channels, err := p.reader.readShadingSpace(object)
+	space, _, lab, channels, err := p.reader.readShadingColorSpace(object, true)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -560,24 +570,31 @@ func (p *pageInterpreter) shadingColorSpace(object Object) (Object, error) {
 // 入参: object 已解析的颜色空间定义
 // 返回: *ColorSpace 输出空间, *deviceNSpace 专色变换, *labSpace Lab变换, int 源分量数, error 格式或能力错误
 func (r *Reader) readShadingSpace(object Object) (*ColorSpace, *deviceNSpace, *labSpace, int, error) {
+	return r.readShadingColorSpace(object, false)
+}
+
+// readShadingColorSpace 读取原始或已按资源校验的着色源空间
+// 入参: object 颜色空间, effective 是否已按资源校验并替换
+// 返回: *ColorSpace 输出空间, *deviceNSpace 专色变换, *labSpace Lab变换, int 源分量数, error 格式或能力错误
+func (r *Reader) readShadingColorSpace(object Object, effective bool) (*ColorSpace, *deviceNSpace, *labSpace, int, error) {
 	if array, ok := object.(Array); ok && len(array) > 0 {
 		switch array[0] {
 		case Name("DeviceN"):
-			tint, err := r.readDeviceN(array)
+			tint, err := r.readDeviceNSpace(array, effective, 0)
 			if err != nil {
 				return nil, nil, nil, 0, err
 			}
 			return tint.alternate, tint, nil, tint.components, nil
 		case Name("Separation"):
-			separation, err := r.readSeparation(array)
+			separation, err := r.readSeparationSpace(array, effective, 0)
 			if err != nil {
 				return nil, nil, nil, 0, err
 			}
-			if separation.name == "None" {
+			if separation.name == "None" || separation.none {
 				return nil, nil, nil, 0, &UnsupportedError{Feature: "Separation None shading"}
 			}
 			space, lab := separation.space, separation.lab
-			return space, &deviceNSpace{alternate: space, lab: lab, transform: separation.transform, components: 1}, nil, 1, nil
+			return space, &deviceNSpace{alternate: space, lab: lab, transform: separation.transform, nested: separation.nested, components: 1}, nil, 1, nil
 		case Name("Lab"):
 			lab, err := r.readLab(array)
 			return &ColorSpace{Model: "DeviceRGB", mapped: true}, nil, lab, 3, err
@@ -632,7 +649,14 @@ func shadingColorValues(space *ColorSpace, tint *deviceNSpace, lab *labSpace, in
 // 入参: space 多色定义, function 渐变函数, domain 输入区间
 // 返回: []GradientStop 备用空间分段, *ColorSpace 备用空间, *gradientFunction 颜色函数, error 能力或格式错误
 func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	tint, err := r.readDeviceN(space)
+	return r.readDeviceNGradient(space, function, domain, false)
+}
+
+// readDeviceNGradient 组合原始或已按资源校验的多色渐变，不线性化非线性嵌套
+// 入参: space 多色定义, function 渐变函数, domain 输入区间, effective 是否已按资源校验并替换
+// 返回: []GradientStop 分段, *ColorSpace 输出空间, *gradientFunction 颜色函数, error 定义或函数错误
+func (r *Reader) readDeviceNGradient(space Array, function Object, domain [2]float64, effective bool) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
+	tint, err := r.readDeviceNSpace(space, effective, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -650,10 +674,10 @@ func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64
 		}
 		return tint.values(values[:tint.components]...)
 	}}
-	if tint.expressions != nil && tint.lab == nil {
+	if tint.expressions != nil && tint.lab == nil && tint.nested == nil {
 		mapped = iccGradientFunction(deviceNGradientFunction(source, tint.input, tint.output, tint.expressions), tint.alternate.profile)
 	}
-	if tint.transform != nil && tint.lab == nil {
+	if tint.transform != nil && tint.lab == nil && tint.nested == nil {
 		composed := iccGradientFunction(composeGradientFunction(source, tint.transform), tint.alternate.profile)
 		mapped.linear = composed.linear
 	}

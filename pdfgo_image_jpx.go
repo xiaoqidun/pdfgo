@@ -385,7 +385,7 @@ func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
 		case Name("CalGray"), Name("Indexed"), Name("Separation"):
 			count = 1
 		case Name("DeviceN"):
-			definition, err := i.reader.readDeviceN(space)
+			definition, err := i.reader.readDeviceNSpace(space, i.effectiveColorSpace, 0)
 			if err != nil {
 				return nil, err
 			}

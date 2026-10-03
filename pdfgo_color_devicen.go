@@ -31,6 +31,16 @@ type deviceNSpace struct {
 	expressions   []affineValue
 	program       []calculatorInstruction
 	sampled       *sampledFunction
+	nested        *tintAlternate
+}
+
+// outputComponents 返回着色函数的输出数，不使用嵌套变换后的显示分量数
+// 返回: int 备用空间输入数
+func (s *deviceNSpace) outputComponents() int {
+	if s.nested != nil {
+		return s.nested.components
+	}
+	return s.alternate.Components()
 }
 
 // paint 按专色浓度生成备用空间颜色并保留原始分量
@@ -81,7 +91,7 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 		for i, tint := range tints {
 			input[i] = math.Max(0, math.Min(1, tint))
 		}
-		s.sampled.evaluate(input, values[:s.alternate.Components()])
+		s.sampled.evaluate(input, values[:s.outputComponents()])
 	} else if s.transform != nil {
 		var err error
 		values, err = s.transform.evaluate(math.Max(0, math.Min(1, tints[0])))
@@ -97,7 +107,7 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 		for i, value := range tints {
 			input[i] = math.Max(s.input[2*i], math.Min(s.input[2*i+1], math.Max(0, math.Min(1, value))))
 		}
-		if err := evaluateCalculator(s.program, input, values[:s.alternate.Components()]); err != nil {
+		if err := evaluateCalculator(s.program, input, values[:s.outputComponents()]); err != nil {
 			return values, err
 		}
 		values = clipGradientValue(values, s.output)
@@ -110,6 +120,9 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 			}
 		}
 		values = clipGradientValue(values, s.output)
+	}
+	if s.nested != nil {
+		return s.nested.values(values[:s.nested.components])
 	}
 	if s.lab != nil {
 		color := s.lab.color(values[0], values[1], values[2])
@@ -125,9 +138,9 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 }
 
 // readSingleDeviceN 解析单分量DeviceN颜色空间，不将专色浓度解释为设备灰度
-// 入参: space 颜色空间数组
+// 入参: space 颜色空间数组, effective 是否已按资源校验并替换, depth 嵌套深度
 // 返回: *deviceNSpace 着色定义, error 解析或未支持的分量错误
-func (r *Reader) readSingleDeviceN(space Array) (*deviceNSpace, error) {
+func (r *Reader) readSingleDeviceN(space Array, effective bool, depth int) (*deviceNSpace, error) {
 	names, none, err := r.deviceNColorants(space)
 	if err != nil {
 		return nil, err
@@ -141,22 +154,36 @@ func (r *Reader) readSingleDeviceN(space Array) (*deviceNSpace, error) {
 		}
 		return &deviceNSpace{alternate: &ColorSpace{Model: "DeviceRGB"}, components: 1, none: true}, nil
 	}
-	alternate, lab, err := r.readDeviceNAlternate(space[2])
+	alternate, err := r.readTintAlternate(space[2], effective, depth+1)
 	if err != nil {
 		return nil, err
 	}
-	transform, err := r.readGradientFunction(space[3], alternate.Components(), 0)
+	transform, err := r.readGradientFunction(space[3], alternate.components, 0)
 	if err != nil {
 		return nil, err
 	}
-	return &deviceNSpace{alternate: alternate, lab: lab, transform: transform, components: 1}, nil
+	result := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, transform: transform, components: 1}
+	if alternate.separation != nil || alternate.deviceN != nil {
+		result.nested, result.none = alternate, alternate.none
+	}
+	return result, nil
 }
 
 // readDeviceN 解析单分量函数或多分量采样与计算器专色变换
 // 入参: space 颜色空间数组
 // 返回: *deviceNSpace 着色定义, error 格式或能力错误
 func (r *Reader) readDeviceN(space Array) (*deviceNSpace, error) {
-	if len(space) != 4 && len(space) != 5 {
+	return r.readDeviceNSpace(space, false, 0)
+}
+
+// readDeviceNSpace 读取原始多色或已校验的默认空间替换，限制嵌套深度
+// 入参: space 多色数组, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: *deviceNSpace 专色变换, error 定义或函数错误
+func (r *Reader) readDeviceNSpace(space Array, effective bool, depth int) (*deviceNSpace, error) {
+	if depth >= 64 {
+		return nil, fmt.Errorf("color space recursion limit exceeded")
+	}
+	if len(space) != 4 && len(space) != 5 || space[0] != Name("DeviceN") {
 		return nil, fmt.Errorf("invalid DeviceN color space")
 	}
 	object, err := r.Resolve(space[1])
@@ -165,9 +192,9 @@ func (r *Reader) readDeviceN(space Array) (*deviceNSpace, error) {
 	}
 	var result *deviceNSpace
 	if names, ok := object.(Array); ok && len(names) == 1 {
-		result, err = r.readSingleDeviceN(space)
+		result, err = r.readSingleDeviceN(space, effective, depth)
 	} else {
-		result, err = r.readMultiDeviceN(space)
+		result, err = r.readMultiDeviceN(space, effective, depth)
 	}
 	if err != nil {
 		return nil, err
@@ -179,9 +206,9 @@ func (r *Reader) readDeviceN(space Array) (*deviceNSpace, error) {
 }
 
 // readMultiDeviceN 读取多分量专色的备用空间、区间和着色函数
-// 入参: space 多色定义
+// 入参: space 多色定义, effective 是否已按资源校验并替换, depth 嵌套深度
 // 返回: *deviceNSpace 专色变换, error 解析错误
-func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
+func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*deviceNSpace, error) {
 	names, none, err := r.deviceNColorants(space)
 	if err != nil {
 		return nil, err
@@ -192,7 +219,7 @@ func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
 		}
 		return &deviceNSpace{alternate: &ColorSpace{Model: "DeviceRGB"}, components: len(names), none: true}, nil
 	}
-	alternate, lab, err := r.readDeviceNAlternate(space[2])
+	alternate, err := r.readTintAlternate(space[2], effective, depth+1)
 	if err != nil {
 		return nil, err
 	}
@@ -203,17 +230,24 @@ func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
 	stream, ok := value.(*Stream)
 	var kind Object
 	if ok {
+		if stream == nil {
+			return nil, fmt.Errorf("invalid DeviceN tint function")
+		}
 		kind, err = r.Resolve(stream.Dictionary["FunctionType"])
 		if err != nil {
 			return nil, err
 		}
 	}
 	if kind == Integer(0) {
-		function, err := r.readSampledFunction(stream, len(names), alternate.Components())
+		function, err := r.readSampledFunction(stream, len(names), alternate.components)
 		if err != nil {
 			return nil, err
 		}
-		return &deviceNSpace{alternate: alternate, lab: lab, components: len(names), sampled: function}, nil
+		result := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), sampled: function}
+		if alternate.separation != nil || alternate.deviceN != nil {
+			result.nested, result.none = alternate, alternate.none
+		}
+		return result, nil
 	}
 	if !ok || kind != Integer(4) {
 		return nil, &UnsupportedError{Feature: "DeviceN tint function"}
@@ -222,7 +256,7 @@ func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	output, err := r.numberArray(stream.Dictionary["Range"], 2*alternate.Components())
+	output, err := r.numberArray(stream.Dictionary["Range"], 2*alternate.components)
 	if err != nil {
 		return nil, err
 	}
@@ -241,8 +275,11 @@ func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &deviceNSpace{alternate: alternate, lab: lab, components: len(names), input: input, output: output}
-	s.expressions, err = affineCalculator(data, len(names), alternate.Components())
+	s := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), input: input, output: output}
+	if alternate.separation != nil || alternate.deviceN != nil {
+		s.nested, s.none = alternate, alternate.none
+	}
+	s.expressions, err = affineCalculator(data, len(names), alternate.components)
 	if err != nil {
 		s.program = program
 	}
@@ -251,7 +288,7 @@ func (r *Reader) readMultiDeviceN(space Array) (*deviceNSpace, error) {
 	for i := range names {
 		inputs[i] = input[2*i]
 	}
-	if err := evaluateCalculator(program, inputs, outputs[:alternate.Components()]); err != nil {
+	if err := evaluateCalculator(program, inputs, outputs[:alternate.components]); err != nil {
 		return nil, err
 	}
 	return s, nil

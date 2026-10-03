@@ -130,6 +130,17 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 	if base < 0 {
 		return value, nil
 	}
+	if base == 2 {
+		original, err := r.remapColorSpace(array[base], resources, false, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		switch colorSpaceFamily(original) {
+		case "DeviceGray", "DeviceRGB", "DeviceCMYK", "CalGray", "CalRGB", "Lab", "ICCBased":
+		default:
+			return nil, fmt.Errorf("invalid alternate color space")
+		}
+	}
 	resolved, err := r.remapColorSpace(array[base], resources, remap, depth+1)
 	if err != nil {
 		return nil, err

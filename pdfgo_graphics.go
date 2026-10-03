@@ -1300,7 +1300,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 		image.Intent = normalizeRenderingIntent(p.state.style.RenderingIntent)
 	}
 	if !image.ImageMask {
-		none, err := p.reader.colorantNone(image.ColorSpace)
+		none, err := p.reader.colorSpaceNone(image.ColorSpace, true)
 		if err != nil || none {
 			return err
 		}
