@@ -35,6 +35,7 @@ type TilingPattern struct {
 	initial       graphicsState
 	blendingSpace *ColorSpace
 	maskGroup     *Stream
+	halftones     map[string]*Halftone
 }
 
 // Walk 独立解释图案单元内容，保留图案边界与无色图案的基色
@@ -43,6 +44,9 @@ type TilingPattern struct {
 func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) error {
 	if p.depth > 64 {
 		return &UnsupportedError{Feature: "nested pattern depth"}
+	}
+	if visitor.Halftones == nil {
+		visitor.Halftones = p.halftones
 	}
 	box := p.BBox
 	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
@@ -152,7 +156,7 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup}, nil
+	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones}, nil
 }
 
 // patternBaseColor 按底层颜色空间解释无色图案的颜色分量

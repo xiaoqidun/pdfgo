@@ -48,7 +48,7 @@ func (r *Reader) ReadHalftone(object Object) (*Halftone, error) {
 			return cached, nil
 		}
 	}
-	h, err := r.readHalftone(object, false)
+	h, err := r.readHalftone(object, false, nil, nil)
 	if err == nil && indirect {
 		if r.halftones == nil {
 			r.halftones = make(map[Reference]*Halftone)
@@ -58,10 +58,52 @@ func (r *Reader) ReadHalftone(object Object) (*Halftone, error) {
 	return h, err
 }
 
+// ReadHalftoneForDevice 优先选择设备命名网屏，未匹配时解析文件中的备用定义
+// 入参: object 网屏对象, named 只读设备网屏，匹配后不解析其他字段或阈值流
+// 返回: *Halftone 有效网屏, error 名称或备用定义错误
+func (r *Reader) ReadHalftoneForDevice(object Object, named map[string]*Halftone) (*Halftone, error) {
+	if len(named) == 0 {
+		return r.ReadHalftone(object)
+	}
+	ref, indirect := object.(Reference)
+	if indirect && !r.closed {
+		if cached, ok := r.halftones[ref]; ok && !cached.namedOverride(named) {
+			return cached, nil
+		}
+	}
+	used := false
+	h, err := r.readHalftone(object, false, named, &used)
+	if err == nil && indirect && !used {
+		if r.halftones == nil {
+			r.halftones = make(map[Reference]*Halftone)
+		}
+		r.halftones[ref] = h
+	}
+	return h, err
+}
+
+// namedOverride 检查缓存定义及其单层分量是否被设备名称覆盖
+// 入参: named 只读设备命名网屏
+// 返回: bool 是否存在名称匹配
+func (h *Halftone) namedOverride(named map[string]*Halftone) bool {
+	if h == nil {
+		return false
+	}
+	if h.Name != nil && named[string(h.Name)] != nil {
+		return true
+	}
+	for _, part := range h.Components {
+		if part != nil && part.Name != nil && named[string(part.Name)] != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // readHalftone 读取单色或分量网屏，禁止嵌套类型5
-// 入参: object 网屏对象, component 是否为分量网屏
+// 入参: object 网屏对象, component 是否为分量网屏, named 只读设备命名网屏, used 记录名称匹配
 // 返回: *Halftone 网屏参数, error 定义错误
-func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) {
+func (r *Reader) readHalftone(object Object, component bool, named map[string]*Halftone, used *bool) (*Halftone, error) {
 	value, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -77,18 +119,26 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 	if !ok {
 		return nil, fmt.Errorf("invalid halftone dictionary")
 	}
-	h := &Halftone{Dictionary: dict, reader: r}
 	value, err = r.Resolve(dict["HalftoneName"])
 	if err != nil {
 		return nil, err
 	}
+	var name []byte
 	if value != nil {
-		name, ok := value.(String)
+		raw, ok := value.(String)
 		if !ok {
 			return nil, fmt.Errorf("invalid halftone name")
 		}
-		h.Name = append([]byte{}, name...)
+		if device := named[string(raw)]; device != nil {
+			if component && device.Type == 5 {
+				return nil, fmt.Errorf("invalid component halftone type")
+			}
+			*used = true
+			return device, nil
+		}
+		name = append([]byte{}, raw...)
 	}
+	h := &Halftone{Dictionary: dict, Name: name, reader: r}
 	value, err = r.Resolve(dict["HalftoneType"])
 	if err != nil {
 		return nil, err
@@ -108,10 +158,6 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 	if !ok {
 		return h, nil
 	}
-	h.TransferFunction, err = r.Resolve(dict["TransferFunction"])
-	if err != nil {
-		return nil, err
-	}
 	if kind == 5 {
 		if component || isStream {
 			return nil, fmt.Errorf("invalid component halftone type")
@@ -121,7 +167,7 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 			if key == "Type" || key == "HalftoneType" || key == "HalftoneName" {
 				continue
 			}
-			part, err := r.readHalftone(object, true)
+			part, err := r.readHalftone(object, true, named, used)
 			if err != nil {
 				return nil, err
 			}
@@ -131,6 +177,10 @@ func (r *Reader) readHalftone(object Object, component bool) (*Halftone, error) 
 			return nil, fmt.Errorf("missing default component halftone")
 		}
 		return h, nil
+	}
+	h.TransferFunction, err = r.Resolve(dict["TransferFunction"])
+	if err != nil {
+		return nil, err
 	}
 	if kind == 1 {
 		if isStream {

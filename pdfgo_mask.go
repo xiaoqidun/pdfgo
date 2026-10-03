@@ -55,6 +55,9 @@ func (m *SoftMask) Walk(visitor Visitor) error {
 	if visitor.Reference == nil {
 		visitor.Reference = p.visitor.Reference
 	}
+	if visitor.Halftones == nil {
+		visitor.Halftones = p.visitor.Halftones
+	}
 	p.visitor = visitor
 	p.maskGroup = m.stream
 	return p.form(m.stream)

@@ -122,6 +122,7 @@ type TextMark struct {
 	Mode                  int
 	Clip                  *TextClip
 	glyphStreams          []*Stream
+	halftones             map[string]*Halftone
 }
 
 // TextObject 保留文字对象身份，Knockout为真时整段挖空，为假时逐字合成
@@ -163,6 +164,7 @@ type MarkedContentMark struct {
 // OptionalContent可覆盖XObject的可选内容状态，缺省使用文档默认配置
 // Reference可提供引用表单的目标页面，缺省或返回nil时绘制代理内容
 // ColorantDevice声明输出设备，保留其可用色料，实际分色求值与合成由访问器完成
+// Halftones提供只读设备命名网屏，优先于文件中的同名备用定义
 type Visitor struct {
 	Path            func(PathMark) error
 	Text            func(TextMark) error
@@ -172,6 +174,7 @@ type Visitor struct {
 	OptionalContent func(Object) (bool, error)
 	Reference       ReferenceResolver
 	ColorantDevice  *ColorantDevice
+	Halftones       map[string]*Halftone
 	Warning         func(Diagnostic)
 }
 
@@ -364,6 +367,9 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			if v.ColorantDevice == nil {
 				v.ColorantDevice = visitor.ColorantDevice
 			}
+			if v.Halftones == nil {
+				v.Halftones = visitor.Halftones
+			}
 			child.visitor = v
 			return child.run(data)
 		})
@@ -377,6 +383,9 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, visitor Visitor) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if visitor.Halftones == nil {
+		visitor.Halftones = mark.halftones
 	}
 	font := mark.Font
 	if font == nil || font.Subtype != Name("Type3") || index < 0 || index >= len(mark.Glyphs) || index >= len(mark.Positions) {
@@ -1214,6 +1223,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 		}
 		mark := TextMark{Object: p.textObject, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
 		mark.glyphStreams = p.glyphStreams
+		mark.halftones = p.visitor.Halftones
 		if mark.Mode >= 4 {
 			mark.Clip = &TextClip{Font: mark.Font, Glyphs: glyphs, Positions: positions, Matrix: mark.Matrix, Size: mark.Size, HorizontalScale: mark.HorizontalScale}
 			p.textClips = append(p.textClips, mark.Clip)
@@ -1579,6 +1589,9 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			if visitor.ColorantDevice == nil {
 				visitor.ColorantDevice = child.visitor.ColorantDevice
 			}
+			if visitor.Halftones == nil {
+				visitor.Halftones = child.visitor.Halftones
+			}
 			group.visitor = visitor
 			return walk(&group)
 		})
@@ -1662,7 +1675,7 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 			}
 			p.state.nonKnockout = !bool(flag)
 		case "HT":
-			p.state.style.Halftone, err = p.reader.ReadHalftone(dict[key])
+			p.state.style.Halftone, err = p.reader.ReadHalftoneForDevice(dict[key], p.visitor.Halftones)
 			if err != nil {
 				return err
 			}
