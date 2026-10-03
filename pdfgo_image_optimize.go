@@ -321,33 +321,24 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 }
 
 // writePNGChunk 写入带校验的PNG块
-// 入参: w 内存输出, kind 块类型, data 块内容
-func writePNGChunk(w *bytes.Buffer, kind string, data []byte) {
+// 入参: w 输出流, kind 块类型, data 块内容
+// 返回: error 写入错误
+func writePNGChunk(w io.Writer, kind string, data []byte) error {
 	var header [8]byte
 	binary.BigEndian.PutUint32(header[:4], uint32(len(data)))
 	copy(header[4:], kind)
-	w.Write(header[:])
-	w.Write(data)
-	hash := crc32.NewIEEE()
-	hash.Write(header[4:])
-	hash.Write(data)
+	hash := crc32.Update(0, crc32.IEEETable, header[4:])
+	hash = crc32.Update(hash, crc32.IEEETable, data)
 	var checksum [4]byte
-	binary.BigEndian.PutUint32(checksum[:], hash.Sum32())
-	w.Write(checksum[:])
-}
-
-// contextInput 在分块读取之间检查取消
-type contextInput struct {
-	ctx    context.Context
-	reader io.Reader
-}
-
-// Read 检查取消状态后读取数据
-// 入参: p 数据缓冲区
-// 返回: int 已读字节数, error 读取错误
-func (r *contextInput) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
+	binary.BigEndian.PutUint32(checksum[:], hash)
+	for _, part := range [][]byte{header[:], data, checksum[:]} {
+		n, err := w.Write(part)
+		if err != nil {
+			return err
+		}
+		if n != len(part) {
+			return io.ErrShortWrite
+		}
 	}
-	return r.reader.Read(p)
+	return nil
 }

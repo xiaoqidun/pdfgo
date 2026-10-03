@@ -19,20 +19,21 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"image/color"
 	"math"
 )
 
 // iccRGBSpace 保存RGB矩阵曲线配置文件到sRGB的变换
 type iccRGBSpace struct {
-	matrix calRGBSpace
-	curves [3]iccToneCurve
+	matrix  calRGBSpace
+	curves  [3]iccToneCurve
+	inverse [9]float64
 }
 
-// iccGraySpace 保存灰度曲线及D50连接空间到sRGB的变换
+// iccGraySpace 保存灰度曲线及XYZ或Lab连接空间到sRGB的变换
 type iccGraySpace struct {
 	matrix calRGBSpace
 	curve  iccToneCurve
+	lab    bool
 }
 
 // iccToneCurve 保存ICC采样曲线或参数曲线
@@ -43,13 +44,18 @@ type iccToneCurve struct {
 	direction  int8
 }
 
-// iccColorSpace 统一灰度、RGB与CMYK配置文件的绘制颜色变换
+// iccColorSpace 统一灰度、RGB、CMYK与Lab配置文件的绘制颜色变换
 type iccColorSpace struct {
 	rgb                *iccRGBSpace
 	gray               *iccGraySpace
 	lut                *iccLUTSpace
 	toFloat, fromFloat [4]*iccProcessElements
 	processPCS         string
+	absoluteScale      [3]float64
+	ranges             *[8]float64
+	lab                bool
+	inverse            *iccInverseSpace
+	signature          *[32]byte
 }
 
 // readICCColorSpace 读取内容流使用的ICC颜色空间
@@ -64,32 +70,52 @@ func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
 		return nil, err
 	}
 	stream, ok := value.(*Stream)
-	if !ok {
+	if !ok || stream == nil {
 		return nil, fmt.Errorf("invalid ICC profile stream")
 	}
-	count, ok := stream.Dictionary["N"].(Integer)
-	if !ok || count != 1 && count != 3 && count != 4 {
-		return nil, fmt.Errorf("invalid ICC component count")
-	}
-	data, err := r.readICCProfile(object, int64(count))
+	value, err = r.Resolve(stream.Dictionary["N"])
 	if err != nil {
 		return nil, err
 	}
-	model := map[Integer]string{1: "GRAY", 3: "RGB ", 4: "CMYK"}[count]
-	tags, err := iccProfileTags(data, model)
+	count, ok := value.(Integer)
+	if !ok || count != 1 && count != 3 && count != 4 {
+		return nil, fmt.Errorf("invalid ICC component count")
+	}
+	ranges, err := r.iccRanges(stream.Dictionary["Range"], int(count))
+	if err != nil {
+		return nil, err
+	}
+	data, err := stream.Decode()
 	if err != nil {
 		return nil, err
 	}
 	key := sha256.Sum256(data)
 	if cached := r.colorProfiles[key]; cached != nil {
-		return cached, nil
+		if cached.components() != int(count) {
+			return nil, &UnsupportedError{Feature: "ICC profile model"}
+		}
+		return cached.withRanges(ranges), nil
 	}
-	space := &iccColorSpace{}
+	model := map[Integer]string{1: "GRAY", 3: "RGB ", 4: "CMYK"}[count]
+	if count == 3 && len(data) >= 20 && string(data[16:20]) == "Lab " {
+		model = "Lab "
+	}
+	tags, err := iccProfileTags(data, model)
+	if err != nil {
+		return nil, err
+	}
+	switch string(data[12:16]) {
+	case "scnr", "mntr", "prtr", "spac":
+	default:
+		return nil, fmt.Errorf("invalid ICC source profile class")
+	}
+	signature := key
+	space := &iccColorSpace{absoluteScale: iccAbsoluteScale(tags["wtpt"]), lab: model == "Lab ", signature: &signature}
 	if tags["A2B0"] != nil {
 		space.lut, err = parseICCLUTSpace(data, tags)
 	} else if count == 1 {
 		space.gray, err = parseICCGray(data)
-	} else if count == 3 {
+	} else if count == 3 && !space.lab {
 		space.rgb, err = parseICCRGB(data)
 	} else {
 		err = fmt.Errorf("missing ICC A2B0 transform")
@@ -99,32 +125,107 @@ func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
 	}
 	space.processPCS = string(data[20:24])
 	for n := range space.toFloat {
-		for _, direction := range []struct {
-			name       string
-			input, out int
-			target     **iccProcessElements
-		}{{fmt.Sprintf("D2B%d", n), int(count), 3, &space.toFloat[n]}, {fmt.Sprintf("B2D%d", n), 3, int(count), &space.fromFloat[n]}} {
-			if tag := tags[direction.name]; tag != nil {
-				transform, err := parseICCProcessElements(tag)
-				var unsupported *UnsupportedError
-				if errors.As(err, &unsupported) {
-					continue
-				}
-				if err != nil {
-					return nil, fmt.Errorf("ICC %s: %w", direction.name, err)
-				}
-				if transform.input != direction.input || transform.output != direction.out {
-					return nil, fmt.Errorf("invalid ICC %s channels", direction.name)
-				}
-				*direction.target = transform
+		name := fmt.Sprintf("D2B%d", n)
+		if tag := tags[name]; tag != nil {
+			transform, err := parseICCProcessElements(tag)
+			var unsupported *UnsupportedError
+			if errors.As(err, &unsupported) {
+				continue
 			}
+			if err != nil {
+				return nil, fmt.Errorf("ICC %s: %w", name, err)
+			}
+			if transform.input != int(count) || transform.output != 3 {
+				return nil, fmt.Errorf("invalid ICC %s channels", name)
+			}
+			space.toFloat[n] = transform
 		}
 	}
+	space.inverse = newICCInverse(tags, int(count), space.processPCS)
 	if r.colorProfiles == nil {
 		r.colorProfiles = make(map[[32]byte]*iccColorSpace)
 	}
 	r.colorProfiles[key] = space
-	return space, nil
+	return space.withRanges(ranges), nil
+}
+
+// iccRanges 读取PDF声明的源分量范围，缺省或单位范围不分配配置副本
+// 入参: object 范围数组, count 源分量数
+// 返回: *[8]float64 分量范围，单位范围为nil, error 无效范围
+func (r *Reader) iccRanges(object Object, count int) (*[8]float64, error) {
+	object, err := r.Resolve(object)
+	if err != nil || object == nil {
+		return nil, err
+	}
+	values, err := r.numberArray(object, count*2)
+	if err != nil {
+		return nil, err
+	}
+	var ranges [8]float64
+	unit := true
+	for i := range count {
+		low, high := values[2*i], values[2*i+1]
+		if math.IsNaN(low) || math.IsNaN(high) || math.IsInf(low, 0) || math.IsInf(high, 0) || low > high {
+			return nil, fmt.Errorf("invalid ICC component range")
+		}
+		ranges[2*i], ranges[2*i+1] = low, high
+		unit = unit && low == 0 && high == 1
+	}
+	if unit {
+		return nil, nil
+	}
+	return &ranges, nil
+}
+
+// withRanges 复用不可变ICC变换，为当前PDF定义保留独立分量范围
+// 入参: ranges 源分量范围
+// 返回: *iccColorSpace 当前定义的颜色空间
+func (s *iccColorSpace) withRanges(ranges *[8]float64) *iccColorSpace {
+	if ranges == nil {
+		return s
+	}
+	copy := *s
+	copy.ranges = ranges
+	return &copy
+}
+
+// sourceRanges 返回PDF源分量范围，不使用PCS编码范围替代
+// 返回: [8]float64 每个源分量的最小与最大值
+func (s *iccColorSpace) sourceRanges() [8]float64 {
+	if s.ranges != nil {
+		return *s.ranges
+	}
+	return [8]float64{0, 1, 0, 1, 0, 1, 0, 1}
+}
+
+// normalize 将实际源分量裁切到PDF范围并映射为合成使用的单位分量
+// 入参: values 实际源分量
+// 返回: [4]float64 单位分量
+func (s *iccColorSpace) normalize(values []float64) [4]float64 {
+	var result [4]float64
+	ranges := s.sourceRanges()
+	for i, value := range values {
+		low, high := ranges[2*i], ranges[2*i+1]
+		if low != high {
+			result[i] = functionPosition(math.Max(low, math.Min(high, value)), low, high)
+		}
+	}
+	return result
+}
+
+// deviceValues 将合成分量恢复到ICC设备单位，Lab浮点标签使用真实Lab数值
+// 入参: values 单位分量
+// 返回: [4]float64 ICC设备分量
+func (s *iccColorSpace) deviceValues(values []float64) [4]float64 {
+	var result [4]float64
+	if s.ranges == nil {
+		copy(result[:], values)
+		return result
+	}
+	for i, value := range values {
+		result[i] = functionValue(value, s.ranges[2*i], s.ranges[2*i+1])
+	}
+	return result
 }
 
 // components 返回配置文件的颜色分量数
@@ -139,42 +240,24 @@ func (s *iccColorSpace) components() int {
 	return 3
 }
 
-// paint 保存ICC源分量与显示颜色，避免混合时从已截断的sRGB反推颜色
-// 入参: values 源颜色分量, intent 渲染意图
-// 返回: Paint 原始与显示颜色, error 颜色变换错误
+// paint 保存ICC合成分量与显示颜色，避免混合时从已截断的sRGB反推颜色
+// 入参: values PDF源分量, intent 渲染意图
+// 返回: Paint 源空间与显示颜色, error 颜色变换错误
 func (s *iccColorSpace) paint(values []float64, intent Name) (Paint, error) {
 	model := map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[s.components()]
 	paint := Paint{SourceSpace: "ICCBased", Space: &ColorSpace{Model: model, profile: s}}
-	for i, value := range values {
-		paint.Values[i] = math.Max(0, math.Min(1, value))
-	}
+	paint.Values = s.normalize(values)
 	var err error
 	paint.RGB, err = s.color(paint.Values[:s.components()], intent)
 	return paint, err
 }
 
-// color 将内容流ICC颜色转换为sRGB
-// 入参: values 编码分量, intent 渲染意图
+// color 将ICC合成分量转换为sRGB
+// 入参: values 单位分量, intent 渲染意图
 // 返回: [3]float64 sRGB分量, error 不支持的变换
 func (s *iccColorSpace) color(values []float64, intent Name) ([3]float64, error) {
-	if xyz, used, err := s.processXYZ(values, intent); used || err != nil {
-		return iccXYZRGB(xyz), err
-	}
-	if s.lut != nil {
-		xyz, err := s.lut.xyz(values, intent)
-		if err != nil {
-			return [3]float64{}, err
-		}
-		return iccXYZRGB(xyz), nil
-	}
-	if s.gray == nil {
-		return s.rgb.color(values, intent)
-	}
-	if intent == "AbsoluteColorimetric" {
-		return [3]float64{}, &UnsupportedError{Feature: "ICC absolute colorimetric conversion"}
-	}
-	c := s.gray.color(values[0])
-	return [3]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}, nil
+	xyz, err := s.xyz(values, intent)
+	return iccXYZRGB(xyz), err
 }
 
 // validateRGBGroupSpace 检查混合空间与sRGB的偏差是否在8位量化精度内
@@ -189,72 +272,6 @@ func (r *Reader) validateRGBGroupSpace(object Object) error {
 		return &UnsupportedError{Feature: "non-sRGB group color space"}
 	}
 	return nil
-}
-
-// readICCRGB 解析基于矩阵和曲线的ICC颜色空间，不以备用空间替代配置文件
-// 入参: object ICCBased颜色空间数组
-// 返回: *iccRGBSpace 颜色变换, error 错误信息
-func (r *Reader) readICCRGB(object Array) (*iccRGBSpace, error) {
-	data, err := r.readICCProfile(object, 3)
-	if err != nil {
-		return nil, err
-	}
-	return parseICCRGB(data)
-}
-
-// readICCGray 解析ICC灰度配置文件
-// 入参: object ICCBased颜色空间数组
-// 返回: *iccGraySpace 灰度颜色变换, error 错误信息
-func (r *Reader) readICCGray(object Array) (*iccGraySpace, error) {
-	data, err := r.readICCProfile(object, 1)
-	if err != nil {
-		return nil, err
-	}
-	return parseICCGray(data)
-}
-
-// readICCProfile 读取并检查ICC颜色空间的配置文件流
-// 入参: object ICCBased颜色空间数组, components 分量数
-// 返回: []byte 配置文件数据, error 错误信息
-func (r *Reader) readICCProfile(object Array, components int64) ([]byte, error) {
-	if len(object) != 2 || object[0] != Name("ICCBased") {
-		return nil, fmt.Errorf("invalid ICCBased color space")
-	}
-	value, err := r.Resolve(object[1])
-	if err != nil {
-		return nil, err
-	}
-	stream, ok := value.(*Stream)
-	if !ok {
-		return nil, fmt.Errorf("invalid ICC profile stream")
-	}
-	count, ok := stream.Dictionary["N"].(Integer)
-	if !ok {
-		return nil, fmt.Errorf("invalid ICC component count")
-	}
-	if count != Integer(components) {
-		return nil, &UnsupportedError{Feature: "ICC component count"}
-	}
-	if v := stream.Dictionary["Range"]; v != nil {
-		v, err = r.Resolve(v)
-		if err != nil {
-			return nil, err
-		}
-		a, ok := v.(Array)
-		if !ok {
-			return nil, fmt.Errorf("invalid ICC component range")
-		}
-		n, err := numbers(a, int(components)*2)
-		if err != nil {
-			return nil, err
-		}
-		for i, v := range n {
-			if v != float64(i%2) {
-				return nil, &UnsupportedError{Feature: "ICC component range"}
-			}
-		}
-	}
-	return stream.Decode()
 }
 
 // parseICCRGB 校验ICC标签边界并读取D50矩阵和色调曲线
@@ -281,6 +298,7 @@ func parseICCRGB(data []byte) (*iccRGBSpace, error) {
 			return nil, err
 		}
 	}
+	s.inverse = iccInverseMatrix(s.matrix.matrix)
 	return s, nil
 }
 
@@ -300,12 +318,30 @@ func parseICCGray(data []byte) (*iccGraySpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &iccGraySpace{curve: curve, matrix: calRGBSpace{gamma: [3]float64{1, 1, 1}, matrix: [9]float64{0.9642, 0, 0, 0, 1, 0, 0, 0, 0.8249}}}
+	s := &iccGraySpace{curve: curve, lab: string(data[20:24]) == "Lab ", matrix: calRGBSpace{gamma: [3]float64{1, 1, 1}, matrix: [9]float64{0.9642, 0, 0, 0, 1, 0, 0, 0, 0.8249}}}
 	source, target := bradford([3]float64{0.9642, 1, 0.8249}), bradford([3]float64{0.95047, 1, 1.08883})
 	for i := range s.matrix.adapt {
 		s.matrix.adapt[i] = target[i] / source[i]
 	}
 	return s, nil
+}
+
+// iccAbsoluteScale 预计算媒体白点相对于D50的比率，缺失或无效时不提供传统绝对色度变换
+// 入参: data 媒体白点标签
+// 返回: [3]float64 换算比率，无效时为零
+func iccAbsoluteScale(data []byte) [3]float64 {
+	var scale [3]float64
+	if len(data) != 20 || string(data[:4]) != "XYZ " {
+		return scale
+	}
+	for i, illuminant := range [...]float64{.9642, 1, .8249} {
+		white := float64(int32(binary.BigEndian.Uint32(data[8+4*i:]))) / 65536
+		if white <= 0 {
+			return [3]float64{}
+		}
+		scale[i] = white / illuminant
+	}
+	return scale
 }
 
 // iccTags 校验ICC标签边界并读取指定模型的配置文件标签
@@ -316,7 +352,7 @@ func iccTags(data []byte, model string) (map[string][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if string(data[20:24]) != "XYZ " {
+	if string(data[20:24]) != "XYZ " && (model != "GRAY" || string(data[20:24]) != "Lab ") {
 		return nil, &UnsupportedError{Feature: "ICC profile connection space"}
 	}
 	for _, name := range []string{"A2B0", "A2B1", "A2B2"} {
@@ -392,6 +428,10 @@ func iccCurve(data []byte) (iccToneCurve, error) {
 			if y := curve.parametric(x); math.IsNaN(y) || math.IsInf(y, 0) {
 				return iccToneCurve{}, fmt.Errorf("undefined ICC parametric curve")
 			}
+		}
+		curve.direction = 1
+		if curve.evaluate(0) == curve.evaluate(1) {
+			curve.direction = 2
 		}
 		return curve, nil
 	}
@@ -486,14 +526,6 @@ func (c iccToneCurve) evaluate(value float64) float64 {
 		return (float64(c.samples[index]) + (position-float64(index))*(float64(c.samples[index+1])-float64(c.samples[index]))) / 65535
 	}
 	return v
-}
-
-// color 将ICC灰度样本转换为sRGB颜色
-// 入参: value 灰度编码分量
-// 返回: color.NRGBA64 非预乘sRGB颜色
-func (s *iccGraySpace) color(value float64) color.NRGBA64 {
-	v := s.curve.evaluate(value)
-	return s.matrix.color(v, v, v)
 }
 
 // color 将ICC编码分量变换到sRGB，矩阵配置文件使用同一色度变换

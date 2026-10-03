@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -24,7 +25,7 @@ import (
 )
 
 // ReferenceXObject 保存引用表单的目标文件、页面选择及文件标识
-// PageLabel非空时按文本页标签选择，否则使用从0开始的PageIndex
+// PageLabel不为nil时按文本页标签选择，否则使用从0开始的PageIndex
 type ReferenceXObject struct {
 	File      FileSpecification
 	PageIndex int64
@@ -106,12 +107,19 @@ func (r *Reader) ReadReferenceXObject(object Object) (ReferenceXObject, error) {
 // 入参: ctx 取消上下文, visit 区间访问函数
 // 返回: error 数字树、标签定义或访问错误
 func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRange) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	catalog, err := r.catalogDictionary()
 	if err != nil {
 		return err
 	}
+	root, err := r.Resolve(catalog["PageLabels"])
+	if err != nil || root == nil {
+		return err
+	}
 	first := true
-	return r.WalkNumberTree(ctx, catalog["PageLabels"], func(index int64, object Object) error {
+	err = r.WalkNumberTree(ctx, root, func(index int64, object Object) error {
 		if index < 0 || first && index != 0 {
 			return fmt.Errorf("invalid page label range start")
 		}
@@ -169,12 +177,25 @@ func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRa
 		}
 		return visit(result)
 	})
+	if err != nil {
+		return err
+	}
+	if first {
+		return fmt.Errorf("missing page label range for page zero")
+	}
+	return ctx.Err()
 }
 
 // ResolveReferencePage 在目标文档中按索引或页标签查找引用页面
 // 入参: ctx 取消上下文, reference 引用目标
 // 返回: *Page 目标页面, error 页面缺失或标签结构错误
 func (r *Reader) ResolveReferencePage(ctx context.Context, reference ReferenceXObject) (*Page, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if reference.PageLabel == nil && reference.PageIndex < 0 {
+		return nil, fmt.Errorf("negative reference XObject page index")
+	}
 	var ranges []PageLabelRange
 	if reference.PageLabel != nil {
 		if err := r.WalkPageLabelRanges(ctx, func(label PageLabelRange) error {
@@ -183,34 +204,34 @@ func (r *Reader) ResolveReferencePage(ctx context.Context, reference ReferenceXO
 		}); err != nil {
 			return nil, err
 		}
+		if len(ranges) == 0 {
+			return nil, fmt.Errorf("%w: reference XObject page label", ErrDestinationNotFound)
+		}
 	}
 	var selected *Page
+	stop := errors.New("reference page selected")
 	labelIndex := 0
 	err := r.WalkPages(ctx, func(index int, page *Page) error {
 		match := int64(index) == reference.PageIndex
 		if reference.PageLabel != nil {
-			match = false
-			if len(ranges) == 0 {
-				match = *reference.PageLabel == strconv.Itoa(index+1)
-			} else {
-				for labelIndex+1 < len(ranges) && ranges[labelIndex+1].Start <= int64(index) {
-					labelIndex++
-				}
-				match = ranges[labelIndex].matches(int64(index), *reference.PageLabel)
+			for labelIndex+1 < len(ranges) && ranges[labelIndex+1].Start <= int64(index) {
+				labelIndex++
 			}
+			match = ranges[labelIndex].matches(int64(index), *reference.PageLabel)
 		}
-		if match && selected == nil {
+		if match {
 			selected = page
+			return stop
 		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && err != stop {
 		return nil, err
 	}
 	if selected == nil {
 		return nil, fmt.Errorf("%w: reference XObject page", ErrDestinationNotFound)
 	}
-	return selected, nil
+	return selected, ctx.Err()
 }
 
 // ReferenceIDMatches 比较引用记录与目标文档的文件标识，不阻止读取已变化的文件

@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"image"
 )
@@ -126,8 +127,18 @@ func (i *ImageComponents) ValuesAt(x, y int) ([4]float64, float64) {
 // DecodeComponents 读取已映射分量，专色保留备用空间及浓度，Lab映射为RGB
 // 返回: *ImageComponents 颜色分量及透明度, error 解码或不支持的源空间错误
 func (i *Image) DecodeComponents() (*ImageComponents, error) {
+	return i.DecodeComponentsContext(context.Background())
+}
+
+// DecodeComponentsContext 读取映射后的颜色分量及遮罩，逐行检查取消
+// 入参: ctx 取消上下文
+// 返回: *ImageComponents 独立颜色分量及透明度, error 解码或取消错误
+func (i *Image) DecodeComponentsContext(ctx context.Context) (*ImageComponents, error) {
 	result := &ImageComponents{}
-	if _, err := i.decodeImage(result); err != nil {
+	if _, err := i.decodeImage(ctx, result); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return result, nil

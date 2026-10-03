@@ -93,8 +93,12 @@ func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
 	}
 	return &patternColorSpace{space.Components(), func(values []float64, intent Name) (Paint, error) {
 		paint := Paint{SourceSpace: source, Space: space, Alpha: 1}
-		for i, value := range values {
-			paint.Values[i] = math.Max(0, math.Min(1, value))
+		if space.profile != nil {
+			paint.Values = space.profile.normalize(values)
+		} else {
+			for i, value := range values {
+				paint.Values[i] = math.Max(0, math.Min(1, value))
+			}
 		}
 		var err error
 		paint.RGB, err = space.RGB(paint.Values[:space.Components()], intent)

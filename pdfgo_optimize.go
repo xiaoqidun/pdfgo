@@ -743,7 +743,7 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 				}
 				if e == nil && len(pixels) <= optimizationBufferLimit {
 					dict, _ := params[0].(Dictionary)
-					pixels, e = decodePredictor(pixels, dict)
+					pixels, e = decodePredictorContext(ctx, pixels, dict)
 				}
 			}
 			channels := int64(3)
@@ -869,9 +869,9 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 		}
 		decodedLimit *= factor
 	}
-	data, e := s.Decode()
+	data, e := s.DecodeContext(ctx)
 	if e != nil {
-		return s, nil
+		return s, ctx.Err()
 	}
 	encoded, e := compressPDFBytes(ctx, data)
 	if e != nil {

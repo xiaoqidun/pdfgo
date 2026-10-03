@@ -520,6 +520,8 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 		f := composeGradientFunction(source, separation.transform)
 		if lab != nil {
 			f = labGradientFunction(f, lab)
+		} else {
+			f = iccGradientFunction(f, space.profile)
 		}
 		var stops []GradientStop
 		if f.linear != nil {
@@ -537,6 +539,8 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 	}
 	if lab != nil {
 		f = labGradientFunction(f, lab)
+	} else {
+		f = iccGradientFunction(f, space.profile)
 	}
 	var stops []GradientStop
 	if f.linear != nil {
@@ -598,9 +602,9 @@ func (r *Reader) readShadingSpace(object Object) (*ColorSpace, *deviceNSpace, *l
 }
 
 // shadingColorValues 将源分量转换到备用空间，保留专色和Lab转换顺序
-// 入参: tint 专色变换, lab Lab变换, input 源颜色分量
+// 入参: space 输出空间, tint 专色变换, lab Lab变换, input 源颜色分量
 // 返回: [4]float64 输出分量, error 颜色错误
-func shadingColorValues(tint *deviceNSpace, lab *labSpace, input []float64) ([4]float64, error) {
+func shadingColorValues(space *ColorSpace, tint *deviceNSpace, lab *labSpace, input []float64) ([4]float64, error) {
 	var values [4]float64
 	if tint != nil {
 		var err error
@@ -617,6 +621,14 @@ func shadingColorValues(tint *deviceNSpace, lab *labSpace, input []float64) ([4]
 	if lab != nil {
 		c := lab.color(values[0], values[1], values[2])
 		values = [4]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
+	}
+	if tint == nil && lab == nil && space != nil && space.profile != nil && space.profile.ranges != nil {
+		for _, value := range values[:space.Components()] {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return values, fmt.Errorf("nonfinite shading color")
+			}
+		}
+		return space.profile.normalize(values[:space.Components()]), nil
 	}
 	for i, value := range values {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
@@ -650,10 +662,10 @@ func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64
 		return tint.values(values[:tint.components]...)
 	}}
 	if tint.expressions != nil && tint.lab == nil {
-		mapped = deviceNGradientFunction(source, tint.input, tint.output, tint.expressions)
+		mapped = iccGradientFunction(deviceNGradientFunction(source, tint.input, tint.output, tint.expressions), tint.alternate.profile)
 	}
 	if tint.transform != nil && tint.lab == nil {
-		composed := composeGradientFunction(source, tint.transform)
+		composed := iccGradientFunction(composeGradientFunction(source, tint.transform), tint.alternate.profile)
 		mapped.linear = composed.linear
 	}
 	var stops []GradientStop

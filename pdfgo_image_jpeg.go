@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"image"
@@ -99,6 +100,16 @@ func (i *Image) jpegTransform(data []byte, params Dictionary) (jpegFrame, bool, 
 // 入参: data JPEG数据, params DCT解码参数
 // 返回: image.Image 原始颜色样本, error 参数或解码错误
 func (i *Image) jpegSamples(data []byte, params Dictionary) (image.Image, error) {
+	return i.jpegSamplesContext(context.Background(), data, params)
+}
+
+// jpegSamplesContext 按PDF的DCT颜色规则解码，在读取和逐行变换间检查取消
+// 入参: ctx 取消上下文, data JPEG数据, params DCT解码参数
+// 返回: image.Image 原始颜色样本, error 参数、解码或取消错误
+func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dictionary) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	frame, transform, tagged, err := i.jpegTransform(data, params)
 	if err != nil {
 		return nil, err
@@ -114,7 +125,7 @@ func (i *Image) jpegSamples(data []byte, params Dictionary) (image.Image, error)
 			return io.MultiReader(bytes.NewReader(data[:2]), bytes.NewReader(marker), bytes.NewReader(data[2:]))
 		}
 	}
-	config, err := jpeg.DecodeConfig(reader())
+	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: reader()})
 	if err != nil {
 		return nil, err
 	}
@@ -129,12 +140,17 @@ func (i *Image) jpegSamples(data []byte, params Dictionary) (image.Image, error)
 			return nil, err
 		}
 	}
-	result, err := jpeg.Decode(reader())
+	result, err := jpeg.Decode(&contextInput{ctx: ctx, reader: reader()})
 	if err != nil {
 		return nil, err
 	}
 	if cmyk, ok := result.(*image.CMYK); ok {
 		for n := range cmyk.Pix {
+			if n&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			cmyk.Pix[n] = 255 - cmyk.Pix[n]
 		}
 		return cmyk, nil
@@ -148,6 +164,9 @@ func (i *Image) jpegSamples(data []byte, params Dictionary) (image.Image, error)
 	}
 	out := image.NewRGBA(result.Bounds())
 	for y := out.Rect.Min.Y; y < out.Rect.Max.Y; y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for x := out.Rect.Min.X; x < out.Rect.Max.X; x++ {
 			var red, green, blue uint8
 			if rawYCbCr {

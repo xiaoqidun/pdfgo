@@ -322,11 +322,10 @@ func (s *separationSpace) paint(tint float64, intent Name) (Paint, error) {
 	case "Lab":
 		copy(paint.RGB[:], values[:])
 	case "ICCBased":
-		paint, err = s.icc.paint(values[:s.icc.components()], intent)
+		paint.RGB, err = s.icc.color(values[:s.icc.components()], intent)
 		if err != nil {
 			return Paint{}, err
 		}
-		paint.SourceSpace = "Separation"
 	case "CalRGB", "CalGray":
 		if s.gray {
 			values[1], values[2] = values[0], values[0]
@@ -358,6 +357,9 @@ func (s *separationSpace) values(tint float64) ([4]float64, error) {
 	if s.lab != nil {
 		pixel := s.lab.color(values[0], values[1], values[2])
 		return [4]float64{float64(pixel.R) / 65535, float64(pixel.G) / 65535, float64(pixel.B) / 65535}, nil
+	}
+	if s.icc != nil && s.icc.ranges != nil {
+		return s.icc.normalize(values[:s.icc.components()]), nil
 	}
 	for i := range values {
 		values[i] = math.Max(0, math.Min(1, values[i]))

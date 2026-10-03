@@ -330,7 +330,7 @@ func (r *Reader) deviceNWideGradient(function Object, tint *deviceNSpace, domain
 					stops = append(stops, stop)
 				}
 			}
-			return clipGradientValues(slices.Compact(stops), tint.output)
+			return iccGradientStops(clipGradientValues(slices.Compact(stops), tint.output), tint.alternate.profile)
 		}
 	}
 	var stops []GradientStop

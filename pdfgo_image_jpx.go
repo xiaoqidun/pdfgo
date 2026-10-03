@@ -117,6 +117,31 @@ func (s *jpxSampleImage) At(x, y int) color.Color {
 	if len(s.channels) > 4 {
 		return jpxDeviceNSample{source: s, x: x, y: y}
 	}
+	return s.pixel(x, y)
+}
+
+// NRGBA64At 直接读取JPEG2000预览颜色，保留独立透明度
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.NRGBA64 非预乘颜色
+func (s *jpxSampleImage) NRGBA64At(x, y int) color.NRGBA64 {
+	if !image.Pt(x, y).In(s.bounds) {
+		return color.NRGBA64{}
+	}
+	if len(s.channels) > 4 {
+		return imageNRGBASample(jpxDeviceNSample{source: s, x: x, y: y})
+	}
+	pixel := s.pixel(x, y)
+	if pixel.cmyk {
+		r, g, b, a := pixel.RGBA()
+		return imageUnpremultiply(color.RGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(a)})
+	}
+	return color.NRGBA64{R: pixel.values[0], G: pixel.values[1], B: pixel.values[2], A: pixel.alpha}
+}
+
+// pixel 读取映射后的原始分量，不通过颜色接口传递
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: jpxSample 样本颜色
+func (s *jpxSampleImage) pixel(x, y int) jpxSample {
 	pixel := jpxSample{alpha: 65535, cmyk: s.cmyk}
 	for c, index := range s.channels {
 		pixel.values[c] = s.sample(index, x, y)

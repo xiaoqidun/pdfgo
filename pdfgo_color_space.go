@@ -40,11 +40,20 @@ func (s *ColorSpace) Device() bool {
 // 返回: bool 是否校准
 func (s *ColorSpace) Calibrated() bool { return s.profile != nil }
 
-// Equal 判断颜色模型和校准变换是否相同
+// Equal 判断颜色模型、配置定义与分量范围是否相同，不受逆向缓存初始化影响
 // 入参: other 待比较空间
 // 返回: bool 是否相同
 func (s *ColorSpace) Equal(other *ColorSpace) bool {
-	return s != nil && other != nil && s.Model == other.Model && (s.profile == other.profile || reflect.DeepEqual(s.profile, other.profile))
+	if s == nil || other == nil || s.Model != other.Model {
+		return false
+	}
+	if s.profile == other.profile {
+		return true
+	}
+	if s.profile != nil && other.profile != nil && s.profile.signature != nil && other.profile.signature != nil {
+		return *s.profile.signature == *other.profile.signature && reflect.DeepEqual(s.profile.ranges, other.profile.ranges)
+	}
+	return reflect.DeepEqual(s.profile, other.profile)
 }
 
 // SRGBEquivalent 检查混合空间与sRGB的偏差是否在8位量化精度内
@@ -129,7 +138,7 @@ func (s *ColorSpace) RGB(values []float64, intent Name) ([3]float64, error) {
 		return [3]float64{}, err
 	}
 	if s.profile != nil {
-		return s.profile.color(values, intent)
+		return s.profile.color(values, normalizeRenderingIntent(intent))
 	}
 	switch s.Model {
 	case "DeviceGray":
@@ -162,6 +171,7 @@ func (s *ColorSpace) ConvertWith(values []float64, source *ColorSpace, intent Na
 		copy(result[:], values)
 		return result, nil
 	}
+	intent = normalizeRenderingIntent(intent)
 	if s.Calibrated() {
 		xyz, err := source.xyz(values, intent)
 		if err != nil {
@@ -201,7 +211,7 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 		return 0, err
 	}
 	if p := s.profile; p != nil {
-		xyz, err := s.xyz(values, intent)
+		xyz, err := s.xyz(values, normalizeRenderingIntent(intent))
 		return math.Max(0, math.Min(1, xyz[1])), err
 	}
 	if s.Model == "DeviceCMYK" {
@@ -241,8 +251,10 @@ func (r *Reader) readBlendingSpace(value Object) (*ColorSpace, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.profile != nil && s.profile.lut != nil && s.profile.lut.fromPCS[0] == nil && s.profile.fromFloat == ([4]*iccProcessElements{}) {
-		return nil, fmt.Errorf("missing ICC B2A0 blending transform")
+	if s.profile != nil {
+		if err := s.profile.validateBlending(); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -347,7 +359,7 @@ func (r *Reader) readCalibratedSpace(array Array) (*ColorSpace, error) {
 		profile.gray = &iccGraySpace{matrix: matrix, curve: iccToneCurve{parameters: []float64{calibrated.gamma[0]}}}
 		model = "DeviceGray"
 	} else {
-		profile.rgb = &iccRGBSpace{matrix: matrix}
+		profile.rgb = &iccRGBSpace{matrix: matrix, inverse: iccInverseMatrix(matrix.matrix)}
 		for i, gamma := range calibrated.gamma {
 			profile.rgb.curves[i] = iccToneCurve{parameters: []float64{gamma}}
 		}

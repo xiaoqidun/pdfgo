@@ -56,6 +56,7 @@ func (m *SoftMask) Walk(visitor Visitor) error {
 		visitor.Reference = p.visitor.Reference
 	}
 	p.visitor = visitor
+	p.maskGroup = m.stream
 	return p.form(m.stream)
 }
 
@@ -123,6 +124,10 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		if m.ColorSpace.Model == "DeviceCMYK" {
 			m.Backdrop[3] = 1
 		}
+		if profile := m.ColorSpace.profile; profile != nil {
+			values := profile.normalize(m.Backdrop)
+			copy(m.Backdrop, values[:])
+		}
 	}
 	m.interpreter.state.style.SoftMask = nil
 	m.interpreter.state.style.BlendMode = "Normal"
@@ -137,6 +142,16 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 			n, err := p.reader.numberArray(v, m.ColorSpace.Components())
 			if err != nil {
 				return nil, err
+			}
+			if profile := m.ColorSpace.profile; profile != nil {
+				ranges := profile.sourceRanges()
+				for i, value := range n {
+					if math.IsNaN(value) || math.IsInf(value, 0) || value < ranges[2*i] || value > ranges[2*i+1] {
+						return nil, fmt.Errorf("invalid soft mask backdrop")
+					}
+				}
+				values := profile.normalize(n)
+				copy(n, values[:])
 			}
 			if m.ColorSpace.validate(n) != nil {
 				return nil, fmt.Errorf("invalid soft mask backdrop")

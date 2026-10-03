@@ -433,7 +433,7 @@ func (r *Reader) optimizationFontData(ctx context.Context, stream *Stream, limit
 			return nil, io.ErrShortBuffer
 		}
 		parameters, _ := params[0].(Dictionary)
-		data, err = decodePredictor(data, parameters)
+		data, err = decodePredictorContext(ctx, data, parameters)
 		if err != nil {
 			return nil, err
 		}

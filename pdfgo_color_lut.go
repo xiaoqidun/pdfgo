@@ -38,7 +38,7 @@ type iccLUTSpace struct {
 	fromPCS    [3]*iccLUT
 }
 
-// parseICCLUTSpace 读取ICC双向查找表，保留不同渲染意图
+// parseICCLUTSpace 读取ICC源空间的正向查找表，逆向信息由目标转换按需读取
 // 入参: data 配置文件数据, tags 已校验的标签
 // 返回: *iccLUTSpace 颜色变换, error 格式或能力错误
 func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error) {
@@ -46,7 +46,7 @@ func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error)
 	switch string(data[16:20]) {
 	case "GRAY":
 		s.components = 1
-	case "RGB ":
+	case "RGB ", "Lab ":
 		s.components = 3
 	case "CMYK":
 		s.components = 4
@@ -54,35 +54,42 @@ func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error)
 		return nil, &UnsupportedError{Feature: "ICC lookup table color model"}
 	}
 	for i := range s.toPCS {
-		for _, direction := range []struct {
-			name       string
-			input, out int
-			target     **iccLUT
-		}{{fmt.Sprintf("A2B%d", i), s.components, 3, &s.toPCS[i]}, {fmt.Sprintf("B2A%d", i), 3, s.components, &s.fromPCS[i]}} {
-			if tag := tags[direction.name]; tag != nil {
-				lut, err := parseICCLUT(tag)
-				if err != nil {
-					return nil, fmt.Errorf("ICC %s: %w", direction.name, err)
-				}
-				if len(lut.input) != direction.input || len(lut.output) != direction.out {
-					return nil, fmt.Errorf("invalid ICC %s channels", direction.name)
-				}
-				if s.pcs == "XYZ " && lut.precision == 8 {
-					return nil, &UnsupportedError{Feature: "8-bit ICC XYZ encoding"}
-				}
-				if lut.pipeline == nil && (direction.name[0] == 'A' || s.pcs != "XYZ ") {
-					if lut.matrix != [9]float64{1, 0, 0, 0, 1, 0, 0, 0, 1} {
-						return nil, fmt.Errorf("invalid ICC lookup matrix")
-					}
-				}
-				*direction.target = lut
+		name := fmt.Sprintf("A2B%d", i)
+		if tag := tags[name]; tag != nil {
+			lut, err := iccLookupTransform(tag, s.components, 3, s.pcs, false)
+			if err != nil {
+				return nil, fmt.Errorf("ICC %s: %w", name, err)
 			}
+			s.toPCS[i] = lut
 		}
 	}
 	if s.toPCS[0] == nil {
 		return nil, fmt.Errorf("missing ICC A2B0 transform")
 	}
 	return s, nil
+}
+
+// iccLookupTransform 按变换方向校验查找表通道、PCS编码及矩阵
+// 入参: data 标签数据, input 输入通道, output 输出通道, pcs 连接空间, inverse 是否逆向
+// 返回: *iccLUT 查找表, error 无效变换
+func iccLookupTransform(data []byte, input, output int, pcs string, inverse bool) (*iccLUT, error) {
+	if len(data) >= 4 && (string(data[:4]) == "mAB " && inverse || string(data[:4]) == "mBA " && !inverse) {
+		return nil, fmt.Errorf("invalid ICC lookup direction")
+	}
+	lut, err := parseICCLUT(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(lut.input) != input || len(lut.output) != output {
+		return nil, fmt.Errorf("invalid ICC lookup channels")
+	}
+	if pcs == "XYZ " && lut.precision == 8 {
+		return nil, &UnsupportedError{Feature: "8-bit ICC XYZ encoding"}
+	}
+	if lut.pipeline == nil && (!inverse || pcs != "XYZ ") && lut.matrix != [9]float64{1, 0, 0, 0, 1, 0, 0, 0, 1} {
+		return nil, fmt.Errorf("invalid ICC lookup matrix")
+	}
+	return lut, nil
 }
 
 // parseICCLUT 解析ICC查找表及多阶段变换，按实际数据长度校验维数

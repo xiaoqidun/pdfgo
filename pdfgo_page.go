@@ -51,6 +51,9 @@ type pageAttributes struct {
 // 入参: ctx 取消上下文, visit 页面访问函数
 // 返回: error 错误信息
 func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	root, err := r.Resolve(r.Trailer["Root"])
 	if err != nil {
 		return err
@@ -106,7 +109,11 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 				*attr.value = value
 			}
 		}
-		switch dict["Type"] {
+		kind, err := r.Resolve(dict["Type"])
+		if err != nil {
+			return err
+		}
+		switch kind {
 		case Name("Pages"):
 			kids, err := r.Resolve(dict["Kids"])
 			if err != nil {

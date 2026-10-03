@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -324,7 +325,19 @@ func (i *Image) renderingIntent() (Name, error) {
 // 异尺寸遮罩按单位方形对齐，输出尺寸取各轴较大的采样数以保留边缘精度
 // 返回: image.Image 解码图像, error 错误信息
 func (i *Image) DecodeImage() (image.Image, error) {
-	return i.decodeImage(nil)
+	return i.DecodeImageContext(context.Background())
+}
+
+// DecodeImageContext 解码图像及遮罩，在读取和逐行映射之间检查取消
+// 返回图像的后续延迟采样由调用方管理，不持有取消上下文
+// 入参: ctx 取消上下文
+// 返回: image.Image 解码图像, error 解码或取消错误
+func (i *Image) DecodeImageContext(ctx context.Context) (image.Image, error) {
+	result, err := i.decodeImage(ctx, nil)
+	if canceled := ctx.Err(); canceled != nil {
+		return nil, canceled
+	}
+	return result, err
 }
 
 // ColorModel 返回可无损表达原始采样精度的非预乘颜色模型
@@ -365,8 +378,7 @@ func (s *deviceSampleImage) Opaque() bool {
 	bounds := s.Bounds()
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			_, _, _, alpha := s.At(x, y).RGBA()
-			if alpha != 65535 {
+			if s.NRGBA64At(x, y).A != 65535 {
 				return false
 			}
 		}
@@ -378,10 +390,28 @@ func (s *deviceSampleImage) Opaque() bool {
 // 入参: x 横向坐标, y 纵向坐标
 // 返回: color.Color 像素颜色
 func (s *deviceSampleImage) At(x, y int) color.Color {
+	pixel := s.NRGBA64At(x, y)
+	if s.byteExact {
+		return color.NRGBA{R: uint8(pixel.R >> 8), G: uint8(pixel.G >> 8), B: uint8(pixel.B >> 8), A: uint8(pixel.A >> 8)}
+	}
+	return pixel
+}
+
+// NRGBA64At 直接读取非预乘颜色，避免逐像素接口分配
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.NRGBA64 像素颜色
+func (s *deviceSampleImage) NRGBA64At(x, y int) color.NRGBA64 {
 	if !image.Pt(x, y).In(s.Bounds()) {
 		return color.NRGBA64{}
 	}
-	pixel := imageNRGBASample(s.source.At(x, y))
+	pixel := imageNRGBA64At(s.source, x, y)
+	return s.combine(pixel, x, y)
+}
+
+// combine 将已采样颜色与索引色、内嵌透明度和显式遮罩合成
+// 入参: pixel 非预乘颜色, x 横向坐标, y 纵向坐标
+// 返回: color.NRGBA64 合成颜色
+func (s *deviceSampleImage) combine(pixel color.NRGBA64, x, y int) color.NRGBA64 {
 	if !s.embedded {
 		pixel.A = 65535
 	}
@@ -395,14 +425,15 @@ func (s *deviceSampleImage) At(x, y int) color.Color {
 	}
 	alpha := uint32(65535)
 	if s.mask != nil {
-		alpha, _, _, _ = s.mask.At(x, y).RGBA()
+		gray := imageRGBA64At(s.mask, x, y)
+		alpha = uint32(gray.R)
 		if s.inverted {
 			alpha = 65535 - alpha
 		}
 	}
 	pixel.A = uint16(uint32(pixel.A) * alpha / 65535)
 	if s.byteExact {
-		return color.NRGBA{R: uint8(pixel.R >> 8), G: uint8(pixel.G >> 8), B: uint8(pixel.B >> 8), A: uint8(pixel.A >> 8)}
+		pixel = color.NRGBA64{R: pixel.R >> 8 * 257, G: pixel.G >> 8 * 257, B: pixel.B >> 8 * 257, A: pixel.A >> 8 * 257}
 	}
 	return pixel
 }
@@ -481,6 +512,17 @@ func (s *imageResample) At(x, y int) color.Color {
 // CMYK图像还原DCT分量，取消通用JPEG解码器的Adobe反相处理
 // 返回: image.Image 样本图像, error 错误信息
 func (i *Image) DecodeSamples() (image.Image, error) {
+	return i.DecodeSamplesContext(context.Background())
+}
+
+// DecodeSamplesContext 解码原始样本，在流读取及样本处理之间检查取消
+// JBIG2及JPEG2000解码器的内部运算完成后才检查取消
+// 入参: ctx 取消上下文
+// 返回: image.Image 独立原始样本, error 解码或取消错误
+func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
 	}
@@ -505,16 +547,16 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 			parameters = parameters[:len(parameters)-1]
 		}
 	}
-	data, err := (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: i.Stream.Data}).Decode()
+	data, err := (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: i.Stream.Data}).DecodeContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var result image.Image
 	switch terminal {
 	case "CCITTFaxDecode":
-		return i.ccittSamples(data, terminalParams)
+		result, err = i.ccittSamplesContext(ctx, data, terminalParams)
 	case "DCTDecode":
-		result, err = i.jpegSamples(data, terminalParams)
+		result, err = i.jpegSamplesContext(ctx, data, terminalParams)
 		if err != nil {
 			return nil, err
 		}
@@ -535,13 +577,16 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 			if !ok {
 				return nil, fmt.Errorf("invalid JBIG2 globals")
 			}
-			globals, err = stream.Decode()
+			globals, err = stream.DecodeContext(ctx)
 			if err != nil {
 				return nil, err
 			}
 		}
-		decoder, err := jbig2.NewDecoderWithGlobals(bytes.NewReader(data), globals)
+		decoder, err := jbig2.NewDecoderWithGlobals(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, globals)
 		if err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		result, err = decoder.Decode()
@@ -561,9 +606,15 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 			}
 			cmyk = profile.Dictionary["N"] == Integer(4)
 		}
-		return i.jpxSamples(data, cmyk)
+		result, err = i.jpxSamples(data, cmyk)
 	default:
-		return i.rawSamples(data)
+		result, err = i.rawSamples(ctx, data)
+	}
+	if canceled := ctx.Err(); canceled != nil {
+		return nil, canceled
+	}
+	if err != nil {
+		return nil, err
 	}
 	if result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height {
 		return nil, fmt.Errorf("decoded image dimensions differ from dictionary")
@@ -642,9 +693,12 @@ func (s *packedGrayImage) At(x, y int) color.Color {
 }
 
 // decodeImage 共用解码、遮罩和预混合恢复流程，按需保留颜色分量
-// 入参: target 可选分量输出
+// 入参: ctx 取消上下文, target 可选分量输出
 // 返回: image.Image 显示图像，分量模式下为空, error 解码错误
-func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
+func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
 	}
@@ -741,6 +795,10 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	if lab != nil {
 		copy(ranges, []float64{0, 100, lab.rangeAB[0], lab.rangeAB[1], lab.rangeAB[2], lab.rangeAB[3]})
 	}
+	if profile != nil {
+		bounds := profile.sourceRanges()
+		copy(ranges, bounds[:components*2])
+	}
 	limits := append([]float64(nil), ranges...)
 	if palette != nil {
 		ranges[1] = float64((uint32(1) << i.BitsPerComponent) - 1)
@@ -769,7 +827,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 			ranges[n] = v
 		}
 	}
-	samples, err := i.DecodeSamples()
+	samples, err := i.DecodeSamplesContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -777,7 +835,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 	var keys, matte []float64
 	var inverted bool
 	if embeddedMask == 0 {
-		mask, keys, inverted, matte, err = i.decodeMask(components)
+		mask, keys, inverted, matte, err = i.decodeMask(ctx, components)
 		if err != nil {
 			return nil, err
 		}
@@ -798,7 +856,7 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
 	}
 	if target == nil && i.ColorSpace == Name("DeviceGray") && !i.ImageMask && embeddedMask == 0 && mask == nil && len(keys) == 0 && len(matte) == 0 {
-		gray, err := decodeGrayImage(samples, ranges[0], ranges[1])
+		gray, err := decodeGrayImageContext(ctx, samples, ranges[0], ranges[1])
 		if err != nil {
 			return nil, err
 		}
@@ -832,6 +890,9 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: float64((uint32(1) << i.BitsPerComponent) - 1), byteExact: byteExact, embedded: embeddedMask != 0}, nil
 	}
 	var out *image.NRGBA64
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if target == nil {
 		if _, _, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 8); err != nil {
 			return nil, err
@@ -887,6 +948,9 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 		inputs = make([]float64, components)
 	}
 	for y := 0; y < bounds.Dy(); y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for x := 0; x < bounds.Dx(); x++ {
 			alpha := uint16(65535)
 			if mask != nil {
@@ -953,6 +1017,9 @@ func (i *Image) decodeImage(target *ImageComponents) (image.Image, error) {
 				}
 			}
 			copy(values[:], inputs)
+			if profile != nil {
+				values = profile.normalize(values[:components])
+			}
 			if components == 1 {
 				values[1], values[2] = values[0], values[0]
 			}
@@ -1066,8 +1133,12 @@ func imageByteExact(source image.Image) bool {
 	switch s := source.(type) {
 	case *image.NRGBA:
 		return s.Opaque()
-	case *image.RGBA, *image.Gray, *image.YCbCr, *packedGrayImage:
+	case *image.RGBA, *image.Gray, *image.YCbCr:
 		return true
+	case *packedGrayImage:
+		return s.depth <= 8
+	case *mappedGrayImage:
+		return s.byteExact
 	case *deviceSampleImage:
 		return s.byteExact
 	case *jpxSampleImage:
@@ -1300,9 +1371,12 @@ func (i *Image) palette() (*imagePalette, error) {
 }
 
 // decodeMask 读取有效遮罩，软遮罩优先于显式遮罩和色键遮罩
-// 入参: components 原始图像分量数
+// 入参: ctx 取消上下文, components 原始图像分量数
 // 返回: *imageResample 遮罩图像, []float64 色键范围, bool 是否反转遮罩灰度, []float64 预混合底色, error 错误信息
-func (i *Image) decodeMask(components int) (*imageResample, []float64, bool, []float64, error) {
+func (i *Image) decodeMask(ctx context.Context, components int) (*imageResample, []float64, bool, []float64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, false, nil, err
+	}
 	object, err := i.reader.Resolve(i.SoftMask)
 	if err != nil {
 		return nil, nil, false, nil, err
@@ -1368,7 +1442,7 @@ func (i *Image) decodeMask(components int) (*imageResample, []float64, bool, []f
 			}
 		}
 	}
-	decoded, err := mask.DecodeImage()
+	decoded, err := mask.DecodeImageContext(ctx)
 	if err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -1379,6 +1453,13 @@ func (i *Image) decodeMask(components int) (*imageResample, []float64, bool, []f
 // 入参: data 编码数据, params 解码参数
 // 返回: image.Image 样本图像, error 错误信息
 func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error) {
+	return i.ccittSamplesContext(context.Background(), data, params)
+}
+
+// ccittSamplesContext 按行边界读取CCITT样本并检查取消
+// 入参: ctx 取消上下文, data 编码数据, params 解码参数
+// 返回: image.Image 样本图像, error 解码或取消错误
+func (i *Image) ccittSamplesContext(ctx context.Context, data []byte, params Dictionary) (image.Image, error) {
 	if i.BitsPerComponent != 1 {
 		return nil, fmt.Errorf("invalid CCITT component depth")
 	}
@@ -1390,6 +1471,7 @@ func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error
 	if err != nil {
 		return nil, err
 	}
+	reader = &contextInput{ctx: ctx, reader: reader}
 	samples, err := io.ReadAll(io.LimitReader(reader, int64(expected)))
 	if err != nil {
 		return nil, err
@@ -1407,7 +1489,7 @@ func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error
 			return nil, err
 		}
 	}
-	return i.rawSamples(samples)
+	return i.rawSamples(ctx, samples)
 }
 
 // ccittImageReader 按图像尺寸和过滤器参数建立CCITT解码器
@@ -1471,10 +1553,13 @@ func ccittImageReader(source io.Reader, width, height int, params Dictionary) (i
 	return ccitt.NewReader(source, ccitt.MSB, ccitt.Group4, width, height, &ccitt.Options{Align: align, Invert: invert}), endOfBlock, nil
 }
 
-// rawSamples 将已解压的设备色彩样本或颜色索引展开为图像
-// 入参: data 原始样本字节
+// rawSamples 接管独立解压缓冲，将设备色彩样本或颜色索引解释为图像
+// 入参: ctx 取消上下文, data 独立原始样本字节
 // 返回: image.Image 样本图像, error 错误信息
-func (i *Image) rawSamples(data []byte) (image.Image, error) {
+func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	components := 0
 	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
 		deviceN, err := i.reader.readDeviceN(space)
@@ -1533,7 +1618,12 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 		return nil, fmt.Errorf("image sample size mismatch")
 	}
 	if expected < len(data) {
-		for _, value := range data[expected:] {
+		for n, value := range data[expected:] {
+			if n&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			if value != 0 {
 				if i.Warning == nil {
 					return nil, fmt.Errorf("image sample size mismatch")
@@ -1542,25 +1632,31 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 				break
 			}
 		}
-		data = data[:expected]
+		data = bytes.Clone(data[:expected])
 	}
 	if components > 4 {
-		return &packedDeviceNImage{data: bytes.Clone(data), rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent, channels: components}, nil
+		return &packedDeviceNImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent, channels: components}, nil
 	}
 	if components == 4 {
 		if i.BitsPerComponent != 8 {
-			return &packedCMYKImage{data: bytes.Clone(data), rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
+			return &packedCMYKImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
 		}
-		return &image.CMYK{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
+		return &image.CMYK{Pix: data, Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 	}
 	if components == 3 && i.BitsPerComponent == 8 {
 		if _, _, err := imageBufferSize(i.Width, i.Height, 4); err != nil {
 			return nil, err
 		}
 		out := image.NewNRGBA(image.Rect(0, 0, i.Width, i.Height))
-		for n := 0; n < i.Width*i.Height; n++ {
-			copy(out.Pix[n*4:n*4+3], data[n*3:n*3+3])
-			out.Pix[n*4+3] = 255
+		for y := 0; y < i.Height; y++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			input, output := data[y*stride:], out.Pix[y*out.Stride:]
+			for x := 0; x < i.Width; x++ {
+				copy(output[x*4:x*4+3], input[x*3:x*3+3])
+				output[x*4+3] = 255
+			}
 		}
 		return out, nil
 	}
@@ -1571,6 +1667,9 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 		}
 		out := image.NewNRGBA64(image.Rect(0, 0, i.Width, i.Height))
 		for y := 0; y < i.Height; y++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			line := data[y*stride : (y+1)*stride]
 			for x := 0; x < i.Width; x++ {
 				var values [3]uint16
@@ -1583,12 +1682,12 @@ func (i *Image) rawSamples(data []byte) (image.Image, error) {
 		return out, nil
 	}
 	if i.BitsPerComponent < 8 {
-		return &packedGrayImage{data: bytes.Clone(data), rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
+		return &packedGrayImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
 	}
 	if i.BitsPerComponent == 16 {
-		return &image.Gray16{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
+		return &image.Gray16{Pix: data, Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 	}
-	return &image.Gray{Pix: bytes.Clone(data), Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
+	return &image.Gray{Pix: data, Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 }
 
 // imageNRGBASample 取得非预乘颜色，保留透明像素中仍有效的原始颜色分量

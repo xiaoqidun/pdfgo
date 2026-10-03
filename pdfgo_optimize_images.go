@@ -45,11 +45,11 @@ func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters,
 			input.Close()
 			if err == nil && len(data) <= optimizationBufferLimit {
 				dict, _ := params[i].(Dictionary)
-				data, err = decodePredictor(data, dict)
+				data, err = decodePredictorContext(ctx, data, dict)
 			}
 		case Name("ASCIIHexDecode"), Name("ASCII85Decode"):
 			wrapper := &Stream{Dictionary: Dictionary{"Filter": filter, "DecodeParms": params[i]}, Data: data}
-			data, err = wrapper.Decode()
+			data, err = wrapper.DecodeContext(ctx)
 		default:
 			return nil, nil
 		}
@@ -199,7 +199,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 							return fmt.Errorf("invalid image form resources")
 						}
 					}
-					content, err := stream.Decode()
+					content, err := stream.DecodeContext(ctx)
 					if err != nil {
 						return err
 					}

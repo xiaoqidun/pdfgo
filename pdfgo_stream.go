@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"encoding/ascii85"
 	"encoding/binary"
 	"encoding/hex"
@@ -33,16 +34,36 @@ type Stream struct {
 	decrypted  bool
 }
 
+// contextInput 在分块读取之间检查取消
+type contextInput struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
 // Decode 解码通用流过滤器，图像专用过滤器由图像接口处理
 // 阅读器返回的流按需解析参数引用，手工构造的流需提供直接参数
 // 返回: []byte 解码数据, error 错误信息
 func (s *Stream) Decode() ([]byte, error) {
+	return s.DecodeContext(context.Background())
+}
+
+// DecodeContext 解码通用流过滤器，在读取及样本处理间检查取消
+// 阅读器返回的流需与所属Reader串行调用，并保持数据源可读
+// 入参: ctx 取消上下文
+// 返回: []byte 独立解码数据, error 解码或取消错误
+func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	filters, params, err := s.filterChain(s.reader)
 	if err != nil {
 		return nil, err
 	}
 	data := s.Data
 	for i, filter := range filters {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		name := filter.(Name)
 		dict, _ := params[i].(Dictionary)
 		var err error
@@ -55,7 +76,7 @@ func (s *Stream) Decode() ([]byte, error) {
 			var reader io.ReadCloser
 			reader, err = zlib.NewReader(bytes.NewReader(data))
 			if err == nil {
-				data, err = io.ReadAll(reader)
+				data, err = io.ReadAll(&contextInput{ctx: ctx, reader: reader})
 				closeErr := reader.Close()
 				if err == nil {
 					err = closeErr
@@ -65,22 +86,22 @@ func (s *Stream) Decode() ([]byte, error) {
 			var early int64
 			early, err = integerDefault(dict, "EarlyChange", 1)
 			if err == nil {
-				data, err = decodeLZW(data, early)
+				data, _, err = decodeLZWBytesContext(ctx, data, early)
 			}
 		case "ASCIIHexDecode":
-			data, err = decodeASCIIHex(data)
+			data, err = decodeASCIIHexContext(ctx, data)
 		case "ASCII85Decode":
 			end := bytes.Index(data, []byte("~>"))
 			if end < 0 {
 				return nil, fmt.Errorf("missing ASCII85 terminator")
 			}
-			encoded, validateErr := validateASCII85(data[:end])
+			encoded, validateErr := validateASCII85(ctx, data[:end])
 			if validateErr != nil {
 				return nil, validateErr
 			}
-			data, err = io.ReadAll(ascii85.NewDecoder(bytes.NewReader(encoded)))
+			data, err = io.ReadAll(&contextInput{ctx: ctx, reader: ascii85.NewDecoder(bytes.NewReader(encoded))})
 		case "RunLengthDecode":
-			data, err = decodeRunLength(data)
+			data, err = decodeRunLength(ctx, data)
 		default:
 			return nil, &UnsupportedError{Feature: "stream filter " + string(name)}
 		}
@@ -88,14 +109,20 @@ func (s *Stream) Decode() ([]byte, error) {
 			return nil, err
 		}
 		if name == "FlateDecode" || name == "LZWDecode" {
-			data, err = decodePredictor(data, dict)
+			data, err = decodePredictorContext(ctx, data, dict)
 			if err != nil {
 				return nil, err
 			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(filters) == 0 || len(filters) == 1 && filters[0] == Name("Crypt") {
-		return bytes.Clone(data), nil
+		data = bytes.Clone(data)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return data, nil
 }
@@ -104,20 +131,37 @@ func (*Stream) pdfObject() {}
 
 // decodeASCIIHex 解码十六进制流，忽略空白并为末尾单个半字节补零
 func decodeASCIIHex(data []byte) ([]byte, error) {
+	return decodeASCIIHexContext(context.Background(), data)
+}
+
+// decodeASCIIHexContext 解码十六进制流，分段检查取消
+// 入参: ctx 取消上下文, data 编码数据
+// 返回: []byte 解码数据, error 编码或取消错误
+func decodeASCIIHexContext(ctx context.Context, data []byte) ([]byte, error) {
 	end := bytes.IndexByte(data, '>')
 	if end < 0 {
 		return nil, fmt.Errorf("missing ASCIIHex terminator")
 	}
 	data = data[:end]
 	count := 0
-	for _, b := range data {
+	for n, b := range data {
+		if n&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if !isSpace(b) {
 			count++
 		}
 	}
 	out := make([]byte, count/2+count%2)
 	index := 0
-	for _, b := range data {
+	for n, b := range data {
+		if n&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		var value byte
 		switch {
 		case '0' <= b && b <= '9':
@@ -235,6 +279,13 @@ func decodeLZW(data []byte, early int64) ([]byte, error) {
 // 入参: data 压缩数据, early 提前增长标志
 // 返回: []byte 解码数据, int 已消费字节数, error 编码错误
 func decodeLZWBytes(data []byte, early int64) ([]byte, int, error) {
+	return decodeLZWBytesContext(context.Background(), data, early)
+}
+
+// decodeLZWBytesContext 解码LZW并返回消费长度，分段检查取消
+// 入参: ctx 取消上下文, data 编码数据, early 提前增长标志
+// 返回: []byte 解码数据, int 消费字节数, error 编码或取消错误
+func decodeLZWBytesContext(ctx context.Context, data []byte, early int64) ([]byte, int, error) {
 	if early != 0 && early != 1 {
 		return nil, 0, fmt.Errorf("invalid LZW EarlyChange")
 	}
@@ -244,7 +295,12 @@ func decodeLZWBytes(data []byte, early int64) ([]byte, int, error) {
 	var bits uint32
 	available, position := uint(0), 0
 	width, next, previous := uint(9), 258, -1
-	for {
+	for steps := 0; ; steps++ {
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+		}
 		for available < width {
 			if position == len(data) {
 				return nil, 0, io.ErrUnexpectedEOF
@@ -291,14 +347,22 @@ func decodeLZWBytes(data []byte, early int64) ([]byte, int, error) {
 	}
 }
 
-// validateASCII85 检查编码分组溢出并移除PDF空白
-// 入参: data 编码数据
-// 返回: []byte 有效编码数据, error 错误信息
-func validateASCII85(data []byte) ([]byte, error) {
+// validateASCII85 检查编码分组并移除空白，分段检查取消
+// 入参: ctx 取消上下文, data 编码数据
+// 返回: []byte 有效编码数据, error 编码或取消错误
+func validateASCII85(ctx context.Context, data []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	encoded := make([]byte, 0, len(data))
 	var value uint64
 	digits := 0
-	for _, b := range data {
+	for n, b := range data {
+		if n&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if isSpace(b) {
 			continue
 		}
@@ -335,12 +399,19 @@ func validateASCII85(data []byte) ([]byte, error) {
 	return encoded, nil
 }
 
-// decodeRunLength 解码游程压缩数据
-// 入参: data 压缩数据
-// 返回: []byte 解码数据, error 错误信息
-func decodeRunLength(data []byte) ([]byte, error) {
+// decodeRunLength 解码游程压缩，分段检查取消
+// 入参: ctx 取消上下文, data 编码数据
+// 返回: []byte 解码数据, error 编码或取消错误
+func decodeRunLength(ctx context.Context, data []byte) ([]byte, error) {
 	var out []byte
+	checkpoint := 0
 	for i := 0; i < len(data); {
+		if i >= checkpoint {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			checkpoint = i + min(4096, len(data)-i)
+		}
 		n := int(data[i])
 		i++
 		if n == 128 {
@@ -388,6 +459,16 @@ func integerDefault(dict Dictionary, key Name, fallback int64) (int64, error) {
 // 入参: data 预测后的数据, params 预测参数
 // 返回: []byte 还原的样本数据, error 错误信息
 func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
+	return decodePredictorContext(context.Background(), data, params)
+}
+
+// decodePredictorContext 还原TIFF及PNG预测样本，逐行检查取消
+// 入参: ctx 取消上下文, data 预测样本, params 预测参数
+// 返回: []byte 还原数据, error 参数或取消错误
+func decodePredictorContext(ctx context.Context, data []byte, params Dictionary) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	predictor, err := integerDefault(params, "Predictor", 1)
 	if err != nil {
 		return nil, err
@@ -421,6 +502,9 @@ func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 		}
 		out := bytes.Clone(data)
 		for start := int64(0); start < int64(len(out)); start += row {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			line := out[start : start+row]
 			if bits == 8 {
 				for x := int(colors); x < len(line); x++ {
@@ -445,6 +529,9 @@ func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 	out := make([]byte, rows*row)
 	var previous []byte
 	for y := int64(0); y < rows; y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		filter := data[y*(row+1)]
 		if filter > 4 {
 			return nil, fmt.Errorf("invalid PNG predictor")
@@ -493,6 +580,16 @@ func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
 		previous = line
 	}
 	return out, nil
+}
+
+// Read 检查取消状态后读取数据
+// 入参: p 数据缓冲区
+// 返回: int 已读字节数, error 读取错误
+func (r *contextInput) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }
 
 // packedSample 读取按高位优先排列的图像分量

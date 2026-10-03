@@ -56,7 +56,9 @@ type meshBits struct {
 
 // UsesFunction 判断颜色分量是否需在插值后经过函数变换
 // 返回: bool 是否使用颜色函数
-func (g *MeshGradient) UsesFunction() bool { return g.function != nil || g.tint != nil || g.lab != nil }
+func (g *MeshGradient) UsesFunction() bool {
+	return g.function != nil || g.tint != nil || g.lab != nil || g.Space != nil && g.Space.profile != nil && g.Space.profile.ranges != nil
+}
 
 // PointAt 计算单位参数域内的双三次曲面坐标
 // 入参: u 横向参数, v 纵向参数
@@ -157,7 +159,7 @@ func (g *MeshGradient) functionValues(x float64) ([4]float64, error) {
 // 入参: input 源空间颜色分量
 // 返回: [4]float64 备用空间分量, error 颜色错误
 func (g *MeshGradient) colorValues(input []float64) ([4]float64, error) {
-	return shadingColorValues(g.tint, g.lab, input)
+	return shadingColorValues(g.Space, g.tint, g.lab, input)
 }
 
 // meshBernstein 计算三次伯恩斯坦基函数

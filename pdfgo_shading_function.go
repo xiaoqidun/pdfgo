@@ -58,8 +58,50 @@ func labGradientFunction(source *gradientFunction, lab *labSpace) *gradientFunct
 		if err != nil {
 			return values, err
 		}
-		return shadingColorValues(nil, lab, values[:3])
+		return shadingColorValues(nil, nil, lab, values[:3])
 	}}
+}
+
+// iccGradientFunction 在源函数求值后裁切并归一化ICC分量，保留范围外截断语义
+// 入参: source 源函数, profile ICC源空间
+// 返回: *gradientFunction 合成分量函数
+func iccGradientFunction(source *gradientFunction, profile *iccColorSpace) *gradientFunction {
+	if profile == nil || profile.ranges == nil {
+		return source
+	}
+	mapped := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+		values, err := source.evaluate(x)
+		if err != nil {
+			return values, err
+		}
+		for _, value := range values[:profile.components()] {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return values, fmt.Errorf("nonfinite shading color")
+			}
+		}
+		return profile.normalize(values[:profile.components()]), nil
+	}}
+	if source.linear != nil {
+		mapped.linear = func(interval [2]float64) []GradientStop {
+			return iccGradientStops(source.linear(interval), profile)
+		}
+	}
+	return mapped
+}
+
+// iccGradientStops 归一化精确分段并保留源范围的截断位置，不将颜色变换近似为RGB分段
+// 入参: stops 源分量分段, profile ICC源空间
+// 返回: []GradientStop 合成分量分段
+func iccGradientStops(stops []GradientStop, profile *iccColorSpace) []GradientStop {
+	if profile == nil || profile.ranges == nil {
+		return stops
+	}
+	ranges := profile.sourceRanges()
+	stops = clipGradientValues(stops, ranges[:profile.components()*2])
+	for i := range stops {
+		stops[i].Values = profile.normalize(stops[i].Values[:profile.components()])
+	}
+	return stops
 }
 
 // composeGradientFunction 将单分量渐变输入着色函数，保留分段、跳变及非线性计算

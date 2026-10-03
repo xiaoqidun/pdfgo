@@ -25,27 +25,7 @@ import (
 // 返回: [3]float64 D50色度, error 变换错误
 func (s *ColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 	if p := s.profile; p != nil {
-		if xyz, used, err := p.processXYZ(values, intent); used || err != nil {
-			return xyz, err
-		}
-		if p.lut != nil {
-			return p.lut.xyz(values, intent)
-		}
-		if _, err := iccIntentIndex(intent); err != nil {
-			return [3]float64{}, err
-		}
-		if p.gray != nil {
-			y := p.gray.curve.evaluate(values[0])
-			return p.gray.matrix.linearXYZ(y, y, y), nil
-		}
-		xyz := p.rgb.matrix.offset
-		for c, curve := range p.rgb.curves {
-			v := curve.evaluate(values[c])
-			for i := range xyz {
-				xyz[i] += p.rgb.matrix.matrix[3*c+i] * v
-			}
-		}
-		return xyz, nil
+		return p.xyz(values, intent)
 	}
 	rgb, err := s.RGB(values, intent)
 	if err != nil {
@@ -67,28 +47,131 @@ func (s *ColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 	return [3]float64{.9869929*cone[0] - .1470543*cone[1] + .1599627*cone[2], .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2], -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]}, nil
 }
 
-// fromXYZ 将D50连接空间转换到ICC设备分量
+// xyz 按渲染意图取得ICC连接空间色度，传统绝对色度由相对色度与媒体白点换算
+// 入参: values 单位分量, intent 渲染意图
+// 返回: [3]float64 色度, error 变换错误
+func (s *iccColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
+	device := s.deviceValues(values)
+	values = device[:len(values)]
+	if xyz, used, err := s.processXYZ(values, intent); used || err != nil {
+		return xyz, err
+	}
+	if s.lab {
+		device[0] /= 100
+		device[1], device[2] = (device[1]+128)/255, (device[2]+128)/255
+	}
+	legacy := intent
+	if legacy == "AbsoluteColorimetric" {
+		legacy = "RelativeColorimetric"
+	}
+	var xyz [3]float64
+	if s.lut != nil {
+		var err error
+		xyz, err = s.lut.xyz(values, legacy)
+		if err != nil {
+			return xyz, err
+		}
+	} else {
+		if _, err := iccIntentIndex(legacy); err != nil {
+			return xyz, err
+		}
+		if s.gray != nil {
+			y := s.gray.curve.evaluate(values[0])
+			if s.gray.lab {
+				xyz = iccFloatLabXYZ([3]float64{100 * y, 0, 0})
+			} else {
+				xyz = s.gray.matrix.linearXYZ(y, y, y)
+			}
+		} else {
+			xyz = s.rgb.matrix.offset
+			for c, curve := range s.rgb.curves {
+				v := curve.evaluate(values[c])
+				for i := range xyz {
+					xyz[i] += s.rgb.matrix.matrix[3*c+i] * v
+				}
+			}
+		}
+	}
+	if intent == "AbsoluteColorimetric" {
+		return s.absoluteXYZ(xyz, false)
+	}
+	return xyz, nil
+}
+
+// absoluteXYZ 按ICC.1第6.3.2.2节在媒体相对色度与绝对色度间换算，不重复应用色适应矩阵
+// 入参: xyz 连接空间色度, inverse 是否由绝对色度恢复相对色度
+// 返回: [3]float64 换算色度, error 缺少或无效的媒体白点
+func (s *iccColorSpace) absoluteXYZ(xyz [3]float64, inverse bool) ([3]float64, error) {
+	for i, scale := range s.absoluteScale {
+		if scale == 0 {
+			return [3]float64{}, fmt.Errorf("invalid ICC media white point")
+		}
+		if inverse {
+			xyz[i] /= scale
+		} else {
+			xyz[i] *= scale
+		}
+	}
+	return xyz, nil
+}
+
+// fromXYZ 将D50连接空间转换到ICC合成分量
 // 入参: xyz D50色度, intent 渲染意图
-// 返回: [4]float64 设备分量, error 不可逆或未支持的变换
+// 返回: [4]float64 合成分量, error 不可逆或未支持的变换
 func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
+	values, err := s.fromDeviceXYZ(xyz, intent)
+	if err != nil || s.ranges == nil && !s.lab {
+		return values, err
+	}
+	return s.normalize(values[:s.components()]), nil
+}
+
+// fromDeviceXYZ 将连接空间转换为ICC设备单位，不混淆Lab设备值与PCS编码
+// 入参: xyz D50色度, intent 渲染意图
+// 返回: [4]float64 ICC设备分量, error 不可逆或未支持的变换
+func (s *iccColorSpace) fromDeviceXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
+	lut, floating, err := s.inverseTransforms()
+	if err != nil {
+		return [4]float64{}, err
+	}
 	index, err := iccProcessIntentIndex(intent)
 	if err != nil {
 		return [4]float64{}, err
 	}
-	if transform := s.fromFloat[index]; transform != nil {
+	transform := floating[index]
+	if intent == "AbsoluteColorimetric" && transform == nil {
+		xyz, err = s.absoluteXYZ(xyz, true)
+		if err != nil {
+			return [4]float64{}, err
+		}
+		intent = "RelativeColorimetric"
+		transform = floating[1]
+	}
+	if transform != nil {
 		if s.processPCS == "Lab " {
 			xyz = iccFloatXYZLab(xyz)
 		}
 		return transform.evaluate(xyz[:])
 	}
-	if s.lut != nil {
-		return s.lut.fromXYZ(xyz, intent)
+	legacyIndex, err := iccIntentIndex(intent)
+	if err != nil {
+		return [4]float64{}, err
+	}
+	if s.lut != nil || lut != nil && (lut.fromPCS[legacyIndex] != nil || lut.fromPCS[0] != nil) {
+		values, err := lut.fromXYZ(xyz, intent)
+		if s.lab {
+			values[0] *= 100
+			values[1], values[2] = values[1]*255-128, values[2]*255-128
+		}
+		return values, err
 	}
 	var result [4]float64
-	if _, err := iccIntentIndex(intent); err != nil {
-		return result, err
-	}
 	if s.gray != nil {
+		if s.gray.lab {
+			value, err := s.gray.curve.inverse(iccFloatXYZLab(xyz)[0] / 100)
+			result[0] = value
+			return result, err
+		}
 		m := s.gray.matrix
 		scale := m.matrix[1] + m.matrix[4] + m.matrix[7]
 		if scale == 0 {
@@ -102,13 +185,15 @@ func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error)
 	for n := range xyz {
 		xyz[n] -= s.rgb.matrix.offset[n]
 	}
-	cofactor := [9]float64{m[4]*m[8] - m[5]*m[7], m[5]*m[6] - m[3]*m[8], m[3]*m[7] - m[4]*m[6], m[2]*m[7] - m[1]*m[8], m[0]*m[8] - m[2]*m[6], m[1]*m[6] - m[0]*m[7], m[1]*m[5] - m[2]*m[4], m[2]*m[3] - m[0]*m[5], m[0]*m[4] - m[1]*m[3]}
-	determinant := m[0]*cofactor[0] + m[1]*cofactor[1] + m[2]*cofactor[2]
-	if determinant == 0 {
+	inverse := s.rgb.inverse
+	if inverse == ([9]float64{}) {
+		inverse = iccInverseMatrix(m)
+	}
+	if inverse == ([9]float64{}) {
 		return result, fmt.Errorf("singular ICC colorant matrix")
 	}
 	for i, curve := range s.rgb.curves {
-		linear := (cofactor[3*i]*xyz[0] + cofactor[3*i+1]*xyz[1] + cofactor[3*i+2]*xyz[2]) / determinant
+		linear := inverse[3*i]*xyz[0] + inverse[3*i+1]*xyz[1] + inverse[3*i+2]*xyz[2]
 		v, err := curve.inverse(linear)
 		if err != nil {
 			return result, err
@@ -116,6 +201,25 @@ func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error)
 		result[i] = v
 	}
 	return result, nil
+}
+
+// iccInverseMatrix 预计算RGB矩阵的逆向系数，不拒绝只能用于源绘制的配置
+// 入参: matrix 正向色度矩阵
+// 返回: [9]float64 逆向系数，不可逆时为零
+func iccInverseMatrix(matrix [9]float64) [9]float64 {
+	m := matrix
+	inverse := [9]float64{m[4]*m[8] - m[5]*m[7], m[5]*m[6] - m[3]*m[8], m[3]*m[7] - m[4]*m[6], m[2]*m[7] - m[1]*m[8], m[0]*m[8] - m[2]*m[6], m[1]*m[6] - m[0]*m[7], m[1]*m[5] - m[2]*m[4], m[2]*m[3] - m[0]*m[5], m[0]*m[4] - m[1]*m[3]}
+	determinant := m[0]*inverse[0] + m[1]*inverse[1] + m[2]*inverse[2]
+	if determinant == 0 || math.IsNaN(determinant) || math.IsInf(determinant, 0) {
+		return [9]float64{}
+	}
+	for i := range inverse {
+		inverse[i] /= determinant
+		if math.IsNaN(inverse[i]) || math.IsInf(inverse[i], 0) {
+			return [9]float64{}
+		}
+	}
+	return inverse
 }
 
 // iccProcessIntentIndex 选择浮点变换的渲染意图，绝对色度使用独立标签
@@ -137,6 +241,10 @@ func (s *iccColorSpace) processXYZ(values []float64, intent Name) ([3]float64, b
 		return [3]float64{}, false, err
 	}
 	transform := s.toFloat[index]
+	absolute := intent == "AbsoluteColorimetric" && transform == nil
+	if absolute {
+		transform = s.toFloat[1]
+	}
 	if transform == nil {
 		return [3]float64{}, false, nil
 	}
@@ -147,6 +255,10 @@ func (s *iccColorSpace) processXYZ(values []float64, intent Name) ([3]float64, b
 	xyz := [3]float64{v[0], v[1], v[2]}
 	if s.processPCS == "Lab " {
 		xyz = iccFloatLabXYZ(xyz)
+	}
+	if absolute {
+		xyz, err = s.absoluteXYZ(xyz, false)
+		return xyz, true, err
 	}
 	return xyz, true, nil
 }
@@ -184,6 +296,9 @@ func iccFloatXYZLab(xyz [3]float64) [3]float64 {
 // 返回: float64 编码分量, error 不可逆的参数曲线
 func (c iccToneCurve) inverse(value float64) (float64, error) {
 	if len(c.parameters) > 0 {
+		if c.direction == 2 || c.direction == 0 && c.evaluate(0) == c.evaluate(1) {
+			return 0, fmt.Errorf("noninvertible ICC constant curve")
+		}
 		p := c.parameters
 		if c.function >= 3 && (p[1] <= 0 || p[3] < 0) {
 			return 0, fmt.Errorf("nonmonotonic ICC parametric curve")

@@ -115,6 +115,9 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 		color := s.lab.color(values[0], values[1], values[2])
 		return [4]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}, nil
 	}
+	if profile := s.alternate.profile; profile != nil && profile.ranges != nil {
+		return profile.normalize(values[:s.alternate.Components()]), nil
+	}
 	for c := 0; c < s.alternate.Components(); c++ {
 		values[c] = math.Max(0, math.Min(1, values[c]))
 	}

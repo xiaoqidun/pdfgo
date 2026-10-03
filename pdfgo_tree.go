@@ -120,7 +120,17 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 	if err != nil || value == nil {
 		return err
 	}
-	stack := []Object{root}
+	type frame struct {
+		object  Object
+		kids    Array
+		next    int
+		entered bool
+		first   int64
+		last    int64
+		hasKeys bool
+		limits  [2]int64
+	}
+	stack := []frame{{object: root}}
 	seen := make(map[Reference]bool)
 	var previous int64
 	hasPrevious := false
@@ -128,8 +138,31 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		object := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
+		current := &stack[len(stack)-1]
+		if current.entered {
+			if current.next < len(current.kids) {
+				object := current.kids[current.next]
+				current.next++
+				if _, ok := object.(Reference); !ok {
+					return fmt.Errorf("number tree child is not indirect")
+				}
+				stack = append(stack, frame{object: object})
+				continue
+			}
+			if len(stack) > 1 {
+				if !current.hasKeys || current.limits != [2]int64{current.first, current.last} {
+					return fmt.Errorf("number tree limits do not match keys")
+				}
+				parent := &stack[len(stack)-2]
+				if !parent.hasKeys {
+					parent.first, parent.hasKeys = current.first, true
+				}
+				parent.last = current.last
+			}
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		object := current.object
 		if ref, ok := object.(Reference); ok {
 			if seen[ref] {
 				return fmt.Errorf("repeated number tree node")
@@ -144,6 +177,34 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 		if !ok {
 			return fmt.Errorf("invalid number tree node")
 		}
+		value, err = r.Resolve(node["Limits"])
+		if err != nil {
+			return err
+		}
+		if len(stack) == 1 {
+			if value != nil {
+				return fmt.Errorf("number tree root contains limits")
+			}
+		} else {
+			limits, ok := value.(Array)
+			if !ok || len(limits) != 2 {
+				return fmt.Errorf("invalid number tree limits")
+			}
+			for index, object := range limits {
+				value, err := r.Resolve(object)
+				if err != nil {
+					return err
+				}
+				key, ok := value.(Integer)
+				if !ok {
+					return fmt.Errorf("invalid number tree limit key")
+				}
+				current.limits[index] = int64(key)
+			}
+			if current.limits[0] > current.limits[1] {
+				return fmt.Errorf("invalid number tree limits order")
+			}
+		}
 		pairs, err := r.Resolve(node["Nums"])
 		if err != nil {
 			return err
@@ -152,8 +213,8 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 		if err != nil {
 			return err
 		}
-		if pairs != nil && kids != nil {
-			return fmt.Errorf("number tree node contains both pairs and children")
+		if (pairs == nil) == (kids == nil) {
+			return fmt.Errorf("number tree node requires pairs or children")
 		}
 		if pairs != nil {
 			array, ok := pairs.(Array)
@@ -173,6 +234,10 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 					return fmt.Errorf("invalid number tree key order")
 				}
 				previous, hasPrevious = int64(key), true
+				if !current.hasKeys {
+					current.first, current.hasKeys = int64(key), true
+				}
+				current.last = int64(key)
 				if err := visit(int64(key), array[i+1]); err != nil {
 					return err
 				}
@@ -183,13 +248,9 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 			if !ok {
 				return fmt.Errorf("invalid number tree children")
 			}
-			for i := len(array) - 1; i >= 0; i-- {
-				if _, ok := array[i].(Reference); !ok {
-					return fmt.Errorf("number tree child is not indirect")
-				}
-				stack = append(stack, array[i])
-			}
+			current.kids = array
 		}
+		current.entered = true
 	}
 	return ctx.Err()
 }

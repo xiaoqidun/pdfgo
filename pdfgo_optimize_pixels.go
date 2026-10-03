@@ -118,7 +118,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 			return stream, ctx.Err()
 		}
 		dict, _ := params[0].(Dictionary)
-		pixels, err = decodePredictor(pixels, dict)
+		pixels, err = decodePredictorContext(ctx, pixels, dict)
 		if err != nil {
 			return stream, nil
 		}

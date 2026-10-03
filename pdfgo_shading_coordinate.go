@@ -62,7 +62,7 @@ func (g *FunctionGradient) ValuesAt(point Point) ([4]float64, error) {
 	if err := g.function.evaluate([2]float64{point.X, point.Y}, values); err != nil {
 		return [4]float64{}, err
 	}
-	return shadingColorValues(g.tint, g.lab, values)
+	return shadingColorValues(g.Space, g.tint, g.lab, values)
 }
 
 // ColorAt 计算定义域坐标的颜色，再按渲染意图转换为sRGB

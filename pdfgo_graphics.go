@@ -214,6 +214,7 @@ type pageInterpreter struct {
 	type3                  bool
 	uncoloredType3         bool
 	glyphStreams           []*Stream
+	maskGroup              *Stream
 }
 
 // Identity 返回单位矩阵
@@ -1521,19 +1522,21 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 		profile *iccColorSpace
 		paint   *Paint
 	}{{fill, p.state.fillICC, &p.state.style.Fill}, {stroke, p.state.strokeICC, &p.state.style.Stroke}} {
-		if !target.used || target.profile == nil {
+		if !target.used || target.paint.None || target.paint.Axial != nil || target.paint.Radial != nil || target.paint.Function != nil || target.paint.Mesh != nil || target.paint.Tiling != nil {
 			continue
 		}
-		if p.state.style.RenderingIntent == "AbsoluteColorimetric" && target.profile.toFloat[3] == nil {
-			return &UnsupportedError{Feature: "absolute colorimetric ICC transform"}
+		profile := target.profile
+		if profile == nil && target.paint.Space != nil {
+			profile = target.paint.Space.profile
 		}
-		if target.profile.toFloat != ([4]*iccProcessElements{}) {
-			rgb, err := target.profile.color(target.paint.Values[:target.profile.components()], p.state.style.RenderingIntent)
-			if err != nil {
-				return err
-			}
-			target.paint.RGB = rgb
+		if profile == nil {
+			continue
 		}
+		rgb, err := profile.color(target.paint.Values[:profile.components()], p.state.style.RenderingIntent)
+		if err != nil {
+			return err
+		}
+		target.paint.RGB = rgb
 	}
 	return nil
 }
@@ -1585,7 +1588,6 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	var groupMark *GroupMark
 	var groupObject Object
 	groupReader := p.reader
-	targetGroup := false
 	if stream.Dictionary["Group"] != nil {
 		groupObject, err = p.reader.Resolve(stream.Dictionary["Group"])
 		if err != nil {
@@ -1593,7 +1595,6 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		}
 	}
 	if groupObject == nil && target != nil {
-		targetGroup = true
 		groupReader = target.reader
 		groupObject, err = groupReader.Resolve(target.Dictionary["Group"])
 		if err != nil {
@@ -1631,7 +1632,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			*flag.target = bool(boolean)
 		}
 		var space Object
-		if !targetGroup || groupMark.Isolated {
+		if groupMark.Isolated || p.maskGroup == stream {
 			space, err = groupReader.Resolve(group["CS"])
 			if err != nil {
 				return err
