@@ -51,8 +51,23 @@ func (i *Image) ColorantSpace() (*ColorantSpace, error) {
 // 入参: x 横坐标, y 纵坐标, device 输出设备, intent 渲染意图, softMask 是否用于软蒙版组
 // 返回: ColorantResult 原生和备用色料, float64 源透明度, error 色料或变换错误
 func (i *ImageComponents) ResolveColorantsAt(x, y int, device *ColorantDevice, intent Name, softMask bool) (ColorantResult, float64, error) {
-	if i.ColorantSpace == nil || !(image.Point{X: x, Y: y}).In(i.Rect) {
+	if device == nil {
+		device = &ColorantDevice{Space: &ColorSpace{Model: "DeviceRGB"}}
+	}
+	group := ColorantGroup{Space: device.Space, Device: device}
+	return i.ResolveColorantsInGroupAt(x, y, &group, intent, softMask)
+}
+
+// ResolveColorantsInGroupAt 在透明组空间求值像素，不将设备过程分量误用于其他组空间
+// 入参: x 横坐标, y 纵坐标, group 组定义, intent 渲染意图, softMask 是否用于软蒙版组
+// 返回: ColorantResult 组过程色、原生及备用专色, float64 源透明度, error 缓冲、定义或变换错误
+func (i *ImageComponents) ResolveColorantsInGroupAt(x, y int, group *ColorantGroup, intent Name, softMask bool) (ColorantResult, float64, error) {
+	if i == nil || i.ColorantSpace == nil || !(image.Point{X: x, Y: y}).In(i.Rect) {
 		return ColorantResult{}, 0, nil
+	}
+	offset, err := i.colorantSampleOffset(x, y)
+	if err != nil {
+		return ColorantResult{}, 0, err
 	}
 	samples := i.TintsAt(x, y)
 	var buffer [32]float64
@@ -63,16 +78,31 @@ func (i *ImageComponents) ResolveColorantsAt(x, y int, device *ColorantDevice, i
 	for c, sample := range samples {
 		tints[c] = float64(sample) / 65535
 	}
-	result, err := i.ColorantSpace.Resolve(tints, device, intent, softMask)
+	result, err := group.Resolve(&ColorantPaint{Space: i.ColorantSpace, Tints: tints}, intent, softMask)
 	if err != nil || result.Process == nil && result.Spots == nil && len(result.Alternates) == 0 {
 		return result, 0, err
 	}
-	offset := (y-i.Rect.Min.Y)*i.Rect.Dx() + x - i.Rect.Min.X
 	alpha := i.Pix[offset*(i.Space.Components()+1)+i.Space.Components()]
 	if i.ColorantAlpha != nil {
 		alpha = i.ColorantAlpha[offset]
 	}
 	return result, float64(alpha) / 65535, nil
+}
+
+// colorantSampleOffset 校验完整像素布局，防止无效公开缓冲触发切片越界
+// 入参: x 区域内横坐标, y 区域内纵坐标
+// 返回: int 像素下标, error 分量、尺寸或缓冲错误
+func (i *ImageComponents) colorantSampleOffset(x, y int) (int, error) {
+	width, height, count := i.Rect.Dx(), i.Rect.Dy(), len(i.Colorants)
+	maximum := int(^uint(0) >> 1)
+	if i.Space == nil || i.Space.Components() == 0 || count == 0 || count != len(i.ColorantSpace.Names) || width <= 0 || height <= 0 || height > maximum/width {
+		return 0, fmt.Errorf("invalid image colorant layout")
+	}
+	pixels, channels := width*height, i.Space.Components()+1
+	if pixels > maximum/count || pixels > maximum/channels || len(i.Tints) != pixels*count || len(i.Pix) != pixels*channels || i.ColorantAlpha != nil && len(i.ColorantAlpha) != pixels {
+		return 0, fmt.Errorf("invalid image colorant buffers")
+	}
+	return (y-i.Rect.Min.Y)*width + x - i.Rect.Min.X, nil
 }
 
 // Colorants 读取图像或索引基础空间的专色名称，设备色返回空列表

@@ -123,9 +123,25 @@ func (r *Reader) ReadPopupAnnotation(object Object) (PopupAnnotation, error) {
 // Annotations 按页面顺序读取注解，外观和动作由调用方解释
 // 返回: []Annotation 注解信息, error 错误信息
 func (p *Page) Annotations() ([]Annotation, error) {
-	value, err := p.reader.Resolve(p.Dictionary["Annots"])
-	if err != nil || value == nil {
+	return p.AnnotationsContext(context.Background())
+}
+
+// AnnotationsContext 按页面顺序读取注解，取消或解析失败时不返回部分结果
+// 入参: ctx 取消上下文
+// 返回: []Annotation 注解信息, error 错误信息
+func (p *Page) AnnotationsContext(ctx context.Context) ([]Annotation, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	value, err := p.reader.Resolve(p.Dictionary["Annots"])
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
 	}
 	array, ok := value.(Array)
 	if !ok {
@@ -133,6 +149,9 @@ func (p *Page) Annotations() ([]Annotation, error) {
 	}
 	result := make([]Annotation, 0, len(array))
 	for _, object := range array {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		value, err := p.reader.Resolve(object)
 		if err != nil {
 			return nil, err
@@ -155,6 +174,9 @@ func (p *Page) Annotations() ([]Annotation, error) {
 		}
 		reference, _ := object.(Reference)
 		result = append(result, Annotation{Reference: reference, Subtype: subtype, Rect: box, Dictionary: dict})
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }

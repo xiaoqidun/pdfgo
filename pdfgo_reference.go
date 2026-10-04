@@ -274,7 +274,7 @@ func (p *pageInterpreter) referencePage(page *Page) error {
 	if err := p.run(data.Bytes()); err != nil {
 		return err
 	}
-	annotations, err := page.Annotations()
+	annotations, err := page.AnnotationsContext(p.ctx)
 	if err != nil {
 		return err
 	}

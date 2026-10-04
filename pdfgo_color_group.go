@@ -70,6 +70,16 @@ func (g *ColorantGroup) Components() int {
 	return g.Space.Components() + len(g.spots())
 }
 
+// Resolve 在组空间求值源画刷，软蒙版不保留原生专色
+// 入参: source 只读源色料及浓度, intent 渲染意图, softMask 是否用于软蒙版组
+// 返回: ColorantResult 组过程色、原生专色及备用色, error 定义或变换错误
+func (g *ColorantGroup) Resolve(source *ColorantPaint, intent Name, softMask bool) (ColorantResult, error) {
+	if g == nil || g.Space == nil || source == nil {
+		return ColorantResult{}, fmt.Errorf("invalid colorant group source")
+	}
+	return source.Space.ResolveInGroup(source.Tints, g.Device, g.Space, intent, softMask)
+}
+
 // Composite 在组空间合成过程色和独立专色，未指定通道按无色料计算
 // 入参: out 输出缓冲，可与backdrop相同, backdrop 非预乘背景, source 已在组空间求值的色料, backdropAlpha 背景透明度, sourceAlpha 源透明度, mode 混合模式
 // 返回: float64 结果透明度, error 定义或数值错误，错误时不修改输出

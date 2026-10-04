@@ -226,8 +226,9 @@ func (s *ColorantSpace) ResolveInGroup(tints []float64, device *ColorantDevice, 
 	}
 	output := device.Space
 	if group != nil {
-		if group.Components() == 0 {
-			return result, fmt.Errorf("invalid colorant blending space")
+		definition := ColorantGroup{Space: group, Device: device}
+		if err := definition.validate("Normal"); err != nil {
+			return result, err
 		}
 		output = group
 	}
