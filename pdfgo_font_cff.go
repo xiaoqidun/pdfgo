@@ -41,25 +41,32 @@ func cffIndex(data []byte, offset int) ([][]byte, int, error) {
 		return nil, 0, fmt.Errorf("invalid CFF index offsets")
 	}
 	base := offset + 3 + (count+1)*width
-	positions := make([]int, count+1)
-	for n := range positions {
+	readOffset := func(n int) uint64 {
 		v := uint64(0)
 		for _, b := range data[offset+3+n*width : offset+3+(n+1)*width] {
 			v = v<<8 | uint64(b)
 		}
-		if v < 1 || v-1 > uint64(len(data)-base) || n > 0 && v < uint64(positions[n-1]+1) {
+		return v
+	}
+	var previous uint64
+	for n := 0; n <= count; n++ {
+		v := readOffset(n)
+		if v < 1 || v-1 > uint64(len(data)-base) || n > 0 && v < previous {
 			return nil, 0, fmt.Errorf("invalid CFF index range")
 		}
-		positions[n] = int(v - 1)
-	}
-	if positions[0] != 0 {
-		return nil, 0, fmt.Errorf("invalid first CFF index offset")
+		if n == 0 && v != 1 {
+			return nil, 0, fmt.Errorf("invalid first CFF index offset")
+		}
+		previous = v
 	}
 	items := make([][]byte, count)
+	start := base
 	for n := range items {
-		items[n] = data[base+positions[n] : base+positions[n+1]]
+		end := base + int(readOffset(n+1)-1)
+		items[n] = data[start:end]
+		start = end
 	}
-	return items, base + positions[count], nil
+	return items, start, nil
 }
 
 // cffDictionary 读取CFF字典数值及双字节操作符
@@ -163,12 +170,16 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 }
 
 // cffFontMapping 读取CID或内置字符编码到字形编号的映射，不重新解释轮廓
-// 入参: data CFF数据, composite 是否为复合字体, encoding PDF基础编码, differences PDF编码差异, identity 是否允许非CID字形身份映射
+// 入参: data CFF数据, composite 是否为复合字体, encoding PDF基础编码, differences PDF编码差异
+// 入参: identity 是否允许非CID字形身份映射, programType 字体容器类型
 // 返回: map[uint32]uint16 字符码或CID到字形编号的映射, map[uint32]string 字符码到字形名称的映射, error 错误信息
-func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool) (map[uint32]uint16, map[uint32]string, error) {
+func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool, programType Name) (map[uint32]uint16, map[uint32]string, error) {
 	dict, stringsIndex, chars, err := cffFontData(data)
 	if err != nil {
 		return nil, nil, err
+	}
+	if kind := dict[1206]; programType == "OpenType" && len(kind) != 0 && kind[0] != 2 {
+		return nil, nil, &UnsupportedError{Feature: "OpenType CFF charstring type"}
 	}
 	cidKeyed := false
 	for operator := 1230; operator <= 1238; operator++ {
@@ -379,7 +390,7 @@ func cffFontData(data []byte) (map[int][]float64, [][]byte, [][]byte, error) {
 			return nil, nil, nil, fmt.Errorf("singular CFF FontMatrix")
 		}
 	}
-	if kind, ok := dict[1206]; ok && (len(kind) != 1 || kind[0] != 2) {
+	if kind, ok := dict[1206]; ok && (len(kind) != 1 || kind[0] != 1 && kind[0] != 2) {
 		return nil, nil, nil, &UnsupportedError{Feature: "CFF charstring type"}
 	}
 	charOffset, err := cffOffset(data, dict, 17, 0)

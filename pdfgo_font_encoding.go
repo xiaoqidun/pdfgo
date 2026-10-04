@@ -266,13 +266,28 @@ func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
 		if uint64(length) > uint64(len(program)-6) {
 			return nil, fmt.Errorf("truncated PFB header")
 		}
-		program = program[6 : 6+length]
-	}
-	if at := bytes.Index(program, []byte("eexec")); at >= 0 {
-		program = program[:at]
+		header, rest := program[6:6+length], program[6+length:]
+		if len(rest) >= 2 && rest[0] == 0x80 && rest[1] == 1 {
+			header = bytes.Clone(header)
+			for len(rest) >= 2 && rest[0] == 0x80 && rest[1] == 1 {
+				if len(rest) < 6 {
+					return nil, fmt.Errorf("truncated PFB header")
+				}
+				length = binary.LittleEndian.Uint32(rest[2:6])
+				if uint64(length) > uint64(len(rest)-6) {
+					return nil, fmt.Errorf("truncated PFB header")
+				}
+				header = append(header, rest[6:6+length]...)
+				rest = rest[6+length:]
+			}
+		}
+		program = header
 	}
 	scanner := type1EncodingScanner{data: program}
 	for token := scanner.next(); token != ""; token = scanner.next() {
+		if token == "eexec" {
+			break
+		}
 		if token != "/Encoding" {
 			continue
 		}
@@ -292,6 +307,9 @@ func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
 				names[uint32(code)] = ".notdef"
 			}
 			for token := scanner.next(); token != ""; token = scanner.next() {
+				if token == "eexec" {
+					break
+				}
 				if token == "def" {
 					return names, nil
 				}
@@ -316,12 +334,17 @@ func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
 	return nil, fmt.Errorf("Type1 font has no built-in encoding")
 }
 
+// type1EncodingSpace 判断PostScript空白字节
+func type1EncodingSpace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n' || value == '\f' || value == 0
+}
+
 // next 读取Type1明文段的下一个PostScript词项
 // 返回: string 词项
 func (s *type1EncodingScanner) next() string {
 	for s.pos < len(s.data) {
 		c := s.data[s.pos]
-		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' {
+		if type1EncodingSpace(c) {
 			s.pos++
 			continue
 		}
@@ -337,11 +360,41 @@ func (s *type1EncodingScanner) next() string {
 		return ""
 	}
 	start := s.pos
-	if bytes.IndexByte([]byte("[]{}"), s.data[s.pos]) >= 0 {
+	if s.data[s.pos] == '(' {
+		depth := 1
+		s.pos++
+		for s.pos < len(s.data) && depth > 0 {
+			switch s.data[s.pos] {
+			case '\\':
+				if s.pos+1 < len(s.data) {
+					s.pos++
+				}
+			case '(':
+				depth++
+			case ')':
+				depth--
+			}
+			s.pos++
+		}
+		return string(s.data[start:s.pos])
+	}
+	if s.data[s.pos] == '<' && (s.pos+1 == len(s.data) || s.data[s.pos+1] != '<') {
+		for s.pos < len(s.data) && s.data[s.pos] != '>' {
+			s.pos++
+		}
+		if s.pos < len(s.data) {
+			s.pos++
+		}
+		return string(s.data[start:s.pos])
+	}
+	if bytes.IndexByte([]byte("[]{}()<>"), s.data[s.pos]) >= 0 {
 		s.pos++
 		return string(s.data[start:s.pos])
 	}
-	for s.pos < len(s.data) && s.data[s.pos] != ' ' && s.data[s.pos] != '\t' && s.data[s.pos] != '\r' && s.data[s.pos] != '\n' && bytes.IndexByte([]byte("[]{}%"), s.data[s.pos]) < 0 {
+	if s.data[s.pos] == '/' {
+		s.pos++
+	}
+	for s.pos < len(s.data) && !type1EncodingSpace(s.data[s.pos]) && bytes.IndexByte([]byte("[]{}%()/<>"), s.data[s.pos]) < 0 {
 		s.pos++
 	}
 	return string(s.data[start:s.pos])

@@ -495,7 +495,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
 		identity := font.composite && (cidSubtype == Name("CIDFontType0") || cidSubtype == Name("CIDFontType2") && font.glyphMap == nil)
-		font.cffGlyphs, font.cffNames, err = cffFontMapping(cffProgram, font.composite, font.encoding, font.differences, identity)
+		font.cffGlyphs, font.cffNames, err = cffFontMapping(cffProgram, font.composite, font.encoding, font.differences, identity, font.ProgramType)
 		if err != nil {
 			return nil, err
 		}
