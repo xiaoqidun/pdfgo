@@ -36,34 +36,42 @@ type jpegFrame struct {
 // JPEGFile 返回可脱离PDF字典直接显示的原始JPEG，需颜色映射或遮罩时返回空值
 // 返回: []byte 原始JPEG数据或空值, error 解码参数错误
 func (i *Image) JPEGFile() ([]byte, error) {
-	filter, err := i.reader.Resolve(i.Stream.Dictionary["Filter"])
-	if err != nil {
+	return i.JPEGFileContext(context.Background())
+}
+
+// JPEGFileContext 返回可直接复用的JPEG，通用前置过滤器解码期间检查取消
+// 入参: ctx 取消上下文
+// 返回: []byte 原始JPEG数据或空值, error 参数、编码或取消错误
+func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if filter != Name("DCTDecode") || i.ImageMask || len(i.Decode) != 0 || i.Mask != nil || i.SoftMask != nil || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB") {
+	if i.ImageMask || len(i.Decode) != 0 || i.Mask != nil || i.SoftMask != nil || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB") {
 		return nil, nil
 	}
-	value, err := i.reader.Resolve(i.Stream.Dictionary["DecodeParms"])
+	data, params, err := i.encodedFileContext(ctx, "DCTDecode")
 	if err != nil {
 		return nil, err
 	}
-	params, ok := value.(Dictionary)
-	if value != nil && !ok {
-		return nil, fmt.Errorf("invalid JPEG decode parameters")
+	if data == nil {
+		return nil, nil
 	}
-	frame, transform, _, err := i.jpegTransform(i.Stream.Data, params)
+	frame, transform, _, err := i.jpegTransformContext(ctx, data, params)
 	if err != nil {
 		return nil, err
 	}
-	config, err := jpeg.DecodeConfig(bytes.NewReader(i.Stream.Data))
+	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
 	}
 	if config.Width != i.Width || config.Height != i.Height {
 		return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if frame.components == 1 && i.ColorSpace == Name("DeviceGray") || frame.components == 3 && i.ColorSpace == Name("DeviceRGB") && transform == (config.ColorModel == color.YCbCrModel) {
-		return i.Stream.Data, nil
+		return data, nil
 	}
 	return nil, nil
 }
@@ -72,7 +80,14 @@ func (i *Image) JPEGFile() ([]byte, error) {
 // 入参: data JPEG数据, params DCT参数
 // 返回: jpegFrame 采样布局, bool 是否进行颜色变换, bool 是否有Adobe标记, error 参数错误
 func (i *Image) jpegTransform(data []byte, params Dictionary) (jpegFrame, bool, bool, error) {
-	frame, adobe, tagged, err := jpegColorInfo(data)
+	return i.jpegTransformContext(context.Background(), data, params)
+}
+
+// jpegTransformContext 解析DCT颜色规则并检查标记扫描取消
+// 入参: ctx 取消上下文, data JPEG数据, params DCT参数
+// 返回: jpegFrame 采样布局, bool 颜色变换, bool Adobe标记, error 参数或取消错误
+func (i *Image) jpegTransformContext(ctx context.Context, data []byte, params Dictionary) (jpegFrame, bool, bool, error) {
+	frame, adobe, tagged, err := jpegColorInfoContext(ctx, data)
 	if err != nil {
 		return jpegFrame{}, false, false, err
 	}
@@ -110,7 +125,7 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	frame, transform, tagged, err := i.jpegTransform(data, params)
+	frame, transform, tagged, err := i.jpegTransformContext(ctx, data, params)
 	if err != nil {
 		return nil, err
 	}
@@ -186,23 +201,46 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 // 入参: data JPEG数据
 // 返回: jpegFrame 采样布局, byte Adobe变换值, bool 是否有Adobe标记, error 格式错误
 func jpegColorInfo(data []byte) (jpegFrame, byte, bool, error) {
+	return jpegColorInfoContext(context.Background(), data)
+}
+
+// jpegColorInfoContext 分段扫描JPEG标记及渐进数据，限制取消检查间隔
+// 入参: ctx 取消上下文, data JPEG数据
+// 返回: jpegFrame 采样布局, byte Adobe变换, bool Adobe标记, error 格式或取消错误
+func jpegColorInfoContext(ctx context.Context, data []byte) (jpegFrame, byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return jpegFrame{}, 0, false, err
+	}
 	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
 		return jpegFrame{}, 0, false, fmt.Errorf("invalid JPEG start marker")
 	}
 	var frame jpegFrame
 	adobe, tagged, entropy := byte(0), false, false
 	for pos := 2; pos < len(data); {
+		if err := ctx.Err(); err != nil {
+			return jpegFrame{}, 0, false, err
+		}
 		if data[pos] != 0xff {
 			if !entropy {
 				return jpegFrame{}, 0, false, fmt.Errorf("invalid JPEG marker")
 			}
-			n := bytes.IndexByte(data[pos:], 0xff)
+			end := pos + min(65536, len(data)-pos)
+			n := bytes.IndexByte(data[pos:end], 0xff)
 			if n < 0 {
-				return jpegFrame{}, 0, false, fmt.Errorf("truncated JPEG scan")
+				if end == len(data) {
+					return jpegFrame{}, 0, false, fmt.Errorf("truncated JPEG scan")
+				}
+				pos = end
+				continue
 			}
 			pos += n
 		}
 		for pos < len(data) && data[pos] == 0xff {
+			if pos&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return jpegFrame{}, 0, false, err
+				}
+			}
 			pos++
 		}
 		if pos == len(data) {

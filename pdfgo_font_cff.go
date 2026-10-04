@@ -82,6 +82,9 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 				op = 1200 + int(data[p])
 				p++
 			}
+			if len(values) == 0 {
+				return nil, fmt.Errorf("missing CFF dictionary operands")
+			}
 			result[op] = values
 			values = nil
 			continue
@@ -121,6 +124,9 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 						return nil, fmt.Errorf("invalid CFF real")
 					}
 					if ended {
+						if v>>4 == 15 && v&15 != 15 {
+							return nil, fmt.Errorf("invalid CFF real padding")
+						}
 						break
 					}
 				}
@@ -144,6 +150,9 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 			p++
 		default:
 			return nil, fmt.Errorf("invalid CFF dictionary byte")
+		}
+		if len(values) == 48 {
+			return nil, fmt.Errorf("CFF dictionary operand limit exceeded")
 		}
 		values = append(values, value)
 	}

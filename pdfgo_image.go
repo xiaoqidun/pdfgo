@@ -134,53 +134,91 @@ func (s *emptySampleImage) Opaque() bool { return false }
 // 不适合直接复用的图像返回nil，调用DecodeImage可得到已应用颜色与遮罩的像素
 // 返回: []byte 完整JBIG2文件, error 解码参数或资源错误
 func (i *Image) JBIG2File() ([]byte, error) {
+	return i.JBIG2FileContext(context.Background())
+}
+
+// JBIG2FileContext 无损封装单页JBIG2，前置过滤器与全局段解码期间检查取消
+// 入参: ctx 取消上下文
+// 返回: []byte 完整JBIG2文件或空值, error 参数、编码或取消错误
+func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if i.ImageMask || i.BitsPerComponent != 1 || i.ColorSpace != Name("DeviceGray") || len(i.Decode) != 0 || i.Mask != nil || i.SoftMask != nil || i.Stream.Dictionary["SMaskInData"] != nil || i.Stream.Dictionary["Matte"] != nil {
 		return nil, nil
 	}
-	filter, err := i.reader.Resolve(i.Stream.Dictionary["Filter"])
+	encoded, params, err := i.encodedFileContext(ctx, "JBIG2Decode")
 	if err != nil {
 		return nil, err
 	}
-	if filter != Name("JBIG2Decode") {
+	if encoded == nil {
 		return nil, nil
 	}
 	var globals []byte
-	if i.Stream.Dictionary["DecodeParms"] != nil {
-		value, err := i.reader.Resolve(i.Stream.Dictionary["DecodeParms"])
+	if params["JBIG2Globals"] != nil {
+		value, err := i.reader.Resolve(params["JBIG2Globals"])
 		if err != nil {
 			return nil, err
 		}
-		params, ok := value.(Dictionary)
-		if !ok {
-			return nil, fmt.Errorf("invalid JBIG2 decode parameters")
+		stream, ok := value.(*Stream)
+		if !ok || stream == nil {
+			return nil, fmt.Errorf("invalid JBIG2 globals")
 		}
-		if params["JBIG2Globals"] != nil {
-			value, err := i.reader.Resolve(params["JBIG2Globals"])
-			if err != nil {
-				return nil, err
-			}
-			stream, ok := value.(*Stream)
-			if !ok {
-				return nil, fmt.Errorf("invalid JBIG2 globals")
-			}
-			globals, err = stream.Decode()
-			if err != nil {
-				return nil, err
-			}
+		globals, err = stream.DecodeContext(ctx)
+		if err != nil {
+			return nil, err
 		}
 	}
-	data := make([]byte, 0, len(jbig2FileHeader)+len(globals)+len(i.Stream.Data))
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	data := make([]byte, 0, len(jbig2FileHeader)+len(globals)+len(encoded))
 	data = append(data, jbig2FileHeader...)
 	data = append(data, globals...)
-	data = append(data, i.Stream.Data...)
-	config, err := jbig2.DecodeConfig(bytes.NewReader(data))
+	data = append(data, encoded...)
+	config, err := jbig2.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
 	}
 	if config.Width != i.Width || config.Height != i.Height {
 		return nil, fmt.Errorf("JBIG2 dimensions differ from image dictionary")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return data, nil
+}
+
+// encodedFileContext 解析图像过滤器链，仅解码末级图像编码之前的通用过滤器
+// 入参: ctx 取消上下文, terminal 末级图像过滤器
+// 返回: []byte 图像编码或空值, Dictionary 末级参数, error 编码或取消错误
+func (i *Image) encodedFileContext(ctx context.Context, terminal Name) ([]byte, Dictionary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	filters, params, err := i.Stream.filterChain(i.reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(filters) == 0 || filters[len(filters)-1] != terminal {
+		return nil, nil, nil
+	}
+	data := i.Stream.Data
+	if len(filters) > 1 {
+		prefix := Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": params[:len(params)-1]}, Data: data, reader: i.reader}
+		data, err = prefix.DecodeContext(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if data == nil {
+		data = []byte{}
+	}
+	dict, _ := params[len(params)-1].(Dictionary)
+	return data, dict, nil
 }
 
 // ReadImage 读取图像XObject描述，不隐式转换颜色或丢弃遮罩

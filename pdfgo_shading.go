@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"slices"
@@ -695,11 +696,15 @@ func (r *Reader) readDeviceNGradient(space Array, function Object, domain [2]flo
 // 入参: stops 源分段, bounds 各分量下界与上界
 // 返回: []GradientStop 截断后的分段
 func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
-	var result []GradientStop
+	if len(stops) == 0 {
+		return nil
+	}
+	result := make([]GradientStop, 0, len(stops))
 	for i, stop := range stops {
 		if i > 0 && stops[i-1].Position < stop.Position {
 			a := stops[i-1]
-			var positions []float64
+			var storage [8]float64
+			positions := storage[:0]
 			for c := 0; c < len(bounds)/2; c++ {
 				if a.Values[c] == stop.Values[c] {
 					continue
@@ -780,13 +785,23 @@ func gradientInterval(stops []GradientStop, start, end float64) []GradientStop {
 		}
 		return result
 	}
-	result := []GradientStop{{Position: 0, Values: gradientValue(stops, start)}}
+	first, last := 0, 0
 	if start != end {
-		for _, stop := range stops {
-			if stop.Position > start && stop.Position <= end {
-				stop.Position = (stop.Position - start) / (end - start)
-				result = append(result, stop)
-			}
+		first, _ = slices.BinarySearchFunc(stops, start, func(stop GradientStop, position float64) int { return cmp.Compare(stop.Position, position) })
+		for first < len(stops) && stops[first].Position == start {
+			first++
+		}
+		last, _ = slices.BinarySearchFunc(stops, end, func(stop GradientStop, position float64) int { return cmp.Compare(stop.Position, position) })
+		for last < len(stops) && stops[last].Position == end {
+			last++
+		}
+	}
+	result := make([]GradientStop, 1, last-first+2)
+	result[0] = GradientStop{Position: 0, Values: gradientValue(stops, start)}
+	if start != end {
+		for _, stop := range stops[first:last] {
+			stop.Position = (stop.Position - start) / (end - start)
+			result = append(result, stop)
 		}
 	}
 	return slices.Compact(append(result, GradientStop{Position: 1, Values: gradientValue(stops, end)}))

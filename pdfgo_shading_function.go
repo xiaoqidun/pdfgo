@@ -120,7 +120,10 @@ func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
 	if source.linear != nil && tint.linear != nil {
 		f.linear = func(interval [2]float64) []GradientStop {
 			stops := clipGradientValues(source.linear(interval), []float64{0, 1})
-			var result []GradientStop
+			if len(stops) == 0 {
+				return nil
+			}
+			result := make([]GradientStop, 0, len(stops))
 			for i, stop := range stops {
 				if i > 0 && stops[i-1].Position < stop.Position {
 					previous := stops[i-1]
