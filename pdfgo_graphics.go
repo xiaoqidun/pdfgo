@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -173,6 +174,7 @@ type Visitor struct {
 	MarkedContent   func(MarkedContentMark) error
 	OptionalContent func(Object) (bool, error)
 	Reference       ReferenceResolver
+	PostScript      func(PostScriptMark) error
 	ColorantDevice  *ColorantDevice
 	Halftones       map[string]*Halftone
 	Warning         func(Diagnostic)
@@ -225,6 +227,8 @@ type pageInterpreter struct {
 	glyphStreams           []*Stream
 	maskGroup              *Stream
 	blendingSpace          *ColorSpace
+	forms                  *formCache
+	content                *formContent
 }
 
 // Identity 返回单位矩阵
@@ -342,8 +346,8 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			return &UnsupportedError{Feature: "page transition " + fmt.Sprint(style)}
 		}
 	}
-	data, err := page.Content()
-	if err != nil {
+	var data bytes.Buffer
+	if _, err := page.WriteContent(ctx, &data); err != nil {
 		return err
 	}
 	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
@@ -371,10 +375,10 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 				v.Halftones = visitor.Halftones
 			}
 			child.visitor = v
-			return child.run(data)
+			return child.run(data.Bytes())
 		})
 	}
-	return interpreter.run(data)
+	return interpreter.run(data.Bytes())
 }
 
 // WalkType3Glyph 按文字位置解释Type3字形内容流并访问其中的图元
@@ -466,16 +470,7 @@ func (p *pageInterpreter) run(data []byte) error {
 		initial := p.state
 		p.patternState = &initial
 	}
-	err := walkOperations(p.ctx, data, p.operation, func(value Object) (Object, error) {
-		if name, ok := value.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
-			var err error
-			value, err = p.resource("ColorSpace", name)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return p.reader.Resolve(value)
-	})
+	operations, size, err := p.walkContent(data)
 	if err != nil {
 		return err
 	}
@@ -484,6 +479,13 @@ func (p *pageInterpreter) run(data []byte) error {
 	}
 	if p.compatibility != 0 {
 		return fmt.Errorf("unbalanced compatibility section")
+	}
+	if p.content != nil {
+		p.content.parsed = true
+		if operations != nil && size <= formCacheLimit-p.forms.bytes {
+			p.content.operations = operations
+			p.forms.bytes += size
+		}
 	}
 	return nil
 }
@@ -1301,6 +1303,9 @@ func (p *pageInterpreter) xobject(a []Object) error {
 	if kind == Name("Image") {
 		return p.image(stream)
 	}
+	if kind == Name("PS") {
+		return p.postscript(stream)
+	}
 	if kind != Name("Form") {
 		return &UnsupportedError{Feature: "XObject subtype"}
 	}
@@ -1391,6 +1396,13 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 // 入参: stream 表单内容流
 // 返回: error 解析或访问错误
 func (p *pageInterpreter) form(stream *Stream) error {
+	subtype, err := p.reader.Resolve(stream.Dictionary["Subtype2"])
+	if err != nil {
+		return err
+	}
+	if subtype == Name("PS") {
+		return p.postscript(stream)
+	}
 	if p.depth >= 32 {
 		return fmt.Errorf("form recursion limit exceeded")
 	}
@@ -1431,6 +1443,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		}
 	}
 	child := *p
+	child.content = nil
 	if target == nil && stream.Dictionary["Resources"] != nil {
 		resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
 		if err != nil {
@@ -1567,10 +1580,11 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	child.patternState = nil
 	var data []byte
 	if target == nil {
-		data, err = stream.Decode()
+		data, child.content, err = p.formData(stream)
 		if err != nil {
 			return err
 		}
+		child.forms = p.forms
 	} else {
 		child.reader, child.resources = target.reader, target.Resources
 	}

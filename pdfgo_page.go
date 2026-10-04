@@ -151,7 +151,7 @@ func (p *Page) Content() ([]byte, error) {
 }
 
 // WriteContent 逐个解码并输出页面内容流，以换行分隔，不拼接整页内容；单个流仍完整解码
-// 入参: ctx 取消上下文，在流之间检查, writer 输出流
+// 入参: ctx 取消上下文，在流解码及写出间检查, writer 输出流
 // 返回: int64 已写字节数, error 解码或写入错误，出错时可能已有部分输出
 func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error) {
 	if err := ctx.Err(); err != nil {
@@ -181,7 +181,7 @@ func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error
 		if !ok {
 			return written, fmt.Errorf("page content is not a stream")
 		}
-		data, err := stream.Decode()
+		data, err := stream.DecodeContext(ctx)
 		if err != nil {
 			return written, err
 		}
