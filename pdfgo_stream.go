@@ -621,14 +621,17 @@ func setPackedSample(data []byte, index, bits int, value uint16) {
 // 入参: a 左侧样本, b 上方样本, c 左上样本
 // 返回: byte 预测值
 func paeth(a, b, c byte) byte {
-	p := int(a) + int(b) - int(c)
-	abs := func(v int) int {
-		if v < 0 {
-			return -v
-		}
-		return v
+	pa, pb := int(b)-int(c), int(a)-int(c)
+	pc := pa + pb
+	if pa < 0 {
+		pa = -pa
 	}
-	pa, pb, pc := abs(p-int(a)), abs(p-int(b)), abs(p-int(c))
+	if pb < 0 {
+		pb = -pb
+	}
+	if pc < 0 {
+		pc = -pc
+	}
 	if pa <= pb && pa <= pc {
 		return a
 	}

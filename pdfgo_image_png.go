@@ -80,7 +80,7 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	depth, channels, kind := pngSampleFormat(source)
 	pixelBytes := max(1, channels*depth/8)
 	stride, _, err := imageSampleSize(bounds.Dx(), 1, channels, depth)
-	if err != nil || stride >= imageBufferLimit()/7 {
+	if err != nil || stride >= imageBufferLimit()/4 {
 		return fmt.Errorf("PNG row exceeds platform buffer range")
 	}
 	row, previous := make([]byte, stride), make([]byte, stride)
@@ -93,10 +93,9 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	if gray != nil && depth == gray.source.depth && depth < 8 {
 		grayBytes = pngGrayByteMap(gray, depth)
 	}
-	var filters [5][]byte
+	var filters [2][]byte
 	for n := range filters {
 		filters[n] = make([]byte, stride+1)
-		filters[n][0] = byte(n)
 	}
 	if _, err := output.Write([]byte("\x89PNG\r\n\x1a\n")); err != nil {
 		return err
@@ -241,19 +240,20 @@ func pngGrayRow(row []byte, source *mappedGrayImage, y, depth int, lookup *[256]
 // pngFilterRow 比较五种标准行过滤器，使用有符号残差较小的结果
 // 入参: row 当前行, previous 上一行, pixelBytes 像素字节数, filters 复用缓冲
 // 返回: []byte 带过滤器编号的样本行
-func pngFilterRow(row, previous []byte, pixelBytes int, filters *[5][]byte) []byte {
+func pngFilterRow(row, previous []byte, pixelBytes int, filters *[2][]byte) []byte {
+	filters[0][0] = 0
 	copy(filters[0][1:], row)
 	var score uint64
 	for _, value := range row {
 		score += uint64(min(int(value), 256-int(value)))
 	}
-	best := 0
 	for _, kind := range [4]int{2, 1, 4, 3} {
 		if score == 0 {
 			break
 		}
 		var candidate uint64
-		output := filters[kind][1:]
+		filters[1][0] = byte(kind)
+		output := filters[1][1:]
 		prefix := min(pixelBytes, len(row))
 		for index := 0; index < prefix; index++ {
 			prediction := previous[index]
@@ -296,10 +296,11 @@ func pngFilterRow(row, previous []byte, pixelBytes int, filters *[5][]byte) []by
 			}
 		}
 		if candidate < score {
-			best, score = kind, candidate
+			filters[0], filters[1] = filters[1], filters[0]
+			score = candidate
 		}
 	}
-	return filters[best]
+	return filters[0]
 }
 
 // newPNGRowSampler 为设备色插值建立两行缓存，其他图像保留直接采样

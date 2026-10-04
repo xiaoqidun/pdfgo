@@ -82,7 +82,7 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 				op = 1200 + int(data[p])
 				p++
 			}
-			if len(values) == 0 {
+			if len(values) == 0 && !(op >= 6 && op <= 9 || op == 1212 || op == 1213) {
 				return nil, fmt.Errorf("missing CFF dictionary operands")
 			}
 			result[op] = values
@@ -369,6 +369,18 @@ func cffFontData(data []byte) (map[int][]float64, [][]byte, [][]byte, error) {
 	dict, err := cffDictionary(tops[0])
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if matrix, ok := dict[1207]; ok {
+		if len(matrix) != 6 {
+			return nil, nil, nil, fmt.Errorf("invalid CFF FontMatrix length")
+		}
+		determinant := matrix[0]*matrix[3] - matrix[1]*matrix[2]
+		if math.IsInf(determinant, 0) || math.IsNaN(determinant) || determinant == 0 {
+			return nil, nil, nil, fmt.Errorf("singular CFF FontMatrix")
+		}
+	}
+	if kind, ok := dict[1206]; ok && (len(kind) != 1 || kind[0] != 2) {
+		return nil, nil, nil, &UnsupportedError{Feature: "CFF charstring type"}
 	}
 	charOffset, err := cffOffset(data, dict, 17, 0)
 	if err != nil {
