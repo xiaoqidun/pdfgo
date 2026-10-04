@@ -154,13 +154,16 @@ func (r *Reader) applyNChannelProcess(space Array, tint *deviceNSpace, effective
 			tint.colorants.Process.Channels[i] = channel
 		}
 	}
-	if spots || lab != nil {
+	if spots {
 		return nil
 	}
-	tint.alternate, tint.lab = output, nil
+	tint.alternate, tint.lab = output, lab
 	tint.nested, tint.none = nil, false
 	tint.process = &ProcessColorants{Space: output, Channels: make([]int, tint.components)}
 	tint.input, tint.output = gradientUnitBounds(tint.components), gradientUnitBounds(output.Components())
+	if lab != nil {
+		tint.output = []float64{0, 100, lab.rangeAB[0], lab.rangeAB[1], lab.rangeAB[2], lab.rangeAB[3]}
+	}
 	tint.transform, tint.sampled, tint.program = nil, nil, nil
 	tint.expressions = make([]affineValue, output.Components())
 	for channel, input := range indices {

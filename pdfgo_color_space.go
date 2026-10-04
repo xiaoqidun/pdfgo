@@ -24,10 +24,11 @@ import (
 // ColorSpace 保存设备或校准颜色空间，不包含绘制或输出格式逻辑
 // Model为DeviceGray、DeviceRGB或DeviceCMYK，校准色保留对应模型与颜色变换
 type ColorSpace struct {
-	Model   Name
-	profile *iccColorSpace
-	srgb    uint32
-	mapped  bool
+	Model    Name
+	profile  *iccColorSpace
+	srgb     uint32
+	blending uint32
+	mapped   bool
 }
 
 // Device 判断分量是否属于原始设备空间，不将校准色的RGB显示结果视为设备源色

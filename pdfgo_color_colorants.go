@@ -82,44 +82,9 @@ func NewColorantDevice(space *ColorSpace, spots []Name) (*ColorantDevice, error)
 // 入参: out 输出缓冲，可与backdrop相同, backdrop 过程色及专色背景, source 已求值的原生色料, overprint 是否保留未标记通道
 // 返回: error 分量错误或仍需合成备用色，错误时不修改输出
 func (d *ColorantDevice) CompositeOpaque(out, backdrop []float64, source ColorantResult, overprint bool) error {
-	if d == nil || d.Space == nil || !d.Space.Device() {
-		return fmt.Errorf("invalid native colorant device")
-	}
-	components := d.Space.Components()
-	if len(out) != components+len(d.Spots) || len(backdrop) != len(out) {
-		return fmt.Errorf("invalid device colorant buffer")
-	}
-	if len(source.Alternates) != 0 {
-		return &UnsupportedError{Feature: "colorant alternate compositing"}
-	}
-	for _, value := range backdrop {
-		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 1 {
-			return fmt.Errorf("invalid device colorant backdrop")
-		}
-	}
-	if source.Process != nil {
-		if !d.Space.Equal(source.Process.Space) {
-			return fmt.Errorf("mismatched native process color space")
-		}
-		if err := d.Space.validate(source.Process.Values[:components]); err != nil {
-			return err
-		}
-	}
-	if len(source.Spots) != len(source.SpotMask) || len(source.Spots) != 0 && len(source.Spots) != len(d.Spots) {
-		return fmt.Errorf("invalid native spot colorants")
-	}
-	marked := false
-	for c, mask := range source.ProcessMask {
-		if mask && (c >= components || source.Process == nil) {
-			return fmt.Errorf("invalid native process mask")
-		}
-		marked = marked || mask
-	}
-	for c, value := range source.Spots {
-		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 1 {
-			return fmt.Errorf("invalid native spot tint")
-		}
-		marked = marked || source.SpotMask[c]
+	components, marked, err := d.validateComposite(out, backdrop, source, 1, 1, false)
+	if err != nil {
+		return err
 	}
 	if !marked || overprint {
 		copy(out, backdrop)
@@ -142,6 +107,42 @@ func (d *ColorantDevice) CompositeOpaque(out, backdrop []float64, source Coloran
 		}
 	}
 	return nil
+}
+
+// Composite 按PDF透明模型分别合成过程色和原生专色，未指定通道按无色料计算，不执行套印
+// 入参: out 输出缓冲，可与backdrop相同, backdrop 非预乘过程色及专色背景, source 原生源色料, backdropAlpha 背景透明度, sourceAlpha 源透明度, mode 标准混合模式
+// 返回: float64 结果透明度, error 定义错误或仍需合成备用色，错误时不修改输出
+func (d *ColorantDevice) Composite(out, backdrop []float64, source ColorantResult, backdropAlpha, sourceAlpha float64, mode Name) (float64, error) {
+	return d.composite(out, backdrop, source, backdropAlpha, sourceAlpha, mode, false)
+}
+
+// CompositeOverprint 按兼容套印和当前混合模式合成原生色料，源掩码须已按套印模式选择
+// 入参: out 输出缓冲，可与backdrop相同, backdrop 非预乘背景, source 原生源色料, backdropAlpha 背景透明度, sourceAlpha 源透明度, mode 当前混合模式
+// 返回: float64 结果透明度, error 定义错误或仍需合成备用色，错误时不修改输出
+func (d *ColorantDevice) CompositeOverprint(out, backdrop []float64, source ColorantResult, backdropAlpha, sourceAlpha float64, mode Name) (float64, error) {
+	return d.composite(out, backdrop, source, backdropAlpha, sourceAlpha, mode, true)
+}
+
+// composite 统一原生透明合成，兼容套印先计算未标记通道的隐式组贡献
+// 入参: out 输出缓冲, backdrop 背景分量, source 原生源色料, backdropAlpha 背景透明度, sourceAlpha 源透明度, mode 混合模式, overprint 是否兼容套印
+// 返回: float64 结果透明度, error 定义或数值错误
+func (d *ColorantDevice) composite(out, backdrop []float64, source ColorantResult, backdropAlpha, sourceAlpha float64, mode Name, overprint bool) (float64, error) {
+	if d == nil || d.Space == nil || !d.Space.Device() {
+		return 0, fmt.Errorf("invalid native colorant device")
+	}
+	group := ColorantGroup{Space: d.Space, Device: d}
+	return group.composite(out, backdrop, source, backdropAlpha, sourceAlpha, mode, overprint)
+}
+
+// validateComposite 校验输出缓冲和原生通道，零透明度不读取未定义颜色
+// 入参: out 输出缓冲, backdrop 背景分量, source 源色料, backdropAlpha 背景透明度, sourceAlpha 源透明度, overprint 是否忽略未标记源分量
+// 返回: int 过程分量数, bool 是否指定色料, error 定义或数值错误
+func (d *ColorantDevice) validateComposite(out, backdrop []float64, source ColorantResult, backdropAlpha, sourceAlpha float64, overprint bool) (int, bool, error) {
+	if d == nil || d.Space == nil || !d.Space.Device() {
+		return 0, false, fmt.Errorf("invalid native colorant device")
+	}
+	group := ColorantGroup{Space: d.Space, Device: d}
+	return group.validateComposite(out, backdrop, source, backdropAlpha, sourceAlpha, overprint)
 }
 
 // ReadColorantSpace 读取分色、多色或索引基础空间，解析资源别名及实际选用的默认备用色
