@@ -74,6 +74,7 @@ type Paint struct {
 
 // Style 保存绘制状态及按顺序相交的裁剪路径
 // Transfer在最终设备颜色转换及透明合成后应用，不预先改变Fill和Stroke
+// HalftoneOrigin保存设置时的页面用户坐标，后续变换不移动原点，空值采用设备默认值
 type Style struct {
 	Fill, Stroke    Paint
 	LineWidth       float64
@@ -93,6 +94,7 @@ type Style struct {
 	Smoothness      *float64
 	Antialias       *bool
 	Halftone        *Halftone
+	HalftoneOrigin  *Point
 	Transfer        *TransferFunction
 	ColorConversion ColorConversion
 }
@@ -1661,6 +1663,11 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 		return err
 	}
 	for key, value := range dict {
+		switch key {
+		case "Type", "TK", "HT", "HTO", "UseBlackPtComp", "D", "FL", "TR", "TR2", "Font", "RI", "ca", "CA", "LW", "LC", "LJ", "ML", "BM", "SMask", "AIS", "SA", "OP", "op", "OPM", "SM", "AAPL:AA", "BG", "BG2", "UCR", "UCR2":
+		default:
+			continue
+		}
 		if key == "TR" && transfer != nil {
 			continue
 		}
@@ -1682,6 +1689,9 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 		}
 		switch key {
 		case "Type":
+			if value != Name("ExtGState") {
+				return fmt.Errorf("invalid graphics state object type")
+			}
 		case "TK":
 			flag, ok := value.(Boolean)
 			if !ok || p.inText {
@@ -1693,6 +1703,16 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 			if err != nil {
 				return err
 			}
+		case "HTO":
+			values, err := p.reader.numberArray(value, 2)
+			if err != nil {
+				return err
+			}
+			origin := p.state.matrix.Apply(Point{values[0], values[1]})
+			if math.IsNaN(origin.X) || math.IsInf(origin.X, 0) || math.IsNaN(origin.Y) || math.IsInf(origin.Y, 0) {
+				return fmt.Errorf("invalid halftone origin")
+			}
+			p.state.style.HalftoneOrigin = &origin
 		case "D":
 			values, ok := value.(Array)
 			if !ok || len(values) != 2 {

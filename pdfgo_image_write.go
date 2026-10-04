@@ -29,12 +29,18 @@ import (
 	"slices"
 )
 
+// ImageWriteOptions 保存图像替换参数
+// PreblendBinary对二值透明图像采用标准Matte预混合，保留可见颜色，透明像素的隐藏颜色不保留
+type ImageWriteOptions struct {
+	PreblendBinary bool
+}
+
 // ReplaceImagesTo 无损替换间接图像，保留页面布局、其他对象及原加密配置
-// 非预乘颜色和透明度保留八位或十六位精度；不修改源对象，不替换遮罩图像或签名文档
+// 默认保留非预乘颜色和透明度的八位或十六位精度；不修改源对象，不替换遮罩图像或签名文档
 // 出错时应丢弃本次输出，Reader及图片须在调用期间保持可读
-// 入参: ctx 取消上下文, writer 输出流, images 图像引用与替换像素
+// 入参: ctx 取消上下文, writer 输出流, images 图像引用与替换像素, options 可选替换参数，至多一项
 // 返回: OptimizeReport 写出结果, error 参数、编码或写入错误
-func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images map[Reference]image.Image) (OptimizeReport, error) {
+func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images map[Reference]image.Image, options ...ImageWriteOptions) (OptimizeReport, error) {
 	if r.closed {
 		return OptimizeReport{}, os.ErrClosed
 	}
@@ -43,6 +49,13 @@ func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images m
 	}
 	if writer == nil {
 		return OptimizeReport{}, fmt.Errorf("missing output writer")
+	}
+	if len(options) > 1 {
+		return OptimizeReport{}, fmt.Errorf("too many image write options")
+	}
+	var settings ImageWriteOptions
+	if len(options) == 1 {
+		settings = options[0]
 	}
 	maximum := int64(0)
 	for number := range r.xref {
@@ -82,7 +95,7 @@ func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images m
 		if original.ImageMask {
 			return OptimizeReport{}, fmt.Errorf("cannot replace a stencil image")
 		}
-		stream, mask, err := encodePDFImage(ctx, images[ref])
+		stream, mask, err := encodePDFImage(ctx, images[ref], settings)
 		if err != nil {
 			return OptimizeReport{}, err
 		}
@@ -105,9 +118,9 @@ func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images m
 }
 
 // encodePDFImage 逐行编码设备色像素和独立软遮罩，不分配整图样本缓冲
-// 入参: ctx 取消上下文, img 像素图像
+// 入参: ctx 取消上下文, img 像素图像, options 替换参数
 // 返回: *Stream 颜色流, *Stream 软遮罩或nil, error 编码错误
-func encodePDFImage(ctx context.Context, img image.Image) (*Stream, *Stream, error) {
+func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOptions) (*Stream, *Stream, error) {
 	if img == nil {
 		return nil, nil, fmt.Errorf("missing replacement image")
 	}
@@ -141,6 +154,14 @@ func encodePDFImage(ctx context.Context, img image.Image) (*Stream, *Stream, err
 	}
 	if img.ColorModel() == color.RGBAModel && opaque {
 		bits = 8
+	}
+	preblend := false
+	if options.PreblendBinary && channels == 3 && !opaque {
+		var err error
+		preblend, err = imageBinaryAlpha(ctx, img)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	var pixels, alpha bytes.Buffer
 	colorWriter := zlib.NewWriter(&pixels)
@@ -180,6 +201,9 @@ func encodePDFImage(ctx context.Context, img image.Image) (*Stream, *Stream, err
 			default:
 				c := imageNRGBA64At(img, bounds.Min.X+x, y)
 				values[0], values[1], values[2], a = c.R, c.G, c.B, c.A
+				if preblend && a == 0 {
+					values[0], values[1], values[2] = 65535, 65535, 65535
+				}
 			}
 			for c, value := range values[:channels] {
 				index := (x*channels + c) * (bits / 8)
@@ -223,6 +247,32 @@ func encodePDFImage(ctx context.Context, img image.Image) (*Stream, *Stream, err
 	if hasAlpha {
 		mask = &Stream{Dictionary: maps.Clone(stream.Dictionary), Data: alpha.Bytes()}
 		mask.Dictionary["ColorSpace"] = Name("DeviceGray")
+		if preblend {
+			mask.Dictionary["Matte"] = Array{Integer(1), Integer(1), Integer(1)}
+		}
 	}
 	return stream, mask, nil
+}
+
+// imageBinaryAlpha 判断是否具有二值透明度，不复制像素
+// 入参: ctx 取消上下文, img 像素图像
+// 返回: bool 存在全透明像素且无渐变透明度, error 取消错误
+func imageBinaryAlpha(ctx context.Context, img image.Image) (bool, error) {
+	bounds := img.Bounds()
+	transparent := false
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if (x-bounds.Min.X)%256 == 0 {
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+			}
+			a := imageNRGBA64At(img, x, y).A
+			if a != 0 && a != 65535 {
+				return false, nil
+			}
+			transparent = transparent || a == 0
+		}
+	}
+	return transparent, ctx.Err()
 }

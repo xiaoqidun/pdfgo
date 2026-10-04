@@ -47,7 +47,7 @@ type jpxSampleImage struct {
 	mapping  []jpxMapping
 	alpha    int
 	bounds   image.Rectangle
-	x0, y0   int
+	x0, y0   int64
 	cmyk     bool
 	ycc      bool
 	chroma   [2]float64
@@ -172,11 +172,31 @@ func (s *jpxSampleImage) sample(index, x, y int) uint16 {
 		index = s.mapping[index].component
 	}
 	c := s.planes[index]
-	sx := min(c.W-1, max(0, (x+s.x0)/c.XRsiz-(s.x0+c.XRsiz-1)/c.XRsiz))
-	sy := min(c.H-1, max(0, (y+s.y0)/c.YRsiz-(s.y0+c.YRsiz-1)/c.YRsiz))
+	sx, sy := x, y
+	if c.XRsiz != 1 {
+		ratio := int64(c.XRsiz)
+		sx = int((int64(x)+s.x0)/ratio - (s.x0+ratio-1)/ratio)
+	}
+	if c.YRsiz != 1 {
+		ratio := int64(c.YRsiz)
+		sy = int((int64(y)+s.y0)/ratio - (s.y0+ratio-1)/ratio)
+	}
+	sx, sy = min(c.W-1, max(0, sx)), min(c.H-1, max(0, sy))
 	value := uint64(int64(c.Samples[sy*c.W+sx]) + int64(1)<<(c.Precision-1))
 	if palette != nil {
 		return palette[min(value, uint64(len(palette)-1))]
+	}
+	switch c.Precision {
+	case 1:
+		return uint16(value * 65535)
+	case 2:
+		return uint16(value * 21845)
+	case 4:
+		return uint16(value * 4369)
+	case 8:
+		return uint16(value * 257)
+	case 16:
+		return uint16(value)
 	}
 	maximum := uint64(1)<<c.Precision - 1
 	return uint16((value*65535 + maximum/2) / maximum)
@@ -439,7 +459,7 @@ func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: image.Rect(0, 0, i.Width, i.Height), x0: int(binary.BigEndian.Uint32(stream[14:18])), y0: int(binary.BigEndian.Uint32(stream[18:22])), cmyk: count == 4, ycc: ycc}
+	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: image.Rect(0, 0, i.Width, i.Height), x0: int64(binary.BigEndian.Uint32(stream[14:18])), y0: int64(binary.BigEndian.Uint32(stream[18:22])), cmyk: count == 4, ycc: ycc}
 	if ycc {
 		for n := range out.chroma {
 			precision := out.precision(channels[n+1])

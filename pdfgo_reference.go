@@ -282,29 +282,18 @@ func (p *pageInterpreter) referencePage(page *Page) error {
 		if err := p.ctx.Err(); err != nil {
 			return err
 		}
-		value, err := p.reader.Resolve(annotation.Dictionary["F"])
+		flags, err := p.reader.ReadAnnotationFlags(annotation)
 		if err != nil {
 			return err
 		}
-		flags := Integer(0)
-		if value != nil {
-			var ok bool
-			flags, ok = value.(Integer)
-			if !ok || flags < 0 {
-				return fmt.Errorf("invalid reference page annotation flags")
-			}
-		}
-		if flags&4 == 0 || flags&2 != 0 {
+		if flags&4 == 0 || flags&2 != 0 || flags&1 != 0 && !annotation.IsStandard() {
 			continue
 		}
-		value, err = p.reader.Resolve(annotation.Dictionary["AP"])
+		value, err := p.reader.Resolve(annotation.Dictionary["AP"])
 		if err != nil {
 			return err
 		}
 		if value == nil {
-			continue
-		}
-		if flags&1 != 0 && !standardAnnotationSubtype(annotation.Subtype) {
 			continue
 		}
 		if err := p.reader.walkAnnotationAppearance(p.ctx, page, annotation, p.visitor, &initial); err != nil {
@@ -312,17 +301,6 @@ func (p *pageInterpreter) referencePage(page *Page) error {
 		}
 	}
 	return p.ctx.Err()
-}
-
-// standardAnnotationSubtype 判断标准定义的注解类型，不执行交互内容
-// 入参: subtype 注解类型
-// 返回: bool 标准类型
-func standardAnnotationSubtype(subtype Name) bool {
-	switch subtype {
-	case "Text", "Link", "FreeText", "Line", "Square", "Circle", "Polygon", "PolyLine", "Highlight", "Underline", "Squiggly", "StrikeOut", "Caret", "Ink", "Stamp", "Popup", "FileAttachment", "Sound", "Movie", "Widget", "Screen", "PrinterMark", "TrapNet", "Watermark", "3D", "Redact", "RichMedia", "Projection":
-		return true
-	}
-	return false
 }
 
 // matches 按标准编号规则比较单页标签，不分配超出目标文本长度的字符串

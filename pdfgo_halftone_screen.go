@@ -25,6 +25,7 @@ import (
 )
 
 // HalftoneOptions 保存设备网屏参数，分量值采用黑零白一的加色形式
+// Origin指定设备像素原点，不自动换算用户坐标或分辨率
 type HalftoneOptions struct {
 	Resolution    float64
 	Bits          int
@@ -32,6 +33,7 @@ type HalftoneOptions struct {
 	Transfer      Object
 	Named         map[string]*Halftone
 	MaxCellPixels int
+	Origin        image.Point
 }
 
 // HalftoneScreen 保存独立于阅读器的设备网屏，编译后可并发读取
@@ -40,6 +42,9 @@ type HalftoneScreen struct {
 	width2        int
 	height2       int
 	xsign, ysign  int
+	originX       uint64
+	originY       uint64
+	originKey     [2]uint64
 	levels        uint64
 	thresholds    []uint16
 	tiled         map[[2]uint64]uint16
@@ -167,6 +172,25 @@ func (r *Reader) compileHalftone(ctx context.Context, h *Halftone, options Halft
 		}
 		s.thresholds = nil
 	}
+	if s.tiled != nil {
+		n := uint64(s.width*s.height + s.width2*s.height2)
+		x, y := halftoneModulo(options.Origin.X, n), halftoneModulo(options.Origin.Y, n)
+		if s.xsign < 0 {
+			x = halftonePhase(0, x, n)
+		}
+		if s.ysign < 0 {
+			y = halftonePhase(0, y, n)
+		}
+		s.originKey = s.tileResidues(x, y)
+	} else {
+		s.originX, s.originY = halftoneModulo(options.Origin.X, uint64(s.width)), halftoneModulo(options.Origin.Y, uint64(s.height))
+		if s.xsign < 0 {
+			s.originX = halftonePhase(0, s.originX, uint64(s.width))
+		}
+		if s.ysign < 0 {
+			s.originY = halftonePhase(0, s.originY, uint64(s.height))
+		}
+	}
 	var value Object
 	var err error
 	overridden := false
@@ -261,11 +285,29 @@ func (s *HalftoneScreen) cellPixels(limit int) (int, error) {
 func (s *HalftoneScreen) tileKey(x, y int) [2]uint64 {
 	n := uint64(s.width*s.height + s.width2*s.height2)
 	xm, ym := halftoneModulo(x, n), halftoneModulo(y, n)
+	return s.tileResidues(xm, ym)
+}
+
+// tileResidues 将坐标余数映射到双矩形格点商
+// 入参: xm 横向余数, ym 纵向余数
+// 返回: [2]uint64 格点标识
+func (s *HalftoneScreen) tileResidues(xm, ym uint64) [2]uint64 {
+	n := uint64(s.width*s.height + s.width2*s.height2)
 	a := halftoneProduct(uint64(s.height)%n, xm, n)
 	b := halftoneProduct(uint64(s.width2)%n, ym, n)
 	u := (a + n - b) % n
 	v := (halftoneProduct(uint64(s.height2)%n, xm, n) + halftoneProduct(uint64(s.width)%n, ym, n)) % n
 	return [2]uint64{u, v}
+}
+
+// halftonePhase 从坐标余数扣除原点相位，避免有符号坐标相减溢出
+// 入参: value 坐标余数, origin 原点余数, period 网格周期
+// 返回: uint64 平移后的非负余数
+func halftonePhase(value, origin, period uint64) uint64 {
+	if value < origin {
+		return value + period - origin
+	}
+	return value - origin
 }
 
 // halftoneModulo 计算有符号设备坐标的非负余数
@@ -300,9 +342,15 @@ func (s *HalftoneScreen) Quantize(value uint16, x, y int) uint16 {
 	}
 	var threshold uint16
 	if s.tiled != nil {
-		threshold = s.tiled[s.tileKey(x, y)]
+		key := s.tileKey(x, y)
+		if s.originKey != [2]uint64{} {
+			n := uint64(s.width*s.height + s.width2*s.height2)
+			key[0], key[1] = halftonePhase(key[0], s.originKey[0], n), halftonePhase(key[1], s.originKey[1], n)
+		}
+		threshold = s.tiled[key]
 	} else {
 		xm, ym := halftoneModulo(x, uint64(s.width)), halftoneModulo(y, uint64(s.height))
+		xm, ym = halftonePhase(xm, s.originX, uint64(s.width)), halftonePhase(ym, s.originY, uint64(s.height))
 		threshold = s.thresholds[int(ym)*s.width+int(xm)]
 	}
 	return s.quantize(value, threshold)
@@ -357,7 +405,8 @@ func (s *HalftoneScreen) QuantizeRow(ctx context.Context, out, values []uint16, 
 	if s.ysign < 0 {
 		y = ^y
 	}
-	xm, ym := int(halftoneModulo(x, uint64(s.width))), int(halftoneModulo(y, uint64(s.height)))
+	xm := int(halftonePhase(halftoneModulo(x, uint64(s.width)), s.originX, uint64(s.width)))
+	ym := int(halftonePhase(halftoneModulo(y, uint64(s.height)), s.originY, uint64(s.height)))
 	row := s.thresholds[ym*s.width : (ym+1)*s.width]
 	for i, value := range out {
 		if i%256 == 0 {

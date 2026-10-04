@@ -1535,15 +1535,15 @@ func (i *Image) decodeMask(ctx context.Context, components int) (*imageResample,
 		return nil, nil, false, nil, fmt.Errorf("invalid image mask dictionary")
 	}
 	var matte []float64
-	if value := mask.Stream.Dictionary["Matte"]; value != nil {
-		if !soft {
+	value, err := i.reader.Resolve(mask.Stream.Dictionary["Matte"])
+	if err != nil {
+		return nil, nil, false, nil, err
+	}
+	if value != nil {
+		if !soft || mask.Width != i.Width || mask.Height != i.Height {
 			return nil, nil, false, nil, fmt.Errorf("invalid image Matte array")
 		}
-		resolved, err := i.reader.Resolve(value)
-		if err != nil {
-			return nil, nil, false, nil, err
-		}
-		array, ok := resolved.(Array)
+		array, ok := value.(Array)
 		if !ok || len(array) != components {
 			return nil, nil, false, nil, fmt.Errorf("invalid image Matte array")
 		}

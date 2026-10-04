@@ -116,16 +116,22 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 		if gray != nil {
 			pngGrayRow(row, gray, y, depth, &grayBytes)
 		} else {
-			sampler.prepare(y)
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				pixel := sampler.sample(x, y)
-				values := [4]uint16{pixel.R, pixel.G, pixel.B, pixel.A}
-				for c := 0; c < channels; c++ {
-					offset := (x-bounds.Min.X)*pixelBytes + c*depth/8
-					if depth == 8 {
-						row[offset] = byte(values[c] >> 8)
-					} else {
-						binary.BigEndian.PutUint16(row[offset:], values[c])
+			written, err := pngJPXRow(ctx, row, source, y, depth, channels)
+			if err != nil {
+				return err
+			}
+			if !written {
+				sampler.prepare(y)
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					pixel := sampler.sample(x, y)
+					values := [4]uint16{pixel.R, pixel.G, pixel.B, pixel.A}
+					for c := 0; c < channels; c++ {
+						offset := (x-bounds.Min.X)*pixelBytes + c*depth/8
+						if depth == 8 {
+							row[offset] = byte(values[c] >> 8)
+						} else {
+							binary.BigEndian.PutUint16(row[offset:], values[c])
+						}
 					}
 				}
 			}
@@ -143,6 +149,95 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 		return err
 	}
 	return writePNGChunk(output, "IEND", nil)
+}
+
+// pngJPXRow 直接读取等横向采样的分量行，保持通道排序、调色板及透明度精度
+// 入参: ctx 取消上下文, row 输出行, source 图像, y 行坐标, depth 输出位深, channels 输出通道数
+// 返回: bool 是否完成直接采样, error 取消错误
+func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, channels int) (bool, error) {
+	var samples *jpxSampleImage
+	embedded := true
+	switch s := source.(type) {
+	case *jpxSampleImage:
+		samples = s
+	case *deviceSampleImage:
+		if s.mask != nil || s.palette != nil {
+			return false, nil
+		}
+		samples, _ = s.source.(*jpxSampleImage)
+		embedded = s.embedded
+	}
+	if samples == nil || samples.bounds.Min != (image.Point{}) || samples.cmyk || samples.ycc || len(samples.channels) != 1 && len(samples.channels) != 3 {
+		return false, nil
+	}
+	indices := [4]int{samples.channels[0], samples.channels[0], samples.channels[0], -1}
+	if len(samples.channels) == 3 {
+		copy(indices[:3], samples.channels)
+	}
+	if embedded {
+		indices[3] = samples.alpha
+	}
+	width := samples.bounds.Dx()
+	for _, index := range indices[:channels] {
+		if index < 0 {
+			continue
+		}
+		if len(samples.mapping) != 0 {
+			index = samples.mapping[index].component
+		}
+		plane := samples.planes[index]
+		if plane.XRsiz != 1 || width > plane.W {
+			return false, nil
+		}
+	}
+	stride := channels * depth / 8
+	for channel, index := range indices[:channels] {
+		var data []int32
+		var palette []uint16
+		var bias int64
+		var maximum, step uint64
+		if index >= 0 {
+			if len(samples.mapping) != 0 {
+				palette = samples.mapping[index].palette
+				index = samples.mapping[index].component
+			}
+			plane := samples.planes[index]
+			ratio := int64(plane.YRsiz)
+			sy := min(plane.H-1, max(0, int((int64(y)+samples.y0)/ratio-(samples.y0+ratio-1)/ratio)))
+			data = plane.Samples[sy*plane.W : sy*plane.W+width]
+			bias = int64(1) << (plane.Precision - 1)
+			maximum = uint64(1)<<plane.Precision - 1
+			if 65535%maximum == 0 {
+				step = 65535 / maximum
+			}
+		}
+		for start := 0; start < width; start += 4096 {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			for x := start; x < min(start+4096, width); x++ {
+				value := uint16(65535)
+				if data != nil {
+					raw := uint64(int64(data[x]) + bias)
+					switch {
+					case palette != nil:
+						value = palette[min(raw, uint64(len(palette)-1))]
+					case step != 0:
+						value = uint16(raw * step)
+					default:
+						value = uint16((raw*65535 + maximum/2) / maximum)
+					}
+				}
+				offset := x*stride + channel*depth/8
+				if depth == 8 {
+					row[offset] = byte(value >> 8)
+				} else {
+					binary.BigEndian.PutUint16(row[offset:], value)
+				}
+			}
+		}
+	}
+	return true, nil
 }
 
 // pngSampleFormat 按颜色模型选择无损位深，已知不透明时省略透明度通道

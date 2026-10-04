@@ -47,6 +47,31 @@ type Destination struct {
 	Parameters Array
 }
 
+// IsStandard 判断注解类型是否由PDF标准定义，不表示交互能力已实现
+// 返回: bool 标准类型
+func (a Annotation) IsStandard() bool {
+	switch a.Subtype {
+	case "Text", "Link", "FreeText", "Line", "Square", "Circle", "Polygon", "PolyLine", "Highlight", "Underline", "Squiggly", "StrikeOut", "Caret", "Ink", "Stamp", "Popup", "FileAttachment", "Sound", "Movie", "Widget", "Screen", "PrinterMark", "TrapNet", "Watermark", "3D", "Redact", "RichMedia", "Projection":
+		return true
+	}
+	return false
+}
+
+// ReadAnnotationFlags 读取非负注解标志，未提供或空值按零处理
+// 入参: annotation 注解信息
+// 返回: int64 标志位, error 类型或引用错误
+func (r *Reader) ReadAnnotationFlags(annotation Annotation) (int64, error) {
+	value, err := r.Resolve(annotation.Dictionary["F"])
+	if err != nil || value == nil {
+		return 0, err
+	}
+	flags, ok := value.(Integer)
+	if !ok || flags < 0 {
+		return 0, fmt.Errorf("invalid annotation flags")
+	}
+	return int64(flags), nil
+}
+
 // ReadPopupAnnotation 读取弹出批注，继承父批注的Contents、M、C和T，不执行界面操作
 // 入参: object 弹出批注字典或间接引用
 // 返回: PopupAnnotation 弹出批注信息, error 解析错误
@@ -195,6 +220,18 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if page.reader != r {
+		return fmt.Errorf("page belongs to another reader")
+	}
+	if !annotation.IsStandard() {
+		flags, err := r.ReadAnnotationFlags(annotation)
+		if err != nil {
+			return err
+		}
+		if flags&1 != 0 {
+			return ctx.Err()
+		}
+	}
 	if object := annotation.Dictionary["OC"]; object != nil {
 		visible := visitor.OptionalContent
 		if visible == nil {
@@ -204,9 +241,6 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		if err != nil || !show {
 			return err
 		}
-	}
-	if page.reader != r {
-		return fmt.Errorf("page belongs to another reader")
 	}
 	if annotation.Rect.XMin == annotation.Rect.XMax || annotation.Rect.YMin == annotation.Rect.YMax {
 		return ctx.Err()
@@ -220,6 +254,9 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		return err
 	}
 	provided := value != nil
+	if value == nil && !annotation.IsStandard() {
+		return ctx.Err()
+	}
 	if value == nil && annotation.Subtype == "Stamp" {
 		stream, err := r.stampAppearance(annotation)
 		if err != nil {
