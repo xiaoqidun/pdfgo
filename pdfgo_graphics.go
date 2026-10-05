@@ -55,6 +55,7 @@ type TextClip struct {
 // Colorant保留专色定义和源浓度快照，不随后续图形状态变化
 // ColorantDevice访问器可接收备用色为None但原生色料可用的画刷，None仅描述其备用显示
 // SourceSpace保留普通颜色的来源空间族，图案基色使用底层空间族，不以转换后的Space或CMYK代替
+// Shading保留着色图案的内部状态，Alpha仍属于使用图案的对象
 type Paint struct {
 	RGB         [3]float64
 	CMYK        *[4]float64
@@ -70,6 +71,7 @@ type Paint struct {
 	Function    *FunctionGradient
 	Mesh        *MeshGradient
 	Tiling      *TilingPattern
+	Shading     *ShadingPattern
 }
 
 // Style 保存绘制状态及按顺序相交的裁剪路径
@@ -958,7 +960,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 				if pattern.PaintType == 2 && patternBase == nil || pattern.PaintType == 1 && patternBase != nil {
 					return fmt.Errorf("pattern paint type does not match color space")
 				}
-				paint.Tiling, paint.Axial, paint.Radial, paint.Mesh, paint.Function = pattern, nil, nil, nil, nil
+				paint.Tiling, paint.Axial, paint.Radial, paint.Mesh, paint.Function, paint.Shading = pattern, nil, nil, nil, nil, nil
 				if operator == "g" {
 					p.state.style.Fill = paint
 				} else {
@@ -1365,7 +1367,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 // 入参: fill 是否填充, stroke 是否描边
 // 返回: error 颜色状态错误
 func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
-	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil && p.state.style.Fill.Mesh == nil && p.state.style.Fill.Tiling == nil && p.state.style.Fill.Function == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil && p.state.style.Stroke.Mesh == nil && p.state.style.Stroke.Tiling == nil && p.state.style.Stroke.Function == nil {
+	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil && p.state.style.Fill.Mesh == nil && p.state.style.Fill.Tiling == nil && p.state.style.Fill.Function == nil && p.state.style.Fill.Shading == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil && p.state.style.Stroke.Mesh == nil && p.state.style.Stroke.Tiling == nil && p.state.style.Stroke.Function == nil && p.state.style.Stroke.Shading == nil {
 		return fmt.Errorf("missing pattern color")
 	}
 	for _, target := range []struct {
@@ -1374,7 +1376,7 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 		paint   *Paint
 		values  [4]float64
 	}{{fill, p.state.fillICC, &p.state.style.Fill, p.state.fillICCValues}, {stroke, p.state.strokeICC, &p.state.style.Stroke, p.state.strokeICCValues}} {
-		if !target.used || target.paint.None || target.paint.Axial != nil || target.paint.Radial != nil || target.paint.Function != nil || target.paint.Mesh != nil || target.paint.Tiling != nil {
+		if !target.used || target.paint.None || target.paint.Axial != nil || target.paint.Radial != nil || target.paint.Function != nil || target.paint.Mesh != nil || target.paint.Tiling != nil || target.paint.Shading != nil {
 			continue
 		}
 		profile := target.profile
@@ -1658,6 +1660,13 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 	if !ok {
 		return fmt.Errorf("invalid external graphics state")
 	}
+	return p.applyExtState(dict)
+}
+
+// applyExtState 解释图形状态字典，保留间接空值和字段覆盖顺序
+// 入参: dict 图形状态字典
+// 返回: error 参数或资源错误
+func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 	if p.uncoloredPattern || p.uncoloredType3 {
 		for _, key := range []Name{"TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT"} {
 			value, err := p.reader.Resolve(dict[key])

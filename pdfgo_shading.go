@@ -166,37 +166,10 @@ func (r *Reader) numberArray(object Object, count int) ([]float64, error) {
 	return values, nil
 }
 
-// shadingPattern 解析着色图案的渐变、背景和边界
-// 入参: name 图案资源名
+// shadingPatternPaint 解析着色图案的渐变、背景和边界
+// 入参: v 着色字典或流, m 图案坐标到页面的变换
 // 返回: Paint 渐变画刷, error 不支持的图案或解析错误
-func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
-	object, err := p.resource("Pattern", name)
-	if err != nil {
-		return Paint{}, err
-	}
-	v, err := p.reader.Resolve(object)
-	if err != nil {
-		return Paint{}, err
-	}
-	dict, ok := v.(Dictionary)
-	if !ok || dict["PatternType"] != Integer(2) {
-		return Paint{}, &UnsupportedError{Feature: "shading pattern type"}
-	}
-	child := *p
-	child.state = p.patternInitialState()
-	p = &child
-	m := p.patternMatrix
-	if dict["Matrix"] != nil {
-		v, err := p.reader.numberArray(dict["Matrix"], 6)
-		if err != nil {
-			return Paint{}, err
-		}
-		m = m.Mul(Matrix(v))
-	}
-	v, err = p.reader.Resolve(dict["Shading"])
-	if err != nil {
-		return Paint{}, err
-	}
+func (p *pageInterpreter) shadingPatternPaint(v Object, m Matrix) (Paint, error) {
 	shading, ok := v.(Dictionary)
 	if stream, streamOK := v.(*Stream); streamOK {
 		shading, ok = stream.Dictionary, true
@@ -215,8 +188,13 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if !visible {
 		return Paint{None: true}, nil
 	}
-	if dict["ExtGState"] != nil {
-		return Paint{}, &UnsupportedError{Feature: "shading pattern graphics state"}
+	backgroundValue, err := p.reader.Resolve(shading["Background"])
+	if err != nil {
+		return Paint{}, err
+	}
+	boundsValue, err := p.reader.Resolve(shading["BBox"])
+	if err != nil {
+		return Paint{}, err
 	}
 	if stream, ok := v.(*Stream); ok {
 		paint, err := p.meshPaint(stream, m)
@@ -227,12 +205,12 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		if paint.None {
 			return paint, nil
 		}
-		if stream.Dictionary["Background"] != nil {
+		if backgroundValue != nil {
 			components := mesh.Space.Components()
 			if mesh.tint != nil {
 				components = mesh.tint.components
 			}
-			values, err := p.reader.numberArray(stream.Dictionary["Background"], components)
+			values, err := p.reader.numberArray(backgroundValue, components)
 			if err != nil {
 				return Paint{}, err
 			}
@@ -242,8 +220,8 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 			}
 			mesh.Background = &background
 		}
-		if stream.Dictionary["BBox"] != nil {
-			box, err := p.reader.rectangle(stream.Dictionary["BBox"])
+		if boundsValue != nil {
+			box, err := p.reader.rectangle(boundsValue)
 			if err != nil {
 				return Paint{}, err
 			}
@@ -260,7 +238,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		return paint, nil
 	}
 	var bounds *Rectangle
-	if shading["Background"] != nil {
+	if backgroundValue != nil {
 		object, err := p.shadingColorSpace(shading["ColorSpace"])
 		if err != nil {
 			return Paint{}, err
@@ -269,7 +247,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		if err != nil {
 			return Paint{}, err
 		}
-		values, err := p.reader.numberArray(shading["Background"], base.components)
+		values, err := p.reader.numberArray(backgroundValue, base.components)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -301,8 +279,8 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		}
 		background = &converted
 	}
-	if shading["BBox"] != nil {
-		box, err := p.reader.rectangle(shading["BBox"])
+	if boundsValue != nil {
+		box, err := p.reader.rectangle(boundsValue)
 		if err != nil {
 			return Paint{}, err
 		}

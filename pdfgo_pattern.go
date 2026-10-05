@@ -57,7 +57,7 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	child.state.matrix = Identity()
 	child.state.style.Clips = []Path{clip}
 	if p.PaintType == 2 {
-		base.Tiling, base.Axial, base.Radial, base.Mesh, base.Function = nil, nil, nil, nil, nil
+		base.Tiling, base.Axial, base.Radial, base.Mesh, base.Function, base.Shading = nil, nil, nil, nil, nil, nil
 		base.Alpha = 1
 		child.state.style.Fill, child.state.style.Stroke = base, base
 		child.state.fillSpace, child.state.strokeSpace = "DeviceRGB", "DeviceRGB"
@@ -104,11 +104,15 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	} else {
 		return nil, fmt.Errorf("invalid pattern resource")
 	}
-	if dict["PatternType"] == Integer(2) {
+	kind, err := p.reader.Resolve(dict["PatternType"])
+	if err != nil {
+		return nil, err
+	}
+	if kind == Integer(2) {
 		return nil, nil
 	}
 	stream, ok := value.(*Stream)
-	if !ok || dict["PatternType"] != Integer(1) {
+	if !ok || kind != Integer(1) {
 		return nil, &UnsupportedError{Feature: "pattern type"}
 	}
 	paintType, ok := dict["PaintType"].(Integer)
