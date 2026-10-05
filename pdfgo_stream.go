@@ -617,26 +617,18 @@ func setPackedSample(data []byte, index, bits int, value uint16) {
 	data[index/perByte] = data[index/perByte]&^mask | byte(value<<shift)&mask
 }
 
-// paeth 计算PNG预测样本
+// paeth 按相邻端点区间计算PNG预测值，保持等距离时的标准选择顺序
 // 入参: a 左侧样本, b 上方样本, c 左上样本
 // 返回: byte 预测值
 func paeth(a, b, c byte) byte {
-	pa, pb := int(b)-int(c), int(a)-int(c)
-	pc := pa + pb
-	if pa < 0 {
-		pa = -pa
+	left, right := min(int(a), int(b)), max(int(a), int(b))
+	sum, triple := int(a)+int(b), 3*int(c)
+	result := int(c)
+	if triple <= sum+left {
+		result = right
 	}
-	if pb < 0 {
-		pb = -pb
+	if triple >= sum+right {
+		result = left
 	}
-	if pc < 0 {
-		pc = -pc
-	}
-	if pa <= pb && pa <= pc {
-		return a
-	}
-	if pb <= pc {
-		return b
-	}
-	return c
+	return byte(result)
 }

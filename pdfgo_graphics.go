@@ -1018,7 +1018,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if err != nil {
 			return err
 		}
-		font, err := p.reader.ReadFont(object)
+		font, err := p.reader.ReadFontContext(p.ctx, object)
 		if err != nil {
 			return err
 		}
@@ -1202,13 +1202,18 @@ func (p *pageInterpreter) showText(data []byte) error {
 		}
 		mode = mode/4*4 + paintMode
 	}
-	glyphs, err := p.state.font.Decode(data)
+	glyphs, err := p.state.font.DecodeContext(p.ctx, data)
 	if err != nil {
 		return err
 	}
 	positions := make([]Point, len(glyphs))
 	advance := Point{}
 	for n, glyph := range glyphs {
+		if n&255 == 0 {
+			if err := p.ctx.Err(); err != nil {
+				return err
+			}
+		}
 		spacing := p.state.spacing
 		if glyph.WordSpace {
 			spacing += p.state.wordSpacing
@@ -1222,6 +1227,9 @@ func (p *pageInterpreter) showText(data []byte) error {
 		}
 	}
 	if len(glyphs) > 0 {
+		if err := p.ctx.Err(); err != nil {
+			return err
+		}
 		if p.visitor.Text == nil {
 			return fmt.Errorf("text visitor missing")
 		}
@@ -1634,8 +1642,11 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 	if resources != nil && !ok {
 		return fmt.Errorf("invalid ExtGState dictionary")
 	}
-	object := dictionary[name]
-	if object == nil {
+	value, err := p.reader.Resolve(dictionary[name])
+	if err != nil {
+		return err
+	}
+	if value == nil {
 		message := fmt.Sprintf("undefined ExtGState resource %s; current graphics state retained", name)
 		if p.visitor.Warning == nil {
 			return fmt.Errorf("%s", message)
@@ -1643,22 +1654,26 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 		p.visitor.Warning(Diagnostic{Offset: offset, Message: message})
 		return nil
 	}
-	value, err := p.reader.Resolve(object)
-	if err != nil {
-		return err
-	}
 	dict, ok := value.(Dictionary)
 	if !ok {
 		return fmt.Errorf("invalid external graphics state")
 	}
 	if p.uncoloredPattern || p.uncoloredType3 {
 		for _, key := range []Name{"TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT"} {
-			if dict[key] != nil {
+			value, err := p.reader.Resolve(dict[key])
+			if err != nil {
+				return err
+			}
+			if value != nil {
 				return fmt.Errorf("color graphics state in uncolored content")
 			}
 		}
 	}
 	transfer, err := p.reader.Resolve(dict["TR2"])
+	if err != nil {
+		return err
+	}
+	nonstrokingOverprint, err := p.reader.Resolve(dict["op"])
 	if err != nil {
 		return err
 	}
@@ -1753,7 +1768,7 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 			if math.IsNaN(size) || math.IsInf(size, 0) {
 				return fmt.Errorf("invalid font size")
 			}
-			font, err := p.reader.ReadFont(array[0])
+			font, err := p.reader.ReadFontContext(p.ctx, array[0])
 			if err != nil {
 				return err
 			}
@@ -1817,7 +1832,7 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 				p.state.style.StrokeAdjust = bool(flag)
 			case "OP":
 				p.state.style.StrokeOverprint = bool(flag)
-				if dict["op"] == nil {
+				if nonstrokingOverprint == nil {
 					p.state.style.FillOverprint = bool(flag)
 				}
 			case "op":

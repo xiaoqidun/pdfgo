@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"image"
@@ -42,15 +43,17 @@ type jpxMapping struct {
 
 // jpxSampleImage 保留原始分量平面，按通道定义和采样间隔读取
 type jpxSampleImage struct {
-	planes   []j2k.Component
-	channels []int
-	mapping  []jpxMapping
-	alpha    int
-	bounds   image.Rectangle
-	x0, y0   int64
-	cmyk     bool
-	ycc      bool
-	chroma   [2]float64
+	planes    []j2k.Component
+	samples8  [][]byte
+	samples16 [][]uint16
+	channels  []int
+	mapping   []jpxMapping
+	alpha     int
+	bounds    image.Rectangle
+	x0, y0    int64
+	cmyk      bool
+	ycc       bool
+	chroma    [2]float64
 }
 
 // jpxMaskMode 读取JPEG2000内嵌软遮罩模式
@@ -182,7 +185,15 @@ func (s *jpxSampleImage) sample(index, x, y int) uint16 {
 		sy = int((int64(y)+s.y0)/ratio - (s.y0+ratio-1)/ratio)
 	}
 	sx, sy = min(c.W-1, max(0, sx)), min(c.H-1, max(0, sy))
-	value := uint64(int64(c.Samples[sy*c.W+sx]) + int64(1)<<(c.Precision-1))
+	offset := sy*c.W + sx
+	var value uint64
+	if len(s.samples8) != 0 && s.samples8[index] != nil {
+		value = uint64(s.samples8[index][offset])
+	} else if len(s.samples16) != 0 && s.samples16[index] != nil {
+		value = uint64(s.samples16[index][offset])
+	} else {
+		value = uint64(int64(c.Samples[offset]) + int64(1)<<(c.Precision-1))
+	}
 	if palette != nil {
 		return palette[min(value, uint64(len(palette)-1))]
 	}
@@ -231,32 +242,20 @@ func (r *Reader) jpxDefaults(stream *Stream) (int, Object, error) {
 	if err != nil || len(filters) == 0 || filters[len(filters)-1] != Name("JPXDecode") {
 		return 0, nil, err
 	}
-	data, err := (&Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": parameters[:len(parameters)-1]}, Data: stream.Data}).Decode()
-	if err != nil {
-		return 0, nil, err
-	}
-	code := data
-	if len(data) >= 12 && bytes.Equal(data[:12], []byte{0, 0, 0, 12, 'j', 'P', ' ', ' ', 13, 10, 135, 10}) {
-		code = nil
-		err = walkJPXBoxes(data, func(name string, payload []byte) error {
-			if name == "jp2c" {
-				if code != nil {
-					return &UnsupportedError{Feature: "multiple JPEG2000 codestreams"}
-				}
-				code = payload
-			}
-			return nil
-		})
+	data := stream.Data
+	if len(filters) > 1 {
+		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": parameters[:len(parameters)-1]}, Data: data}).Decode()
 		if err != nil {
 			return 0, nil, err
 		}
 	}
-	if len(code) < 42 || !bytes.Equal(code[:4], []byte{255, 79, 255, 81}) {
-		return 0, nil, fmt.Errorf("invalid JPEG2000 size marker")
+	code, err := jpxCodestream(data)
+	if err != nil {
+		return 0, nil, err
 	}
-	count := int(binary.BigEndian.Uint16(code[40:42]))
-	if count == 0 || len(code) < 42+3*count || int(binary.BigEndian.Uint16(code[4:6])) != 38+3*count {
-		return 0, nil, fmt.Errorf("invalid JPEG2000 component descriptors")
+	_, _, count, err := jpxSize(code)
+	if err != nil {
+		return 0, nil, err
 	}
 	depth := int(code[42]&127) + 1
 	for n := 0; n < count; n++ {
@@ -384,15 +383,25 @@ func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object,
 // 入参: data JPEG2000编码数据, cmyk 是否使用四色空间
 // 返回: image.Image 采样图像, error 解码错误
 func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
+	return i.jpxSamplesContext(context.Background(), data, cmyk)
+}
+
+// jpxSamplesContext 按原始分量解码JPEG2000，在码流读取及解码前后检查取消
+// 入参: ctx 取消上下文, data 编码数据, cmyk 是否使用四色空间
+// 返回: image.Image 独立采样图像, error 参数、解码或取消错误
+func (i *Image) jpxSamplesContext(ctx context.Context, data []byte, cmyk bool) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	stream, err := jpxCodestream(data)
 	if err != nil {
 		return nil, err
 	}
-	config, err := j2k.DecodeConfig(bytes.NewReader(stream))
+	width, height, _, err := jpxSize(stream)
 	if err != nil {
 		return nil, err
 	}
-	if config.Width != i.Width || config.Height != i.Height {
+	if width != i.Width || height != i.Height {
 		return nil, fmt.Errorf("JPEG2000 dimensions differ from image dictionary")
 	}
 	count := 3
@@ -422,7 +431,10 @@ func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	components, err := j2k.DecodeComponents(bytes.NewReader(stream), j2k.Options{})
+	components, err := j2k.DecodeComponents(&contextInput{ctx: ctx, reader: bytes.NewReader(stream)}, j2k.Options{})
+	if canceled := ctx.Err(); canceled != nil {
+		return nil, canceled
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -459,14 +471,95 @@ func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: image.Rect(0, 0, i.Width, i.Height), x0: int64(binary.BigEndian.Uint32(stream[14:18])), y0: int64(binary.BigEndian.Uint32(stream[18:22])), cmyk: count == 4, ycc: ycc}
+	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: image.Rect(0, 0, i.Width, i.Height), x0: int64(binary.BigEndian.Uint32(stream[16:20])), y0: int64(binary.BigEndian.Uint32(stream[20:24])), cmyk: count == 4, ycc: ycc}
 	if ycc {
 		for n := range out.chroma {
 			precision := out.precision(channels[n+1])
 			out.chroma[n] = float64(uint64(1)<<(precision-1)) * 65535 / float64(uint64(1)<<precision-1)
 		}
 	}
+	if err := out.compact(ctx); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// compact 按原始位深保存无符号样本，释放解码器的三十二位平面，不改变采样精度
+// 入参: ctx 取消上下文
+// 返回: error 取消错误
+func (s *jpxSampleImage) compact(ctx context.Context) error {
+	for index, plane := range s.planes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if plane.Samples == nil || plane.Precision > 16 {
+			continue
+		}
+		shift := int64(1) << (plane.Precision - 1)
+		if plane.Precision <= 8 {
+			if s.samples8 == nil {
+				s.samples8 = make([][]byte, len(s.planes))
+			}
+			data := make([]byte, len(plane.Samples))
+			for i, value := range plane.Samples {
+				if i%4096 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				data[i] = byte(int64(value) + shift)
+			}
+			s.samples8[index] = data
+		} else {
+			if s.samples16 == nil {
+				s.samples16 = make([][]uint16, len(s.planes))
+			}
+			data := make([]uint16, len(plane.Samples))
+			for i, value := range plane.Samples {
+				if i%4096 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				data[i] = uint16(int64(value) + shift)
+			}
+			s.samples16[index] = data
+		}
+		s.planes[index].Samples = nil
+	}
+	return ctx.Err()
+}
+
+// jpxSize 校验码流尺寸和分量缓冲，不依赖普通图像颜色模型或分配像素
+// 入参: data 原始码流
+// 返回: int 宽度, int 高度, int 分量数, error 头部或平台范围错误
+func jpxSize(data []byte) (int, int, int, error) {
+	if len(data) < 42 || !bytes.Equal(data[:4], []byte{255, 79, 255, 81}) {
+		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 size marker")
+	}
+	count := int(binary.BigEndian.Uint16(data[40:42]))
+	if count == 0 || len(data) < 42+3*count || int(binary.BigEndian.Uint16(data[4:6])) != 38+3*count {
+		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 component descriptors")
+	}
+	x, y := int64(binary.BigEndian.Uint32(data[8:12])), int64(binary.BigEndian.Uint32(data[12:16]))
+	x0, y0 := int64(binary.BigEndian.Uint32(data[16:20])), int64(binary.BigEndian.Uint32(data[20:24]))
+	maximum := int64(^uint(0) >> 1)
+	if x <= x0 || y <= y0 || x > maximum || y > maximum {
+		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 reference grid or platform range")
+	}
+	width, height := int(x-x0), int(y-y0)
+	if _, _, err := imageBufferSize(width, height, count*4); err != nil {
+		return 0, 0, 0, err
+	}
+	for n := 0; n < count; n++ {
+		if int(data[42+3*n]&127)+1 > 31 {
+			return 0, 0, 0, &UnsupportedError{Feature: "JPEG2000 component precision"}
+		}
+		if data[43+3*n] == 0 || data[44+3*n] == 0 {
+			return 0, 0, 0, fmt.Errorf("invalid JPEG2000 component sampling")
+		}
+	}
+	return width, height, count, nil
 }
 
 // jpxComponentMapping 解析JP2调色板和直接通道映射，保留原始采样精度

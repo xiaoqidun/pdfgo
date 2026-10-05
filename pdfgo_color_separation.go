@@ -271,7 +271,7 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 	if !f.sampled {
 		t := math.Pow(tint, f.exponent)
 		for n := range out {
-			out[n] = f.values[2*n] + t*(f.values[2*n+1]-f.values[2*n])
+			out[n] = functionValue(t, f.values[2*n], f.values[2*n+1])
 			if f.outputRange != nil {
 				out[n] = math.Max(f.outputRange[2*n], math.Min(f.outputRange[2*n+1], out[n]))
 			}

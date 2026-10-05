@@ -103,16 +103,27 @@ func gradientValues(stops []GradientStop, function *gradientFunction, domain [2]
 	if function == nil {
 		return gradientValue(stops, position), nil
 	}
-	position = math.Max(0, math.Min(1, position))
+	if position <= 0 {
+		position = 0
+	} else if position >= 1 {
+		position = 1
+	}
 	values, err := function.evaluate(functionValue(position, domain[0], domain[1]))
 	if err != nil {
 		return [4]float64{}, err
 	}
 	for i, value := range values {
+		if value > 0 && value < 1 {
+			continue
+		}
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return [4]float64{}, fmt.Errorf("nonfinite gradient color")
 		}
-		values[i] = math.Max(0, math.Min(1, value))
+		if value <= 0 {
+			values[i] = 0
+		} else {
+			values[i] = 1
+		}
 	}
 	return values, nil
 }
@@ -692,9 +703,9 @@ func (r *Reader) readDeviceNGradient(space Array, function Object, domain [2]flo
 	return stops, tint.alternate, mapped, nil
 }
 
-// clipGradientValues 在截断位置增加精确断点，不改变其余分段或跳变
+// clipGradientValues 增加截断断点，无法保留边界位置时不生成分段
 // 入参: stops 源分段, bounds 各分量下界与上界
-// 返回: []GradientStop 截断后的分段
+// 返回: []GradientStop 截断后的分段，不可精确表达时为空
 func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
 	if len(stops) == 0 {
 		return nil
@@ -709,18 +720,36 @@ func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
 				if a.Values[c] == stop.Values[c] {
 					continue
 				}
+				lower, upper := min(a.Values[c], stop.Values[c]), max(a.Values[c], stop.Values[c])
+				first := functionPosition(bounds[2*c], a.Values[c], stop.Values[c])
+				last := functionPosition(bounds[2*c+1], a.Values[c], stop.Values[c])
+				if bounds[2*c] != bounds[2*c+1] && first == last && first > 0 && first < 1 {
+					return nil
+				}
 				for _, bound := range bounds[c*2 : c*2+2] {
-					t := (bound - a.Values[c]) / (stop.Values[c] - a.Values[c])
+					t := functionPosition(bound, a.Values[c], stop.Values[c])
+					if bound > lower && bound < upper && (t <= 0 || t >= 1) {
+						return nil
+					}
 					if t > 0 && t < 1 {
+						position := gradientPosition(a.Position, stop.Position, t)
+						if position <= a.Position || position >= stop.Position {
+							return nil
+						}
 						positions = append(positions, t)
 					}
 				}
 			}
 			slices.Sort(positions)
-			for _, t := range slices.Compact(positions) {
+			var previous float64
+			for i, t := range slices.Compact(positions) {
 				v := GradientStop{Position: gradientPosition(a.Position, stop.Position, t)}
+				if i > 0 && v.Position <= previous {
+					return nil
+				}
+				previous = v.Position
 				for c := range v.Values {
-					v.Values[c] = a.Values[c] + t*(stop.Values[c]-a.Values[c])
+					v.Values[c] = functionValue(t, a.Values[c], stop.Values[c])
 				}
 				result = append(result, v)
 			}
@@ -746,7 +775,11 @@ func (r *Reader) linearGradientStops(object Object, interval [2]float64, channel
 	if f.linear == nil {
 		return nil, &UnsupportedError{Feature: "nonlinear gradient function"}
 	}
-	return clipGradientValues(f.linear(interval), gradientUnitBounds(channels)), nil
+	stops := clipGradientValues(f.linear(interval), gradientUnitBounds(channels))
+	if len(stops) == 0 {
+		return nil, &UnsupportedError{Feature: "unrepresentable gradient function stops"}
+	}
+	return stops, nil
 }
 
 // gradientUnitBounds 返回设备或ICC分量的单位区间
@@ -777,6 +810,9 @@ func gradientPosition(start, end, position float64) float64 {
 // 入参: stops 原分段, start 起始参数, end 终止参数
 // 返回: []GradientStop 归一化分段
 func gradientInterval(stops []GradientStop, start, end float64) []GradientStop {
+	if len(stops) == 0 {
+		return nil
+	}
 	if start > end {
 		result := gradientInterval(stops, end, start)
 		slices.Reverse(result)
@@ -800,7 +836,7 @@ func gradientInterval(stops []GradientStop, start, end float64) []GradientStop {
 	result[0] = GradientStop{Position: 0, Values: gradientValue(stops, start)}
 	if start != end {
 		for _, stop := range stops[first:last] {
-			stop.Position = (stop.Position - start) / (end - start)
+			stop.Position = functionPosition(stop.Position, start, end)
 			result = append(result, stop)
 		}
 	}
@@ -824,10 +860,10 @@ func gradientValueSide(stops []GradientStop, position float64, left bool) [4]flo
 	for i := 1; i < len(stops); i++ {
 		if position < stops[i].Position || left && position == stops[i].Position && stops[i-1].Position < position {
 			a, b := stops[i-1], stops[i]
-			t := (position - a.Position) / (b.Position - a.Position)
+			t := functionPosition(position, a.Position, b.Position)
 			var value [4]float64
 			for c := range value {
-				value[c] = a.Values[c] + t*(b.Values[c]-a.Values[c])
+				value[c] = functionValue(t, a.Values[c], b.Values[c])
 			}
 			return value
 		}

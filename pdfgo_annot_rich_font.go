@@ -105,7 +105,7 @@ func (r *Reader) newAnnotationRichFonts(ctx context.Context, resources Dictionar
 		if err != nil || !families[strings.ToLower(family)] {
 			continue
 		}
-		font, err := r.ReadFont(fonts[other])
+		font, err := r.ReadFontContext(ctx, fonts[other])
 		if err != nil {
 			return nil, err
 		}
@@ -292,7 +292,7 @@ func (s *annotationRichFonts) selectLetter(style annotationRichStyle, ch rune) (
 			}
 			if !exists {
 				object := Dictionary{"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name(standard), "Encoding": Name("WinAnsiEncoding")}
-				font, err := s.reader.ReadFont(object)
+				font, err := s.reader.ReadFontContext(s.ctx, object)
 				if err != nil {
 					return nil, annotationLetter{}, err
 				}

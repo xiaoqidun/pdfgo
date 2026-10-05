@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -31,25 +32,55 @@ type UnicodeMap map[string]string
 // 入参: data 已解码的CMap数据
 // 返回: UnicodeMap 字符映射, error 错误信息
 func ParseUnicodeMap(data []byte) (UnicodeMap, error) {
-	return parseUnicodeMap(data, nil)
+	return ParseUnicodeMapContext(context.Background(), data)
+}
+
+// ParseUnicodeMapContext 读取Unicode映射，在解析、展开及继承时检查取消
+// 入参: ctx 取消上下文, data 已解码的CMap数据
+// 返回: UnicodeMap 完整映射, error 解析或取消错误
+func ParseUnicodeMapContext(ctx context.Context, data []byte) (UnicodeMap, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid CMap context")
+	}
+	return parseUnicodeMapContext(ctx, data, nil)
 }
 
 // parseUnicodeMap 读取Unicode映射并展开命名基础资源
 // 入参: data 映射数据, active 当前命名继承链
 // 返回: UnicodeMap 独立映射, error 解析错误
 func parseUnicodeMap(data []byte, active map[Name]bool) (UnicodeMap, error) {
+	return parseUnicodeMapContext(context.Background(), data, active)
+}
+
+// parseUnicodeMapContext 读取映射及命名继承，取消时不返回部分结果
+// 入参: ctx 取消上下文, data 映射数据, active 当前命名继承链
+// 返回: UnicodeMap 独立映射, error 解析或取消错误
+func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bool) (UnicodeMap, error) {
 	p := objectParser{data: data}
 	result := UnicodeMap{}
 	var inherited UnicodeMap
 	previous := ""
 	var name Name
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		p.skipSpace()
 		if p.pos == len(data) {
+			index := 0
 			for code, text := range inherited {
+				if index&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				index++
 				if _, exists := result[code]; !exists {
 					result[code] = text
 				}
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
 			return result, nil
 		}
@@ -73,7 +104,7 @@ func parseUnicodeMap(data []byte, active map[Name]bool) (UnicodeMap, error) {
 				return nil, p.fail("invalid ToUnicode CMap inheritance")
 			}
 			var err error
-			inherited, err = loadUnicodeCMap(name, active)
+			inherited, err = loadUnicodeCMapContext(ctx, name, active)
 			if err != nil {
 				return nil, err
 			}
@@ -89,7 +120,12 @@ func parseUnicodeMap(data []byte, active map[Name]bool) (UnicodeMap, error) {
 		if err != nil || count < 0 || count > 65536 {
 			return nil, p.fail("invalid CMap mapping count")
 		}
-		for range count {
+		for index := range count {
+			if index&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			from, err := p.object()
 			if err != nil {
 				return nil, err
@@ -130,6 +166,11 @@ func parseUnicodeMap(data []byte, active map[Name]bool) (UnicodeMap, error) {
 					return nil, err
 				}
 				for code := a; code <= b; code++ {
+					if (code-a)&255 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					var target String
 					switch v := to.(type) {
 					case String:

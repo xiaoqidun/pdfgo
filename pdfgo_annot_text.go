@@ -269,7 +269,7 @@ func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary
 		return nil, nil, nil, err
 	}
 	standard := Dictionary{"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica"), "Encoding": Name("WinAnsiEncoding")}
-	font, err := r.ReadFont(standard)
+	font, err := r.ReadFontContext(ctx, standard)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -297,7 +297,7 @@ func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, err
 		}
-		font, err := r.ReadFont(fonts[name])
+		font, err := r.ReadFontContext(ctx, fonts[name])
 		if err != nil || font.Vertical {
 			continue
 		}
@@ -658,7 +658,7 @@ func annotationLetterLookup(ctx context.Context, font *Font, wanted map[rune]boo
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		glyphs, err := font.Decode([]byte(code))
+		glyphs, err := font.DecodeContext(ctx, []byte(code))
 		if err != nil || len(glyphs) != 1 || utf8.RuneCountInString(glyphs[0].Text) != 1 {
 			continue
 		}
@@ -670,6 +670,9 @@ func annotationLetterLookup(ctx context.Context, font *Font, wanted map[rune]boo
 		if _, ok := lookup[letter]; !ok && wanted[letter] {
 			lookup[letter] = annotationLetter{letter, code, glyph.Width, glyph.WordSpace}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return lookup, nil
 }

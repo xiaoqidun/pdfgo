@@ -16,8 +16,8 @@ package pdfgo
 
 import (
 	"cmp"
+	"context"
 	"fmt"
-	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -67,12 +67,22 @@ type cidCMap struct {
 // 入参: data CMap数据
 // 返回: CIDMap 字符映射, error 错误信息
 func ParseCIDMap(data []byte) (CIDMap, error) {
-	mapping, err := parseCIDCMap(data)
+	return ParseCIDMapContext(context.Background(), data)
+}
+
+// ParseCIDMapContext 读取并展开CID映射，继承及范围展开可取消
+// 入参: ctx 取消上下文, data CMap数据
+// 返回: CIDMap 完整字符映射, error 解析或取消错误
+func ParseCIDMapContext(ctx context.Context, data []byte) (CIDMap, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid CMap context")
+	}
+	mapping, err := parseCIDCMapContext(ctx, data)
 	if err != nil {
 		return nil, err
 	}
 	if mapping.use != "" {
-		mapping.base, err = loadCIDCMap(mapping.use, nil)
+		mapping.base, err = loadCIDCMapContext(ctx, mapping.use, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -81,6 +91,11 @@ func ParseCIDMap(data []byte) (CIDMap, error) {
 	for current := mapping; current != nil; current = current.base {
 		for _, entry := range current.ranges {
 			for code := entry.first; code <= entry.last; code++ {
+				if (code-entry.first)&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				raw := make([]byte, code>>32)
 				for n := range raw {
 					raw[len(raw)-n-1] = byte(code >> (n * 8))
@@ -92,6 +107,9 @@ func ParseCIDMap(data []byte) (CIDMap, error) {
 			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -99,18 +117,36 @@ func ParseCIDMap(data []byte) (CIDMap, error) {
 // 入参: data CMap数据
 // 返回: *cidCMap 本层映射, error 格式错误
 func parseCIDCMap(data []byte) (*cidCMap, error) {
+	return parseCIDCMapContext(context.Background(), data)
+}
+
+// parseCIDCMapContext 解析CID元数据和范围，取消时不保留部分映射
+// 入参: ctx 取消上下文, data CMap数据
+// 返回: *cidCMap 本层映射, error 格式或取消错误
+func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
 	p := objectParser{data: data}
 	result := &cidCMap{}
 	previous := ""
 	var name Name
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		p.skipSpace()
 		if p.pos == len(data) {
 			slices.SortFunc(result.ranges, func(a, b cidMappedRange) int { return cmp.Compare(a.first, b.first) })
 			var end uint64
 			for i := range result.ranges {
+				if i&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				end = max(end, result.ranges[i].last)
 				result.ranges[i].end = end
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
 			return result, nil
 		}
@@ -184,7 +220,12 @@ func parseCIDCMap(data []byte) (*cidCMap, error) {
 		if err != nil || count < 0 {
 			return nil, p.fail("invalid CMap mapping count")
 		}
-		for range count {
+		for index := range count {
+			if index&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			from, err := p.object()
 			if err != nil {
 				return nil, err
@@ -333,15 +374,25 @@ func (c *cidCMap) undefined(raw []byte) uint16 {
 // 入参: object 编码对象, active 当前流继承链
 // 返回: *cidCMap 编码映射, error 解析错误
 func (r *Reader) readCIDCMap(object Object, active map[*Stream]bool) (*cidCMap, error) {
+	return r.readCIDCMapContext(context.Background(), object, active)
+}
+
+// readCIDCMapContext 读取文档编码并沿用本次上下文解析继承流
+// 入参: ctx 取消上下文, object 编码对象, active 当前流继承链
+// 返回: *cidCMap 完整映射, error 解析或取消错误
+func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, active map[*Stream]bool) (*cidCMap, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
 	}
 	if name, ok := value.(Name); ok {
-		return loadCIDCMap(name, nil)
+		return loadCIDCMapContext(ctx, name, nil)
 	}
 	stream, ok := value.(*Stream)
-	if !ok {
+	if !ok || stream == nil {
 		return nil, fmt.Errorf("invalid composite font encoding")
 	}
 	if active[stream] {
@@ -352,11 +403,11 @@ func (r *Reader) readCIDCMap(object Object, active map[*Stream]bool) (*cidCMap, 
 	}
 	active[stream] = true
 	defer delete(active, stream)
-	data, err := stream.Decode()
+	data, err := stream.DecodeContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	mapping, err := parseCIDCMap(data)
+	mapping, err := parseCIDCMapContext(ctx, data)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +419,7 @@ func (r *Reader) readCIDCMap(object Object, active map[*Stream]bool) (*cidCMap, 
 		base = mapping.use
 	}
 	if base != nil {
-		mapping.base, err = r.readCIDCMap(base, active)
+		mapping.base, err = r.readCIDCMapContext(ctx, base, active)
 		if err != nil {
 			return nil, err
 		}
@@ -385,6 +436,9 @@ func (r *Reader) readCIDCMap(object Object, active map[*Stream]bool) (*cidCMap, 
 	if len(mapping.spaces) == 0 {
 		return nil, fmt.Errorf("missing CMap codespace")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return mapping, nil
 }
 
@@ -392,16 +446,33 @@ func (r *Reader) readCIDCMap(object Object, active map[*Stream]bool) (*cidCMap, 
 // 入参: object 映射对象, active 当前流继承链
 // 返回: UnicodeMap 独立映射, error 解析错误
 func (r *Reader) readUnicodeCMap(object Object, active map[*Stream]bool) (UnicodeMap, error) {
+	return r.readUnicodeCMapContext(context.Background(), object, active)
+}
+
+// readUnicodeCMapContext 读取独立Unicode映射，流继承及合并均检查取消
+// 入参: ctx 取消上下文, object 映射对象, active 当前流继承链
+// 返回: UnicodeMap 完整映射, error 解析或取消错误
+func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, active map[*Stream]bool) (UnicodeMap, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
 	}
 	if name, ok := value.(Name); ok {
-		mapping, err := loadUnicodeCMap(name, nil)
-		return maps.Clone(mapping), err
+		mapping, err := loadUnicodeCMapContext(ctx, name, nil)
+		if err != nil {
+			return nil, err
+		}
+		result := make(UnicodeMap, len(mapping))
+		if err := copyUnicodeMapContext(ctx, result, mapping); err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
 	stream, ok := value.(*Stream)
-	if !ok {
+	if !ok || stream == nil {
 		return nil, fmt.Errorf("invalid ToUnicode")
 	}
 	if active[stream] {
@@ -412,22 +483,47 @@ func (r *Reader) readUnicodeCMap(object Object, active map[*Stream]bool) (Unicod
 	}
 	active[stream] = true
 	defer delete(active, stream)
-	data, err := stream.Decode()
+	data, err := stream.DecodeContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	result, err := ParseUnicodeMap(data)
+	result, err := ParseUnicodeMapContext(ctx, data)
 	if err != nil {
 		return nil, err
 	}
 	base, err := r.Resolve(stream.Dictionary["UseCMap"])
-	if err != nil || base == nil {
-		return result, err
-	}
-	mapping, err := r.readUnicodeCMap(base, active)
 	if err != nil {
 		return nil, err
 	}
-	maps.Copy(mapping, result)
+	if base == nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+	mapping, err := r.readUnicodeCMapContext(ctx, base, active)
+	if err != nil {
+		return nil, err
+	}
+	if err := copyUnicodeMapContext(ctx, mapping, result); err != nil {
+		return nil, err
+	}
 	return mapping, nil
+}
+
+// copyUnicodeMapContext 合并独立映射，在复制期间及完成前检查取消
+// 入参: ctx 取消上下文, target 目标映射, source 源映射
+// 返回: error 取消错误
+func copyUnicodeMapContext(ctx context.Context, target, source UnicodeMap) error {
+	index := 0
+	for code, text := range source {
+		if index&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		index++
+		target[code] = text
+	}
+	return ctx.Err()
 }

@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -33,16 +34,20 @@ type SoftMask struct {
 // 入参: value 蒙版采样值
 // 返回: float64 限定在零至一之间的不透明度, error 传递函数错误
 func (m *SoftMask) Transfer(value float64) (float64, error) {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
+	if m == nil || math.IsNaN(value) || math.IsInf(value, 0) {
 		return 0, fmt.Errorf("invalid mask transfer input")
 	}
 	value = math.Max(0, math.Min(1, value))
-	if m.transfer != nil {
-		values, err := m.transfer.evaluate(value)
-		if err != nil {
-			return 0, err
-		}
-		value = values[0]
+	if m.transfer == nil {
+		return value, nil
+	}
+	values, err := m.transfer.evaluate(value)
+	if err != nil {
+		return 0, err
+	}
+	value = values[0]
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, fmt.Errorf("invalid mask transfer result")
 	}
 	return math.Max(0, math.Min(1, value)), nil
 }
@@ -51,7 +56,31 @@ func (m *SoftMask) Transfer(value float64) (float64, error) {
 // 入参: visitor 蒙版图元访问器
 // 返回: error 解析或访问错误
 func (m *SoftMask) Walk(visitor Visitor) error {
+	if m == nil {
+		return fmt.Errorf("invalid soft mask")
+	}
+	ctx := m.interpreter.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return m.WalkContext(ctx, visitor)
+}
+
+// WalkContext 使用本次取消上下文访问蒙版图元，不修改原始解析状态
+// 入参: ctx 取消上下文, visitor 蒙版图元访问器
+// 返回: error 解析、访问或取消错误
+func (m *SoftMask) WalkContext(ctx context.Context, visitor Visitor) error {
+	if ctx == nil {
+		return fmt.Errorf("invalid soft mask context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m == nil || m.stream == nil {
+		return fmt.Errorf("invalid soft mask group")
+	}
 	p := m.interpreter
+	p.ctx = ctx
 	if visitor.Reference == nil {
 		visitor.Reference = p.visitor.Reference
 	}

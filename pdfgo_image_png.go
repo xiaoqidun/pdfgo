@@ -26,6 +26,9 @@ import (
 	"math"
 )
 
+// pngRowCacheLimit 限制单个重采样器的临时缓存，超限仍按原图像采样
+const pngRowCacheLimit = 8 << 20
+
 // pngContextWriter 在分块写入前检查取消及短写
 type pngContextWriter struct {
 	ctx    context.Context
@@ -38,10 +41,16 @@ type pngChunkWriter struct {
 	data   []byte
 }
 
-// pngRowSampler 在逐行编码中复用双线性插值的源行和横向坐标
+// pngRowSampler 独立复用颜色及遮罩的重采样行，不展开整幅图像
 type pngRowSampler struct {
-	source   image.Image
-	device   *deviceSampleImage
+	source image.Image
+	device *deviceSampleImage
+	colors *pngResampleRows
+	mask   *pngResampleRows
+}
+
+// pngResampleRows 保存两行预乘样本及像素中心的横向映射
+type pngResampleRows struct {
 	resample *imageResample
 	x        []pngSampleColumn
 	rows     [2][]color.RGBA64
@@ -114,31 +123,52 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 			return err
 		}
 		if gray != nil {
-			pngGrayRow(row, gray, y, depth, &grayBytes)
+			if err := pngGrayRow(ctx, row, gray, y, depth, &grayBytes); err != nil {
+				return err
+			}
 		} else {
 			written, err := pngJPXRow(ctx, row, source, y, depth, channels)
 			if err != nil {
 				return err
 			}
 			if !written {
-				sampler.prepare(y)
-				for x := bounds.Min.X; x < bounds.Max.X; x++ {
-					pixel := sampler.sample(x, y)
-					values := [4]uint16{pixel.R, pixel.G, pixel.B, pixel.A}
-					for c := 0; c < channels; c++ {
-						offset := (x-bounds.Min.X)*pixelBytes + c*depth/8
-						if depth == 8 {
-							row[offset] = byte(values[c] >> 8)
-						} else {
-							binary.BigEndian.PutUint16(row[offset:], values[c])
+				if err := sampler.prepare(ctx, y); err != nil {
+					return err
+				}
+				for start := bounds.Min.X; start < bounds.Max.X; {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					end := start + min(4096, bounds.Max.X-start)
+					for x := start; x < end; x++ {
+						pixel := sampler.sample(x, y)
+						values := [4]uint16{pixel.R, pixel.G, pixel.B, pixel.A}
+						for c := 0; c < channels; c++ {
+							offset := (x-bounds.Min.X)*pixelBytes + c*depth/8
+							if depth == 8 {
+								row[offset] = byte(values[c] >> 8)
+							} else {
+								binary.BigEndian.PutUint16(row[offset:], values[c])
+							}
 						}
 					}
+					start = end
 				}
 			}
 		}
-		filtered := pngFilterRow(row, previous, pixelBytes, &filters)
-		if _, err := compressed.Write(filtered); err != nil {
+		filtered, err := pngFilterRow(ctx, row, previous, pixelBytes, &filters)
+		if err != nil {
 			return err
+		}
+		for len(filtered) != 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			n := min(32768, len(filtered))
+			if _, err := compressed.Write(filtered[:n]); err != nil {
+				return err
+			}
+			filtered = filtered[n:]
 		}
 		row, previous = previous, row
 	}
@@ -193,6 +223,8 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 	stride := channels * depth / 8
 	for channel, index := range indices[:channels] {
 		var data []int32
+		var data8 []byte
+		var data16 []uint16
 		var palette []uint16
 		var bias int64
 		var maximum, step uint64
@@ -204,7 +236,14 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 			plane := samples.planes[index]
 			ratio := int64(plane.YRsiz)
 			sy := min(plane.H-1, max(0, int((int64(y)+samples.y0)/ratio-(samples.y0+ratio-1)/ratio)))
-			data = plane.Samples[sy*plane.W : sy*plane.W+width]
+			offset := sy * plane.W
+			if len(samples.samples8) != 0 && samples.samples8[index] != nil {
+				data8 = samples.samples8[index][offset : offset+width]
+			} else if len(samples.samples16) != 0 && samples.samples16[index] != nil {
+				data16 = samples.samples16[index][offset : offset+width]
+			} else {
+				data = plane.Samples[offset : offset+width]
+			}
 			bias = int64(1) << (plane.Precision - 1)
 			maximum = uint64(1)<<plane.Precision - 1
 			if 65535%maximum == 0 {
@@ -217,8 +256,15 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 			}
 			for x := start; x < min(start+4096, width); x++ {
 				value := uint16(65535)
-				if data != nil {
-					raw := uint64(int64(data[x]) + bias)
+				if index >= 0 {
+					var raw uint64
+					if data8 != nil {
+						raw = uint64(data8[x])
+					} else if data16 != nil {
+						raw = uint64(data16[x])
+					} else {
+						raw = uint64(int64(data[x]) + bias)
+					}
 					switch {
 					case palette != nil:
 						value = palette[min(raw, uint64(len(palette)-1))]
@@ -300,19 +346,30 @@ func pngGrayByteMap(source *mappedGrayImage, depth int) (lookup [256]byte) {
 }
 
 // pngGrayRow 按输出位深直接映射样本行，不展开整幅灰度图像
-// 入参: row 输出行, source 紧凑图像, y 源行坐标, depth 输出位深, lookup 字节映射表
-func pngGrayRow(row []byte, source *mappedGrayImage, y, depth int, lookup *[256]byte) {
+// 入参: ctx 取消上下文, row 输出行, source 紧凑图像, y 源行坐标, depth 输出位深, lookup 字节映射表
+// 返回: error 取消错误
+func pngGrayRow(ctx context.Context, row []byte, source *mappedGrayImage, y, depth int, lookup *[256]byte) error {
 	width := source.Bounds().Dx()
 	input := source.source.data[(y-source.Bounds().Min.Y)*source.source.stride:]
 	if depth < 8 {
 		if depth == source.source.depth {
 			for n := range row {
+				if n&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				row[n] = lookup[input[n]]
 			}
 		} else {
 			clear(row)
 			step := uint16(65535 / (1<<depth - 1))
 			for x := 0; x < width; x++ {
+				if x&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				value := source.lookup[packedSample(input, x, source.source.depth)] / step
 				setPackedSample(row, x, depth, value)
 			}
@@ -320,9 +377,14 @@ func pngGrayRow(row []byte, source *mappedGrayImage, y, depth int, lookup *[256]
 		if remainder := width % (8 / depth) * depth; remainder != 0 {
 			row[len(row)-1] &= byte(0xff << (8 - remainder))
 		}
-		return
+		return ctx.Err()
 	}
 	for x := 0; x < width; x++ {
+		if x&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		value := source.lookup[packedSample(input, x, source.source.depth)]
 		if depth == 8 {
 			row[x] = byte(value >> 8)
@@ -330,17 +392,26 @@ func pngGrayRow(row []byte, source *mappedGrayImage, y, depth int, lookup *[256]
 			binary.BigEndian.PutUint16(row[2*x:], value)
 		}
 	}
+	return ctx.Err()
 }
 
-// pngFilterRow 比较五种标准行过滤器，使用有符号残差较小的结果
-// 入参: row 当前行, previous 上一行, pixelBytes 像素字节数, filters 复用缓冲
-// 返回: []byte 带过滤器编号的样本行
-func pngFilterRow(row, previous []byte, pixelBytes int, filters *[2][]byte) []byte {
+// pngFilterRow 比较五种标准行过滤器，按原顺序选择较小残差并检查取消
+// 入参: ctx 取消上下文, row 当前行, previous 上一行, pixelBytes 像素字节数, filters 复用缓冲
+// 返回: []byte 带过滤器编号的样本行, error 取消错误
+func pngFilterRow(ctx context.Context, row, previous []byte, pixelBytes int, filters *[2][]byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	filters[0][0] = 0
 	copy(filters[0][1:], row)
 	var score uint64
-	for _, value := range row {
-		score += uint64(min(int(value), 256-int(value)))
+	for start := 0; start < len(row); start += 4096 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for _, value := range row[start:min(start+4096, len(row))] {
+			score += uint64(min(int(value), 256-int(value)))
+		}
 	}
 	for _, kind := range [4]int{2, 1, 4, 3} {
 		if score == 0 {
@@ -362,30 +433,40 @@ func pngFilterRow(row, previous []byte, pixelBytes int, filters *[2][]byte) []by
 			candidate += uint64(min(int(residual), 256-int(residual)))
 		}
 		for start := prefix; start < len(row) && candidate < score; start += 128 {
+			if (start-prefix)&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			end := min(start+128, len(row))
+			current, filtered := row[start:end], output[start:end]
 			switch kind {
 			case 1:
-				for index := start; index < end; index++ {
-					residual := row[index] - row[index-pixelBytes]
-					output[index] = residual
+				left := row[start-pixelBytes:][:len(current)]
+				for index, value := range current {
+					residual := value - left[index]
+					filtered[index] = residual
 					candidate += uint64(min(int(residual), 256-int(residual)))
 				}
 			case 2:
-				for index := start; index < end; index++ {
-					residual := row[index] - previous[index]
-					output[index] = residual
+				above := previous[start:end]
+				for index, value := range current {
+					residual := value - above[index]
+					filtered[index] = residual
 					candidate += uint64(min(int(residual), 256-int(residual)))
 				}
 			case 3:
-				for index := start; index < end; index++ {
-					residual := row[index] - byte((uint16(row[index-pixelBytes])+uint16(previous[index]))/2)
-					output[index] = residual
+				left, above := row[start-pixelBytes:][:len(current)], previous[start:end]
+				for index, value := range current {
+					residual := value - byte((uint16(left[index])+uint16(above[index]))/2)
+					filtered[index] = residual
 					candidate += uint64(min(int(residual), 256-int(residual)))
 				}
 			case 4:
-				for index := start; index < end; index++ {
-					residual := row[index] - paeth(row[index-pixelBytes], previous[index], previous[index-pixelBytes])
-					output[index] = residual
+				left, above, corner := row[start-pixelBytes:][:len(current)], previous[start:end], previous[start-pixelBytes:][:len(current)]
+				for index, value := range current {
+					residual := value - paeth(left[index], above[index], corner[index])
+					filtered[index] = residual
 					candidate += uint64(min(int(residual), 256-int(residual)))
 				}
 			}
@@ -395,10 +476,13 @@ func pngFilterRow(row, previous []byte, pixelBytes int, filters *[2][]byte) []by
 			score = candidate
 		}
 	}
-	return filters[0]
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return filters[0], nil
 }
 
-// newPNGRowSampler 为设备色插值建立两行缓存，其他图像保留直接采样
+// newPNGRowSampler 为颜色及遮罩建立独立缓存，其他图像保留直接采样
 // 入参: source 图像
 // 返回: pngRowSampler 行采样器, error 行缓冲尺寸错误
 func newPNGRowSampler(source image.Image) (pngRowSampler, error) {
@@ -407,26 +491,43 @@ func newPNGRowSampler(source image.Image) (pngRowSampler, error) {
 	if !ok {
 		return s, nil
 	}
-	r, ok := device.source.(*imageResample)
-	if !ok || !r.interpolate || r.bounds == r.source.Bounds() {
-		return s, nil
+	s.device = device
+	var err error
+	if r, ok := device.source.(*imageResample); ok {
+		s.colors, err = newPNGResampleRows(r)
+		if err != nil {
+			return s, err
+		}
+	}
+	if device.mask != nil {
+		s.mask, err = newPNGResampleRows(device.mask)
+	}
+	return s, err
+}
+
+// newPNGResampleRows 为双线性插值建立有界行缓存，不改变超限图像的精度
+// 入参: r 重采样图像
+// 返回: *pngResampleRows 可选缓存, error 无效源尺寸
+func newPNGResampleRows(r *imageResample) (*pngResampleRows, error) {
+	if !r.interpolate || r.bounds == r.source.Bounds() {
+		return nil, nil
 	}
 	switch raw := r.source.(type) {
 	case *image.CMYK, *packedCMYKImage, *packedDeviceNImage, *imageResample:
-		return s, nil
+		return nil, nil
 	case *jpxSampleImage:
 		if raw.cmyk || len(raw.channels) > 4 {
-			return s, nil
+			return nil, nil
 		}
 	}
 	b := r.source.Bounds()
-	if _, _, err := imageBufferSize(b.Dx(), 2, 8); err != nil {
-		return s, err
+	if b.Dx() <= 0 || b.Dy() <= 0 || r.bounds.Dx() <= 0 || r.bounds.Dy() <= 0 {
+		return nil, fmt.Errorf("invalid PNG resampling dimensions")
 	}
-	if _, _, err := imageBufferSize(r.bounds.Dx(), 1, 24); err != nil {
-		return s, err
+	if b.Dx() > pngRowCacheLimit/16 || r.bounds.Dx() > (pngRowCacheLimit-b.Dx()*16)/24 {
+		return nil, nil
 	}
-	s.device, s.resample = device, r
+	s := &pngResampleRows{resample: r}
 	s.rows = [2][]color.RGBA64{make([]color.RGBA64, b.Dx()), make([]color.RGBA64, b.Dx())}
 	s.x = make([]pngSampleColumn, r.bounds.Dx())
 	for index := range s.x {
@@ -437,12 +538,25 @@ func newPNGRowSampler(source image.Image) (pngRowSampler, error) {
 	return s, nil
 }
 
-// prepare 仅在源行变化时读取原始样本，不累积输出行
-// 入参: y 输出行坐标
-func (s *pngRowSampler) prepare(y int) {
-	if s.resample == nil {
-		return
+// prepare 更新颜色及遮罩行缓存，在读取样本期间检查取消
+// 入参: ctx 取消上下文, y 输出行坐标
+// 返回: error 取消错误
+func (s *pngRowSampler) prepare(ctx context.Context, y int) error {
+	if s.colors != nil {
+		if err := s.colors.prepare(ctx, y); err != nil {
+			return err
+		}
 	}
+	if s.mask != nil {
+		return s.mask.prepare(ctx, y)
+	}
+	return ctx.Err()
+}
+
+// prepare 仅在源行变化时读取原始样本，取消后不继续填充缓存
+// 入参: ctx 取消上下文, y 输出行坐标
+// 返回: error 取消错误
+func (s *pngResampleRows) prepare(ctx context.Context, y int) error {
 	b := s.resample.source.Bounds()
 	coordinate := (float64(y-s.resample.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.resample.bounds.Dy()) - .5
 	low := int(math.Floor(coordinate))
@@ -457,29 +571,77 @@ func (s *pngRowSampler) prepare(y int) {
 		if s.valid[n] && s.y[n] == row {
 			continue
 		}
+		s.valid[n] = false
 		for x := range s.rows[n] {
+			if x&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			s.rows[n][x] = imageRGBA64At(s.resample.source, b.Min.X+x, row)
 		}
 		s.y[n], s.valid[n] = row, true
 	}
+	return ctx.Err()
 }
 
 // sample 使用缓存样本执行原有预乘插值和整数舍入，再合成遮罩
 // 入参: x 横向坐标, y 纵向坐标
 // 返回: color.NRGBA64 非预乘颜色
 func (s *pngRowSampler) sample(x, y int) color.NRGBA64 {
-	if s.resample == nil {
+	if s.device == nil {
 		return imageNRGBA64At(s.source, x, y)
 	}
+	var pixel color.NRGBA64
+	if s.colors != nil {
+		pixel = s.colors.sample(x)
+	} else {
+		pixel = imageNRGBA64At(s.device.source, x, y)
+	}
+	alpha := uint32(65535)
+	if s.mask != nil {
+		alpha = uint32(s.mask.red(x))
+	} else if s.device.mask != nil {
+		alpha = uint32(imageRGBA64At(s.device.mask, x, y).R)
+	}
+	if s.device.mask != nil && s.device.inverted {
+		alpha = 65535 - alpha
+	}
+	return s.device.combineAlpha(pixel, alpha)
+}
+
+// sample 使用缓存执行预乘插值，已知不透明时不重复插值覆盖率
+// 入参: x 输出横向坐标
+// 返回: color.NRGBA64 非预乘颜色
+func (s *pngResampleRows) sample(x int) color.NRGBA64 {
 	column := s.x[x-s.resample.bounds.Min.X]
 	a, b, c, d := s.rows[0][column.left], s.rows[0][column.right], s.rows[1][column.left], s.rows[1][column.right]
-	result := imageUnpremultiply(color.RGBA64{
+	alpha := uint16(65535)
+	if a.A != 65535 || b.A != 65535 || c.A != 65535 || d.A != 65535 {
+		alpha = pngInterpolate(a.A, b.A, c.A, d.A, column.weight, s.weightY)
+	}
+	return imageUnpremultiply(color.RGBA64{
 		R: pngInterpolate(a.R, b.R, c.R, d.R, column.weight, s.weightY),
 		G: pngInterpolate(a.G, b.G, c.G, d.G, column.weight, s.weightY),
 		B: pngInterpolate(a.B, b.B, c.B, d.B, column.weight, s.weightY),
-		A: pngInterpolate(a.A, b.A, c.A, d.A, column.weight, s.weightY),
+		A: alpha,
 	})
-	return s.device.combine(result, x, y)
+}
+
+// red 读取遮罩插值后的预乘灰度，不对不透明灰度执行多余颜色计算
+// 入参: x 输出横向坐标
+// 返回: uint16 遮罩覆盖率
+func (s *pngResampleRows) red(x int) uint16 {
+	column := s.x[x-s.resample.bounds.Min.X]
+	a, b, c, d := s.rows[0][column.left], s.rows[0][column.right], s.rows[1][column.left], s.rows[1][column.right]
+	red := pngInterpolate(a.R, b.R, c.R, d.R, column.weight, s.weightY)
+	if a.A == 65535 && b.A == 65535 && c.A == 65535 && d.A == 65535 {
+		return red
+	}
+	alpha := pngInterpolate(a.A, b.A, c.A, d.A, column.weight, s.weightY)
+	pixel := imageUnpremultiply(color.RGBA64{R: red, A: alpha})
+	value, _, _, _ := pixel.RGBA()
+	return uint16(value)
 }
 
 // pngInterpolate 按原有累加顺序插值非负样本，保留半值向上舍入
@@ -497,7 +659,7 @@ func pngInterpolate(a, b, c, d uint16, x, y float64) uint16 {
 	return integer
 }
 
-// Write 检查取消状态后写入数据，不接受未报告错误的短写
+// Write 在写入前后检查取消，不接受未报告错误的短写
 // 入参: data 输出数据
 // 返回: int 已写字节数, error 取消或写入错误
 func (w pngContextWriter) Write(data []byte) (int, error) {
@@ -508,15 +670,24 @@ func (w pngContextWriter) Write(data []byte) (int, error) {
 	if err == nil && n != len(data) {
 		err = io.ErrShortWrite
 	}
+	if err == nil {
+		err = w.ctx.Err()
+	}
 	return n, err
 }
 
-// Write 将压缩字节写入定长块缓冲，满块时直接输出
+// Write 将压缩字节写入定长块缓冲，填充前检查取消，满块时直接输出
 // 入参: data 压缩数据
 // 返回: int 已接收字节数, error 写入错误
 func (w *pngChunkWriter) Write(data []byte) (int, error) {
+	if err := w.writer.ctx.Err(); err != nil {
+		return 0, err
+	}
 	written := 0
 	for len(data) != 0 {
+		if err := w.writer.ctx.Err(); err != nil {
+			return written, err
+		}
 		n := min(len(data), cap(w.data)-len(w.data))
 		w.data = append(w.data, data[:n]...)
 		data, written = data[n:], written+n

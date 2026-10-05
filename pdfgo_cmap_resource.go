@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -76,6 +77,16 @@ func cmapResource(name Name) ([]byte, string, error) {
 // 入参: name 资源名称, active 当前继承链
 // 返回: *cidCMap 只读映射, error 读取或继承错误
 func loadCIDCMap(name Name, active map[Name]bool) (*cidCMap, error) {
+	return loadCIDCMapContext(context.Background(), name, active)
+}
+
+// loadCIDCMapContext 读取只读编码资源，缓存命中及继承过程仍检查取消
+// 入参: ctx 取消上下文, name 资源名称, active 当前继承链
+// 返回: *cidCMap 完整映射, error 读取、继承或取消错误
+func loadCIDCMapContext(ctx context.Context, name Name, active map[Name]bool) (*cidCMap, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if active[name] {
 		return nil, fmt.Errorf("cyclic CMap inheritance")
 	}
@@ -94,12 +105,12 @@ func loadCIDCMap(name Name, active map[Name]bool) (*cidCMap, error) {
 	}
 	active[name] = true
 	defer delete(active, name)
-	mapping, err := parseCIDCMap(data)
+	mapping, err := parseCIDCMapContext(ctx, data)
 	if err != nil {
 		return nil, err
 	}
 	if mapping.use != "" {
-		mapping.base, err = loadCIDCMap(mapping.use, active)
+		mapping.base, err = loadCIDCMapContext(ctx, mapping.use, active)
 		if err != nil {
 			return nil, err
 		}
@@ -107,6 +118,9 @@ func loadCIDCMap(name Name, active map[Name]bool) (*cidCMap, error) {
 	mapping.inherit()
 	if len(mapping.spaces) == 0 {
 		return nil, fmt.Errorf("missing CMap codespace")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	cached, _ := predefinedCIDMaps.LoadOrStore(name, mapping)
 	return cached.(*cidCMap), nil
@@ -116,6 +130,16 @@ func loadCIDCMap(name Name, active map[Name]bool) (*cidCMap, error) {
 // 入参: name 资源名称, active 当前继承链
 // 返回: UnicodeMap 只读映射, error 读取或继承错误
 func loadUnicodeCMap(name Name, active map[Name]bool) (UnicodeMap, error) {
+	return loadUnicodeCMapContext(context.Background(), name, active)
+}
+
+// loadUnicodeCMapContext 读取命名Unicode资源，仅缓存解析完整的映射
+// 入参: ctx 取消上下文, name 资源名称, active 当前继承链
+// 返回: UnicodeMap 只读映射, error 读取、继承或取消错误
+func loadUnicodeCMapContext(ctx context.Context, name Name, active map[Name]bool) (UnicodeMap, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if active[name] {
 		return nil, fmt.Errorf("cyclic ToUnicode CMap inheritance")
 	}
@@ -134,8 +158,11 @@ func loadUnicodeCMap(name Name, active map[Name]bool) (UnicodeMap, error) {
 	}
 	active[name] = true
 	defer delete(active, name)
-	mapping, err := parseUnicodeMap(data, active)
+	mapping, err := parseUnicodeMapContext(ctx, data, active)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	cached, _ := predefinedUnicodeMaps.LoadOrStore(name, mapping)

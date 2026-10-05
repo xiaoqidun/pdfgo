@@ -14,7 +14,10 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // VerticalMetrics 保存千分之一字形单位的竖排纵向位移及相对于横排原点的位置
 type VerticalMetrics struct {
@@ -26,6 +29,16 @@ type VerticalMetrics struct {
 // 入参: font 字体资源, metrics CID字体字典
 // 返回: error 错误信息
 func (r *Reader) readVerticalMetrics(font *Font, metrics Dictionary) error {
+	return r.readVerticalMetricsContext(context.Background(), font, metrics)
+}
+
+// readVerticalMetricsContext 展开竖排度量并响应本次取消
+// 入参: ctx 取消上下文, font 字体资源, metrics CID字体字典
+// 返回: error 读取或取消错误
+func (r *Reader) readVerticalMetricsContext(ctx context.Context, font *Font, metrics Dictionary) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	font.defaultVertical = [2]float64{880, -1000}
 	value, err := r.Resolve(metrics["DW2"])
 	if err != nil {
@@ -53,11 +66,18 @@ func (r *Reader) readVerticalMetrics(font *Font, metrics Dictionary) error {
 	}
 	font.verticals = make(map[uint32]VerticalMetrics)
 	for n := 0; n < len(array); {
-		start, ok := array[n].(Integer)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		value, err := r.Resolve(array[n])
+		if err != nil {
+			return err
+		}
+		start, ok := value.(Integer)
 		if !ok || start < 0 || start > 65535 || n+1 >= len(array) {
 			return fmt.Errorf("invalid CID vertical range")
 		}
-		value, err := r.Resolve(array[n+1])
+		value, err = r.Resolve(array[n+1])
 		if err != nil {
 			return err
 		}
@@ -67,6 +87,11 @@ func (r *Reader) readVerticalMetrics(font *Font, metrics Dictionary) error {
 				return fmt.Errorf("invalid CID vertical range")
 			}
 			for i := 0; i < len(values); i += 3 {
+				if (i/3)&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				metric, err := r.verticalMetric(values[i : i+3])
 				if err != nil {
 					return err
@@ -84,11 +109,16 @@ func (r *Reader) readVerticalMetrics(font *Font, metrics Dictionary) error {
 			}
 			n += 3
 			for cid := start; cid <= end; cid++ {
+				if (cid-start)&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				font.verticals[uint32(cid)] = metric
 			}
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 // verticalMetric 读取竖排位移及原点向量

@@ -46,18 +46,20 @@ var coreFonts = sync.OnceValues(func() (map[string]*coreFontMetrics, error) {
 	return fonts, nil
 })
 
-// coreFontMetrics 保存标准字体的缺省编码及千分之一字宽
+// coreFontMetrics 保存标准字体的缺省编码、字宽及整体边界
 type coreFontMetrics struct {
 	names  [256]string
 	widths map[string]float64
+	bounds *Rectangle
 }
 
-// parseCoreFontMetrics 读取内置AFM资源中的字符编码、名称和横向字宽
+// parseCoreFontMetrics 读取内置AFM资源中的字符编码、名称、横向字宽及边界
 // 入参: data 原始AFM资源
 // 返回: *coreFontMetrics 标准字体度量, error 无效字符度量
 func parseCoreFontMetrics(data []byte) (*coreFontMetrics, error) {
 	metrics := &coreFontMetrics{widths: make(map[string]float64)}
 	remaining := -1
+	boundsFound := false
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
@@ -79,6 +81,27 @@ func parseCoreFontMetrics(data []byte) (*coreFontMetrics, error) {
 				return nil, fmt.Errorf("AFM character count mismatch")
 			}
 			return metrics, nil
+		}
+		if remaining < 0 && fields[0] == "FontBBox" {
+			if len(fields) != 5 || boundsFound {
+				return nil, fmt.Errorf("invalid AFM font bounds")
+			}
+			boundsFound = true
+			var values [4]float64
+			for index := range values {
+				value, err := strconv.ParseFloat(fields[index+1], 64)
+				if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+					return nil, fmt.Errorf("invalid AFM font bounds")
+				}
+				values[index] = value
+			}
+			bounds := Rectangle{values[0], values[1], values[2], values[3]}
+			if bounds.XMin > bounds.XMax || bounds.YMin > bounds.YMax {
+				return nil, fmt.Errorf("invalid AFM font bounds")
+			}
+			if bounds.XMin < bounds.XMax && bounds.YMin < bounds.YMax {
+				metrics.bounds = &bounds
+			}
 		}
 		if remaining < 0 || fields[0] == "Comment" {
 			continue

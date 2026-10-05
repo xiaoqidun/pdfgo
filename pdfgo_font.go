@@ -15,7 +15,10 @@
 package pdfgo
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
+	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -24,41 +27,44 @@ import (
 
 // Font 保存PDF字体程序、字符映射及字宽，不依赖渲染后端
 // Vertical为true时使用竖排度量，字形本身仍以横排原点描述
-// BoundingBox保留非Type3字体描述符的千分之一文字空间边界，未提供有效边界时为空
+// BoundingBox保留非Type3字体描述符边界，未提供有效边界时为空
+// FallbackBoundingBox保留未内嵌标准字体的AFM保守边界，不用于排版，边界单位为千分之一文字空间
 type Font struct {
-	Name            string
-	Subtype         Name
-	Program         []byte
-	ProgramType     Name
-	Dictionary      Dictionary
-	BoundingBox     *Rectangle
-	Unicode         UnicodeMap
-	Vertical        bool
-	widths          map[uint32]float64
-	defaultWidth    float64
-	verticals       map[uint32]VerticalMetrics
-	defaultVertical [2]float64
-	composite       bool
-	encoding        Name
-	cidMap          *cidCMap
-	cidUnicode      UnicodeMap
-	glyphMap        []byte
-	simpleCmap      []byte
-	cmapEncoding    Name
-	symbolic        bool
-	post            *fontPostMapping
-	cffGlyphs       map[uint32]uint16
-	cffNames        map[uint32]string
-	differences     map[uint32]string
-	type3Matrix     Matrix
-	type3Bounds     *Rectangle
-	type3Procs      Dictionary
-	type3Resources  Dictionary
-	reader          *Reader
+	Name                string
+	Subtype             Name
+	Program             []byte
+	ProgramType         Name
+	Dictionary          Dictionary
+	BoundingBox         *Rectangle
+	FallbackBoundingBox *Rectangle
+	Unicode             UnicodeMap
+	Vertical            bool
+	widths              map[uint32]float64
+	defaultWidth        float64
+	verticals           map[uint32]VerticalMetrics
+	defaultVertical     [2]float64
+	composite           bool
+	encoding            Name
+	cidMap              *cidCMap
+	cidUnicode          UnicodeMap
+	glyphMap            []byte
+	glyphCount          uint32
+	simpleCmap          []byte
+	cmapEncoding        Name
+	symbolic            bool
+	post                *fontPostMapping
+	cffGlyphs           map[uint32]uint16
+	cffNames            map[uint32]string
+	differences         map[uint32]string
+	type3Matrix         Matrix
+	type3Bounds         *Rectangle
+	type3Procs          Dictionary
+	type3Resources      Dictionary
+	reader              *Reader
 }
 
 // Glyph 保存原始字符码、Unicode文本、字形名称、编号和千分之一字宽
-// 缺少Unicode映射但具有字形编号时，Text为空，不推测字符含义
+// 缺少Unicode映射但具有字形编号或未定义字形时，Text为空，不推测字符含义
 // CID保留复合字体字符标识，只有可确定内嵌字形编号时HasID才为true
 // Vertical仅在竖排字体中有效，Width始终保留横排字宽
 type Glyph struct {
@@ -77,8 +83,27 @@ type Glyph struct {
 // 入参: object 字体字典或引用
 // 返回: *Font 字体资源, error 错误信息
 func (r *Reader) ReadFont(object Object) (*Font, error) {
+	return r.ReadFontContext(context.Background(), object)
+}
+
+// ReadFontContext 读取字体及映射，解码和度量展开使用本次取消上下文
+// 入参: ctx 取消上下文, object 字体字典或引用
+// 返回: *Font 完整字体资源, error 读取或取消错误
+func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid font context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	ref, indirect := object.(Reference)
 	if indirect && r.fonts[ref] != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return r.fonts[ref], nil
 	}
 	object, err := r.Resolve(object)
@@ -110,6 +135,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		font.Name = string(name)
 	}
 	var descriptor Object
+	boundsDeclared := false
 	ignoreEncoding := false
 	if subtype == "TrueType" {
 		descriptor, err = r.Resolve(dict["FontDescriptor"])
@@ -121,7 +147,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			if !ok {
 				return nil, fmt.Errorf("invalid font descriptor")
 			}
-			flags, err := integerDefault(d, "Flags", 0)
+			flags, err := r.fontFlags(d)
 			if err != nil {
 				return nil, err
 			}
@@ -139,7 +165,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, err
 		}
 		font.encoding, _ = encoding.(Name)
-		font.cidMap, err = r.readCIDCMap(encoding, nil)
+		font.cidMap, err = r.readCIDCMapContext(ctx, encoding, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -185,7 +211,14 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 				return nil, fmt.Errorf("invalid CID widths")
 			}
 			for n := 0; n < len(array); {
-				start, ok := array[n].(Integer)
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				value, err := r.Resolve(array[n])
+				if err != nil {
+					return nil, err
+				}
+				start, ok := value.(Integer)
 				if !ok || start < 0 || start > 65535 || n+1 >= len(array) {
 					return nil, fmt.Errorf("invalid CID width range")
 				}
@@ -200,6 +233,11 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 						return nil, fmt.Errorf("excessive CID width range")
 					}
 					for j, value := range widths {
+						if j&255 == 0 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						width, err := r.number(value)
 						if err != nil {
 							return nil, err
@@ -217,13 +255,18 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 					}
 					n++
 					for code := start; code <= end; code++ {
+						if (code-start)&255 == 0 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						font.widths[uint32(code)] = width
 					}
 				}
 			}
 		}
 		if font.Vertical {
-			if err := r.readVerticalMetrics(font, metrics); err != nil {
+			if err := r.readVerticalMetricsContext(ctx, font, metrics); err != nil {
 				return nil, err
 			}
 		}
@@ -233,10 +276,10 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		}
 		if gidMap != nil && gidMap != Name("Identity") {
 			stream, ok := gidMap.(*Stream)
-			if !ok {
+			if !ok || stream == nil {
 				return nil, fmt.Errorf("invalid CIDToGIDMap")
 			}
-			font.glyphMap, err = stream.Decode()
+			font.glyphMap, err = stream.DecodeContext(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -334,14 +377,15 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 				return nil, err
 			}
 			values, ok := matrix.(Array)
-			if !ok {
+			if !ok || len(values) != 6 {
 				return nil, fmt.Errorf("invalid Type3 font matrix")
 			}
-			numbers, err := numbers(values, 6)
-			if err != nil {
-				return nil, err
+			for index, value := range values {
+				font.type3Matrix[index], err = r.number(value)
+				if err != nil {
+					return nil, err
+				}
 			}
-			font.type3Matrix = Matrix(numbers)
 			if dict["FontBBox"] != nil {
 				box, err := r.rectangle(dict["FontBBox"])
 				if err != nil {
@@ -372,7 +416,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		return nil, &UnsupportedError{Feature: "font subtype " + string(subtype)}
 	}
 	if dict["ToUnicode"] != nil {
-		font.Unicode, err = r.readUnicodeCMap(dict["ToUnicode"], nil)
+		font.Unicode, err = r.readUnicodeCMapContext(ctx, dict["ToUnicode"], nil)
 		if err != nil {
 			return nil, err
 		}
@@ -389,13 +433,14 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			return nil, fmt.Errorf("invalid font descriptor")
 		}
 		if subtype != "TrueType" {
-			flags, err := integerDefault(d, "Flags", 0)
+			flags, err := r.fontFlags(d)
 			if err != nil {
 				return nil, err
 			}
 			font.symbolic = flags&4 != 0
 		}
 		if subtype != "Type3" && d["FontBBox"] != nil {
+			boundsDeclared = true
 			value, err := r.Resolve(d["FontBBox"])
 			if err != nil {
 				return nil, err
@@ -445,7 +490,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 					return nil, fmt.Errorf("invalid font program subtype")
 				}
 			}
-			font.Program, err = stream.Decode()
+			font.Program, err = stream.DecodeContext(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -472,7 +517,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 	if font.ProgramType == "Type1C" || font.ProgramType == "CIDFontType0C" {
 		cffProgram = font.Program
 	} else if font.ProgramType == "OpenType" && len(font.Program) >= 4 && string(font.Program[:4]) == "OTTO" {
-		cffProgram, err = fontTable(font.Program, "CFF ")
+		cffProgram, err = fontTableContext(ctx, font.Program, "CFF ")
 		if err != nil {
 			return nil, err
 		}
@@ -482,7 +527,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 	}
 	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && cffProgram == nil {
 		font.symbolic = font.symbolic || noEncoding
-		font.simpleCmap, font.cmapEncoding, err = fontCmap(font.Program, font.symbolic)
+		font.simpleCmap, font.cmapEncoding, err = fontCmapContext(ctx, font.Program, font.symbolic)
 		if err != nil {
 			return nil, err
 		}
@@ -498,6 +543,21 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 		font.cffGlyphs, font.cffNames, err = cffFontMapping(cffProgram, font.composite, font.encoding, font.differences, identity, font.ProgramType)
 		if err != nil {
 			return nil, err
+		}
+	}
+	if (font.composite && cidSubtype == "CIDFontType2" || font.simpleCmap != nil) && len(font.Program) != 0 && cffProgram == nil {
+		maxp, err := fontTableContext(ctx, font.Program, "maxp")
+		if err != nil {
+			return nil, err
+		}
+		if maxp != nil {
+			if len(maxp) < 6 {
+				return nil, fmt.Errorf("truncated TrueType maximum profile")
+			}
+			font.glyphCount = uint32(binary.BigEndian.Uint16(maxp[4:6]))
+			if font.glyphCount == 0 {
+				return nil, fmt.Errorf("invalid TrueType glyph count")
+			}
 		}
 	}
 	if font.composite && len(font.Program) != 0 && cidSubtype == Name("CIDFontType0") && font.cffGlyphs == nil {
@@ -535,12 +595,25 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 			}
 			name := Name("Adobe-" + string(ord) + "-UCS2")
 			if _, exists := index[name]; exists {
-				font.cidUnicode, err = loadUnicodeCMap(name, nil)
+				font.cidUnicode, err = loadUnicodeCMapContext(ctx, name, nil)
 				if err != nil {
 					return nil, err
 				}
 			}
 		}
+	}
+	if font.Subtype == "Type1" && len(font.Program) == 0 && !boundsDeclared {
+		fonts, err := coreFonts()
+		if err != nil {
+			return nil, err
+		}
+		if metrics := fonts[font.Name]; metrics != nil && metrics.bounds != nil {
+			bounds := *metrics.bounds
+			font.FallbackBoundingBox = &bounds
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if indirect {
 		if r.fonts == nil {
@@ -551,10 +624,38 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 	return font, nil
 }
 
+// fontFlags 读取字体描述符的整数标志，支持间接对象
+// 入参: descriptor 字体描述符
+// 返回: int64 标志值, error 引用或类型错误
+func (r *Reader) fontFlags(descriptor Dictionary) (int64, error) {
+	value, err := r.Resolve(descriptor["Flags"])
+	if err != nil || value == nil {
+		return 0, err
+	}
+	flags, ok := value.(Integer)
+	if !ok {
+		return 0, fmt.Errorf("Flags is not an integer")
+	}
+	return int64(flags), nil
+}
+
 // Decode 解码文字串，未知Unicode映射不会以猜测文本替代
 // 入参: data 原始文字字节
 // 返回: []Glyph 字符信息, error 错误信息
 func (f *Font) Decode(data []byte) ([]Glyph, error) {
+	return f.DecodeContext(context.Background(), data)
+}
+
+// DecodeContext 解码文字串并检查取消，不返回不完整的字形列表
+// 入参: ctx 取消上下文, data 原始文字字节
+// 返回: []Glyph 字符信息, error 解码或取消错误
+func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid font context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var core *coreFontMetrics
 	if f.Subtype == "Type1" && len(f.Program) == 0 {
 		fonts, err := coreFonts()
@@ -572,6 +673,11 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 	}
 	glyphs := make([]Glyph, 0, len(data)/step)
 	for n := 0; n < len(data); n += step {
+		if len(glyphs)&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		valid := true
 		if f.cidMap != nil {
 			step, valid = f.cidMap.next(data[n:])
@@ -642,6 +748,14 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 				}
 			}
 		}
+		if core != nil {
+			if _, exists := core.widths[name]; !exists {
+				name = ".notdef"
+			}
+		}
+		if name == ".notdef" && (f.Subtype == "Type1" || f.Subtype == "MMType1") {
+			ok = true
+		}
 		if !ok && f.cffGlyphs != nil {
 			ok = true
 		}
@@ -681,7 +795,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		if f.Subtype == Name("Type3") {
 			width *= f.type3Matrix[0] * 1000
 		}
-		if !ok && width == 0 && len(f.widths) == 0 && !f.composite {
+		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && (core == nil || name != ".notdef") {
 			return nil, &UnsupportedError{Feature: "unembedded standard font metrics"}
 		}
 		glyph := Glyph{Code: code, Text: text, Width: width, WordSpace: step == 1 && code == 32}
@@ -702,9 +816,12 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 			glyph.Name = name
 		}
 		if f.simpleCmap != nil {
-			id, err := f.simpleGlyph(code, name)
+			id, err := f.simpleGlyphContext(ctx, code, name)
 			if err != nil {
 				return nil, err
+			}
+			if f.glyphCount != 0 && uint32(id) >= f.glyphCount {
+				id = 0
 			}
 			glyph.ID = id
 			glyph.HasID = true
@@ -719,6 +836,9 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 					glyph.ID = uint16(f.glyphMap[cid*2])<<8 | uint16(f.glyphMap[cid*2+1])
 				}
 			}
+			if !f.hasCIDGlyph(cid) {
+				glyph.ID = 0
+			}
 		}
 		if f.cffGlyphs != nil {
 			glyph.ID, glyph.HasID = f.cffGlyphs[cid], true
@@ -730,10 +850,13 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 		}
 		glyphs = append(glyphs, glyph)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return glyphs, nil
 }
 
-// hasCIDGlyph 检查内嵌字体是否提供指定CID的字形映射
+// hasCIDGlyph 检查内嵌字体是否提供指定CID的有效字形
 // 入参: cid 字符标识
 // 返回: bool 是否提供字形
 func (f *Font) hasCIDGlyph(cid uint32) bool {
@@ -742,9 +865,13 @@ func (f *Font) hasCIDGlyph(cid uint32) bool {
 		return ok
 	}
 	if f.glyphMap != nil {
-		return int(cid)*2+1 < len(f.glyphMap) && (f.glyphMap[cid*2] != 0 || f.glyphMap[cid*2+1] != 0)
+		if int(cid)*2+1 >= len(f.glyphMap) {
+			return false
+		}
+		id := uint32(binary.BigEndian.Uint16(f.glyphMap[cid*2:]))
+		return id != 0 && (f.glyphCount == 0 || id < f.glyphCount)
 	}
-	return true
+	return f.glyphCount == 0 || cid < f.glyphCount
 }
 
 // predefinedCodeUnicode 还原以Unicode编码命名的官方CMap字符，不推测其他编码

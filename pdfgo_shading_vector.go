@@ -114,7 +114,9 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 		if tint.sampled && (tint.order != 3 || tint.size < 4) || !tint.sampled && (tint.exponent == 0 || tint.exponent == 1) {
 			for c := range f.parts {
 				stops := projectedTintStops(tint, c)
-				f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
+				if len(stops) > 0 {
+					f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
+				}
 			}
 		}
 	case Integer(4):
@@ -139,7 +141,9 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 					}
 				}
 				stops = clipGradientValues(stops, limits[2*c:2*c+2])
-				f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
+				if len(stops) > 0 {
+					f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
+				}
 			}
 		}
 	case Integer(3):
@@ -194,22 +198,37 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 			for i, part := range parts {
 				if points[i] == points[i+1] {
 					if i == len(parts)-1 {
-						for _, stop := range part.parts[c].linear([2]float64{encode[2*i], encode[2*i]}) {
+						partStops := part.parts[c].linear([2]float64{encode[2*i], encode[2*i]})
+						if len(partStops) == 0 {
+							linear = false
+							break
+						}
+						for _, stop := range partStops {
 							stop.Position = 1
 							stops = append(stops, stop)
 						}
 					}
 					continue
 				}
-				for _, stop := range part.parts[c].linear([2]float64{encode[2*i], encode[2*i+1]}) {
+				partStops := part.parts[c].linear([2]float64{encode[2*i], encode[2*i+1]})
+				if len(partStops) == 0 {
+					linear = false
+					break
+				}
+				for _, stop := range partStops {
 					stop.Position = functionPosition(gradientPosition(points[i], points[i+1], stop.Position), domain[0], domain[1])
 					stops = append(stops, stop)
 				}
 			}
+			if !linear {
+				continue
+			}
 			if limits != nil {
 				stops = clipGradientValues(stops, limits[2*c:2*c+2])
 			}
-			f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
+			if len(stops) > 0 {
+				f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
+			}
 		}
 	default:
 		return nil, &UnsupportedError{Feature: "gradient function type"}
@@ -309,6 +328,9 @@ func (r *Reader) deviceNWideGradient(function Object, tint *deviceNSpace, domain
 			var positions []float64
 			for c, part := range source.parts {
 				parts[c] = clipGradientValues(clipGradientValues(part.linear(interval), []float64{0, 1}), tint.input[2*c:2*c+2])
+				if len(parts[c]) == 0 {
+					return nil
+				}
 				for _, stop := range parts[c] {
 					positions = append(positions, stop.Position)
 				}

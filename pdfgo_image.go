@@ -389,7 +389,7 @@ func (i *Image) DecodeImage() (image.Image, error) {
 // 入参: ctx 取消上下文
 // 返回: image.Image 解码图像, error 解码或取消错误
 func (i *Image) DecodeImageContext(ctx context.Context) (image.Image, error) {
-	result, err := i.decodeImage(ctx, nil)
+	result, err := i.decodeImage(ctx, nil, false)
 	if canceled := ctx.Err(); canceled != nil {
 		return nil, canceled
 	}
@@ -468,6 +468,21 @@ func (s *deviceSampleImage) NRGBA64At(x, y int) color.NRGBA64 {
 // 入参: pixel 非预乘颜色, x 横向坐标, y 纵向坐标
 // 返回: color.NRGBA64 合成颜色
 func (s *deviceSampleImage) combine(pixel color.NRGBA64, x, y int) color.NRGBA64 {
+	alpha := uint32(65535)
+	if s.mask != nil {
+		gray := imageRGBA64At(s.mask, x, y)
+		alpha = uint32(gray.R)
+		if s.inverted {
+			alpha = 65535 - alpha
+		}
+	}
+	return s.combineAlpha(pixel, alpha)
+}
+
+// combineAlpha 将已采样颜色和遮罩覆盖率合成，保持索引色及精度规则
+// 入参: pixel 非预乘颜色, alpha 遮罩覆盖率
+// 返回: color.NRGBA64 合成颜色
+func (s *deviceSampleImage) combineAlpha(pixel color.NRGBA64, alpha uint32) color.NRGBA64 {
 	if !s.embedded {
 		pixel.A = 65535
 	}
@@ -477,14 +492,6 @@ func (s *deviceSampleImage) combine(pixel color.NRGBA64, x, y int) color.NRGBA64
 		pixel = s.palette.colors[index]
 		if s.embedded {
 			pixel.A = uint16(uint32(pixel.A) * uint32(alpha) / 65535)
-		}
-	}
-	alpha := uint32(65535)
-	if s.mask != nil {
-		gray := imageRGBA64At(s.mask, x, y)
-		alpha = uint32(gray.R)
-		if s.inverted {
-			alpha = 65535 - alpha
 		}
 	}
 	pixel.A = uint16(uint32(pixel.A) * alpha / 65535)
@@ -603,9 +610,12 @@ func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
 			parameters = parameters[:len(parameters)-1]
 		}
 	}
-	data, err := (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: i.Stream.Data}).DecodeContext(ctx)
-	if err != nil {
-		return nil, err
+	data := i.Stream.Data
+	if terminal == "" || len(filters) != 0 {
+		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data}).DecodeContext(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var result image.Image
 	switch terminal {
@@ -651,7 +661,7 @@ func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
 		}
 	case "JPXDecode":
 		cmyk := i.ColorSpace == Name("DeviceCMYK")
-		result, err = i.jpxSamples(data, cmyk)
+		result, err = i.jpxSamplesContext(ctx, data, cmyk)
 	default:
 		result, err = i.rawSamples(ctx, data)
 	}
@@ -738,9 +748,9 @@ func (s *packedGrayImage) At(x, y int) color.Color {
 }
 
 // decodeImage 共用解码、遮罩和预混合恢复流程，按需保留颜色分量
-// 入参: ctx 取消上下文, target 可选分量输出
+// 入参: ctx 取消上下文, target 可选分量输出, sampled 是否按需访问设备色分量
 // 返回: image.Image 显示图像，分量模式下为空, error 解码错误
-func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image.Image, error) {
+func (i *Image) decodeImage(ctx context.Context, target *ImageComponents, sampled bool) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -985,6 +995,15 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 		if err != nil {
 			return nil, err
 		}
+		if sampled && palette == nil && deviceN == nil && separation == nil && profile == nil && calibrated == nil && lab == nil {
+			if components == 4 {
+				if _, ok := imageCMYKAt(samples, bounds.Min.X, bounds.Min.Y); !ok {
+					return nil, fmt.Errorf("invalid CMYK image samples")
+				}
+			}
+			target.view = &imageComponentView{source: samples, mask: mask, channels: components, ranges: ranges, keys: keys, matte: matte, inverted: inverted, embedded: embeddedMask != 0, maximum: float64((uint32(1) << i.BitsPerComponent) - 1)}
+			return nil, nil
+		}
 		stride := target.Space.Components() + 1
 		_, size, err := imageSampleSize(bounds.Dx(), bounds.Dy(), stride, 16)
 		if err != nil {
@@ -1022,12 +1041,19 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 				alpha = uint16(value)
 			}
 			var sampleColor color.Color
-			if components != 4 || embeddedMask != 0 {
+			var samplePixel color.NRGBA64
+			if components > 4 || components == 4 && embeddedMask != 0 {
 				sampleColor = samples.At(x, y)
+			} else if components != 4 {
+				samplePixel = imageNRGBA64At(samples, x, y)
 			}
 			if embeddedMask != 0 {
-				_, _, _, value := sampleColor.RGBA()
-				alpha = uint16(value)
+				if sampleColor != nil {
+					_, _, _, value := sampleColor.RGBA()
+					alpha = uint16(value)
+				} else {
+					alpha = samplePixel.A
+				}
 			}
 			var values [4]float64
 			if components > 4 {
@@ -1053,8 +1079,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents) (image
 					values[c] = float64(cmyk[c]) / 65535
 				}
 			} else {
-				pixel := imageNRGBASample(sampleColor)
-				values = [4]float64{float64(pixel.R) / 65535, float64(pixel.G) / 65535, float64(pixel.B) / 65535}
+				values = [4]float64{float64(samplePixel.R) / 65535, float64(samplePixel.G) / 65535, float64(samplePixel.B) / 65535}
 			}
 			if components <= 4 {
 				copy(inputs, values[:components])

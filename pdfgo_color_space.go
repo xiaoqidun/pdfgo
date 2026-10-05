@@ -39,7 +39,7 @@ func (s *ColorSpace) Device() bool {
 
 // Calibrated 判断混合空间是否含校准参数
 // 返回: bool 是否校准
-func (s *ColorSpace) Calibrated() bool { return s.profile != nil }
+func (s *ColorSpace) Calibrated() bool { return s != nil && s.profile != nil }
 
 // Equal 判断颜色模型、配置定义与分量范围是否相同，不受逆向缓存初始化影响
 // 入参: other 待比较空间
@@ -60,7 +60,7 @@ func (s *ColorSpace) Equal(other *ColorSpace) bool {
 // SRGBEquivalent 检查混合空间与sRGB的偏差是否在8位量化精度内
 // 返回: bool 是否等价
 func (s *ColorSpace) SRGBEquivalent() bool {
-	if s.Model != "DeviceRGB" {
+	if s == nil || s.Model != "DeviceRGB" {
 		return false
 	}
 	if s.profile == nil {
@@ -120,6 +120,9 @@ func (s *ColorSpace) srgbEquivalent() bool {
 // Components 返回混合空间的分量数
 // 返回: int 分量数
 func (s *ColorSpace) Components() int {
+	if s == nil {
+		return 0
+	}
 	switch s.Model {
 	case "DeviceGray":
 		return 1
@@ -165,6 +168,9 @@ func (s *ColorSpace) Convert(values []float64, source *ColorSpace, intent Name) 
 // 返回: [4]float64 目标分量, error 无效分量或变换错误
 func (s *ColorSpace) ConvertWith(values []float64, source *ColorSpace, intent Name, conversion ColorConversion) ([4]float64, error) {
 	var result [4]float64
+	if s == nil {
+		return result, fmt.Errorf("invalid destination color space")
+	}
 	if err := source.validate(values); err != nil {
 		return result, err
 	}
@@ -215,11 +221,15 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 		xyz, err := s.xyz(values, normalizeRenderingIntent(intent))
 		return math.Max(0, math.Min(1, xyz[1])), err
 	}
-	if s.Model == "DeviceCMYK" {
+	switch s.Model {
+	case "DeviceGray":
+		return values[0], nil
+	case "DeviceRGB":
+		return .3*values[0] + .59*values[1] + .11*values[2], nil
+	case "DeviceCMYK":
 		return (.3*(1-values[0]) + .59*(1-values[1]) + .11*(1-values[2])) * (1 - values[3]), nil
 	}
-	rgb, err := s.RGB(values, intent)
-	return .3*rgb[0] + .59*rgb[1] + .11*rgb[2], err
+	return 0, &UnsupportedError{Feature: "blending color space " + string(s.Model)}
 }
 
 // deviceCMYKRGB 按PDF设备颜色转换规则叠加黑色分量后取补色
@@ -233,7 +243,8 @@ func deviceCMYKRGB(values []float64) [3]float64 {
 // 入参: values 颜色分量
 // 返回: error 无效颜色
 func (s *ColorSpace) validate(values []float64) error {
-	if s.Components() == 0 || len(values) != s.Components() {
+	components := s.Components()
+	if components == 0 || len(values) != components {
 		return fmt.Errorf("invalid blending color component count")
 	}
 	for _, v := range values {

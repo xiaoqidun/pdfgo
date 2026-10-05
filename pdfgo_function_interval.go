@@ -32,7 +32,7 @@ func functionPosition(value, lower, upper float64) float64 {
 	return (value - lower) / (upper - lower)
 }
 
-// functionValue 映射区间位置，保留端点并避免有限区间的差值溢出
+// functionValue 映射区间位置，保留端点并避免差值溢出和次正规数中间舍入
 // 入参: position 区间位置, lower 区间起点, upper 区间终点
 // 返回: float64 映射值
 func functionValue(position, lower, upper float64) float64 {
@@ -45,6 +45,9 @@ func functionValue(position, lower, upper float64) float64 {
 	span := upper - lower
 	if math.IsInf(span, 0) {
 		return (1-position)*lower + position*upper
+	}
+	if math.Abs(span) < 0x1p-1022 {
+		return math.FMA(position, span, lower)
 	}
 	return lower + position*span
 }

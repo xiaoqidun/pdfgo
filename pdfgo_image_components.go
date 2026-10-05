@@ -22,6 +22,7 @@ import (
 
 // ImageComponents 保存应用Decode、索引映射及遮罩后的16位非预乘颜色分量
 // Pix逐行交错保存Space.Components()个颜色分量和一个透明度分量
+// DecodeComponentsView的设备色缓冲可为空，使用ValuesAt读取只读分量
 // 模板图像保留灰度样本，填充颜色及反向覆盖由调用方应用
 // Colorants和Tints保留专色名称及逐像素浓度，供支持相应色料的输出设备使用
 // Process保留原生过程通道，ValuesAt返回对应过程空间的颜色分量
@@ -35,6 +36,7 @@ type ImageComponents struct {
 	Colorants     []Name
 	Tints         []uint16
 	ColorantAlpha []uint16
+	view          *imageComponentView
 }
 
 // ColorantSpace 读取图像或索引基础空间的只读色料定义及独立专色变换
@@ -187,6 +189,9 @@ func (i *ImageComponents) ValuesAt(x, y int) ([4]float64, float64) {
 	if !(image.Point{X: x, Y: y}).In(i.Rect) {
 		return values, 0
 	}
+	if i.view != nil {
+		return i.view.valuesAt(x, y)
+	}
 	channels := i.Space.Components()
 	offset := ((y-i.Rect.Min.Y)*i.Rect.Dx() + x - i.Rect.Min.X) * (channels + 1)
 	for c := 0; c < channels; c++ {
@@ -206,7 +211,7 @@ func (i *Image) DecodeComponents() (*ImageComponents, error) {
 // 返回: *ImageComponents 独立颜色分量及透明度, error 解码或取消错误
 func (i *Image) DecodeComponentsContext(ctx context.Context) (*ImageComponents, error) {
 	result := &ImageComponents{}
-	if _, err := i.decodeImage(ctx, result); err != nil {
+	if _, err := i.decodeImage(ctx, result, false); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
