@@ -81,6 +81,7 @@ func (m *SoftMask) WalkContext(ctx context.Context, visitor Visitor) error {
 	}
 	p := m.interpreter
 	p.ctx = ctx
+	p.forms, p.content = nil, nil
 	if visitor.Reference == nil {
 		visitor.Reference = p.visitor.Reference
 	}
@@ -139,17 +140,18 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		return nil, fmt.Errorf("invalid soft mask transparency group")
 	}
 	m := &SoftMask{Subtype: subtype, interpreter: *p, stream: stream}
+	m.interpreter.forms, m.interpreter.content = nil, nil
 	v, err = p.reader.Resolve(group["CS"])
 	if err != nil {
 		return nil, err
 	}
 	if v != nil {
 		resources := p.resources
-		if stream.Dictionary["Resources"] != nil {
-			object, err := p.reader.Resolve(stream.Dictionary["Resources"])
-			if err != nil {
-				return nil, err
-			}
+		object, err := p.reader.Resolve(stream.Dictionary["Resources"])
+		if err != nil {
+			return nil, err
+		}
+		if object != nil {
 			var ok bool
 			resources, ok = object.(Dictionary)
 			if !ok {

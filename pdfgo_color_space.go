@@ -141,6 +141,13 @@ func (s *ColorSpace) RGB(values []float64, intent Name) ([3]float64, error) {
 	if err := s.validate(values); err != nil {
 		return [3]float64{}, err
 	}
+	return s.rgb(values, intent)
+}
+
+// rgb 转换已验证的源分量，不重复检查分量数量及范围
+// 入参: values 源分量, intent 渲染意图
+// 返回: [3]float64 sRGB颜色, error 变换错误
+func (s *ColorSpace) rgb(values []float64, intent Name) ([3]float64, error) {
 	if s.profile != nil {
 		return s.profile.color(values, normalizeRenderingIntent(intent))
 	}
@@ -174,11 +181,18 @@ func (s *ColorSpace) ConvertWith(values []float64, source *ColorSpace, intent Na
 	if err := source.validate(values); err != nil {
 		return result, err
 	}
-	if s.Equal(source) {
+	return s.convert(values, source, normalizeRenderingIntent(intent), conversion, s.Equal(source))
+}
+
+// convert 转换已验证的分量，复用相同空间判定
+// 入参: values 源分量, source 源空间, intent 渲染意图, conversion 设备转换函数, same 是否同空间
+// 返回: [4]float64 目标分量, error 变换错误
+func (s *ColorSpace) convert(values []float64, source *ColorSpace, intent Name, conversion ColorConversion, same bool) ([4]float64, error) {
+	var result [4]float64
+	if same {
 		copy(result[:], values)
 		return result, nil
 	}
-	intent = normalizeRenderingIntent(intent)
 	if s.Calibrated() {
 		xyz, err := source.xyz(values, intent)
 		if err != nil {
@@ -186,7 +200,7 @@ func (s *ColorSpace) ConvertWith(values []float64, source *ColorSpace, intent Na
 		}
 		return s.profile.fromXYZ(xyz, intent)
 	}
-	rgb, err := source.RGB(values, intent)
+	rgb, err := source.rgb(values, intent)
 	if err != nil {
 		return result, err
 	}

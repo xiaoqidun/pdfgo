@@ -115,9 +115,11 @@ type PathMark struct {
 // StrokeMatrix保留图形状态坐标变换，描边参数不受文字矩阵和字号影响
 // Mode保留有效绘制模式，Type3除不可见模式3外均按0交付，不产生文字裁剪
 // Object只读共享同一BT与ET边界，不同文字对象使用不同实例
+// Resources保留所在页面的只读资源，供未声明资源字典的Type3字形查找
 type TextMark struct {
 	Object                *TextObject
 	Font                  *Font
+	Resources             Dictionary
 	Glyphs                []Glyph
 	Positions             []Point
 	Matrix                Matrix
@@ -205,6 +207,7 @@ type graphicsState struct {
 type pageInterpreter struct {
 	reader                 *Reader
 	resources              Dictionary
+	pageResources          Dictionary
 	visitor                Visitor
 	ctx                    context.Context
 	state                  graphicsState
@@ -260,17 +263,73 @@ func (m Matrix) Apply(p Point) Point {
 // Inverse 返回可逆仿射矩阵的逆变换
 // 返回: Matrix 逆矩阵, bool 是否存在有限逆矩阵
 func (m Matrix) Inverse() (Matrix, bool) {
-	d := m[0]*m[3] - m[1]*m[2]
-	if d == 0 {
+	for _, value := range m {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return Matrix{}, false
+		}
+	}
+	a, b := m[0]*m[3], m[1]*m[2]
+	d := a - b
+	if d != 0 && !math.IsInf(d, 0) && math.Abs(d) >= 0x1p-1022 && math.Abs(d) >= 0x1p-48*math.Max(math.Abs(a), math.Abs(b)) {
+		n := Matrix{m[3] / d, -m[1] / d, -m[2] / d, m[0] / d, (m[2]*m[5] - m[3]*m[4]) / d, (m[1]*m[4] - m[0]*m[5]) / d}
+		valid := true
+		for _, value := range n {
+			valid = valid && !math.IsNaN(value) && !math.IsInf(value, 0)
+		}
+		if valid {
+			return n, true
+		}
+	}
+	determinant, exponent := matrixProductSum(m[0], m[3], -m[1], m[2])
+	if determinant == 0 {
 		return Matrix{}, false
 	}
-	n := Matrix{m[3] / d, -m[1] / d, -m[2] / d, m[0] / d, (m[2]*m[5] - m[3]*m[4]) / d, (m[1]*m[4] - m[0]*m[5]) / d}
+	divide := func(value float64, power int) float64 {
+		mantissa, shift := math.Frexp(value)
+		return math.Ldexp(mantissa/determinant, power+shift-exponent)
+	}
+	x, xe := matrixProductSum(m[2], m[5], -m[3], m[4])
+	y, ye := matrixProductSum(m[1], m[4], -m[0], m[5])
+	n := Matrix{divide(m[3], 0), divide(-m[1], 0), divide(-m[2], 0), divide(m[0], 0), divide(x, xe), divide(y, ye)}
 	for _, v := range n {
 		if math.IsNaN(v) || math.IsInf(v, 0) {
 			return Matrix{}, false
 		}
 	}
 	return n, true
+}
+
+// MaxScale 返回线性部分的最大伸长率，包含剪切且不受平移影响
+// 返回: float64 最大奇异值，非有限变换返回非有限值
+func (m Matrix) MaxScale() float64 {
+	scale := math.Max(math.Max(math.Abs(m[0]), math.Abs(m[1])), math.Max(math.Abs(m[2]), math.Abs(m[3])))
+	if scale == 0 || math.IsInf(scale, 0) || math.IsNaN(scale) {
+		return scale
+	}
+	a, b, c, d := m[0]/scale, m[1]/scale, m[2]/scale, m[3]/scale
+	return scale * ((math.Hypot(a+d, b-c) + math.Hypot(a-d, b+c)) / 2)
+}
+
+// matrixProductSum 以尾数及指数累加两个乘积，保留乘法舍入残差
+// 入参: a 第一个乘数, b 第二个乘数, c 第三个乘数, d 第四个乘数
+// 返回: float64 结果尾数, int 二进制指数
+func matrixProductSum(a, b, c, d float64) (float64, int) {
+	a, ae := math.Frexp(a)
+	b, be := math.Frexp(b)
+	c, ce := math.Frexp(c)
+	d, de := math.Frexp(d)
+	x, y := a*b, c*d
+	xe, ye := ae+be, ce+de
+	power := max(xe, ye)
+	if x == 0 {
+		power = ye
+	} else if y == 0 {
+		power = xe
+	}
+	value := math.Ldexp(x, xe-power) + math.Ldexp(y, ye-power)
+	value += math.Ldexp(math.FMA(a, b, -x), xe-power) + math.Ldexp(math.FMA(c, d, -y), ye-power)
+	value, shift := math.Frexp(value)
+	return value, power + shift
 }
 
 // WalkPage 解释页面内容并按绘制顺序访问可准确表达的图元，注解由Page.Annotations读取
@@ -354,7 +413,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	if _, err := page.WriteContent(ctx, &data); err != nil {
 		return err
 	}
-	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
+	interpreter := pageInterpreter{reader: r, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
 	interpreter.blendingSpace = groupSpace
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
@@ -436,13 +495,17 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 		visitor.Warning(Diagnostic{Message: message})
 		return nil
 	}
-	data, err := stream.Decode()
+	data, err := stream.DecodeContext(ctx)
 	if err != nil {
 		return err
 	}
 	position := mark.Positions[index]
 	text := Matrix{mark.Size * mark.HorizontalScale, 0, 0, mark.Size, position.X, position.Y}
-	interpreter := pageInterpreter{reader: r, resources: font.type3Resources, visitor: visitor, ctx: ctx, type3: true}
+	resources := font.type3Resources
+	if resources == nil {
+		resources = mark.Resources
+	}
+	interpreter := pageInterpreter{reader: r, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, type3: true}
 	interpreter.glyphStreams = append(append([]*Stream(nil), mark.glyphStreams...), stream)
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
@@ -1236,6 +1299,9 @@ func (p *pageInterpreter) showText(data []byte) error {
 			return fmt.Errorf("text visitor missing")
 		}
 		mark := TextMark{Object: p.textObject, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
+		if mark.Font.Subtype == "Type3" {
+			mark.Resources = p.pageResources
+		}
 		mark.glyphStreams = p.glyphStreams
 		mark.halftones = p.visitor.Halftones
 		if mark.Mode >= 4 {
@@ -1456,15 +1522,17 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	}
 	child := *p
 	child.content = nil
-	if target == nil && stream.Dictionary["Resources"] != nil {
+	if target == nil {
 		resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
 		if err != nil {
 			return err
 		}
-		var ok bool
-		child.resources, ok = resources.(Dictionary)
-		if !ok {
-			return fmt.Errorf("invalid form resources")
+		if resources != nil {
+			var ok bool
+			child.resources, ok = resources.(Dictionary)
+			if !ok {
+				return fmt.Errorf("invalid form resources")
+			}
 		}
 	}
 	var groupMark *GroupMark
@@ -1558,11 +1626,11 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	child.pendingClip = false
 	child.inText = false
 	child.textObject = nil
-	if stream.Dictionary["Matrix"] != nil {
-		value, err := p.reader.Resolve(stream.Dictionary["Matrix"])
-		if err != nil {
-			return err
-		}
+	value, err := p.reader.Resolve(stream.Dictionary["Matrix"])
+	if err != nil {
+		return err
+	}
+	if value != nil {
 		array, ok := value.(Array)
 		if !ok {
 			return fmt.Errorf("invalid form matrix")
@@ -1598,7 +1666,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		}
 		child.forms = p.forms
 	} else {
-		child.reader, child.resources = target.reader, target.Resources
+		child.reader, child.resources, child.pageResources = target.reader, target.Resources, target.Resources
 	}
 	walk := func(interpreter *pageInterpreter) error {
 		if target != nil {

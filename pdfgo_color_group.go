@@ -27,12 +27,11 @@ type ColorantGroup struct {
 
 // ColorantGroupCompositor 保存只读组合成参数，复用空间校验和通道布局
 type ColorantGroupCompositor struct {
-	source, target               ColorantGroup
 	components, targetComponents int
 	spots                        int
 	sameSpace                    bool
-	mode, intent                 Name
-	conversion                   ColorConversion
+	mode                         Name
+	converter                    ColorConverter
 }
 
 // ColorantPixel 保存非预乘过程色及专色，所有通道共用Alpha、Shape和Effect
@@ -118,17 +117,21 @@ func (g *ColorantGroup) PrepareGroup(source *ColorantGroup, mode, intent Name, c
 	if !g.sameDevice(source) {
 		return ColorantGroupCompositor{}, fmt.Errorf("mismatched group spot colorants")
 	}
-	return ColorantGroupCompositor{source: *source, target: *g, components: source.Space.Components(), targetComponents: g.Space.Components(), spots: len(g.spots()), sameSpace: g.Space.Equal(source.Space), mode: mode, intent: intent, conversion: conversion}, nil
+	converter, err := g.Space.PrepareConversion(source.Space, intent, conversion)
+	if err != nil {
+		return ColorantGroupCompositor{}, err
+	}
+	return ColorantGroupCompositor{components: source.Space.Components(), targetComponents: g.Space.Components(), spots: len(g.spots()), sameSpace: converter.same, mode: mode, converter: converter}, nil
 }
 
 // Composite 将已准备的源组结果合成到父组，错误时不修改当前输出
 // 入参: target 父组结果, initial 源组初始背景, result 源组累计结果, opacity 组不透明度及蒙版乘积
 // 返回: error 分量、透明度或空间转换错误
 func (c *ColorantGroupCompositor) Composite(target *ColorantPixel, initial, result ColorantPixel, opacity float64) error {
-	if c == nil || c.source.Space == nil || c.target.Space == nil {
+	if c == nil || !c.converter.ready {
 		return fmt.Errorf("invalid group compositor")
 	}
-	source, g := c.source, c.target
+	space := &c.converter.destination
 	if !colorantUnit(opacity) || target == nil {
 		return fmt.Errorf("invalid group opacity or target")
 	}
@@ -156,11 +159,11 @@ func (c *ColorantGroupCompositor) Composite(target *ColorantPixel, initial, resu
 	}
 	if !c.sameSpace {
 		var err error
-		process, err = g.Space.ConvertWith(process[:components], source.Space, c.intent, c.conversion)
+		process, err = c.converter.Convert(process[:components])
 		if err != nil {
 			return err
 		}
-		if err := g.Space.validate(process[:parentComponents]); err != nil {
+		if err := space.validate(process[:parentComponents]); err != nil {
 			return err
 		}
 	}
@@ -168,7 +171,7 @@ func (c *ColorantGroupCompositor) Composite(target *ColorantPixel, initial, resu
 	if target.Alpha != 0 {
 		copy(backdrop[:], target.Values[:parentComponents])
 	}
-	values, combined := g.Space.compositeValues(backdrop, process, target.Alpha, alpha, c.mode)
+	values, combined := space.compositeValues(backdrop, process, target.Alpha, alpha, c.mode)
 	spots := c.spots
 	for j := range spots {
 		index := j

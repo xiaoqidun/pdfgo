@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -31,6 +32,19 @@ type sampledFunction struct {
 // 入参: stream 函数数据流, inputs 输入数量, outputs 输出数量
 // 返回: *sampledFunction 函数, error 格式或能力错误
 func (r *Reader) readSampledFunction(stream *Stream, inputs, outputs int) (*sampledFunction, error) {
+	return r.readSampledFunctionContext(context.Background(), stream, inputs, outputs)
+}
+
+// readSampledFunctionContext 在本次取消上下文内解码和验证采样函数
+// 入参: ctx 取消上下文, stream 函数数据流, inputs 输入数量, outputs 输出数量
+// 返回: *sampledFunction 函数, error 格式、解码或取消错误
+func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream, inputs, outputs int) (*sampledFunction, error) {
+	if ctx == nil || stream == nil || inputs <= 0 || outputs <= 0 {
+		return nil, fmt.Errorf("invalid sampled function evaluation")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dict := stream.Dictionary
 	f := &sampledFunction{}
 	var err error
@@ -67,7 +81,7 @@ func (r *Reader) readSampledFunction(stream *Stream, inputs, outputs int) (*samp
 	if order == Integer(3) {
 		f.order = 3
 	}
-	data, err := stream.Decode()
+	data, err := stream.DecodeContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -83,18 +97,29 @@ func (r *Reader) readSampledFunction(stream *Stream, inputs, outputs int) (*samp
 		count *= int(size)
 		f.encode[2*i+1] = size - 1
 	}
-	if dict["Encode"] != nil {
-		f.encode, err = r.numberArray(dict["Encode"], 2*inputs)
+	value, err := r.Resolve(dict["Encode"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		f.encode, err = r.numberArray(value, 2*inputs)
 		if err != nil {
 			return nil, err
 		}
 	}
 	f.decode = f.bounds
-	if dict["Decode"] != nil {
-		f.decode, err = r.numberArray(dict["Decode"], 2*outputs)
+	value, err = r.Resolve(dict["Decode"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		f.decode, err = r.numberArray(value, 2*outputs)
 		if err != nil {
 			return nil, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return f, nil
 }

@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -106,6 +107,19 @@ func (f *coordinateFunction) evaluate(point [2]float64, out []float64) error {
 // 入参: object 函数或函数数组, outputs 输出分量数, domain 着色定义域
 // 返回: *coordinateFunction 函数定义, error 格式或能力错误
 func (r *Reader) readCoordinateFunction(object Object, outputs int, domain Rectangle) (*coordinateFunction, error) {
+	return r.readCoordinateFunctionContext(context.Background(), object, outputs, domain)
+}
+
+// readCoordinateFunctionContext 在本次取消上下文内读取二维函数及独立分量
+// 入参: ctx 取消上下文, object 函数或函数数组, outputs 输出分量数, domain 着色定义域
+// 返回: *coordinateFunction 函数定义, error 格式、解码或取消错误
+func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Object, outputs int, domain Rectangle) (*coordinateFunction, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid coordinate function context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -124,7 +138,7 @@ func (r *Reader) readCoordinateFunction(object Object, outputs int, domain Recta
 			if _, nested := item.(Array); nested {
 				return nil, fmt.Errorf("nested coordinate function array")
 			}
-			f.parts[i], err = r.readCoordinateFunction(item, 1, domain)
+			f.parts[i], err = r.readCoordinateFunctionContext(ctx, item, 1, domain)
 			if err != nil {
 				return nil, err
 			}
@@ -159,17 +173,23 @@ func (r *Reader) readCoordinateFunction(object Object, outputs int, domain Recta
 	}
 	switch kind {
 	case Integer(0):
-		f.sampled, err = r.readSampledFunction(stream, 2, outputs)
+		f.sampled, err = r.readSampledFunctionContext(ctx, stream, 2, outputs)
 	case Integer(4):
 		var data []byte
-		data, err = stream.Decode()
+		data, err = stream.DecodeContext(ctx)
 		if err == nil {
 			f.program, err = compileCalculator(data)
 		}
 	default:
 		return nil, fmt.Errorf("invalid two-input function type")
 	}
-	return f, err
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 // functionShading 解析函数着色的定义域、颜色空间及双层坐标变换
@@ -177,8 +197,12 @@ func (r *Reader) readCoordinateFunction(object Object, outputs int, domain Recta
 // 返回: Paint 函数画刷, error 格式或能力错误
 func (p *pageInterpreter) functionShading(shading Dictionary, matrix Matrix) (Paint, error) {
 	g := &FunctionGradient{Domain: Rectangle{0, 0, 1, 1}, Matrix: matrix, PatternMatrix: matrix, Intent: p.state.style.RenderingIntent}
-	if shading["Domain"] != nil {
-		v, err := p.reader.numberArray(shading["Domain"], 4)
+	value, err := p.reader.Resolve(shading["Domain"])
+	if err != nil {
+		return Paint{}, err
+	}
+	if value != nil {
+		v, err := p.reader.numberArray(value, 4)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -187,8 +211,12 @@ func (p *pageInterpreter) functionShading(shading Dictionary, matrix Matrix) (Pa
 		}
 		g.Domain = Rectangle{v[0], v[2], v[1], v[3]}
 	}
-	if shading["Matrix"] != nil {
-		v, err := p.reader.numberArray(shading["Matrix"], 6)
+	value, err = p.reader.Resolve(shading["Matrix"])
+	if err != nil {
+		return Paint{}, err
+	}
+	if value != nil {
+		v, err := p.reader.numberArray(value, 6)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -209,7 +237,7 @@ func (p *pageInterpreter) functionShading(shading Dictionary, matrix Matrix) (Pa
 	if err != nil {
 		return Paint{}, err
 	}
-	g.function, err = p.reader.readCoordinateFunction(shading["Function"], components, g.Domain)
+	g.function, err = p.reader.readCoordinateFunctionContext(p.ctx, shading["Function"], components, g.Domain)
 	if err != nil {
 		return Paint{}, err
 	}

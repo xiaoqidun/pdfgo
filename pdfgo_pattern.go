@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 )
 
 // TilingPattern 保存平铺图案的单元几何及独立内容流
@@ -29,6 +30,7 @@ type TilingPattern struct {
 	PaintType     int
 	reader        *Reader
 	resources     Dictionary
+	pageResources Dictionary
 	data          []byte
 	depth         int
 	glyphStreams  []*Stream
@@ -42,6 +44,15 @@ type TilingPattern struct {
 // 入参: ctx 取消上下文, base 无色图案基色, visitor 绘制访问器
 // 返回: error 解析或访问错误
 func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) error {
+	if p == nil || ctx == nil || p.reader == nil {
+		return fmt.Errorf("invalid tiling pattern evaluation")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.reader.closed {
+		return os.ErrClosed
+	}
 	if p.depth > 64 {
 		return &UnsupportedError{Feature: "nested pattern depth"}
 	}
@@ -50,7 +61,7 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	}
 	box := p.BBox
 	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
-	child := pageInterpreter{reader: p.reader, resources: p.resources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
+	child := pageInterpreter{reader: p.reader, resources: p.resources, pageResources: p.pageResources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
 	child.glyphStreams = p.glyphStreams
 	child.blendingSpace, child.maskGroup = p.blendingSpace, p.maskGroup
 	child.state = p.initial
@@ -115,11 +126,19 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if !ok || kind != Integer(1) {
 		return nil, &UnsupportedError{Feature: "pattern type"}
 	}
-	paintType, ok := dict["PaintType"].(Integer)
+	value, err = p.reader.Resolve(dict["PaintType"])
+	if err != nil {
+		return nil, err
+	}
+	paintType, ok := value.(Integer)
 	if !ok || paintType != 1 && paintType != 2 {
 		return nil, fmt.Errorf("invalid tiling pattern paint type")
 	}
-	if tiling, ok := dict["TilingType"].(Integer); !ok || tiling < 1 || tiling > 3 {
+	value, err = p.reader.Resolve(dict["TilingType"])
+	if err != nil {
+		return nil, err
+	}
+	if tiling, ok := value.(Integer); !ok || tiling < 1 || tiling > 3 {
 		return nil, fmt.Errorf("invalid tiling pattern type")
 	}
 	box, err := p.reader.rectangle(dict["BBox"])
@@ -138,12 +157,22 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 		return nil, fmt.Errorf("invalid tiling pattern step")
 	}
 	matrix := Identity()
-	if dict["Matrix"] != nil {
-		values, err := p.reader.numberArray(dict["Matrix"], 6)
+	value, err = p.reader.Resolve(dict["Matrix"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		values, err := p.reader.numberArray(value, 6)
 		if err != nil {
 			return nil, err
 		}
 		matrix = Matrix(values)
+	}
+	matrix = p.patternMatrix.Mul(matrix)
+	for _, value := range matrix {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, fmt.Errorf("invalid tiling pattern matrix")
+		}
 	}
 	resources, err := p.reader.Resolve(dict["Resources"])
 	if err != nil {
@@ -156,11 +185,11 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 			return nil, fmt.Errorf("invalid tiling pattern resources")
 		}
 	}
-	data, err := stream.Decode()
+	data, _, err := p.formData(stream)
 	if err != nil {
 		return nil, err
 	}
-	return &TilingPattern{BBox: box, Matrix: p.patternMatrix.Mul(matrix), XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones}, nil
+	return &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones}, nil
 }
 
 // patternBaseColor 按底层颜色空间解释无色图案的颜色分量

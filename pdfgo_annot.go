@@ -407,11 +407,11 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		return err
 	}
 	matrix := Identity()
-	if stream.Dictionary["Matrix"] != nil {
-		value, err := r.Resolve(stream.Dictionary["Matrix"])
-		if err != nil {
-			return err
-		}
+	value, err = r.Resolve(stream.Dictionary["Matrix"])
+	if err != nil {
+		return err
+	}
+	if value != nil {
 		array, ok := value.(Array)
 		if !ok {
 			return fmt.Errorf("invalid appearance matrix")
@@ -433,7 +433,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	}
 	rect := annotation.Rect
 	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
-	interpreter := pageInterpreter{reader: r, resources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
+	interpreter := pageInterpreter{reader: r, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
 	if parent != nil {
