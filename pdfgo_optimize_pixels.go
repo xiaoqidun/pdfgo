@@ -78,14 +78,17 @@ func (r *Reader) encodeLosslessPixels(ctx context.Context, source *Stream, img i
 // 入参: ctx 取消上下文, stream 原始图片流
 // 返回: *Stream 更小的流, error 取消或编码错误
 func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stream, error) {
-	d := stream.Dictionary
+	if len(stream.Data) > optimizationBufferLimit {
+		return stream, ctx.Err()
+	}
+	d, err := r.optimizationImageDictionary(stream)
+	if err != nil {
+		return stream, ctx.Err()
+	}
 	if d["Subtype"] != Name("Image") || d["BitsPerComponent"] != Integer(8) || d["ImageMask"] == Boolean(true) || d["F"] != nil {
 		return stream, nil
 	}
-	space, err := r.Resolve(d["ColorSpace"])
-	if err != nil {
-		return stream, nil
-	}
+	space := d["ColorSpace"]
 	channels := 0
 	switch space {
 	case Name("DeviceRGB"):

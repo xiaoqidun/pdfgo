@@ -390,6 +390,13 @@ func (i *Image) jpxSamples(data []byte, cmyk bool) (image.Image, error) {
 // 入参: ctx 取消上下文, data 编码数据, cmyk 是否使用四色空间
 // 返回: image.Image 独立采样图像, error 参数、解码或取消错误
 func (i *Image) jpxSamplesContext(ctx context.Context, data []byte, cmyk bool) (image.Image, error) {
+	return i.jpxSamplesSizeContext(ctx, data, cmyk, image.Point{})
+}
+
+// jpxSamplesSizeContext 按分量解码JPEG2000，仅在明确需求下裁减高分辨率层
+// 入参: ctx 取消上下文, data 编码数据, cmyk 四色空间, size 像素需求
+// 返回: image.Image 独立采样图像, error 参数、解码或取消错误
+func (i *Image) jpxSamplesSizeContext(ctx context.Context, data []byte, cmyk bool, size image.Point) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -431,12 +438,19 @@ func (i *Image) jpxSamplesContext(ctx context.Context, data []byte, cmyk bool) (
 	if err != nil {
 		return nil, err
 	}
-	components, err := j2k.DecodeComponents(&contextInput{ctx: ctx, reader: bytes.NewReader(stream)}, j2k.Options{})
+	reduce, err := jpxReduction(ctx, data, stream, size)
+	if err != nil {
+		return nil, err
+	}
+	components, err := j2k.DecodeComponents(&contextInput{ctx: ctx, reader: bytes.NewReader(stream)}, j2k.Options{ReduceResolutions: reduce})
 	if canceled := ctx.Err(); canceled != nil {
 		return nil, canceled
 	}
 	if err != nil {
 		return nil, err
+	}
+	if len(components) == 0 {
+		return nil, fmt.Errorf("missing JPEG2000 component planes")
 	}
 	for _, c := range components {
 		if c.Precision < 1 || c.Precision > 31 || c.W <= 0 || c.H <= 0 || c.XRsiz <= 0 || c.YRsiz <= 0 || len(c.Samples)/c.W != c.H {
@@ -471,7 +485,16 @@ func (i *Image) jpxSamplesContext(ctx context.Context, data []byte, cmyk bool) (
 	if err != nil {
 		return nil, err
 	}
-	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: image.Rect(0, 0, i.Width, i.Height), x0: int64(binary.BigEndian.Uint32(stream[16:20])), y0: int64(binary.BigEndian.Uint32(stream[20:24])), cmyk: count == 4, ycc: ycc}
+	bounds := image.Rect(0, 0, i.Width, i.Height)
+	if reduce != 0 {
+		bounds = image.Rect(0, 0, components[0].W, components[0].H)
+		for _, plane := range components {
+			if plane.W != bounds.Dx() || plane.H != bounds.Dy() || plane.XRsiz != 1 || plane.YRsiz != 1 {
+				return nil, fmt.Errorf("inconsistent reduced JPEG2000 component dimensions")
+			}
+		}
+	}
+	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: bounds, x0: int64(binary.BigEndian.Uint32(stream[16:20])), y0: int64(binary.BigEndian.Uint32(stream[20:24])), cmyk: count == 4, ycc: ycc}
 	if ycc {
 		for n := range out.chroma {
 			precision := out.precision(channels[n+1])
@@ -482,6 +505,117 @@ func (i *Image) jpxSamplesContext(ctx context.Context, data []byte, cmyk bool) (
 		return nil, err
 	}
 	return out, nil
+}
+
+// jpxReduction 为同采样分量选择不低于两轴需求的分辨率，不裁减调色板索引
+// 入参: ctx 取消上下文, data 容器数据, stream 已校验码流, size 像素需求
+// 返回: int 裁减层数, error 容器错误
+func jpxReduction(ctx context.Context, data, stream []byte, size image.Point) (int, error) {
+	if size.X <= 0 || size.Y <= 0 {
+		return 0, nil
+	}
+	count := int(binary.BigEndian.Uint16(stream[40:42]))
+	for n := range count {
+		if stream[43+3*n] != 1 || stream[44+3*n] != 1 {
+			return 0, nil
+		}
+	}
+	palette := false
+	if !bytes.HasPrefix(data, []byte{255, 79}) {
+		if err := walkJPXBoxes(data, func(name string, payload []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if name != "jp2h" {
+				return nil
+			}
+			return walkJPXBoxes(payload, func(name string, payload []byte) error {
+				palette = palette || name == "pclr"
+				return ctx.Err()
+			})
+		}); err != nil {
+			return 0, err
+		}
+	}
+	if palette {
+		return 0, nil
+	}
+	x, y := uint64(binary.BigEndian.Uint32(stream[8:12])), uint64(binary.BigEndian.Uint32(stream[12:16]))
+	x0, y0 := uint64(binary.BigEndian.Uint32(stream[16:20])), uint64(binary.BigEndian.Uint32(stream[20:24]))
+	reduce := 0
+	for n := 1; n <= 30; n++ {
+		scale := uint64(1) << n
+		w := (x+scale-1)/scale - (x0+scale-1)/scale
+		h := (y+scale-1)/scale - (y0+scale-1)/scale
+		if w < uint64(size.X) || h < uint64(size.Y) {
+			break
+		}
+		reduce = n
+	}
+	if reduce == 0 {
+		return 0, nil
+	}
+	limit, err := jpxReductionLimit(ctx, stream)
+	return min(reduce, limit), err
+}
+
+// jpxReductionLimit 读取默认分解层数，有分量或图块覆盖时保留完整解码
+// 入参: ctx 取消上下文, stream 已校验尺寸的码流
+// 返回: int 可裁减层数, error 标记段边界错误
+func jpxReductionLimit(ctx context.Context, stream []byte) (int, error) {
+	levels, tileEnd := 0, 0
+	for pos := 2; pos < len(stream); {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if len(stream)-pos < 2 || stream[pos] != 255 {
+			return 0, fmt.Errorf("invalid JPEG2000 header marker")
+		}
+		marker := stream[pos+1]
+		if marker == 0xd9 {
+			return levels, nil
+		}
+		if marker == 0x93 {
+			if tileEnd <= pos || tileEnd > len(stream) {
+				return 0, fmt.Errorf("invalid JPEG2000 tile-part boundary")
+			}
+			pos, tileEnd = tileEnd, 0
+			continue
+		}
+		if len(stream)-pos < 4 {
+			return 0, fmt.Errorf("truncated JPEG2000 header segment")
+		}
+		length := int(binary.BigEndian.Uint16(stream[pos+2:]))
+		if length < 2 || length > len(stream)-pos-2 {
+			return 0, fmt.Errorf("invalid JPEG2000 header segment length")
+		}
+		switch marker {
+		case 0x52:
+			if tileEnd != 0 {
+				return 0, nil
+			}
+			if length < 12 || stream[pos+9] > 32 {
+				return 0, fmt.Errorf("invalid JPEG2000 coding style")
+			}
+			levels = int(stream[pos+9])
+		case 0x53:
+			return 0, nil
+		case 0x90:
+			if length != 10 || tileEnd != 0 {
+				return 0, fmt.Errorf("invalid JPEG2000 tile-part header")
+			}
+			length := uint64(binary.BigEndian.Uint32(stream[pos+6:]))
+			if length == 0 {
+				tileEnd = len(stream)
+			} else if length < 14 || length > uint64(len(stream)-pos) {
+				return 0, fmt.Errorf("invalid JPEG2000 tile-part length")
+			} else {
+				tileEnd = pos + int(length)
+			}
+		}
+		pos += length + 2
+	}
+	return levels, nil
 }
 
 // compact 按原始位深保存无符号样本，释放解码器的三十二位平面，不改变采样精度

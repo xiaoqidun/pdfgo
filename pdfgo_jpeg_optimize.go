@@ -303,7 +303,7 @@ func (r *jpegEntropy) symbol(h *jpegHuffman) (byte, error) {
 
 // walk 扫描量化系数符号，统计与写出共用同一遍历
 // 入参: ctx 取消上下文, data JPEG数据, visit 符号访问回调, output 可选输出
-// 返回: int 结束标记偏移, error 扫描错误
+// 返回: int 扫描后片段偏移, error 扫描错误
 func (s *jpegScan) walk(ctx context.Context, data []byte, visit func(int, byte, uint32, uint), output *jpegBitWriter) (int, error) {
 	r := jpegEntropy{data: data, pos: s.start}
 	restart := byte(0)
@@ -364,13 +364,55 @@ func (s *jpegScan) walk(ctx context.Context, data []byte, visit func(int, byte, 
 			}
 		}
 	}
-	for r.pos+1 < len(data) && data[r.pos] == 0xff && data[r.pos+1] == 0xff {
-		r.pos++
-	}
-	if r.pos+2 > len(data) || data[r.pos] != 0xff || data[r.pos+1] != 0xd9 {
-		return 0, fmt.Errorf("missing JPEG end marker")
+	if err := jpegScanTail(ctx, data, r.pos); err != nil {
+		return 0, err
 	}
 	return r.pos, nil
+}
+
+// jpegScanTail 校验最后扫描至结束标记之间的表、应用及注释片段，不丢弃原字节
+// 入参: ctx 取消上下文, data JPEG编码, pos 扫描后偏移
+// 返回: error 片段或取消错误
+func jpegScanTail(ctx context.Context, data []byte, pos int) error {
+	for pos < len(data) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if data[pos] != 255 {
+			return fmt.Errorf("invalid JPEG scan tail")
+		}
+		for pos < len(data) && data[pos] == 255 {
+			if pos&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			pos++
+		}
+		if pos == len(data) {
+			break
+		}
+		marker := data[pos]
+		pos++
+		if marker == 0xd9 {
+			return ctx.Err()
+		}
+		if marker == 1 {
+			continue
+		}
+		if !(marker >= 0xe0 && marker <= 0xef || marker == 0xfe || marker == 0xc4 || marker == 0xcc || marker == 0xdb || marker == 0xdd) {
+			return fmt.Errorf("invalid JPEG scan tail marker")
+		}
+		if pos+2 > len(data) {
+			break
+		}
+		size := int(binary.BigEndian.Uint16(data[pos:]))
+		if size < 2 || size > len(data)-pos {
+			return fmt.Errorf("invalid JPEG scan tail length")
+		}
+		pos += size
+	}
+	return fmt.Errorf("missing JPEG end marker")
 }
 
 // optimalJPEGHuffman 限制码长至16位并预留全1填充码

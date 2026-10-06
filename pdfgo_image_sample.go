@@ -15,10 +15,70 @@
 package pdfgo
 
 import (
+	"context"
 	"image"
 	"image/color"
 	"math"
 )
+
+// imageNRGBAAt 直接读取八位非预乘颜色，保留全透明像素的隐藏颜色
+// 入参: source 图像, x 横向坐标, y 纵向坐标
+// 返回: color.NRGBA 非预乘颜色
+func imageNRGBAAt(source image.Image, x, y int) color.NRGBA {
+	if s, ok := source.(interface{ NRGBAAt(int, int) color.NRGBA }); ok {
+		return s.NRGBAAt(x, y)
+	}
+	c := imageNRGBA64At(source, x, y)
+	return color.NRGBA{R: uint8(c.R >> 8), G: uint8(c.G >> 8), B: uint8(c.B >> 8), A: uint8(c.A >> 8)}
+}
+
+// imageOpaqueContext 分段检查透明度，已知无透明通道时不扫描颜色
+// 入参: ctx 取消上下文, source 图像
+// 返回: bool 是否完全不透明, error 取消错误
+func imageOpaqueContext(ctx context.Context, source image.Image) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	switch s := source.(type) {
+	case *image.Gray, *image.Gray16, *image.CMYK, *image.YCbCr, *packedGrayImage, *mappedGrayImage, *packedCMYKImage:
+		return true, nil
+	case *jpxSampleImage:
+		if s.alpha < 0 {
+			return true, nil
+		}
+	case *deviceSampleImage:
+		if s.mask == nil && !s.embedded && s.palette == nil {
+			return true, nil
+		}
+	}
+	bounds := source.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if (x-bounds.Min.X)&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+			}
+			var alpha uint16
+			switch s := source.(type) {
+			case *image.NRGBA:
+				alpha = uint16(s.NRGBAAt(x, y).A) * 257
+			case *image.RGBA:
+				alpha = uint16(s.RGBAAt(x, y).A) * 257
+			case *jpxSampleImage:
+				alpha = s.sample(s.alpha, x, y)
+			case image.RGBA64Image:
+				alpha = s.RGBA64At(x, y).A
+			default:
+				alpha = imageNRGBA64At(source, x, y).A
+			}
+			if alpha != 65535 {
+				return false, ctx.Err()
+			}
+		}
+	}
+	return true, ctx.Err()
+}
 
 // imageNRGBA64At 优先使用直接采样接口，保留透明像素的隐藏颜色
 // 入参: source 图像, x 横向坐标, y 纵向坐标
@@ -30,6 +90,8 @@ func imageNRGBA64At(source image.Image, x, y int) color.NRGBA64 {
 	case *image.NRGBA:
 		c := s.NRGBAAt(x, y)
 		return color.NRGBA64{R: uint16(c.R) * 257, G: uint16(c.G) * 257, B: uint16(c.B) * 257, A: uint16(c.A) * 257}
+	case *image.Paletted:
+		return imageNRGBASample(s.At(x, y))
 	case *packedGrayImage:
 		if !image.Pt(x, y).In(s.rect) {
 			return color.NRGBA64{}

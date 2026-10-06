@@ -17,7 +17,6 @@ package pdfgo
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -50,84 +49,43 @@ func (b *optimizationBuffer) Write(data []byte) (int, error) {
 // 入参: ctx 取消上下文, data 图片数据, options 压缩配置, size 像素需求
 // 返回: []byte 更小的图片数据, error 编码错误
 func OptimizeImageResource(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
-	best, err := OptimizeImageSize(ctx, data, options, size)
-	if err != nil || options.Mode != CompressionLossy || !plainPNG(data) {
-		return best, err
-	}
-	config, err := png.DecodeConfig(bytes.NewReader(data))
-	if err != nil || int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 {
-		return best, ctx.Err()
-	}
-	img, err := png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
-	if err != nil {
+	if err := options.Validate(); err != nil {
 		return nil, err
 	}
-	if !photographicImage(img) {
-		return best, ctx.Err()
-	}
-	img, err = ResizeImage(ctx, img, size)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	var b bytes.Buffer
-	limit := &optimizationBuffer{buffer: &b, limit: optimizationBufferLimit}
-	output := &pdfOutput{ctx: ctx, writer: limit}
-	if err := jpeg.Encode(output, img, &jpeg.Options{Quality: options.ImageQuality()}); err != nil {
-		if limit.exceeded {
-			return best, ctx.Err()
-		}
-		return nil, err
+	if options.Mode == CompressionLossy && bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
+		return optimizePNG(ctx, data, options, size, true)
 	}
-	encoded, err := OptimizeJPEG(ctx, b.Bytes())
-	if err != nil {
-		return nil, err
-	}
-	if len(encoded) < len(best) {
-		best = encoded
-	}
-	return best, ctx.Err()
+	return OptimizeImageSize(ctx, data, options, size)
 }
 
-// plainPNG 判断图片是否只含像素编码块，避免改写颜色配置和附加信息
-// 入参: data 已校验图片
-// 返回: bool 是否可以转换表示
-func plainPNG(data []byte) bool {
-	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
-		return false
+// photographicImage 保守识别连续色调图片，扫描透明度及颜色期间检查取消
+// 入参: ctx 取消上下文, img 图片
+// 返回: bool 是否适合JPEG, error 取消错误
+func photographicImage(ctx context.Context, img image.Image) (bool, error) {
+	if _, ok := img.(interface{ Opaque() bool }); !ok {
+		return false, ctx.Err()
 	}
-	for pos := 8; pos+12 <= len(data); {
-		n := uint64(binary.BigEndian.Uint32(data[pos:]))
-		if n > uint64(len(data)-pos-12) {
-			return false
-		}
-		switch string(data[pos+4 : pos+8]) {
-		case "IHDR", "IDAT", "IEND", "PLTE", "tRNS":
-		default:
-			return false
-		}
-		pos += int(n) + 12
-	}
-	return true
-}
-
-// photographicImage 保守识别连续色调图片，少色、透明及大量锐利边缘保留无损编码
-// 入参: img 图片
-// 返回: bool 是否适合JPEG
-func photographicImage(img image.Image) bool {
-	if opaque, ok := img.(interface{ Opaque() bool }); !ok || !opaque.Opaque() {
-		return false
+	opaque, err := imageOpaqueContext(ctx, img)
+	if err != nil || !opaque {
+		return false, err
 	}
 	b := img.Bounds()
 	colors := make(map[color.NRGBA]bool)
 	count, edges := 0, 0
 	for y := b.Min.Y; y < b.Max.Y; y += max(1, b.Dy()/128) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		for x := b.Min.X; x < b.Max.X; x += max(1, b.Dx()/128) {
-			c := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+			c := imageNRGBAAt(img, x, y)
 			if len(colors) <= 256 {
 				colors[c] = true
 			}
 			if x+1 < b.Max.X {
-				d := color.NRGBAModel.Convert(img.At(x+1, y)).(color.NRGBA)
+				d := imageNRGBAAt(img, x+1, y)
 				if math.Abs(float64(c.R)-float64(d.R))+math.Abs(float64(c.G)-float64(d.G))+math.Abs(float64(c.B)-float64(d.B)) > 120 {
 					edges++
 				}
@@ -135,29 +93,53 @@ func photographicImage(img image.Image) bool {
 			}
 		}
 	}
-	return len(colors) > 256 && edges*20 < count
+	return len(colors) > 256 && edges*20 < count, ctx.Err()
 }
 
-// compactPNG 比较原色、灰度和精确索引色，有损模式才降低精度及尺寸
-// 入参: ctx 取消上下文, data 无附加块的PNG, options 压缩配置, size 像素需求
-// 返回: []byte 更小的PNG, error 编码错误
-func compactPNG(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
-	config, err := png.DecodeConfig(bytes.NewReader(data))
+// compactPNG 共用一次解码和降采样，比较原色、灰度、索引色及可选JPEG
+// 入参: ctx 取消上下文, data 无附加块的PNG, best 已有候选, options 压缩配置, size 像素需求, resource 是否允许更换格式
+// 返回: []byte 更小的图片编码, error 编码错误
+func compactPNG(ctx context.Context, data, best []byte, options CompressionOptions, size image.Point, resource bool) ([]byte, error) {
+	config, err := png.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
 	}
-	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 || data[24] == 16 {
-		return data, nil
+	depth16 := data[24] == 16
+	pixelSize := int64(4)
+	if depth16 {
+		pixelSize = 8
+	}
+	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/pixelSize || depth16 && (!resource || options.Mode != CompressionLossy) {
+		return best, ctx.Err()
 	}
 	img, err := png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
+	}
+	photo := false
+	if resource && options.Mode == CompressionLossy {
+		photo, err = photographicImage(ctx, img)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if depth16 && !photo {
+		return best, ctx.Err()
 	}
 	if options.Mode == CompressionLossy {
 		img, err = ResizeImage(ctx, img, size)
 		if err != nil {
 			return nil, err
 		}
+	}
+	if photo {
+		best, err = compactJPEG(ctx, img, best, options.ImageQuality())
+		if err != nil {
+			return nil, err
+		}
+	}
+	if depth16 {
+		return best, ctx.Err()
 	}
 	b := img.Bounds()
 	pixels := image.NewNRGBA(b)
@@ -171,7 +153,12 @@ func compactPNG(ctx context.Context, data []byte, options CompressionOptions, si
 			return nil, err
 		}
 		for x := b.Min.X; x < b.Max.X; x++ {
-			c := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+			if (x-b.Min.X)&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			c := imageNRGBAAt(img, x, y)
 			if options.Mode == CompressionLossy {
 				c.R, c.G, c.B = quant(c.R), quant(c.G), quant(c.B)
 			}
@@ -183,7 +170,6 @@ func compactPNG(ctx context.Context, data []byte, options CompressionOptions, si
 			}
 		}
 	}
-	best := data
 	encode := func(img image.Image) error {
 		var out bytes.Buffer
 		encoder := png.Encoder{CompressionLevel: png.BestCompression}
@@ -230,6 +216,32 @@ func compactPNG(ctx context.Context, data []byte, options CompressionOptions, si
 		if err := encode(p); err != nil {
 			return nil, err
 		}
+	}
+	return best, ctx.Err()
+}
+
+// compactJPEG 编码不透明照片并优化熵编码，只采用优于已有候选的结果
+// 入参: ctx 取消上下文, img 图像, best 已有候选, quality 有损质量
+// 返回: []byte 更小的编码, error 编码或取消错误
+func compactJPEG(ctx context.Context, img image.Image, best []byte, quality int) ([]byte, error) {
+	img, err := jpegEncodingImage(ctx, img)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	limit := &optimizationBuffer{buffer: &out, limit: optimizationBufferLimit}
+	if err := jpeg.Encode(&pdfOutput{ctx: ctx, writer: limit}, img, &jpeg.Options{Quality: quality}); err != nil {
+		if limit.exceeded {
+			return best, ctx.Err()
+		}
+		return nil, err
+	}
+	encoded, err := OptimizeJPEG(ctx, out.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) < len(best) {
+		best = encoded
 	}
 	return best, ctx.Err()
 }

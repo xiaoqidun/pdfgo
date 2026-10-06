@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -46,6 +47,7 @@ type iccToneCurve struct {
 
 // iccColorSpace 统一灰度、RGB、CMYK与Lab配置文件的绘制颜色变换
 type iccColorSpace struct {
+	data               []byte
 	rgb                *iccRGBSpace
 	gray               *iccGraySpace
 	lut                *iccLUTSpace
@@ -59,6 +61,85 @@ type iccColorSpace struct {
 	alternate          *patternColorSpace
 	alternateBlending  *ColorSpace
 	alternateCount     int
+	intent             Name
+}
+
+// NewICCColorSpace 解析独立ICC配置快照，复用PDF颜色变换，不依赖PDF阅读器
+// 转换输入为单位分量，Lab映射到L[0,100]及a、b[-128,127]
+// 入参: data 配置文件，支持灰度、RGB、CMYK及Lab源空间
+// 返回: *ColorSpace 不保留调用方缓冲的颜色空间, error 配置或变换错误
+func NewICCColorSpace(data []byte) (*ColorSpace, error) {
+	if len(data) < 132 {
+		return nil, fmt.Errorf("invalid ICC profile header")
+	}
+	count := 0
+	model := Name("")
+	switch string(data[16:20]) {
+	case "GRAY":
+		count, model = 1, "DeviceGray"
+	case "RGB ", "Lab ":
+		count, model = 3, "DeviceRGB"
+	case "CMYK":
+		count, model = 4, "DeviceCMYK"
+	default:
+		return nil, &UnsupportedError{Feature: "ICC source color space " + string(data[16:20])}
+	}
+	if err := validateICCSourceHeader(data, count); err != nil {
+		return nil, err
+	}
+	if binary.BigEndian.Uint32(data[64:68]) > 3 {
+		return nil, fmt.Errorf("invalid ICC rendering intent")
+	}
+	data = bytes.Clone(data)
+	profile, err := parseICCColorSpace(data, count, sha256.Sum256(data))
+	if err != nil {
+		return nil, err
+	}
+	if profile.lab {
+		profile.ranges = &[8]float64{0, 100, -128, 127, -128, 127}
+	}
+	return &ColorSpace{Model: model, profile: profile}, nil
+}
+
+// ICCSource 返回ICC源模型及实际分量范围，不分配配置副本
+// 返回: Name GRAY、RGB、CMYK或Lab，非ICC空间为空, [8]float64 各分量的上下限
+func (s *ColorSpace) ICCSource() (Name, [8]float64) {
+	if s == nil || s.profile == nil || len(s.profile.data) < 132 {
+		return "", [8]float64{}
+	}
+	var model Name
+	switch string(s.profile.data[16:20]) {
+	case "GRAY":
+		model = "GRAY"
+	case "RGB ":
+		model = "RGB"
+	case "CMYK":
+		model = "CMYK"
+	case "Lab ":
+		model = "Lab"
+	}
+	return model, s.profile.sourceRanges()
+}
+
+// ICCProfile 导出独立配置快照，按ICC嵌入规则设置意图，不改标签与配置标识
+// 入参: intent 输出渲染意图，空值或未知值按PDF规则使用相对色度
+// 返回: []byte 配置快照，非ICC空间为nil
+func (s *ColorSpace) ICCProfile(intent Name) []byte {
+	if s == nil || s.profile == nil || len(s.profile.data) < 132 {
+		return nil
+	}
+	data := bytes.Clone(s.profile.data)
+	value := uint32(1)
+	switch normalizeRenderingIntent(intent) {
+	case "Perceptual":
+		value = 0
+	case "Saturation":
+		value = 2
+	case "AbsoluteColorimetric":
+		value = 3
+	}
+	binary.BigEndian.PutUint32(data[64:68], value)
+	return data
 }
 
 // iccProfileStream 解析ICC配置流及必需的分量数，支持间接引用
@@ -131,7 +212,22 @@ func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpac
 		}
 		return cached.withRanges(ranges), nil
 	}
-	model := map[Integer]string{1: "GRAY", 3: "RGB ", 4: "CMYK"}[count]
+	space, err := parseICCColorSpace(data, int(count), key)
+	if err != nil {
+		return nil, err
+	}
+	if r.colorProfiles == nil {
+		r.colorProfiles = make(map[[32]byte]*iccColorSpace)
+	}
+	r.colorProfiles[key] = space
+	return space.withRanges(ranges), nil
+}
+
+// parseICCColorSpace 解析已确定分量数的配置，所有来源共用矩阵、曲线和查找表实现
+// 入参: data 配置快照, count 源分量数, key 内容摘要
+// 返回: *iccColorSpace 不可变颜色变换, error 配置错误
+func parseICCColorSpace(data []byte, count int, key [32]byte) (*iccColorSpace, error) {
+	model := map[int]string{1: "GRAY", 3: "RGB ", 4: "CMYK"}[count]
 	if count == 3 && len(data) >= 20 && string(data[16:20]) == "Lab " {
 		model = "Lab "
 	}
@@ -141,6 +237,16 @@ func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpac
 	}
 	signature := key
 	space := &iccColorSpace{absoluteScale: iccAbsoluteScale(tags["wtpt"]), lab: model == "Lab ", signature: &signature}
+	switch binary.BigEndian.Uint32(data[64:68]) {
+	case 0:
+		space.intent = "Perceptual"
+	case 2:
+		space.intent = "Saturation"
+	case 3:
+		space.intent = "AbsoluteColorimetric"
+	default:
+		space.intent = "RelativeColorimetric"
+	}
 	if tags["A2B0"] != nil {
 		space.lut, err = parseICCLUTSpace(data, tags)
 	} else if count == 1 {
@@ -172,11 +278,8 @@ func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpac
 		}
 	}
 	space.inverse = newICCInverse(tags, int(count), space.processPCS)
-	if r.colorProfiles == nil {
-		r.colorProfiles = make(map[[32]byte]*iccColorSpace)
-	}
-	r.colorProfiles[key] = space
-	return space.withRanges(ranges), nil
+	space.data = data
+	return space, nil
 }
 
 // iccRanges 读取PDF声明的源分量范围，缺省或单位范围不分配配置副本

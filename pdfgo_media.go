@@ -61,7 +61,7 @@ func (r *Reader) ReadFileData(ctx context.Context, file FileSpecification, resol
 	var data []byte
 	var err error
 	if file.Embedded != nil {
-		data, err = file.Embedded.Decode()
+		data, err = file.Embedded.DecodeContext(ctx)
 	} else if resolver != nil {
 		data, err = resolver(ctx, file)
 	} else {

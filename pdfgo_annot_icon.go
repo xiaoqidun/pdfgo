@@ -19,7 +19,7 @@ import (
 	"strings"
 )
 
-// annotationIcons 保存标准注解名称对应的矢量图标，不依赖外部字体
+// annotationIcons 保存标准和附加注解名称对应的矢量图标，不依赖外部字体
 var annotationIcons = map[Name]string{
 	"Note":         "2 2 12 12 re B 4 11 m 12 11 l 4 8 m 12 8 l 4 5 m 9 5 l S",
 	"Comment":      "2 5 m 2 14 l 14 14 l 14 5 l 7 5 l 3 2 l 3 5 l h B",
@@ -28,6 +28,15 @@ var annotationIcons = map[Name]string{
 	"Paragraph":    "9 2 m 9 14 l 5 14 l 1 14 1 8 5 8 c 9 8 l S 12 14 m 12 2 l S",
 	"NewParagraph": "9 2 m 9 14 l 5 14 l 1 14 1 8 5 8 c 9 8 l S 12 14 m 12 2 l 2 4 m 6 4 l 4 2 m 4 6 l S",
 	"Insert":       "2 3 m 8 13 l 14 3 l S",
+	"Check":        "1 8 m 4 11 l 7 7 l 12 14 l 15 12 l 7 2 l h B",
+	"Circle":       "2 8 m 2 11.3 4.7 14 8 14 c 11.3 14 14 11.3 14 8 c 14 4.7 11.3 2 8 2 c 4.7 2 2 4.7 2 8 c h B",
+	"Cross":        "2 4 m 4 2 l 8 6 l 12 2 l 14 4 l 10 8 l 14 12 l 12 14 l 8 10 l 4 14 l 2 12 l 6 8 l h B",
+	"Star":         "8 15 m 9.8 10 l 15 10 l 11 6.6 l 12.4 1.5 l 8 4.4 l 3.6 1.5 l 5 6.6 l 1 10 l 6.2 10 l h B",
+	"RightArrow":   "1 6 m 9 6 l 9 2 l 15 8 l 9 14 l 9 10 l 1 10 l h B",
+	"RightPointer": "3 2 m 14 8 l 3 14 l h B",
+	"UpArrow":      "6 1 m 6 9 l 2 9 l 8 15 l 14 9 l 10 9 l 10 1 l h B",
+	"UpLeftArrow":  "2 7 m 2 14 l 9 14 l 7 12 l 14 5 l 11 2 l 4 9 l h B",
+	"CrossHairs":   "3 8 m 3 10.8 5.2 13 8 13 c 10.8 13 13 10.8 13 8 c 13 5.2 10.8 3 8 3 c 5.2 3 3 5.2 3 8 c h B 1 8 m 15 8 l 8 1 m 8 15 l S",
 	"Graph":        "2 14 m 2 2 l 14 2 l 4 4 m 7 8 l 10 6 l 14 12 l S",
 	"PushPin":      "5 14 m 11 14 l 10 10 l 13 7 l 3 7 l 6 10 l h B 8 7 m 8 1 l S",
 	"Paperclip":    "11 5 m 5 11 l 7 13 10 13 12 11 c 16 7 10 1 6 3 c 1 6 2 10 5 13 c 8 16 l S",

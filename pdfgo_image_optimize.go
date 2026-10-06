@@ -30,6 +30,40 @@ import (
 
 const optimizationBufferLimit = 64 << 20
 
+// pngOptimizationChunk 引用已校验的原PNG块，不复制编码内容
+type pngOptimizationChunk struct {
+	kind string
+	data []byte
+}
+
+// pngIDATReader 顺序读取分散的IDAT内容，不合并完整压缩缓冲
+type pngIDATReader struct {
+	chunks []pngOptimizationChunk
+	index  int
+	offset int
+}
+
+// Read 读取下一个非空IDAT片段
+// 入参: data 读取缓冲
+// 返回: int 读取字节数, error 流结束标记
+func (r *pngIDATReader) Read(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	for r.index < len(r.chunks) {
+		chunk := r.chunks[r.index]
+		if chunk.kind != "IDAT" || r.offset >= len(chunk.data)-12 {
+			r.index++
+			r.offset = 0
+			continue
+		}
+		n := copy(data, chunk.data[8+r.offset:len(chunk.data)-4])
+		r.offset += n
+		return n, nil
+	}
+	return 0, io.EOF
+}
+
 // OptimizeImage 优化PNG或JPEG编码，只采用更小的结果，不改变尺寸和透明度
 // 无损保留像素与元数据，有损可降低RGB精度或JPEG质量；未知格式原样返回
 // 返回值可能引用输入数据；不修改输入，调用方应将结果视为只读
@@ -54,7 +88,7 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 		return data, nil
 	}
 	if bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
-		return optimizePNG(ctx, data, options, size)
+		return optimizePNG(ctx, data, options, size, false)
 	}
 	if !bytes.HasPrefix(data, []byte{255, 216}) {
 		return data, nil
@@ -66,21 +100,21 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 	if options.Mode != CompressionLossy {
 		return best, nil
 	}
-	metadata, adobe, err := jpegMetadata(data)
+	metadata, adobe, err := jpegMetadataContext(ctx, data)
 	if err != nil {
 		return nil, err
 	}
 	if adobe {
 		return best, nil
 	}
-	config, err := jpeg.DecodeConfig(bytes.NewReader(data))
+	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
 	}
 	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 {
 		return best, nil
 	}
-	img, err := jpeg.Decode(bytes.NewReader(data))
+	img, err := jpeg.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
 	}
@@ -91,76 +125,49 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 	if err != nil {
 		return nil, err
 	}
+	img, err = jpegEncodingImage(ctx, img)
+	if err != nil {
+		return nil, err
+	}
 	var encoded bytes.Buffer
-	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: options.ImageQuality()}); err != nil {
+	limit := &optimizationBuffer{buffer: &encoded, limit: min(max(0, len(best)-len(metadata)), optimizationBufferLimit)}
+	if err := jpeg.Encode(&pdfOutput{ctx: ctx, writer: limit}, img, &jpeg.Options{Quality: options.ImageQuality()}); err != nil {
+		if limit.exceeded {
+			return best, ctx.Err()
+		}
 		return nil, err
 	}
 	candidate, err := OptimizeJPEG(ctx, encoded.Bytes())
 	if err != nil {
 		return nil, err
 	}
-	candidate = append(append(append([]byte(nil), candidate[:2]...), metadata...), candidate[2:]...)
-	if len(candidate) < len(best) {
-		best = candidate
+	if len(candidate)+len(metadata) < len(best) {
+		if len(metadata) == 0 {
+			best = candidate
+		} else {
+			joined := make([]byte, len(candidate)+len(metadata))
+			copy(joined, candidate[:2])
+			copy(joined[2:], metadata)
+			copy(joined[2+len(metadata):], candidate[2:])
+			best = joined
+		}
 	}
 	return best, ctx.Err()
 }
 
-// jpegMetadata 保留应用与注释段，识别需要保留原颜色变换的Adobe标记
-// 入参: data JPEG数据
-// 返回: []byte 元数据段, bool 是否包含Adobe标记, error 解析错误
-func jpegMetadata(data []byte) ([]byte, bool, error) {
-	var metadata []byte
-	adobe := false
-	for pos := 2; pos < len(data); {
-		start := pos
-		if data[pos] != 255 {
-			return nil, false, fmt.Errorf("invalid JPEG marker")
-		}
-		for pos < len(data) && data[pos] == 255 {
-			pos++
-		}
-		if pos >= len(data) {
-			break
-		}
-		marker := data[pos]
-		pos++
-		if marker == 0xda || marker == 0xd9 {
-			return metadata, adobe, nil
-		}
-		if pos+2 > len(data) {
-			break
-		}
-		n := int(binary.BigEndian.Uint16(data[pos:]))
-		if n < 2 || n > len(data)-pos {
-			break
-		}
-		if marker >= 0xe0 && marker <= 0xef || marker == 0xfe {
-			metadata = append(metadata, data[start:pos+n]...)
-		}
-		if marker == 0xee {
-			adobe = true
-		}
-		pos += n
-	}
-	return nil, false, fmt.Errorf("truncated JPEG header")
-}
-
-// optimizePNG 流式重压缩IDAT，无附加块时比较精确颜色表示，有损模式可降采样
-// 入参: ctx 取消上下文, data PNG数据, options 压缩配置, size 像素上限
+// optimizePNG 先比较图像表示，再按最小候选体积限制IDAT重压缩
+// 入参: ctx 取消上下文, data PNG数据, options 压缩配置, size 像素上限, resource 是否允许更换格式
 // 返回: []byte 优化数据, error 编码错误
-func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
-	type chunk struct {
-		kind string
-		data []byte
-	}
-	var chunks []chunk
-	var compressed bytes.Buffer
+func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, size image.Point, resource bool) ([]byte, error) {
+	var chunks []pngOptimizationChunk
 	eligible := false
 	plain := true
 	unsafeMetadata := false
 	ended := false
 	for pos := 8; pos < len(data); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(data)-pos < 12 {
 			return nil, fmt.Errorf("truncated PNG chunk")
 		}
@@ -173,7 +180,7 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		if crc32.ChecksumIEEE(raw[4:len(raw)-4]) != binary.BigEndian.Uint32(raw[len(raw)-4:]) {
 			return nil, fmt.Errorf("invalid PNG checksum")
 		}
-		chunks = append(chunks, chunk{kind, raw})
+		chunks = append(chunks, pngOptimizationChunk{kind, raw})
 		if kind != "IHDR" && kind != "IDAT" && kind != "IEND" && kind != "PLTE" && kind != "tRNS" {
 			plain = false
 		}
@@ -188,9 +195,6 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		if kind == "acTL" {
 			return data, nil
 		}
-		if kind == "IDAT" {
-			compressed.Write(raw[8 : len(raw)-4])
-		}
 		pos += len(raw)
 		if kind == "IEND" {
 			ended = true
@@ -203,12 +207,22 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	if !ended {
 		return nil, fmt.Errorf("missing PNG end")
 	}
-	input, err := zlib.NewReader(bytes.NewReader(compressed.Bytes()))
+	best := data
+	if plain {
+		candidate, err := compactPNG(ctx, data, best, options, size, resource)
+		if err != nil {
+			return nil, err
+		}
+		if len(candidate) < len(best) {
+			best = candidate
+		}
+	}
+	input, err := zlib.NewReader(&contextInput{ctx: ctx, reader: &pngIDATReader{chunks: chunks}})
 	if err != nil {
 		return nil, err
 	}
 	var packed bytes.Buffer
-	output := &optimizationBuffer{buffer: &packed, limit: min(len(data), optimizationBufferLimit)}
+	output := &optimizationBuffer{buffer: &packed, limit: min(len(best), optimizationBufferLimit)}
 	encoder, _ := zlib.NewWriterLevel(output, zlib.BestCompression)
 	n, err := io.Copy(encoder, io.LimitReader(&contextInput{ctx: ctx, reader: input}, 512<<20+1))
 	input.Close()
@@ -228,6 +242,16 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	encoded := packed.Bytes()
 	assemble := func(idat, header []byte, lossy bool) []byte {
 		var out bytes.Buffer
+		length := uint64(8 + 12 + len(idat))
+		for _, c := range chunks {
+			if c.kind != "IDAT" && !(lossy && (c.kind == "PLTE" || c.kind == "tRNS" || c.kind == "hIST" || c.kind == "sBIT")) {
+				length += uint64(len(c.data))
+			}
+		}
+		if length >= uint64(len(best)) || length > optimizationBufferLimit {
+			return best
+		}
+		out.Grow(int(length))
 		out.Write(data[:8])
 		written := false
 		for _, c := range chunks {
@@ -253,30 +277,20 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		}
 		return out.Bytes()
 	}
-	best := data
 	if !output.exceeded {
 		if candidate := assemble(encoded, nil, false); len(candidate) < len(best) {
 			best = candidate
 		}
 	}
-	if plain {
-		candidate, err := compactPNG(ctx, data, options, size)
-		if err != nil {
-			return nil, err
-		}
-		if len(candidate) < len(best) {
-			best = candidate
-		}
-	}
 	if !plain && options.Mode == CompressionLossy && eligible && !unsafeMetadata && (options.ImageQuality() < 100 || size.X > 0 && size.Y > 0) {
-		config, err := png.DecodeConfig(bytes.NewReader(data))
+		config, err := png.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 		if err != nil {
 			return nil, err
 		}
 		if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 {
 			return best, nil
 		}
-		img, err := png.Decode(bytes.NewReader(data))
+		img, err := png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 		if err != nil {
 			return nil, err
 		}
@@ -294,26 +308,39 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 				return nil, err
 			}
 			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				c := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+				if (x-bounds.Min.X)&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				c := imageNRGBAAt(img, x, y)
 				c.R, c.G, c.B = quant(c.R), quant(c.G), quant(c.B)
 				pixels.SetNRGBA(x, y, c)
 			}
 		}
 		var b bytes.Buffer
 		encoder := png.Encoder{CompressionLevel: png.BestCompression}
-		if err := encoder.Encode(&b, pixels); err != nil {
+		limit := &optimizationBuffer{buffer: &b, limit: min(len(best), optimizationBufferLimit)}
+		if err := encoder.Encode(&pdfOutput{ctx: ctx, writer: limit}, pixels); err != nil {
+			if limit.exceeded {
+				return best, ctx.Err()
+			}
 			return nil, err
 		}
 		candidate := b.Bytes()
-		var ids bytes.Buffer
+		var ids []pngOptimizationChunk
 		for pos := 33; pos < len(candidate); {
 			n := int(binary.BigEndian.Uint32(candidate[pos:]))
 			if string(candidate[pos+4:pos+8]) == "IDAT" {
-				ids.Write(candidate[pos+8 : pos+8+n])
+				ids = append(ids, pngOptimizationChunk{kind: "IDAT", data: candidate[pos : pos+12+n]})
 			}
 			pos += n + 12
 		}
-		if result := assemble(ids.Bytes(), candidate[8:33], true); len(result) < len(best) {
+		idat, err := io.ReadAll(&pngIDATReader{chunks: ids})
+		if err != nil {
+			return nil, err
+		}
+		if result := assemble(idat, candidate[8:33], true); len(result) < len(best) {
 			best = result
 		}
 	}

@@ -25,23 +25,42 @@ import (
 	"io"
 )
 
-// jpegFrame 保存采样布局，供解码前校验块对齐缓冲和渐进系数尺寸
+// jpegFrame 保存采样布局和独立显示元数据状态
 type jpegFrame struct {
-	components    int
-	width, height int
-	progressive   bool
-	sampling      [4][2]int
+	components      int
+	width, height   int
+	progressive     bool
+	sampling        [4][2]int
+	displayMetadata bool
 }
 
-// JPEGFile 返回可脱离PDF字典直接显示的原始JPEG，需颜色映射或遮罩时返回空值
-// 返回: []byte 原始JPEG数据或空值, error 解码参数错误
+// jpegEncodingImage 为不透明八位图像复用预乘视图，避免编码器逐像素接口分配
+// 入参: ctx 取消上下文, source 待编码图像
+// 返回: image.Image 只读编码视图, error 取消错误
+func jpegEncodingImage(ctx context.Context, source image.Image) (image.Image, error) {
+	s, ok := source.(*image.NRGBA)
+	if !ok {
+		return source, ctx.Err()
+	}
+	opaque, err := imageOpaqueContext(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	if !opaque {
+		return source, nil
+	}
+	return &image.RGBA{Pix: s.Pix, Stride: s.Stride, Rect: s.Rect}, nil
+}
+
+// JPEGFile 返回可脱离PDF字典直接显示的JPEG，移除PDF忽略的方向和配置文件
+// 返回: []byte 未重编码的JPEG或空值, error 解码参数错误
 func (i *Image) JPEGFile() ([]byte, error) {
 	return i.JPEGFileContext(context.Background())
 }
 
-// JPEGFileContext 返回可直接复用的JPEG，通用前置过滤器解码期间检查取消
+// JPEGFileContext 返回可直接复用的JPEG，移除显示元数据期间检查取消
 // 入参: ctx 取消上下文
-// 返回: []byte 原始JPEG数据或空值, error 参数、编码或取消错误
+// 返回: []byte 未重编码的JPEG或空值, error 参数、编码或取消错误
 func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -71,6 +90,9 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	if frame.components == 1 && i.ColorSpace == Name("DeviceGray") || frame.components == 3 && i.ColorSpace == Name("DeviceRGB") && transform == (config.ColorModel == color.YCbCrModel) {
+		if frame.displayMetadata {
+			return jpegDisplayFileContext(ctx, data)
+		}
 		return data, nil
 	}
 	return nil, nil
@@ -208,6 +230,13 @@ func jpegColorInfo(data []byte) (jpegFrame, byte, bool, error) {
 // 入参: ctx 取消上下文, data JPEG数据
 // 返回: jpegFrame 采样布局, byte Adobe变换, bool Adobe标记, error 格式或取消错误
 func jpegColorInfoContext(ctx context.Context, data []byte) (jpegFrame, byte, bool, error) {
+	return jpegColorSegmentsContext(ctx, data, nil)
+}
+
+// jpegColorSegmentsContext 解析颜色标记并访问扫描前后的完整片段
+// 入参: ctx 取消上下文, data JPEG数据, visit 可选片段处理函数
+// 返回: jpegFrame 采样布局, byte Adobe变换, bool Adobe标记, error 格式、处理或取消错误
+func jpegColorSegmentsContext(ctx context.Context, data []byte, visit func(byte, int, int) error) (jpegFrame, byte, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return jpegFrame{}, 0, false, err
 	}
@@ -235,6 +264,7 @@ func jpegColorInfoContext(ctx context.Context, data []byte) (jpegFrame, byte, bo
 			}
 			pos += n
 		}
+		start := pos
 		for pos < len(data) && data[pos] == 0xff {
 			if pos&4095 == 0 {
 				if err := ctx.Err(); err != nil {
@@ -266,12 +296,23 @@ func jpegColorInfoContext(ctx context.Context, data []byte) (jpegFrame, byte, bo
 			return jpegFrame{}, 0, false, fmt.Errorf("invalid JPEG segment length")
 		}
 		segment := data[pos+2 : pos+size]
+		if marker == 0xe1 && bytes.HasPrefix(segment, []byte("Exif\x00\x00")) || marker == 0xe2 && bytes.HasPrefix(segment, []byte("ICC_PROFILE\x00")) {
+			frame.displayMetadata = true
+		}
+		if visit != nil {
+			if err := visit(marker, start, pos+size); err != nil {
+				return jpegFrame{}, 0, false, err
+			}
+		}
 		switch marker {
 		case 0xc0, 0xc1, 0xc2:
 			if len(segment) < 6 {
 				return jpegFrame{}, 0, false, fmt.Errorf("invalid JPEG frame header")
 			}
-			frame = jpegFrame{components: int(segment[5]), width: int(binary.BigEndian.Uint16(segment[3:5])), height: int(binary.BigEndian.Uint16(segment[1:3])), progressive: marker == 0xc2}
+			frame.components = int(segment[5])
+			frame.width = int(binary.BigEndian.Uint16(segment[3:5]))
+			frame.height = int(binary.BigEndian.Uint16(segment[1:3]))
+			frame.progressive = marker == 0xc2
 			if len(segment) != 6+3*frame.components {
 				return jpegFrame{}, 0, false, fmt.Errorf("invalid JPEG frame header")
 			}
@@ -288,6 +329,82 @@ func jpegColorInfoContext(ctx context.Context, data []byte) (jpegFrame, byte, bo
 		pos += size
 	}
 	return jpegFrame{}, 0, false, fmt.Errorf("missing JPEG end marker")
+}
+
+// jpegDisplayFileContext 无损移除PDF忽略的Exif和ICC片段，保留颜色标记及扫描数据
+// 入参: ctx 取消上下文, data JPEG数据
+// 返回: []byte 独立JPEG副本, error 标记或取消错误
+func jpegDisplayFileContext(ctx context.Context, data []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	output := make([]byte, 0, len(data))
+	pos := 0
+	appendUntil := func(end int) error {
+		for pos < end {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			next := pos + min(65536, end-pos)
+			output = append(output, data[pos:next]...)
+			pos = next
+		}
+		return ctx.Err()
+	}
+	_, _, _, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
+		segment := start + 1
+		for data[segment] == 255 {
+			segment++
+		}
+		payload := data[segment+3 : end]
+		if !(marker == 0xe1 && bytes.HasPrefix(payload, []byte("Exif\x00\x00")) || marker == 0xe2 && bytes.HasPrefix(payload, []byte("ICC_PROFILE\x00"))) {
+			return nil
+		}
+		if err := appendUntil(start); err != nil {
+			return err
+		}
+		pos = end
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := appendUntil(len(data)); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+// jpegMetadata 保留扫描前后的应用与注释段，识别Adobe颜色变换标记
+// 入参: data JPEG数据
+// 返回: []byte 元数据段, bool 是否包含Adobe标记, error 解析错误
+func jpegMetadata(data []byte) ([]byte, bool, error) {
+	return jpegMetadataContext(context.Background(), data)
+}
+
+// jpegMetadataContext 扫描完整编码并按原顺序保留元数据，分段检查取消
+// 入参: ctx 取消上下文, data JPEG数据
+// 返回: []byte 元数据段, bool 是否包含Adobe标记, error 解析或取消错误
+func jpegMetadataContext(ctx context.Context, data []byte) ([]byte, bool, error) {
+	var metadata []byte
+	_, _, adobe, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
+		if marker < 0xe0 || marker > 0xef && marker != 0xfe {
+			return nil
+		}
+		for start < end {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			next := start + min(65536, end-start)
+			metadata = append(metadata, data[start:next]...)
+			start = next
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return metadata, adobe, ctx.Err()
 }
 
 // sampleSize 校验JPEG解码器的采样平面及渐进系数缓冲

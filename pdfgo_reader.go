@@ -46,11 +46,12 @@ type Reader struct {
 	colorProfileDepth  int
 	objectStreams      [4]*objectStream
 	security           *standardSecurity
+	warning            func(Diagnostic)
 	closed             bool
 }
 
 // ReaderOptions 设置密码编码及可恢复结构错误的诊断接收方式
-// Warning非空时允许使用超出错误Size声明的已有交叉引用，不重建或猜测对象
+// Warning非空时允许恢复错误Size声明及异常ToUnicode，不重建对象或猜测字符映射
 type ReaderOptions struct {
 	Password     []byte
 	PasswordUTF8 bool
@@ -151,6 +152,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	}
 	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: map[Reference]Object{}, loading: map[Reference]bool{}}
 	r.originalSource, r.originalSize = source, size
+	r.warning = options.Warning
 	var err error
 	for length := min(r.size, int64(4096)); ; length = min(r.size, length+min(length, r.size-length)) {
 		data, err = r.readRange(r.size-length, length)

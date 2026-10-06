@@ -39,7 +39,7 @@ import (
 
 // OptimizeOptions 配置原生PDF重写，不经过页面渲染
 // 默认模式或包含签名时保留源文件；加密文档保留原安全处理器、密码和权限
-// Creator非空时设置重写结果的制作软件；OnProgress回报scan、write阶段，支持取消
+// Creator非空时设置重写结果的制作软件；OnProgress回报scan、compress、write阶段，支持取消
 type OptimizeOptions struct {
 	Compression CompressionOptions
 	Creator     string
@@ -135,11 +135,18 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	var refs []Reference
 	var maskRoots []Object
 	var maskRefs []Reference
+	var dataRoots []Object
+	var dataRefs []Reference
 	lossless := make(map[Reference]bool)
+	exactData := make(map[Reference]bool)
 	protecting := false
+	preservingData := false
 	signed := false
 	var collect func(Object, int) error
 	collect = func(value Object, depth int) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if depth > 256 {
 			return fmt.Errorf("excessive PDF object nesting")
 		}
@@ -156,6 +163,10 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 				lossless[v] = true
 				maskRefs = append(maskRefs, v)
 			}
+			if preservingData && !exactData[v] {
+				exactData[v] = true
+				dataRefs = append(dataRefs, v)
+			}
 		case Array:
 			for _, item := range v {
 				if err := collect(item, depth+1); err != nil {
@@ -168,7 +179,14 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 					return fmt.Errorf("cannot replace a soft-mask image")
 				}
 			}
-			if !protecting && options.Compression.Mode == CompressionLossy {
+			if !protecting && !preservingData {
+				for _, key := range []Name{"JS", "EF"} {
+					if v[key] != nil {
+						dataRoots = append(dataRoots, v[key])
+					}
+				}
+			}
+			if !protecting && !preservingData && options.Compression.Mode == CompressionLossy {
 				keys := []Name{"SMask", "Mask"}
 				if options.Compression.ImageDPI() > 0 {
 					keys = append(keys, "AP", "Pattern", "CharProcs")
@@ -221,6 +239,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		if stream, ok := value.(*Stream); ok {
 			metadata[refs[i]] = stream.Dictionary
+			if stream.Dictionary["Type"] == Name("EmbeddedFile") {
+				dataRoots = append(dataRoots, refs[i])
+			}
 		} else {
 			metadata[refs[i]] = value
 		}
@@ -260,9 +281,35 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			delete(r.cache, maskRefs[i])
 		}
 	}
+	protecting = false
+	preservingData = true
+	for _, root := range dataRoots {
+		if err := collect(root, 0); err != nil {
+			return report, err
+		}
+	}
+	for i := 0; i < len(dataRefs); i++ {
+		if err := progress("scan", i, len(dataRefs)); err != nil {
+			return report, err
+		}
+		ref := dataRefs[i]
+		if replacements[ref] != nil {
+			return report, fmt.Errorf("cannot replace a stream shared with original file data")
+		}
+		value, found := metadata[ref]
+		if !found {
+			return report, fmt.Errorf("missing PDF optimization object metadata")
+		}
+		if err := collect(value, 0); err != nil {
+			return report, err
+		}
+	}
 	var imageSizes map[Reference]image.Point
 	var fontGlyphs map[Reference][]uint16
 	if options.Compression.Mode != CompressionUnchanged {
+		if err := progress("compress", 0, 0); err != nil {
+			return report, err
+		}
 		imageSizes, err = r.imageOutputSizes(ctx, options.Compression.ImageDPI())
 		if err != nil {
 			return report, err
@@ -286,6 +333,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		delete(fontGlyphs, ref)
 		lossless[canonical] = lossless[canonical] || lossless[ref]
+		exactData[canonical] = exactData[canonical] || exactData[ref]
 		a, b := imageSizes[canonical], imageSizes[ref]
 		if imageSizes != nil {
 			if a.X == 0 || a.Y == 0 || b.X == 0 || b.Y == 0 {
@@ -293,6 +341,11 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			} else {
 				imageSizes[canonical] = image.Pt(max(a.X, b.X), max(a.Y, b.Y))
 			}
+		}
+	}
+	for ref := range exactData {
+		if exactData[ref] {
+			delete(fontGlyphs, ref)
 		}
 	}
 	refs = slices.DeleteFunc(refs, func(ref Reference) bool { return out.aliases[ref].Number != 0 })
@@ -441,12 +494,24 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			}
 			value = stream
 			if options.Compression.Mode != CompressionUnchanged {
-				value, err = r.optimizeStreamSize(ctx, stream, compression, imageSizes[ref])
+				if err := progress("compress", report.Streams, 0); err != nil {
+					return report, err
+				}
+				if exactData[ref] {
+					value, err = r.optimizeDataStream(ctx, stream)
+				} else {
+					value, err = r.optimizeStreamSize(ctx, stream, compression, imageSizes[ref])
+				}
 				if err != nil {
 					return report, err
 				}
 			}
 			report.Streams++
+			if options.Compression.Mode != CompressionUnchanged {
+				if err := progress("compress", report.Streams, 0); err != nil {
+					return report, err
+				}
+			}
 		}
 		value = r.optimizedFontNames(value, fontTags, out.aliases, 0)
 		if _, stream := value.(*Stream); packed && !stream && ref.Generation == 0 && ref != out.encrypt {
@@ -705,6 +770,29 @@ func compressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
 	return result.Bytes(), nil
 }
 
+// recompressPDFBytes 流式重压缩已有Flate编码，不持有完整解码副本且只采用更小结果
+// 入参: ctx 取消上下文, data 原始编码
+// 返回: []byte 更小编码或原文, error 取消错误
+func recompressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	input, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return data, ctx.Err()
+	}
+	defer input.Close()
+	var result bytes.Buffer
+	output := &optimizationBuffer{buffer: &result, limit: min(len(data), optimizationBufferLimit)}
+	encoder, _ := zlib.NewWriterLevel(output, zlib.BestCompression)
+	n, err := io.Copy(encoder, io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1))
+	closeErr := encoder.Close()
+	if err != nil || closeErr != nil || n > optimizationBufferLimit || result.Len() >= len(data) {
+		return data, ctx.Err()
+	}
+	return result.Bytes(), ctx.Err()
+}
+
 // optimizeStreamSize 优化流编码并按已知显示尺寸缩小图片
 // 入参: ctx 取消上下文, s 原始流, options 压缩配置, size 像素上限
 // 返回: *Stream 输出流, error 优化错误
@@ -736,12 +824,27 @@ func (r *Reader) optimizeStreamSize(ctx context.Context, s *Stream, options Comp
 // 入参: ctx 取消上下文, s 原始流, options 压缩配置, size 像素需求
 // 返回: *Stream 输出流, error 编码错误
 func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options CompressionOptions, size image.Point) (*Stream, error) {
+	if len(s.Data) > optimizationBufferLimit {
+		return s, ctx.Err()
+	}
+	dict, err := r.optimizationImageDictionary(s)
+	if err != nil {
+		return s, ctx.Err()
+	}
+	if dict["Subtype"] == Name("Image") {
+		copy := *s
+		copy.Dictionary = dict
+		s = &copy
+	}
 	if s.Dictionary["F"] != nil || len(s.Data) > optimizationBufferLimit {
 		return s, nil
 	}
 	filters, params, err := s.filterChain(r)
 	if err != nil {
 		return s, nil
+	}
+	if len(filters) != 0 && filters[len(filters)-1] == Name("JPXDecode") && s.Dictionary["Subtype"] == Name("Image") {
+		return r.optimizeJPXImage(ctx, s, options, size)
 	}
 	if len(filters) > 1 && filters[len(filters)-1] == Name("DCTDecode") {
 		inner, err := r.unwrapImageStream(ctx, s, filters, params)
@@ -805,12 +908,20 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 				} else {
 					p := image.NewNRGBA(image.Rect(0, 0, int(width), int(height)))
 					for i, j := 0, 0; i < len(pixels); i, j = i+3, j+4 {
+						if j&16383 == 0 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						copy(p.Pix[j:j+3], pixels[i:i+3])
 						p.Pix[j+3] = 255
 					}
 					img = p
 				}
-				photo := photographicImage(img)
+				photo, e := photographicImage(ctx, img)
+				if e != nil {
+					return nil, e
+				}
 				img, e = ResizeImage(ctx, img, size)
 				if e != nil {
 					return nil, e
@@ -825,8 +936,12 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 					}
 					return &result, ctx.Err()
 				}
+				img, e = jpegEncodingImage(ctx, img)
+				if e != nil {
+					return nil, e
+				}
 				var b bytes.Buffer
-				if e = jpeg.Encode(&b, img, &jpeg.Options{Quality: options.ImageQuality()}); e != nil {
+				if e = jpeg.Encode(&pdfOutput{ctx: ctx, writer: &b}, img, &jpeg.Options{Quality: options.ImageQuality()}); e != nil {
 					return nil, e
 				}
 				encoded, e := OptimizeJPEG(ctx, b.Bytes())
@@ -868,20 +983,27 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 		}
 		return &result, nil
 	}
+	return r.optimizeDataStream(ctx, s)
+}
+
+// optimizeDataStream 优化通用流编码，保持解码数据及加密策略不变
+// 入参: ctx 取消上下文, s 原始流
+// 返回: *Stream 输出流, error 取消或编码错误
+func (r *Reader) optimizeDataStream(ctx context.Context, s *Stream) (*Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(s.Data) > optimizationBufferLimit || s.Dictionary["F"] != nil {
+		return s, nil
+	}
+	filters, _, err := s.filterChain(r)
+	if err != nil {
+		return s, ctx.Err()
+	}
+	result := *s
+	result.Dictionary = maps.Clone(s.Dictionary)
 	if len(filters) > 0 && filters[0] == Name("FlateDecode") {
-		input, e := zlib.NewReader(bytes.NewReader(s.Data))
-		if e != nil {
-			return s, nil
-		}
-		data, e := io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1))
-		input.Close()
-		if e != nil {
-			return s, nil
-		}
-		if len(data) > optimizationBufferLimit {
-			return s, nil
-		}
-		encoded, e := compressPDFBytes(ctx, data)
+		encoded, e := recompressPDFBytes(ctx, s.Data)
 		if e != nil {
 			return nil, e
 		}
@@ -896,7 +1018,7 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 			return nil, e
 		}
 		if len(data)+40 < len(s.Data) {
-			replace(data, Name("FlateDecode"))
+			return r.reencodedStream(s, data, Name("FlateDecode"))
 		}
 		return &result, nil
 	}
@@ -926,7 +1048,27 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 		return nil, e
 	}
 	if len(encoded)+40 < len(s.Data) {
-		replace(encoded, Name("FlateDecode"))
+		return r.reencodedStream(s, encoded, Name("FlateDecode"))
+	}
+	return &result, nil
+}
+
+// reencodedStream 替换流编码，保留显式加密过滤器
+// 入参: source 原始流, data 输出编码, filter 输出过滤器
+// 返回: *Stream 输出流, error 加密过滤器解析错误
+func (r *Reader) reencodedStream(source *Stream, data []byte, filter Name) (*Stream, error) {
+	result := *source
+	result.Dictionary = maps.Clone(source.Dictionary)
+	result.Data = data
+	result.Dictionary["Filter"] = filter
+	delete(result.Dictionary, "DecodeParms")
+	if source.decrypted {
+		name, err := r.security.outputStreamFilter(source, r)
+		if err != nil {
+			return nil, err
+		}
+		result.Dictionary["Filter"] = Array{Name("Crypt"), filter}
+		result.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, nil}
 	}
 	return &result, nil
 }

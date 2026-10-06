@@ -64,7 +64,7 @@ func (r *Reader) readVerticalMetricsContext(ctx context.Context, font *Font, met
 	if !ok {
 		return fmt.Errorf("invalid CID vertical metrics")
 	}
-	font.verticals = make(map[uint32]VerticalMetrics)
+	font.verticals = cidMetrics[VerticalMetrics]{}
 	for n := 0; n < len(array); {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -96,7 +96,7 @@ func (r *Reader) readVerticalMetricsContext(ctx context.Context, font *Font, met
 				if err != nil {
 					return err
 				}
-				font.verticals[uint32(start)+uint32(i/3)] = metric
+				font.verticals.set(uint32(start)+uint32(i/3), uint32(start)+uint32(i/3), metric)
 			}
 		} else {
 			end, ok := value.(Integer)
@@ -108,14 +108,7 @@ func (r *Reader) readVerticalMetricsContext(ctx context.Context, font *Font, met
 				return err
 			}
 			n += 3
-			for cid := start; cid <= end; cid++ {
-				if (cid-start)&255 == 0 {
-					if err := ctx.Err(); err != nil {
-						return err
-					}
-				}
-				font.verticals[uint32(cid)] = metric
-			}
+			font.verticals.set(uint32(start), uint32(end), metric)
 		}
 	}
 	return ctx.Err()

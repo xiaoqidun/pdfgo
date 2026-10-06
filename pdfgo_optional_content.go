@@ -228,7 +228,11 @@ func (r *Reader) optionalGroupState(object Object, group, config Dictionary) (bo
 // 入参: object 可选内容属性
 // 返回: bool 是否可见, error 配置错误
 func (p *pageInterpreter) optionalVisible(object Object) (bool, error) {
-	if object == nil {
+	value, err := p.reader.Resolve(object)
+	if err != nil {
+		return false, err
+	}
+	if value == nil {
 		return true, nil
 	}
 	if p.visitor.OptionalContent != nil {

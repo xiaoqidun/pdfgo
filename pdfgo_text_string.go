@@ -29,10 +29,10 @@ var pdfDocCharacters = map[byte]rune{
 	0x8f: 0x2018, 0x90: 0x2019, 0x91: 0x201a, 0x92: 0x2122, 0x93: 0xfb01,
 	0x94: 0xfb02, 0x95: 0x0141, 0x96: 0x0152, 0x97: 0x0160, 0x98: 0x0178,
 	0x99: 0x017d, 0x9a: 0x0131, 0x9b: 0x0142, 0x9c: 0x0153, 0x9d: 0x0161,
-	0x9e: 0x017e, 0x9f: 0, 0xa0: 0x20ac,
+	0x9e: 0x017e, 0x9f: 0, 0xa0: 0x20ac, 0xad: 0,
 }
 
-// DecodeTextString 按照PDF文本串编码读取Unicode文字
+// DecodeTextString 按PDF标准表D.2及Unicode文本串编码读取文字
 // 入参: value PDF字符串
 // 返回: string Unicode文字, error 无效编码
 func DecodeTextString(value String) (string, error) {
@@ -63,8 +63,21 @@ func DecodeTextString(value String) (string, error) {
 		}
 		return string(data[3:]), nil
 	}
+	ascii := true
+	for _, code := range data {
+		if code < 0x20 && code != '\t' && code != '\n' && code != '\r' || code >= 0x7f {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return string(data), nil
+	}
 	runes := make([]rune, 0, len(data))
 	for _, code := range data {
+		if code < 0x18 && code != '\t' && code != '\n' && code != '\r' {
+			return "", fmt.Errorf("undefined PDFDocEncoding byte %02x", code)
+		}
 		if mapped, ok := pdfDocCharacters[code]; ok {
 			if mapped == 0 {
 				return "", fmt.Errorf("undefined PDFDocEncoding byte %02x", code)

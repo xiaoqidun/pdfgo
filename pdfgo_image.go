@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash/maphash"
 	"image"
 	"image/color"
 	"io"
@@ -583,6 +584,13 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 // 入参: ctx 取消上下文
 // 返回: image.Image 独立原始样本, error 解码或取消错误
 func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
+	return i.decodeSamplesSizeContext(ctx, image.Point{})
+}
+
+// decodeSamplesSizeContext 解码原始样本，仅对显式尺寸需求启用JPEG2000分辨率裁减
+// 入参: ctx 取消上下文, size 像素需求
+// 返回: image.Image 原始样本, error 解码或取消错误
+func (i *Image) decodeSamplesSizeContext(ctx context.Context, size image.Point) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -661,7 +669,7 @@ func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
 		}
 	case "JPXDecode":
 		cmyk := i.ColorSpace == Name("DeviceCMYK")
-		result, err = i.jpxSamplesContext(ctx, data, cmyk)
+		result, err = i.jpxSamplesSizeContext(ctx, data, cmyk, size)
 	default:
 		result, err = i.rawSamples(ctx, data)
 	}
@@ -671,7 +679,7 @@ func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	if result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height {
+	if (terminal != "JPXDecode" || size.X <= 0 || size.Y <= 0) && (result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height) {
 		return nil, fmt.Errorf("decoded image dimensions differ from dictionary")
 	}
 	return result, nil
@@ -751,6 +759,20 @@ func (s *packedGrayImage) At(x, y int) color.Color {
 // 入参: ctx 取消上下文, target 可选分量输出, sampled 是否按需访问设备色分量
 // 返回: image.Image 显示图像，分量模式下为空, error 解码错误
 func (i *Image) decodeImage(ctx context.Context, target *ImageComponents, sampled bool) (image.Image, error) {
+	return i.decodeImageSize(ctx, target, sampled, image.Point{})
+}
+
+// decodeImageSize 共用颜色和遮罩解释，有外部遮罩或索引色时保留完整原始样本
+// 入参: ctx 取消上下文, target 可选分量输出, sampled 延迟分量采样, size 显式像素需求
+// 返回: image.Image 显示图像，分量模式下为空, error 解码错误
+func (i *Image) decodeImageSize(ctx context.Context, target *ImageComponents, sampled bool, size image.Point) (image.Image, error) {
+	return i.decodeImageOutput(ctx, target, sampled, size, nil)
+}
+
+// decodeImageOutput 共用颜色、遮罩及分量解释，可按行写出校准色图像
+// 入参: ctx 取消上下文, target 可选分量输出, sampled 延迟分量采样, size 显式像素需求, writer 可选PNG输出流
+// 返回: image.Image 显示图像，分量或行输出模式下为空, error 解码或写入错误
+func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, sampled bool, size image.Point, writer io.Writer) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -882,7 +904,10 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents, sample
 			ranges[n] = v
 		}
 	}
-	samples, err := i.DecodeSamplesContext(ctx)
+	if target != nil || i.ImageMask || i.Mask != nil || i.SoftMask != nil || palette != nil || deviceN != nil || separation != nil {
+		size = image.Point{}
+	}
+	samples, err := i.decodeSamplesSizeContext(ctx, size)
 	if err != nil {
 		return nil, err
 	}
@@ -945,14 +970,35 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents, sample
 		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: float64((uint32(1) << i.BitsPerComponent) - 1), byteExact: byteExact, embedded: embeddedMask != 0}, nil
 	}
 	var out *image.NRGBA64
+	var encoder *pngImageEncoder
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if target == nil {
-		if _, _, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 8); err != nil {
-			return nil, err
+		if writer != nil {
+			channels, kind := 4, 6
+			if mask == nil && embeddedMask == 0 && len(keys) == 0 && palette == nil && (deviceN == nil || !deviceN.none) && (separation == nil || separation.name != "None" && !separation.none) && (profile == nil || profile.alternate == nil || !profile.alternate.invisible) {
+				channels, kind = 3, 2
+			}
+			encoder, err = newPNGImageEncoder(ctx, writer, bounds, 16, channels, kind)
+			if err != nil {
+				return nil, err
+			}
+			defer encoder.release()
+			out = &image.NRGBA64{Pix: encoder.row, Stride: len(encoder.row), Rect: image.Rect(0, 0, bounds.Dx(), 1)}
+			if channels == 3 {
+				stride, _, err := imageBufferSize(bounds.Dx(), 1, 8)
+				if err != nil {
+					return nil, err
+				}
+				out.Pix, out.Stride = make([]byte, stride), stride
+			}
+		} else {
+			if _, _, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 8); err != nil {
+				return nil, err
+			}
+			out = image.NewNRGBA64(bounds)
 		}
-		out = image.NewNRGBA64(bounds)
 	} else {
 		if palette != nil {
 			target.Space = palette.space
@@ -1027,11 +1073,20 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents, sample
 	if components > len(componentBuffer) {
 		inputs = make([]float64, components)
 	}
+	var colors *imageColorCache
+	if target == nil && palette == nil && deviceN == nil && separation == nil && (profile != nil || calibrated != nil || lab != nil) && int64(bounds.Dx())*int64(bounds.Dy()) >= 4096 {
+		colors = &imageColorCache{seed: maphash.MakeSeed()}
+	}
 	for y := 0; y < bounds.Dy(); y++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		for x := 0; x < bounds.Dx(); x++ {
+			if x&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			alpha := uint16(65535)
 			if mask != nil {
 				value, _, _, _ := mask.At(x, y).RGBA()
@@ -1175,7 +1230,10 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents, sample
 				continue
 			}
 			var pixel color.NRGBA64
-			if palette != nil {
+			entry, colorKey := colors.entry(values)
+			if entry != nil && entry.valid && entry.key == colorKey {
+				pixel = entry.pixel
+			} else if palette != nil {
 				index := int(math.Max(0, math.Min(float64(len(palette.colors)-1), math.Round(values[0]))))
 				pixel = palette.colors[index]
 			} else if deviceN != nil {
@@ -1220,14 +1278,42 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents, sample
 			} else {
 				pixel = color.NRGBA64{R: uint16(math.Round(values[0] * 65535)), G: uint16(math.Round(values[1] * 65535)), B: uint16(math.Round(values[2] * 65535)), A: 65535}
 			}
+			if entry != nil {
+				entry.key, entry.pixel, entry.valid = colorKey, pixel, true
+			}
 			if transparent {
 				pixel.A = 0
 			}
 			if mask != nil || embeddedMask != 0 {
 				pixel.A = uint16(uint32(pixel.A) * uint32(alpha) / 65535)
 			}
-			out.SetNRGBA64(x, y, pixel)
+			if encoder != nil {
+				out.SetNRGBA64(x, 0, pixel)
+			} else {
+				out.SetNRGBA64(x, y, pixel)
+			}
 		}
+		if encoder != nil {
+			if encoder.pixelBytes == 6 {
+				for start := 0; start < bounds.Dx(); start += 4096 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					for x := start; x < min(start+4096, bounds.Dx()); x++ {
+						copy(encoder.row[x*6:x*6+6], out.Pix[x*8:x*8+6])
+					}
+				}
+			}
+			if err := encoder.writeRow(); err != nil {
+				return nil, err
+			}
+			if encoder.pixelBytes == 8 {
+				out.Pix = encoder.row
+			}
+		}
+	}
+	if encoder != nil {
+		return nil, encoder.finish()
 	}
 	if out == nil {
 		return nil, nil

@@ -37,8 +37,18 @@ type actionFrame struct {
 // 入参: ctx 取消上下文, object 起始动作, visit 动作访问器
 // 返回: error 类型、循环引用或访问器错误
 func (r *Reader) WalkActions(ctx context.Context, object Object, visit func(ActionInfo) error) error {
+	if ctx == nil {
+		return fmt.Errorf("invalid action context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	object, err := r.Resolve(object)
+	if err != nil {
+		return err
+	}
 	if object == nil {
-		return nil
+		return ctx.Err()
 	}
 	if visit == nil {
 		return fmt.Errorf("missing action visitor")
@@ -98,4 +108,39 @@ func (r *Reader) WalkActions(ctx context.Context, object Object, visit func(Acti
 		}
 	}
 	return nil
+}
+
+// actionDictionary 读取指定标准动作的字典，不执行动作或访问外部资源
+// 入参: ctx 取消上下文, object 动作字典或引用, kind 动作类型
+// 返回: Dictionary 只读原始字典, error 类型、引用或取消错误
+func (r *Reader) actionDictionary(ctx context.Context, object Object, kind Name) (Dictionary, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid action context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	value, err := r.Resolve(object)
+	if err != nil {
+		return nil, err
+	}
+	dict, ok := value.(Dictionary)
+	if !ok || dict == nil {
+		return nil, fmt.Errorf("invalid %s action dictionary", kind)
+	}
+	value, err = r.Resolve(dict["S"])
+	if err != nil {
+		return nil, err
+	}
+	if value != kind {
+		return nil, fmt.Errorf("invalid %s action type", kind)
+	}
+	value, err = r.Resolve(dict["Type"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil && value != Name("Action") {
+		return nil, fmt.Errorf("invalid action dictionary type")
+	}
+	return dict, ctx.Err()
 }

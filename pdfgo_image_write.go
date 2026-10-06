@@ -148,9 +148,9 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 	if width <= 0 || height <= 0 || width > math.MaxInt/(channels*(bits/8)) {
 		return nil, nil, fmt.Errorf("invalid replacement image dimensions")
 	}
-	opaque := false
-	if image, ok := img.(interface{ Opaque() bool }); ok {
-		opaque = image.Opaque()
+	opaque, err := imageOpaqueContext(ctx, img)
+	if err != nil {
+		return nil, nil, err
 	}
 	if img.ColorModel() == color.RGBAModel && opaque {
 		bits = 8
@@ -164,12 +164,12 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 		}
 	}
 	var pixels, alpha bytes.Buffer
-	colorWriter := zlib.NewWriter(&pixels)
-	defer colorWriter.Close()
+	colorWriter := imageCompressor(&pixels)
+	defer releaseImageCompressor(colorWriter)
 	var alphaWriter *zlib.Writer
 	if !opaque {
-		alphaWriter = zlib.NewWriter(&alpha)
-		defer alphaWriter.Close()
+		alphaWriter = imageCompressor(&alpha)
+		defer releaseImageCompressor(alphaWriter)
 	}
 	row := make([]byte, width*channels*(bits/8))
 	var maskRow []byte
@@ -182,6 +182,11 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 			return nil, nil, err
 		}
 		for x := 0; x < width; x++ {
+			if x&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, nil, err
+				}
+			}
 			var values [4]uint16
 			a := uint16(65535)
 			switch channels {

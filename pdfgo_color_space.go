@@ -37,9 +37,18 @@ func (s *ColorSpace) Device() bool {
 	return s != nil && s.profile == nil && !s.mapped && s.Components() != 0
 }
 
-// Calibrated 判断混合空间是否含校准参数
+// Calibrated 判断颜色空间是否含校准参数
 // 返回: bool 是否校准
 func (s *ColorSpace) Calibrated() bool { return s != nil && s.profile != nil }
+
+// DefaultIntent 返回ICC头建议的渲染意图，不替代PDF内容流指定的意图
+// 返回: Name 配置默认意图，设备及其他校准空间为相对色度
+func (s *ColorSpace) DefaultIntent() Name {
+	if s != nil && s.profile != nil {
+		return normalizeRenderingIntent(s.profile.intent)
+	}
+	return "RelativeColorimetric"
+}
 
 // Equal 判断颜色模型、配置定义与分量范围是否相同，不受逆向缓存初始化影响
 // 入参: other 待比较空间
@@ -117,7 +126,7 @@ func (s *ColorSpace) srgbEquivalent() bool {
 	return true
 }
 
-// Components 返回混合空间的分量数
+// Components 返回颜色空间的分量数
 // 返回: int 分量数
 func (s *ColorSpace) Components() int {
 	if s == nil {
@@ -134,8 +143,8 @@ func (s *ColorSpace) Components() int {
 	return 0
 }
 
-// RGB 将混合空间分量转换为sRGB显示颜色
-// 入参: values 混合空间分量, intent 渲染意图
+// RGB 将颜色空间分量转换为sRGB显示颜色
+// 入参: values 单位分量, intent 渲染意图
 // 返回: [3]float64 sRGB颜色, error 分量或变换错误
 func (s *ColorSpace) RGB(values []float64, intent Name) ([3]float64, error) {
 	if err := s.validate(values); err != nil {

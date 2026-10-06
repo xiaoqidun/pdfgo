@@ -457,7 +457,7 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 		return nil, err
 	}
 	value, err := r.Resolve(object)
-	if err != nil {
+	if err != nil || value == nil {
 		return nil, err
 	}
 	if name, ok := value.(Name); ok {

@@ -17,7 +17,9 @@ package pdfgo
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"unicode/utf8"
@@ -41,7 +43,8 @@ type Font struct {
 	Vertical            bool
 	widths              map[uint32]float64
 	defaultWidth        float64
-	verticals           map[uint32]VerticalMetrics
+	cidWidths           cidMetrics[float64]
+	verticals           cidMetrics[VerticalMetrics]
 	defaultVertical     [2]float64
 	composite           bool
 	encoding            Name
@@ -152,7 +155,15 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 				return nil, err
 			}
 			font.symbolic = flags&4 != 0
-			ignoreEncoding = font.symbolic && (d["FontFile2"] != nil || d["FontFile3"] != nil || d["FontFile"] != nil)
+			if font.symbolic {
+				for _, key := range []Name{"FontFile2", "FontFile3", "FontFile"} {
+					value, err := r.Resolve(d[key])
+					if err != nil {
+						return nil, err
+					}
+					ignoreEncoding = ignoreEncoding || value != nil
+				}
+			}
 		}
 	}
 	metrics := dict
@@ -195,8 +206,12 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			return nil, &UnsupportedError{Feature: "CID font subtype"}
 		}
 		font.defaultWidth = 1000
-		if metrics["DW"] != nil {
-			font.defaultWidth, err = r.number(metrics["DW"])
+		value, err = r.Resolve(metrics["DW"])
+		if err != nil {
+			return nil, err
+		}
+		if value != nil {
+			font.defaultWidth, err = r.number(value)
 			if err != nil {
 				return nil, err
 			}
@@ -242,7 +257,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 						if err != nil {
 							return nil, err
 						}
-						font.widths[uint32(start)+uint32(j)] = width
+						font.cidWidths.set(uint32(start)+uint32(j), uint32(start)+uint32(j), width)
 					}
 				} else {
 					end, ok := values.(Integer)
@@ -254,14 +269,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 						return nil, err
 					}
 					n++
-					for code := start; code <= end; code++ {
-						if (code-start)&255 == 0 {
-							if err := ctx.Err(); err != nil {
-								return nil, err
-							}
-						}
-						font.widths[uint32(code)] = width
-					}
+					font.cidWidths.set(uint32(start), uint32(end), width)
 				}
 			}
 		}
@@ -418,7 +426,14 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	if dict["ToUnicode"] != nil {
 		font.Unicode, err = r.readUnicodeCMapContext(ctx, dict["ToUnicode"], nil)
 		if err != nil {
-			return nil, err
+			if cause := ctx.Err(); cause != nil {
+				return nil, cause
+			}
+			if r.warning == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, err
+			}
+			font.Unicode = nil
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q ToUnicode unavailable: %v; glyph mapping retained", font.Name, err)})
 		}
 	}
 	if subtype != "TrueType" {
@@ -439,12 +454,16 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			}
 			font.symbolic = flags&4 != 0
 		}
-		if subtype != "Type3" && d["FontBBox"] != nil {
+		boxObject := d["FontBBox"]
+		if subtype == "Type3" {
+			boxObject = nil
+		}
+		value, err := r.Resolve(boxObject)
+		if err != nil {
+			return nil, err
+		}
+		if subtype != "Type3" && value != nil {
 			boundsDeclared = true
-			value, err := r.Resolve(d["FontBBox"])
-			if err != nil {
-				return nil, err
-			}
 			array, ok := value.(Array)
 			if !ok || len(array) != 4 {
 				return nil, fmt.Errorf("invalid font bounding box")
@@ -461,19 +480,27 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 				font.BoundingBox = &bounds
 			}
 		}
-		if !font.composite && d["MissingWidth"] != nil {
-			font.defaultWidth, err = r.number(d["MissingWidth"])
+		missingWidth := d["MissingWidth"]
+		if font.composite {
+			missingWidth = nil
+		}
+		value, err = r.Resolve(missingWidth)
+		if err != nil {
+			return nil, err
+		}
+		if !font.composite && value != nil {
+			font.defaultWidth, err = r.number(value)
 			if err != nil {
 				return nil, err
 			}
 		}
 		for _, key := range []Name{"FontFile2", "FontFile3", "FontFile"} {
-			if d[key] == nil {
-				continue
-			}
 			value, err := r.Resolve(d[key])
 			if err != nil {
 				return nil, err
+			}
+			if value == nil {
+				continue
 			}
 			stream, ok := value.(*Stream)
 			if !ok || stream == nil {
@@ -783,6 +810,9 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 			}
 		}
 		width, ok := f.widths[cid]
+		if f.composite {
+			width, ok = f.cidWidths.get(cid)
+		}
 		if !ok {
 			width = f.defaultWidth
 			if len(f.widths) == 0 && core != nil {
@@ -801,7 +831,7 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		glyph := Glyph{Code: code, Text: text, Width: width, WordSpace: step == 1 && code == 32}
 		if f.Vertical {
 			var ok bool
-			glyph.Vertical, ok = f.verticals[cid]
+			glyph.Vertical, ok = f.verticals.get(cid)
 			if !ok {
 				glyph.Vertical = VerticalMetrics{Advance: f.defaultVertical[1], Origin: Point{width / 2, f.defaultVertical[0]}}
 			}

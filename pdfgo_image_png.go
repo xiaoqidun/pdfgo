@@ -41,6 +41,17 @@ type pngChunkWriter struct {
 	data   []byte
 }
 
+// pngImageEncoder 复用单行过滤及压缩缓冲，取消或写入失败后可独立释放
+type pngImageEncoder struct {
+	output     pngContextWriter
+	chunks     pngChunkWriter
+	compressed *zlib.Writer
+	row        []byte
+	previous   []byte
+	filters    [2][]byte
+	pixelBytes int
+}
+
 // pngRowSampler 独立复用颜色及遮罩的重采样行，不展开整幅图像
 type pngRowSampler struct {
 	source image.Image
@@ -71,6 +82,9 @@ type pngSampleColumn struct {
 // 入参: ctx 取消上下文, writer 输出流, source 已解码图像
 // 返回: error 图像参数、取消或写入错误
 func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error {
+	if ctx == nil || writer == nil {
+		return fmt.Errorf("missing PNG context or writer")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -86,13 +100,10 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	if _, packed := source.(*packedGrayImage); !direct && !packed {
 		return png.Encode(output, source)
 	}
-	depth, channels, kind := pngSampleFormat(source)
-	pixelBytes := max(1, channels*depth/8)
-	stride, _, err := imageSampleSize(bounds.Dx(), 1, channels, depth)
-	if err != nil || stride >= imageBufferLimit()/4 {
-		return fmt.Errorf("PNG row exceeds platform buffer range")
+	depth, channels, kind, err := pngSampleFormat(ctx, source)
+	if err != nil {
+		return err
 	}
-	row, previous := make([]byte, stride), make([]byte, stride)
 	sampler, err := newPNGRowSampler(source)
 	if err != nil {
 		return err
@@ -102,26 +113,16 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	if gray != nil && depth == gray.source.depth && depth < 8 {
 		grayBytes = pngGrayByteMap(gray, depth)
 	}
-	var filters [2][]byte
-	for n := range filters {
-		filters[n] = make([]byte, stride+1)
-	}
-	if _, err := output.Write([]byte("\x89PNG\r\n\x1a\n")); err != nil {
+	encoder, err := newPNGImageEncoder(ctx, writer, bounds, depth, channels, kind)
+	if err != nil {
 		return err
 	}
-	var header [13]byte
-	binary.BigEndian.PutUint32(header[:4], uint32(bounds.Dx()))
-	binary.BigEndian.PutUint32(header[4:8], uint32(bounds.Dy()))
-	header[8], header[9] = byte(depth), byte(kind)
-	if err := writePNGChunk(output, "IHDR", header[:]); err != nil {
-		return err
-	}
-	chunks := pngChunkWriter{writer: output, data: make([]byte, 0, 32768)}
-	compressed := zlib.NewWriter(&chunks)
+	defer encoder.release()
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		row := encoder.row
 		if gray != nil {
 			if err := pngGrayRow(ctx, row, gray, y, depth, &grayBytes); err != nil {
 				return err
@@ -144,7 +145,7 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 						pixel := sampler.sample(x, y)
 						values := [4]uint16{pixel.R, pixel.G, pixel.B, pixel.A}
 						for c := 0; c < channels; c++ {
-							offset := (x-bounds.Min.X)*pixelBytes + c*depth/8
+							offset := (x-bounds.Min.X)*encoder.pixelBytes + c*depth/8
 							if depth == 8 {
 								row[offset] = byte(values[c] >> 8)
 							} else {
@@ -156,29 +157,89 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 				}
 			}
 		}
-		filtered, err := pngFilterRow(ctx, row, previous, pixelBytes, &filters)
-		if err != nil {
+		if err := encoder.writeRow(); err != nil {
 			return err
 		}
-		for len(filtered) != 0 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			n := min(32768, len(filtered))
-			if _, err := compressed.Write(filtered[:n]); err != nil {
-				return err
-			}
-			filtered = filtered[n:]
+	}
+	return encoder.finish()
+}
+
+// newPNGImageEncoder 建立标准PNG行编码器，不分配整幅彩色缓冲
+// 入参: ctx 取消上下文, writer 输出流, bounds 图像边界, depth 位深, channels 通道数, kind 颜色类型
+// 返回: *pngImageEncoder 行编码器, error 参数或写入错误
+func newPNGImageEncoder(ctx context.Context, writer io.Writer, bounds image.Rectangle, depth, channels, kind int) (*pngImageEncoder, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
+		return nil, fmt.Errorf("invalid PNG dimensions")
+	}
+	stride, _, err := imageSampleSize(bounds.Dx(), 1, channels, depth)
+	if err != nil || stride >= imageBufferLimit()/4 {
+		return nil, fmt.Errorf("PNG row exceeds platform buffer range")
+	}
+	s := &pngImageEncoder{output: pngContextWriter{ctx: ctx, writer: writer}, pixelBytes: max(1, channels*depth/8)}
+	s.row, s.previous = make([]byte, stride), make([]byte, stride)
+	for n := range s.filters {
+		s.filters[n] = make([]byte, stride+1)
+	}
+	if _, err := s.output.Write([]byte("\x89PNG\r\n\x1a\n")); err != nil {
+		return nil, err
+	}
+	var header [13]byte
+	binary.BigEndian.PutUint32(header[:4], uint32(bounds.Dx()))
+	binary.BigEndian.PutUint32(header[4:8], uint32(bounds.Dy()))
+	header[8], header[9] = byte(depth), byte(kind)
+	if err := writePNGChunk(s.output, "IHDR", header[:]); err != nil {
+		return nil, err
+	}
+	s.chunks = pngChunkWriter{writer: s.output, data: make([]byte, 0, 32768)}
+	s.compressed = imageCompressor(&s.chunks)
+	return s, nil
+}
+
+// writeRow 写入当前样本行并交换前后行缓冲，不保留已写像素
+// 返回: error 取消、过滤或写入错误
+func (s *pngImageEncoder) writeRow() error {
+	filtered, err := pngFilterRow(s.output.ctx, s.row, s.previous, s.pixelBytes, &s.filters)
+	if err != nil {
+		return err
+	}
+	for len(filtered) != 0 {
+		if err := s.output.ctx.Err(); err != nil {
+			return err
 		}
-		row, previous = previous, row
+		n := min(32768, len(filtered))
+		if _, err := s.compressed.Write(filtered[:n]); err != nil {
+			return err
+		}
+		filtered = filtered[n:]
 	}
-	if err := compressed.Close(); err != nil {
+	s.row, s.previous = s.previous, s.row
+	return s.output.ctx.Err()
+}
+
+// finish 完成压缩数据及标准结束块，错误时不补写结束标记
+// 返回: error 取消或写入错误
+func (s *pngImageEncoder) finish() error {
+	if err := s.output.ctx.Err(); err != nil {
 		return err
 	}
-	if err := chunks.flush(); err != nil {
+	if err := s.compressed.Close(); err != nil {
 		return err
 	}
-	return writePNGChunk(output, "IEND", nil)
+	if err := s.chunks.flush(); err != nil {
+		return err
+	}
+	return writePNGChunk(s.output, "IEND", nil)
+}
+
+// release 解除输出引用并归还压缩器，取消或写入失败后同样释放
+func (s *pngImageEncoder) release() {
+	if s.compressed != nil {
+		releaseImageCompressor(s.compressed)
+		s.compressed = nil
+	}
 }
 
 // pngJPXRow 直接读取等横向采样的分量行，保持通道排序、调色板及透明度精度
@@ -287,9 +348,9 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 }
 
 // pngSampleFormat 按颜色模型选择无损位深，已知不透明时省略透明度通道
-// 入参: source 图像
-// 返回: int 位深, int 通道数, int PNG颜色类型
-func pngSampleFormat(source image.Image) (int, int, int) {
+// 入参: ctx 取消上下文, source 图像
+// 返回: int 位深, int 通道数, int PNG颜色类型, error 取消错误
+func pngSampleFormat(ctx context.Context, source image.Image) (int, int, int, error) {
 	depth := 16
 	model := source.ColorModel()
 	if model == color.GrayModel || model == color.NRGBAModel || model == color.RGBAModel {
@@ -307,27 +368,31 @@ func pngSampleFormat(source image.Image) (int, int, int) {
 					}
 				}
 				if exact {
-					return bits, 1, 0
+					return bits, 1, 0, nil
 				}
 			}
 		}
-		return depth, 1, 0
+		return depth, 1, 0, nil
 	}
 	switch s := source.(type) {
 	case *image.NRGBA64:
-		if s.Opaque() {
-			return depth, 3, 2
+		opaque, err := imageOpaqueContext(ctx, s)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		if opaque {
+			return depth, 3, 2, nil
 		}
 	case *deviceSampleImage:
 		if s.mask == nil && !s.embedded && s.palette == nil {
-			return depth, 3, 2
+			return depth, 3, 2, nil
 		}
 	case *jpxSampleImage:
 		if s.alpha < 0 {
-			return depth, 3, 2
+			return depth, 3, 2, nil
 		}
 	}
-	return depth, 4, 6
+	return depth, 4, 6, nil
 }
 
 // pngGrayByteMap 将同位深的灰度映射合并为逐字节查找表
