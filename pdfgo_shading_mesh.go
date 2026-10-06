@@ -88,13 +88,6 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 		if err != nil {
 			return [4]float64{}, err
 		}
-		if g.function.scalar != nil {
-			values, err := g.function.scalar.evaluate(x)
-			if err != nil {
-				return values, err
-			}
-			return g.colorValues(values[:len(g.function.parts)])
-		}
 		return g.functionValues(x)
 	}
 	var buffer [32]float64
@@ -110,6 +103,13 @@ func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 // 入参: x 插值后的函数输入
 // 返回: [4]float64 备用空间分量, error 函数或颜色错误
 func (g *MeshGradient) functionValues(x float64) ([4]float64, error) {
+	if g.function.scalar != nil {
+		values, err := g.function.scalar.evaluate(x)
+		if err != nil {
+			return values, err
+		}
+		return g.colorValues(values[:len(g.function.parts)])
+	}
 	components := len(g.function.parts)
 	var buffer [32]float64
 	input := buffer[:min(components, len(buffer))]

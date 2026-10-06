@@ -109,7 +109,7 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 	if depth16 {
 		pixelSize = 8
 	}
-	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/pixelSize || depth16 && (!resource || options.Mode != CompressionLossy) {
+	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/pixelSize {
 		return best, ctx.Err()
 	}
 	img, err := png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
@@ -122,9 +122,6 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 		if err != nil {
 			return nil, err
 		}
-	}
-	if depth16 && !photo {
-		return best, ctx.Err()
 	}
 	if options.Mode == CompressionLossy {
 		img, err = ResizeImage(ctx, img, size)
@@ -139,7 +136,17 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 		}
 	}
 	if depth16 {
-		return best, ctx.Err()
+		var byteExact bool
+		img, byteExact, err = compactPNGPrecision(ctx, img)
+		if err != nil {
+			return nil, err
+		}
+		if !byteExact {
+			if _, gray := img.(*image.Gray16); gray || img.Bounds().Dx() != config.Width || img.Bounds().Dy() != config.Height {
+				return compactPNGImage(ctx, img, best)
+			}
+			return best, ctx.Err()
+		}
 	}
 	b := img.Bounds()
 	pixels := image.NewNRGBA(b)
@@ -170,23 +177,8 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 			}
 		}
 	}
-	encode := func(img image.Image) error {
-		var out bytes.Buffer
-		encoder := png.Encoder{CompressionLevel: png.BestCompression}
-		limit := &optimizationBuffer{buffer: &out, limit: min(len(best), optimizationBufferLimit)}
-		output := &pdfOutput{ctx: ctx, writer: limit}
-		if err := encoder.Encode(output, img); err != nil {
-			if limit.exceeded {
-				return ctx.Err()
-			}
-			return err
-		}
-		if out.Len() < len(best) {
-			best = out.Bytes()
-		}
-		return ctx.Err()
-	}
-	if err := encode(pixels); err != nil {
+	best, err = compactPNGImage(ctx, pixels, best)
+	if err != nil {
 		return nil, err
 	}
 	if gray {
@@ -199,7 +191,8 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 				g.SetGray(x, y, color.Gray{Y: pixels.NRGBAAt(x, y).R})
 			}
 		}
-		if err := encode(g); err != nil {
+		best, err = compactPNGImage(ctx, g, best)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -213,9 +206,70 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 				p.SetColorIndex(x, y, indices[pixels.NRGBAAt(x, y)])
 			}
 		}
-		if err := encode(p); err != nil {
+		best, err = compactPNGImage(ctx, p, best)
+		if err != nil {
 			return nil, err
 		}
+	}
+	return best, ctx.Err()
+}
+
+// compactPNGPrecision 检查16位分量能否精确降位，或以不透明灰度减少通道
+// 入参: ctx 取消上下文, img 图像
+// 返回: image.Image 等价图像, bool 是否能精确表示为8位, error 取消错误
+func compactPNGPrecision(ctx context.Context, img image.Image) (image.Image, bool, error) {
+	bounds := img.Bounds()
+	byteExact, gray := true, true
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if (x-bounds.Min.X)&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
+			}
+			c := imageNRGBA64At(img, x, y)
+			byteExact = byteExact && c.R%257 == 0 && c.G%257 == 0 && c.B%257 == 0 && c.A%257 == 0
+			gray = gray && c.R == c.G && c.G == c.B && c.A == 65535
+			if !byteExact && !gray {
+				return img, false, ctx.Err()
+			}
+		}
+	}
+	if byteExact {
+		return img, true, ctx.Err()
+	}
+	if _, ok := img.(*image.Gray16); ok {
+		return img, false, ctx.Err()
+	}
+	result := image.NewGray16(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if (x-bounds.Min.X)&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
+			}
+			result.SetGray16(x, y, color.Gray16{Y: imageNRGBA64At(img, x, y).R})
+		}
+	}
+	return result, false, ctx.Err()
+}
+
+// compactPNGImage 限制PNG候选体积，只采用更小的编码
+// 入参: ctx 取消上下文, img 图像, best 已有候选
+// 返回: []byte 更小的编码, error 编码或取消错误
+func compactPNGImage(ctx context.Context, img image.Image, best []byte) ([]byte, error) {
+	var out bytes.Buffer
+	encoder := png.Encoder{CompressionLevel: png.BestCompression}
+	limit := &optimizationBuffer{buffer: &out, limit: min(len(best), optimizationBufferLimit)}
+	if err := encoder.Encode(&pdfOutput{ctx: ctx, writer: limit}, img); err != nil {
+		if limit.exceeded {
+			return best, ctx.Err()
+		}
+		return nil, err
+	}
+	if out.Len() < len(best) {
+		best = out.Bytes()
 	}
 	return best, ctx.Err()
 }

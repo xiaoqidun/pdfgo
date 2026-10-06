@@ -95,10 +95,19 @@ func (p *pageInterpreter) patternInitialState() graphicsState {
 	return state
 }
 
-// tilingPattern 读取平铺图案，着色图案交由shadingPattern处理
+// tilingPattern 在当前内容流内复用平铺图案，着色图案交由shadingPattern处理
 // 入参: name 图案资源名
 // 返回: *TilingPattern 平铺图案, error 解析错误
 func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
+	if err := p.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if p.reader.closed {
+		return nil, os.ErrClosed
+	}
+	if pattern := p.tilingPatterns[name]; pattern != nil {
+		return pattern, nil
+	}
 	object, err := p.resource("Pattern", name)
 	if err != nil {
 		return nil, err
@@ -189,7 +198,12 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones}, nil
+	pattern := &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones}
+	if p.tilingPatterns == nil {
+		p.tilingPatterns = make(map[Name]*TilingPattern)
+	}
+	p.tilingPatterns[name] = pattern
+	return pattern, nil
 }
 
 // patternBaseColor 按底层颜色空间解释无色图案的颜色分量

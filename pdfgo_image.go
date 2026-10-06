@@ -1110,7 +1110,7 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 					alpha = samplePixel.A
 				}
 			}
-			var values [4]float64
+			var raw [4]uint16
 			if components > 4 {
 				sample, ok := sampleColor.(imageComponentSample)
 				if !ok {
@@ -1130,12 +1130,28 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 				if !ok {
 					return nil, fmt.Errorf("invalid CMYK image samples")
 				}
-				for c := range cmyk {
-					values[c] = float64(cmyk[c]) / 65535
-				}
+				raw = [4]uint16(cmyk)
 			} else {
-				values = [4]float64{float64(samplePixel.R) / 65535, float64(samplePixel.G) / 65535, float64(samplePixel.B) / 65535}
+				raw = [4]uint16{samplePixel.R, samplePixel.G, samplePixel.B}
 			}
+			var matteAlpha uint16
+			if len(matte) != 0 {
+				matteAlpha = alpha
+			}
+			entry, colorKey := colors.entry(raw, matteAlpha)
+			if entry != nil && entry.valid && entry.key == colorKey {
+				pixel := entry.pixel
+				if mask != nil || embeddedMask != 0 {
+					pixel.A = uint16(uint32(pixel.A) * uint32(alpha) / 65535)
+				}
+				if encoder != nil {
+					out.SetNRGBA64(x, 0, pixel)
+				} else {
+					out.SetNRGBA64(x, y, pixel)
+				}
+				continue
+			}
+			values := [4]float64{float64(raw[0]) / 65535, float64(raw[1]) / 65535, float64(raw[2]) / 65535, float64(raw[3]) / 65535}
 			if components <= 4 {
 				copy(inputs, values[:components])
 			}
@@ -1230,10 +1246,7 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 				continue
 			}
 			var pixel color.NRGBA64
-			entry, colorKey := colors.entry(values)
-			if entry != nil && entry.valid && entry.key == colorKey {
-				pixel = entry.pixel
-			} else if palette != nil {
+			if palette != nil {
 				index := int(math.Max(0, math.Min(float64(len(palette.colors)-1), math.Round(values[0]))))
 				pixel = palette.colors[index]
 			} else if deviceN != nil {
@@ -1278,11 +1291,11 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 			} else {
 				pixel = color.NRGBA64{R: uint16(math.Round(values[0] * 65535)), G: uint16(math.Round(values[1] * 65535)), B: uint16(math.Round(values[2] * 65535)), A: 65535}
 			}
-			if entry != nil {
-				entry.key, entry.pixel, entry.valid = colorKey, pixel, true
-			}
 			if transparent {
 				pixel.A = 0
+			}
+			if entry != nil {
+				entry.key, entry.pixel, entry.valid = colorKey, pixel, true
 			}
 			if mask != nil || embeddedMask != 0 {
 				pixel.A = uint16(uint32(pixel.A) * uint32(alpha) / 65535)

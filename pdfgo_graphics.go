@@ -218,6 +218,7 @@ type pageInterpreter struct {
 	inText                 bool
 	textObject             *TextObject
 	path                   Path
+	pathPoints             []Point
 	current, start         Point
 	hasPoint               bool
 	pendingClip            bool
@@ -227,6 +228,7 @@ type pageInterpreter struct {
 	opaqueGroup            bool
 	patternMatrix          Matrix
 	patternState           *graphicsState
+	tilingPatterns         map[Name]*TilingPattern
 	bounds                 Rectangle
 	uncoloredPattern       bool
 	type3                  bool
@@ -533,6 +535,7 @@ func transformedBounds(box Rectangle, matrix Matrix) Rectangle {
 // 入参: data 解码后的内容流
 // 返回: error 错误信息
 func (p *pageInterpreter) run(data []byte) error {
+	p.tilingPatterns = nil
 	if p.patternState == nil && p.resources["Pattern"] != nil {
 		initial := p.state
 		p.patternState = &initial
@@ -639,6 +642,21 @@ func numbers(operands []Object, count int) ([]float64, error) {
 	return values, nil
 }
 
+// addPathSegment 分块保存路径坐标，各段限制容量且不复用已交付的存储
+// 入参: name 路径操作, points 坐标点
+func (p *pageInterpreter) addPathSegment(name string, points ...Point) {
+	var stored []Point
+	if n := len(points); n != 0 {
+		if len(p.pathPoints) < n {
+			p.pathPoints = make([]Point, max(n, min(256, max(4, len(p.path.Segments)*2))))
+		}
+		stored = p.pathPoints[:n:n]
+		copy(stored, points)
+		p.pathPoints = p.pathPoints[n:]
+	}
+	p.path.Segments = append(p.path.Segments, Segment{name, stored})
+}
+
 // operation 执行内容操作，未知可见操作返回明确错误
 // 入参: op 内容操作
 // 返回: error 错误信息
@@ -665,7 +683,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 	}
 	point := func(x, y float64) Point { return p.state.matrix.Apply(Point{x, y}) }
-	add := func(name string, points ...Point) { p.path.Segments = append(p.path.Segments, Segment{name, points}) }
+	add := p.addPathSegment
 	switch op.Operator {
 	case "BX":
 		p.compatibility++
@@ -837,6 +855,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Clips = append(append([]Path(nil), p.state.style.Clips...), clip)
 		}
 		p.path = Path{}
+		p.pathPoints = nil
 		p.hasPoint = false
 		p.pendingClip = false
 	case "g", "G", "rg", "RG", "k", "K":
@@ -1622,6 +1641,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	child.compatibility = 0
 	child.marked = nil
 	child.path = Path{}
+	child.pathPoints = nil
 	child.hasPoint = false
 	child.pendingClip = false
 	child.inText = false

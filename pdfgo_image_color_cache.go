@@ -17,12 +17,11 @@ package pdfgo
 import (
 	"hash/maphash"
 	"image/color"
-	"math"
 )
 
-// imageColorEntry 保存完全相同输入分量的颜色，不缓存逐像素遮罩或色键透明度
+// imageColorEntry 保存完全相同输入分量和背景还原透明度的颜色，包含色键透明度但不叠加遮罩
 type imageColorEntry struct {
-	key   [4]uint64
+	key   [5]uint16
 	pixel color.NRGBA64
 	valid bool
 }
@@ -34,13 +33,13 @@ type imageColorCache struct {
 }
 
 // entry 定位颜色缓存，完整分量用于核对散列碰撞
-// 入参: values 已应用Decode、Matte及范围映射的分量
-// 返回: *imageColorEntry 缓存位置或空值, [4]uint64 精确分量键
-func (c *imageColorCache) entry(values [4]float64) (*imageColorEntry, [4]uint64) {
+// 入参: values 原始16位分量, alpha 背景还原透明度，无背景还原时为零
+// 返回: *imageColorEntry 缓存位置或空值, [5]uint16 精确分量键
+func (c *imageColorCache) entry(values [4]uint16, alpha uint16) (*imageColorEntry, [5]uint16) {
 	if c == nil {
-		return nil, [4]uint64{}
+		return nil, [5]uint16{}
 	}
-	key := [4]uint64{math.Float64bits(values[0]), math.Float64bits(values[1]), math.Float64bits(values[2]), math.Float64bits(values[3])}
+	key := [5]uint16{values[0], values[1], values[2], values[3], alpha}
 	index := maphash.Comparable(c.seed, key) % uint64(len(c.entries))
 	return &c.entries[index], key
 }
