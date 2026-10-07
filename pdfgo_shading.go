@@ -297,9 +297,9 @@ func (p *pageInterpreter) shadingPatternPaint(v Object, m Matrix) (Paint, error)
 }
 
 // shadingFill 按当前裁剪和图形状态直接绘制着色资源，不改变当前路径
-// 入参: operands 着色资源名
+// 入参: operands 着色资源名, offset 当前内容流中的字节位置
 // 返回: error 解析或绘制错误
-func (p *pageInterpreter) shadingFill(operands []Object) error {
+func (p *pageInterpreter) shadingFill(operands []Object, offset int64) error {
 	if len(operands) != 1 {
 		return fmt.Errorf("invalid shading operands")
 	}
@@ -310,13 +310,25 @@ func (p *pageInterpreter) shadingFill(operands []Object) error {
 	if p.hidden {
 		return nil
 	}
-	object, err := p.resource("Shading", name)
+	resources, err := p.reader.Resolve(p.resources["Shading"])
 	if err != nil {
 		return err
 	}
-	value, err := p.reader.Resolve(object)
+	dictionary, ok := resources.(Dictionary)
+	if resources != nil && !ok {
+		return fmt.Errorf("invalid Shading dictionary")
+	}
+	value, err := p.reader.Resolve(dictionary[name])
 	if err != nil {
 		return err
+	}
+	if value == nil {
+		message := fmt.Sprintf("undefined Shading resource %s; shading omitted", name)
+		if p.visitor.Warning == nil {
+			return fmt.Errorf("%s", message)
+		}
+		p.visitor.Warning(Diagnostic{Offset: offset, Message: message})
+		return p.ctx.Err()
 	}
 	dict, ok := value.(Dictionary)
 	var paint Paint

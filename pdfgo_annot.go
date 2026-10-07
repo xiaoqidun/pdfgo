@@ -25,6 +25,12 @@ import (
 // ErrDestinationNotFound 表示命名目标在文档目标表中不存在
 var ErrDestinationNotFound = errors.New("destination not found")
 
+// ErrInvalidDestination 表示目标结构或参数不符合标准，不包含读取和取消错误
+var ErrInvalidDestination = errors.New("invalid destination")
+
+// ErrInvalidAnnotationAppearance 表示所选注解外观结构无效，不包含读取和取消错误
+var ErrInvalidAnnotationAppearance = errors.New("invalid annotation appearance stream")
+
 // Annotation 保存注解类型、区域及原始字典，不执行动作
 type Annotation struct {
 	Reference  Reference
@@ -256,12 +262,13 @@ func (r *Reader) annotationAppearanceStream(appearance Dictionary, selected Obje
 	}
 	stream, ok := value.(*Stream)
 	if !ok || stream == nil {
-		return nil, &UnsupportedError{Feature: "annotation appearance stream"}
+		return nil, ErrInvalidAnnotationAppearance
 	}
 	return stream, nil
 }
 
 // WalkAnnotationAppearance 解释注解当前外观并映射到页面用户空间
+// Warning非空时按控件属性恢复结构无效的外观，保留原始字典并报告原因
 // 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器
 // 返回: error 外观缺失、解析或访问错误
 func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annotation Annotation, visitor Visitor) error {
@@ -308,6 +315,15 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if annotation.Subtype == "Popup" {
 		_, err := r.ReadPopupAnnotation(annotation.Dictionary)
 		return err
+	}
+	if annotation.Subtype == "Projection" {
+		if _, err := r.ReadProjectionAnnotation(annotation); err != nil {
+			return err
+		}
+		appearance, err := r.ReadAnnotationAppearance(annotation)
+		if err != nil || appearance == nil {
+			return err
+		}
 	}
 	value, err := r.Resolve(annotation.Dictionary["AP"])
 	if err != nil {
@@ -416,6 +432,22 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		return &UnsupportedError{Feature: "annotation appearance"}
 	}
 	stream, err := r.annotationAppearanceStream(appearance, annotation.Dictionary["AS"])
+	if err == nil && stream != nil {
+		bounds, readErr := r.Resolve(stream.Dictionary["BBox"])
+		if readErr != nil {
+			return readErr
+		}
+		if array, ok := bounds.(Array); !ok || len(array) != 4 {
+			err = fmt.Errorf("%w: BBox", ErrInvalidAnnotationAppearance)
+		}
+	}
+	if errors.Is(err, ErrInvalidAnnotationAppearance) && annotation.Subtype == "Widget" && visitor.Warning != nil {
+		stream, err = r.widgetAppearance(ctx, page, annotation)
+		if err == nil {
+			provided = false
+			visitor.Warning(Diagnostic{Message: "invalid PDF widget appearance replaced from field properties"})
+		}
+	}
 	if err != nil || stream == nil {
 		return err
 	}
@@ -656,11 +688,11 @@ func (r *Reader) readDestination(ctx context.Context, object Object) (Destinatio
 	}
 	array, ok := value.(Array)
 	if !ok || len(array) < 2 {
-		return Destination{}, fmt.Errorf("invalid or missing destination")
+		return Destination{}, fmt.Errorf("%w: missing array", ErrInvalidDestination)
 	}
 	page, ok := array[0].(Reference)
 	if !ok {
-		return Destination{}, fmt.Errorf("invalid destination page")
+		return Destination{}, fmt.Errorf("%w: page reference", ErrInvalidDestination)
 	}
 	mode, parameters, err := r.destinationParameters(array)
 	if err != nil {
@@ -678,10 +710,9 @@ func (r *Reader) destinationParameters(array Array) (Name, Array, error) {
 		return "", nil, err
 	}
 	mode, ok := modeValue.(Name)
-	counts := map[Name]int{"XYZ": 3, "Fit": 0, "FitH": 1, "FitV": 1, "FitR": 4, "FitB": 0, "FitBH": 1, "FitBV": 1}
-	count, known := counts[mode]
+	count, known := destinationParameterCount(mode)
 	if !ok || !known || len(array) != count+2 {
-		return "", nil, fmt.Errorf("invalid destination mode or parameters")
+		return "", nil, fmt.Errorf("%w: mode or parameter count", ErrInvalidDestination)
 	}
 	parameters := make(Array, count)
 	for n, v := range array[2:] {
@@ -690,15 +721,20 @@ func (r *Reader) destinationParameters(array Array) (Name, Array, error) {
 			return "", nil, err
 		}
 		if parameters[n] == nil && mode == "FitR" {
-			return "", nil, fmt.Errorf("null rectangle destination parameter")
+			return "", nil, fmt.Errorf("%w: null rectangle parameter", ErrInvalidDestination)
 		}
 		if parameters[n] != nil {
-			value, err := r.number(parameters[n])
-			if err != nil {
-				return "", nil, err
+			var value float64
+			switch number := parameters[n].(type) {
+			case Integer:
+				value = float64(number)
+			case Real:
+				value = float64(number)
+			default:
+				return "", nil, fmt.Errorf("%w: numeric parameter", ErrInvalidDestination)
 			}
 			if math.IsNaN(value) || math.IsInf(value, 0) || mode == "XYZ" && n == 2 && value < 0 {
-				return "", nil, fmt.Errorf("invalid destination parameter")
+				return "", nil, fmt.Errorf("%w: parameter range", ErrInvalidDestination)
 			}
 		}
 	}

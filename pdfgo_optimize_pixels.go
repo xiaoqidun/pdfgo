@@ -78,6 +78,9 @@ func (r *Reader) encodeLosslessPixels(ctx context.Context, source *Stream, img i
 // 入参: ctx 取消上下文, stream 原始图片流
 // 返回: *Stream 更小的流, error 取消或编码错误
 func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(stream.Data) > optimizationBufferLimit {
 		return stream, ctx.Err()
 	}
@@ -123,7 +126,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		dict, _ := params[0].(Dictionary)
 		pixels, err = decodePredictorContext(ctx, pixels, dict)
 		if err != nil {
-			return stream, nil
+			return stream, ctx.Err()
 		}
 	}
 	if int64(len(pixels)) != int64(w*h)*int64(channels) {
@@ -133,13 +136,13 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 	encode := func(data []byte, row, bpp, bits, colors int, cs Object) error {
 		var buffer bytes.Buffer
 		limit := &optimizationBuffer{buffer: &buffer, limit: len(best.Data)}
-		zw, _ := zlib.NewWriterLevel(limit, zlib.BestCompression)
+		zw := optimizationCompressor(limit)
+		defer releaseOptimizationCompressor(zw)
 		prior := make([]byte, row)
 		candidate := make([]byte, row+1)
 		selected := make([]byte, row+1)
 		for start := 0; start < len(data); start += row {
 			if err := ctx.Err(); err != nil {
-				zw.Close()
 				return err
 			}
 			line := data[start : start+row]
@@ -180,7 +183,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 			if _, err := zw.Write(selected); err != nil {
 				zw.Close()
 				if limit.exceeded {
-					return nil
+					return ctx.Err()
 				}
 				return err
 			}
@@ -188,7 +191,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		}
 		if err := zw.Close(); err != nil {
 			if limit.exceeded {
-				return nil
+				return ctx.Err()
 			}
 			return err
 		}
@@ -237,7 +240,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 			index, ok := palette[key]
 			if !ok {
 				if len(palette) == 256 {
-					return best, nil
+					return best, ctx.Err()
 				}
 				index = byte(len(palette))
 				palette[key] = index
@@ -256,6 +259,9 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		row := (int(w)*bits + 7) / 8
 		packed := make([]byte, row*int(h))
 		for y := 0; y < int(h); y++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			for x := 0; x < int(w); x++ {
 				packed[y*row+x*bits/8] |= indices[y*int(w)+x] << uint(8-bits-x*bits%8)
 			}

@@ -77,7 +77,7 @@ type ThreeDLighting struct {
 
 // ThreeDPresentation 保存当前视图的绘制模式、叠加外观及节点状态，未知绘制模式按默认处理
 type ThreeDPresentation struct {
-	RenderMode    Name
+	RenderMode    *ThreeDRenderMode
 	Overlay       *Stream
 	CrossSections []ThreeDCrossSection
 	Nodes         []ThreeDNode
@@ -93,23 +93,9 @@ func (r *Reader) ReadThreeDPresentation(object Object) (ThreeDPresentation, erro
 	if err != nil {
 		return result, err
 	}
-	mode, err := r.mediaDictionary(dict["RM"], true)
+	result.RenderMode, err = r.ReadThreeDRenderMode(dict["RM"])
 	if err != nil {
 		return result, err
-	}
-	if mode != nil {
-		value, err := r.Resolve(mode["Subtype"])
-		if err != nil {
-			return result, err
-		}
-		name, ok := value.(Name)
-		if !ok {
-			return result, fmt.Errorf("invalid 3D render mode")
-		}
-		switch name {
-		case "Solid", "SolidWireframe", "Transparent", "TransparentWireframe", "BoundingBox", "TransparentBoundingBox", "TransparentBoundingBoxOutline", "Wireframe", "ShadedWireframe", "HiddenWireframe", "Vertices", "ShadedVertices", "Illustration", "SolidOutline", "ShadedIllustration":
-			result.RenderMode = name
-		}
 	}
 	sections, err := r.mediaDictionaries(dict["SA"])
 	if err != nil {

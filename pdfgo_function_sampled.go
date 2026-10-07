@@ -162,7 +162,7 @@ func (f *sampledFunction) evaluate(inputs, outputs []float64) {
 		}
 	}
 	accumulate(0, 0, 1)
-	maxSample := math.Exp2(float64(f.table.bits)) - 1
+	maxSample := float64(uint64(1)<<uint(f.table.bits) - 1)
 	for c, value := range outputs {
 		value = functionValue(value/maxSample, f.decode[2*c], f.decode[2*c+1])
 		outputs[c] = math.Max(f.bounds[2*c], math.Min(f.bounds[2*c+1], value))
@@ -199,7 +199,7 @@ func (f *sampledFunction) evaluateCubic(inputs, outputs []float64) {
 		}
 	}
 	accumulate(0, 0, 1)
-	maxSample := math.Exp2(float64(f.table.bits)) - 1
+	maxSample := float64(uint64(1)<<uint(f.table.bits) - 1)
 	for c, value := range outputs {
 		value = functionValue(value/maxSample, f.decode[2*c], f.decode[2*c+1])
 		outputs[c] = math.Max(f.bounds[2*c], math.Min(f.bounds[2*c+1], value))

@@ -280,6 +280,7 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 	}
 	position := functionValue(functionPosition(tint, f.domain[0], f.domain[1]), f.encoded[0], f.encoded[1])
 	position = math.Max(0, math.Min(float64(f.size-1), position))
+	maxSample := float64(uint64(1)<<uint(f.bits) - 1)
 	if f.order == 3 && f.size >= 4 {
 		indices, weights := sampledSplineSpan(position, f.size)
 		for n := range out {
@@ -289,7 +290,7 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 					value += weight * f.sample(indices[i]*f.channels+n)
 				}
 			}
-			value = functionValue(value/(math.Exp2(float64(f.bits))-1), f.decode[2*n], f.decode[2*n+1])
+			value = functionValue(value/maxSample, f.decode[2*n], f.decode[2*n+1])
 			out[n] = math.Max(f.values[2*n], math.Min(f.values[2*n+1], value))
 		}
 		return
@@ -301,7 +302,7 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 		a := f.sample(low*f.channels + n)
 		b := f.sample(high*f.channels + n)
 		v := a + weight*(b-a)
-		v = functionValue(v/(math.Exp2(float64(f.bits))-1), f.decode[2*n], f.decode[2*n+1])
+		v = functionValue(v/maxSample, f.decode[2*n], f.decode[2*n+1])
 		out[n] = math.Max(f.values[2*n], math.Min(f.values[2*n+1], v))
 	}
 }

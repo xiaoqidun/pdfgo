@@ -17,10 +17,14 @@ package pdfgo
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"unicode/utf16"
 	"unicode/utf8"
 )
+
+// errFontCmapUnavailable 表示缺少适用字符表，非符号字体可改用名称表
+var errFontCmapUnavailable = errors.New("TrueType cmap unavailable")
 
 // fontTable 读取SFNT字体的指定表并校验目录与数据范围
 // 入参: data 字体数据, tag 表标签
@@ -87,8 +91,11 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool) ([]byte, N
 	if err != nil {
 		return nil, "", err
 	}
+	if len(cmap) == 0 {
+		return nil, "", errFontCmapUnavailable
+	}
 	if len(cmap) < 4 {
-		return nil, "", fmt.Errorf("missing TrueType cmap")
+		return nil, "", fmt.Errorf("truncated TrueType cmap")
 	}
 	entries := int(binary.BigEndian.Uint16(cmap[2:]))
 	if entries > (len(cmap)-4)/8 {
@@ -141,7 +148,7 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool) ([]byte, N
 		}
 	}
 	if selected < 0 {
-		return nil, "", &UnsupportedError{Feature: "TrueType cmap selection"}
+		return nil, "", errFontCmapUnavailable
 	}
 	offset := uint64(binary.BigEndian.Uint32(cmap[4+selected*8+4:]))
 	if offset+2 > uint64(len(cmap)) {
@@ -349,6 +356,9 @@ func (f *Font) simpleGlyphContext(ctx context.Context, code uint32, name string)
 	}
 	if name == "" || name == ".notdef" {
 		return 0, nil
+	}
+	if f.simpleCmap == nil {
+		return f.post.lookupContext(ctx, name)
 	}
 	var codepoint uint32
 	mapped := false

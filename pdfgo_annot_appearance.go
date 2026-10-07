@@ -28,6 +28,46 @@ type annotationBorder struct {
 	dash, color   Array
 }
 
+// ReadAnnotationBackground 按PDF标准表189读取外观特征中的背景色，空值表示透明
+// 入参: annotation 注解，仅读取MK中的BG，不分析外观流
+// 返回: *[3]float64 设备RGB背景色, error 字典、颜色或引用错误
+func (r *Reader) ReadAnnotationBackground(annotation Annotation) (*[3]float64, error) {
+	value, err := r.Resolve(annotation.Dictionary["MK"])
+	if err != nil || value == nil {
+		return nil, err
+	}
+	dict, ok := value.(Dictionary)
+	if !ok {
+		return nil, fmt.Errorf("invalid annotation appearance characteristics")
+	}
+	value, err = r.Resolve(dict["BG"])
+	if err != nil || value == nil {
+		return nil, err
+	}
+	array, ok := value.(Array)
+	if !ok || len(array) != 0 && len(array) != 1 && len(array) != 3 && len(array) != 4 {
+		return nil, fmt.Errorf("invalid annotation background color")
+	}
+	if len(array) == 0 {
+		return nil, nil
+	}
+	var values [4]float64
+	for i, component := range array {
+		n, err := r.number(component)
+		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || n > 1 {
+			return nil, fmt.Errorf("invalid annotation background component")
+		}
+		values[i] = n
+	}
+	color := [3]float64{values[0], values[1], values[2]}
+	if len(array) == 1 {
+		color = [3]float64{values[0], values[0], values[0]}
+	} else if len(array) == 4 {
+		color = deviceCMYKRGB(values[:])
+	}
+	return &color, nil
+}
+
 // readAnnotationBorder 读取注解笔画属性，BS优先于Border
 // 入参: annotation 注解
 // 返回: *annotationBorder 笔画样式, error 属性错误

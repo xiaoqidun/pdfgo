@@ -173,7 +173,7 @@ type MarkedContentMark struct {
 }
 
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
-// Warning非空时报告空Type3字形、缺失的ExtGState资源及未保留的内容语义，其他解析错误仍返回错误
+// Warning非空时报告空Type3字形、缺失的ExtGState或Shading资源及未保留的内容语义，其他解析错误仍返回错误
 // OptionalContent可覆盖内容区段及XObject的可选内容状态，缺省使用文档默认配置
 // Reference可提供引用表单的目标页面，缺省或返回nil时绘制代理内容
 // ColorantDevice声明输出设备，保留其可用色料，实际分色求值与合成由访问器完成
@@ -1226,7 +1226,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 		}
 	case "sh":
-		return p.shadingFill(a)
+		return p.shadingFill(a, op.Offset)
 	case "Do":
 		return p.xobject(a)
 	case "BI":

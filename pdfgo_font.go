@@ -555,10 +555,20 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && cffProgram == nil {
 		font.symbolic = font.symbolic || noEncoding
 		font.simpleCmap, font.cmapEncoding, err = fontCmapContext(ctx, font.Program, font.symbolic)
+		if errors.Is(err, errFontCmapUnavailable) && !font.symbolic {
+			glyphs, readErr := fontPostGlyphsContext(ctx, font.Program)
+			if readErr != nil {
+				return nil, readErr
+			}
+			if len(glyphs) != 0 {
+				font.post = &fontPostMapping{program: font.Program, glyphs: glyphs, ready: true}
+				err = nil
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
-		if !font.symbolic {
+		if !font.symbolic && font.post == nil {
 			font.post = &fontPostMapping{program: font.Program}
 		}
 	}
@@ -572,7 +582,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			return nil, err
 		}
 	}
-	if (font.composite && cidSubtype == "CIDFontType2" || font.simpleCmap != nil) && len(font.Program) != 0 && cffProgram == nil {
+	if (font.composite && cidSubtype == "CIDFontType2" || font.simpleCmap != nil || font.post != nil) && len(font.Program) != 0 && cffProgram == nil {
 		maxp, err := fontTableContext(ctx, font.Program, "maxp")
 		if err != nil {
 			return nil, err
@@ -789,7 +799,7 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		if !ok && (f.Subtype == "Type1" || f.Subtype == "MMType1") && len(f.Program) != 0 {
 			ok = true
 		}
-		if !ok && f.simpleCmap != nil {
+		if !ok && (f.simpleCmap != nil || f.post != nil) {
 			ok = true
 		}
 		if !ok && f.composite && len(f.Program) != 0 && f.cffGlyphs == nil {
@@ -845,7 +855,7 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		if f.Subtype == Name("Type3") {
 			glyph.Name = name
 		}
-		if f.simpleCmap != nil {
+		if f.simpleCmap != nil || f.post != nil {
 			id, err := f.simpleGlyphContext(ctx, code, name)
 			if err != nil {
 				return nil, err

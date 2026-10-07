@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"bytes"
 	"compress/zlib"
 	"context"
 	"encoding/binary"
@@ -460,12 +461,25 @@ func pngGrayRow(ctx context.Context, row []byte, source *mappedGrayImage, y, dep
 	return ctx.Err()
 }
 
-// pngFilterRow 比较五种标准行过滤器，按原顺序选择较小残差并检查取消
+// pngFilterRow 比较五种标准行过滤器，重复行直接生成零残差，保留原选择顺序
 // 入参: ctx 取消上下文, row 当前行, previous 上一行, pixelBytes 像素字节数, filters 复用缓冲
 // 返回: []byte 带过滤器编号的样本行, error 取消错误
 func pngFilterRow(ctx context.Context, row, previous []byte, pixelBytes int, filters *[2][]byte) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if bytes.Equal(row, previous) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		clear(filters[0])
+		if bytes.Count(row, []byte{0}) != len(row) {
+			filters[0][0] = 2
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return filters[0], nil
 	}
 	filters[0][0] = 0
 	copy(filters[0][1:], row)

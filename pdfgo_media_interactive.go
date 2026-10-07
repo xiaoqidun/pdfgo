@@ -20,27 +20,31 @@ import (
 )
 
 // ThreeD 保存3D数据、视图和激活参数，不解码模型或执行脚本
+// AnnotationBackground仅在面色要求宿主背景时读取，空值表示透明
+// AnnotationBox使用页面用户坐标，ViewBox以注解中心为原点
 type ThreeD struct {
-	Stream           *Stream
-	Format           Name
-	Views            []Dictionary
-	DefaultView      Object
-	SelectedView     Dictionary
-	Activation       Dictionary
-	ActivationPolicy ThreeDActivation
-	AnimationStyle   ThreeDAnimation
-	Projection       *ThreeDProjection
-	Camera           ThreeDCamera
-	Background       ThreeDBackground
-	Lighting         ThreeDLighting
-	Presentation     ThreeDPresentation
-	AnnotationBox    Rectangle
-	ViewBox          Rectangle
-	Resources        Object
-	OnInstantiate    *Stream
-	Animation        Dictionary
-	Interactive      bool
-	Dictionary       Dictionary
+	Stream               *Stream
+	Format               Name
+	Views                []Dictionary
+	DefaultView          Object
+	SelectedView         Dictionary
+	Activation           Dictionary
+	ActivationPolicy     ThreeDActivation
+	AnimationStyle       ThreeDAnimation
+	Projection           *ThreeDProjection
+	Camera               ThreeDCamera
+	Background           ThreeDBackground
+	AnnotationBackground *[3]float64
+	Lighting             ThreeDLighting
+	Presentation         ThreeDPresentation
+	Measurements         []ThreeDMeasurement
+	AnnotationBox        Rectangle
+	ViewBox              Rectangle
+	Resources            Object
+	OnInstantiate        *Stream
+	Animation            Dictionary
+	Interactive          bool
+	Dictionary           Dictionary
 }
 
 // RichMedia 保存富媒体资源、配置、视图和播放设置，不执行脚本
@@ -120,7 +124,20 @@ func (r *Reader) mediaDictionaries(object Object) ([]Dictionary, error) {
 // 入参: annotation 3D注解
 // 返回: ThreeD 模型信息, error 类型、引用或视图错误
 func (r *Reader) ReadThreeD(annotation Annotation) (ThreeD, error) {
+	return r.ReadThreeDContext(context.Background(), annotation)
+}
+
+// ReadThreeDContext 解析三维注解及默认视图，支持批量测量读取取消
+// 入参: ctx 取消上下文, annotation 三维注解
+// 返回: ThreeD 模型信息, error 类型、引用、视图或取消错误
+func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (ThreeD, error) {
 	result := ThreeD{Interactive: true, Dictionary: annotation.Dictionary}
+	if ctx == nil || r == nil || r.closed {
+		return result, fmt.Errorf("invalid 3D reader or context")
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if annotation.Subtype != "3D" {
 		return result, fmt.Errorf("not a 3D annotation")
 	}
@@ -278,9 +295,8 @@ func (r *Reader) ReadThreeD(annotation Annotation) (ThreeD, error) {
 	if err != nil {
 		return result, err
 	}
-	width := max(annotation.Rect.XMax-annotation.Rect.XMin, annotation.Rect.XMin-annotation.Rect.XMax)
-	height := max(annotation.Rect.YMax-annotation.Rect.YMin, annotation.Rect.YMin-annotation.Rect.YMax)
-	result.AnnotationBox = Rectangle{-width / 2, -height / 2, width / 2, height / 2}
+	box := annotation.Rect
+	result.AnnotationBox = Rectangle{min(box.XMin, box.XMax), min(box.YMin, box.YMax), max(box.XMin, box.XMax), max(box.YMin, box.YMax)}
 	if result.SelectedView != nil {
 		projection, err := r.ReadThreeDProjection(result.SelectedView["P"])
 		if err != nil {
@@ -304,7 +320,17 @@ func (r *Reader) ReadThreeD(annotation Annotation) (ThreeD, error) {
 	if err != nil {
 		return result, err
 	}
-	return result, nil
+	result.Measurements, err = r.ReadThreeDMeasurements(ctx, result.SelectedView["MA"])
+	if err != nil {
+		return result, err
+	}
+	if mode := result.Presentation.RenderMode; mode != nil && mode.AnnotationBackground {
+		result.AnnotationBackground, err = r.ReadAnnotationBackground(annotation)
+		if err != nil {
+			return result, err
+		}
+	}
+	return result, ctx.Err()
 }
 
 // ReadRichMedia 解析资源名称树和实例配置，允许实例资源不出现在名称树中

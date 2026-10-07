@@ -104,12 +104,21 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 	if err != nil {
 		return nil, err
 	}
-	if adobe {
+	if adobe || len(metadata) >= optimizationBufferLimit {
 		return best, nil
 	}
 	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
+	}
+	if size.X <= 0 || size.Y <= 0 || size.X >= config.Width || size.Y >= config.Height {
+		sufficient, err := jpegQualitySufficient(ctx, data, options.ImageQuality())
+		if err != nil {
+			return nil, err
+		}
+		if sufficient {
+			return best, nil
+		}
 	}
 	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 {
 		return best, nil
@@ -130,7 +139,7 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 		return nil, err
 	}
 	var encoded bytes.Buffer
-	limit := &optimizationBuffer{buffer: &encoded, limit: min(max(0, len(best)-len(metadata)), optimizationBufferLimit)}
+	limit := &optimizationBuffer{buffer: &encoded, limit: optimizationBufferLimit - len(metadata)}
 	if err := jpeg.Encode(&pdfOutput{ctx: ctx, writer: limit}, img, &jpeg.Options{Quality: options.ImageQuality()}); err != nil {
 		if limit.exceeded {
 			return best, ctx.Err()
@@ -223,7 +232,8 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	}
 	var packed bytes.Buffer
 	output := &optimizationBuffer{buffer: &packed, limit: min(len(best), optimizationBufferLimit)}
-	encoder, _ := zlib.NewWriterLevel(output, zlib.BestCompression)
+	encoder := optimizationCompressor(output)
+	defer releaseOptimizationCompressor(encoder)
 	n, err := io.Copy(encoder, io.LimitReader(&contextInput{ctx: ctx, reader: input}, 512<<20+1))
 	input.Close()
 	closeErr := encoder.Close()
@@ -299,7 +309,10 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 			return nil, err
 		}
 		bounds := img.Bounds()
-		pixels := image.NewNRGBA(bounds)
+		pixels, _, err := compactPNGStorage(ctx, img)
+		if err != nil {
+			return nil, err
+		}
 		bits := uint(4 + options.ImageQuality()*4/100)
 		levels := (1 << bits) - 1
 		quant := func(v uint8) uint8 { return uint8(((int(v)*levels + 127) / 255) * 255 / levels) }

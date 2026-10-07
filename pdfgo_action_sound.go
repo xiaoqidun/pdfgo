@@ -34,26 +34,19 @@ type SoundAction struct {
 // 入参: ctx 取消上下文, object 动作字典或间接引用
 // 返回: SoundAction 音频动作, error 类型、必填字段或播放参数错误
 func (r *Reader) ReadSoundAction(ctx context.Context, object Object) (SoundAction, error) {
-	if err := ctx.Err(); err != nil {
-		return SoundAction{}, err
-	}
-	value, err := r.Resolve(object)
+	dict, err := r.actionDictionary(ctx, object, "Sound")
 	if err != nil {
 		return SoundAction{}, err
 	}
-	dict, ok := value.(Dictionary)
-	if !ok {
-		return SoundAction{}, fmt.Errorf("invalid sound action")
-	}
-	value, err = r.Resolve(dict["S"])
+	value, err := r.Resolve(dict["Sound"])
 	if err != nil {
 		return SoundAction{}, err
 	}
-	if value != Name("Sound") {
-		return SoundAction{}, fmt.Errorf("invalid sound action type")
+	if stream, ok := value.(*Stream); !ok || stream == nil {
+		return SoundAction{}, fmt.Errorf("%w: sound stream required", ErrInvalidAction)
 	}
 	result := SoundAction{Volume: 1}
-	result.Sound, err = r.ReadSound(dict["Sound"])
+	result.Sound, err = r.ReadSound(value)
 	if err != nil {
 		return result, err
 	}

@@ -16,10 +16,14 @@ package pdfgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"reflect"
 )
+
+// ErrInvalidAction 表示已识别的动作结构或参数错误，不包含资源读取和取消错误
+var ErrInvalidAction = errors.New("invalid action")
 
 // ActionInfo 保存动作类型和原始属性，不执行脚本、启动程序或访问网络
 type ActionInfo struct {
@@ -126,21 +130,21 @@ func (r *Reader) actionDictionary(ctx context.Context, object Object, kind Name)
 	}
 	dict, ok := value.(Dictionary)
 	if !ok || dict == nil {
-		return nil, fmt.Errorf("invalid %s action dictionary", kind)
+		return nil, fmt.Errorf("%w: %s dictionary", ErrInvalidAction, kind)
 	}
 	value, err = r.Resolve(dict["S"])
 	if err != nil {
 		return nil, err
 	}
 	if value != kind {
-		return nil, fmt.Errorf("invalid %s action type", kind)
+		return nil, fmt.Errorf("%w: %s type", ErrInvalidAction, kind)
 	}
 	value, err = r.Resolve(dict["Type"])
 	if err != nil {
 		return nil, err
 	}
 	if value != nil && value != Name("Action") {
-		return nil, fmt.Errorf("invalid action dictionary type")
+		return nil, fmt.Errorf("%w: dictionary type", ErrInvalidAction)
 	}
 	return dict, ctx.Err()
 }

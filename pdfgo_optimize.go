@@ -751,11 +751,14 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 // 入参: ctx 取消上下文, data 原始数据
 // 返回: []byte 压缩数据, error 压缩错误
 func compressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var result bytes.Buffer
-	writer, _ := zlib.NewWriterLevel(&result, zlib.BestCompression)
+	writer := optimizationCompressor(&result)
+	defer releaseOptimizationCompressor(writer)
 	for len(data) > 0 {
 		if err := ctx.Err(); err != nil {
-			writer.Close()
 			return nil, err
 		}
 		n := min(len(data), 64<<10)
@@ -765,6 +768,9 @@ func compressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
 		data = data[n:]
 	}
 	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return result.Bytes(), nil
@@ -784,7 +790,8 @@ func recompressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
 	defer input.Close()
 	var result bytes.Buffer
 	output := &optimizationBuffer{buffer: &result, limit: min(len(data), optimizationBufferLimit)}
-	encoder, _ := zlib.NewWriterLevel(output, zlib.BestCompression)
+	encoder := optimizationCompressor(output)
+	defer releaseOptimizationCompressor(encoder)
 	n, err := io.Copy(encoder, io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1))
 	closeErr := encoder.Close()
 	if err != nil || closeErr != nil || n > optimizationBufferLimit || result.Len() >= len(data) {
