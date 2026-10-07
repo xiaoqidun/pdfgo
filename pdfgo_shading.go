@@ -307,6 +307,9 @@ func (p *pageInterpreter) shadingFill(operands []Object) error {
 	if !ok {
 		return fmt.Errorf("invalid shading name")
 	}
+	if p.hidden {
+		return nil
+	}
 	object, err := p.resource("Shading", name)
 	if err != nil {
 		return err

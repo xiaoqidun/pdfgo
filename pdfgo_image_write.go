@@ -29,10 +29,40 @@ import (
 	"slices"
 )
 
-// ImageWriteOptions 保存图像替换参数
+// ImageWriteOptions 保存图像创建与替换参数
 // PreblendBinary对二值透明图像采用标准Matte预混合，保留可见颜色，透明像素的隐藏颜色不保留
 type ImageWriteOptions struct {
 	PreblendBinary bool
+}
+
+// CreateImage 从像素创建独立PDF图像及软遮罩，不修改文档或分配间接对象编号
+// 入参: ctx 取消上下文, source 像素图像, options 可选编码参数，至多一项
+// 返回: *Image 图像描述及独立编码数据, error 参数、编码或关闭错误
+func (r *Reader) CreateImage(ctx context.Context, source image.Image, options ...ImageWriteOptions) (*Image, error) {
+	if ctx == nil || r == nil {
+		return nil, fmt.Errorf("invalid image creation context")
+	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(options) > 1 {
+		return nil, fmt.Errorf("too many image write options")
+	}
+	var settings ImageWriteOptions
+	if len(options) == 1 {
+		settings = options[0]
+	}
+	stream, mask, err := encodePDFImage(ctx, source, settings)
+	if err != nil {
+		return nil, err
+	}
+	if mask != nil {
+		stream.Dictionary["SMask"] = mask
+	}
+	return r.ReadImage(stream)
 }
 
 // ReplaceImagesTo 无损替换间接图像，保留页面布局、其他对象及原加密配置

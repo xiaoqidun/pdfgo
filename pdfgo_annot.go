@@ -206,6 +206,61 @@ func (p *Page) AnnotationsContext(ctx context.Context) ([]Annotation, error) {
 	return result, nil
 }
 
+// ReadAnnotationAppearance 读取已有的正常外观，按AS选择状态，不生成或解码外观
+// 入参: annotation 注解
+// 返回: *Stream 表单外观，未提供或状态不存在时为空, error 类型或引用错误
+func (r *Reader) ReadAnnotationAppearance(annotation Annotation) (*Stream, error) {
+	value, err := r.Resolve(annotation.Dictionary["AP"])
+	if err != nil || value == nil {
+		return nil, err
+	}
+	appearance, ok := value.(Dictionary)
+	if !ok {
+		return nil, fmt.Errorf("invalid annotation appearance dictionary")
+	}
+	stream, err := r.annotationAppearanceStream(appearance, annotation.Dictionary["AS"])
+	if err != nil || stream == nil {
+		return nil, err
+	}
+	subtype, err := r.Resolve(stream.Dictionary["Subtype"])
+	if err != nil {
+		return nil, err
+	}
+	if subtype != Name("Form") {
+		return nil, fmt.Errorf("invalid annotation appearance subtype")
+	}
+	return stream, nil
+}
+
+// annotationAppearanceStream 从正常外观字典选择状态，不解码流内容
+// 入参: appearance 外观字典, selected 当前状态
+// 返回: *Stream 已选流，状态不存在时为空, error 类型或引用错误
+func (r *Reader) annotationAppearanceStream(appearance Dictionary, selected Object) (*Stream, error) {
+	value, err := r.Resolve(appearance["N"])
+	if err != nil {
+		return nil, err
+	}
+	if states, ok := value.(Dictionary); ok {
+		selected, err := r.Resolve(selected)
+		if err != nil {
+			return nil, err
+		}
+		state, ok := selected.(Name)
+		if !ok {
+			return nil, fmt.Errorf("missing annotation appearance state")
+		}
+		value, err = r.Resolve(states[state])
+		if err != nil || value == nil {
+			return nil, err
+		}
+	}
+	stream, ok := value.(*Stream)
+	if !ok || stream == nil {
+		return nil, &UnsupportedError{Feature: "annotation appearance stream"}
+	}
+	return stream, nil
+}
+
 // WalkAnnotationAppearance 解释注解当前外观并映射到页面用户空间
 // 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器
 // 返回: error 外观缺失、解析或访问错误
@@ -360,30 +415,9 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if !ok {
 		return &UnsupportedError{Feature: "annotation appearance"}
 	}
-	value, err = r.Resolve(appearance["N"])
-	if err != nil {
+	stream, err := r.annotationAppearanceStream(appearance, annotation.Dictionary["AS"])
+	if err != nil || stream == nil {
 		return err
-	}
-	if states, ok := value.(Dictionary); ok {
-		selected, err := r.Resolve(annotation.Dictionary["AS"])
-		if err != nil {
-			return err
-		}
-		state, ok := selected.(Name)
-		if !ok {
-			return fmt.Errorf("missing annotation appearance state")
-		}
-		value, err = r.Resolve(states[state])
-		if err != nil {
-			return err
-		}
-		if value == nil {
-			return nil
-		}
-	}
-	stream, ok := value.(*Stream)
-	if !ok || stream == nil {
-		return &UnsupportedError{Feature: "annotation appearance stream"}
 	}
 	subtype, err := r.Resolve(stream.Dictionary["Subtype"])
 	if err != nil {

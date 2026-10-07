@@ -144,6 +144,12 @@ type ImageMark struct {
 	Style  Style
 }
 
+// FormMark 保存普通表单的局部边界及到页面坐标的变换，不代表透明组
+type FormMark struct {
+	Bounds Rectangle
+	Matrix Matrix
+}
+
 // GroupMark 保存透明度组的边界不透明度和隔离方式，组内绘制使用独立状态
 // Page区分页面初始组与内容流中的表单组
 type GroupMark struct {
@@ -168,14 +174,18 @@ type MarkedContentMark struct {
 
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
 // Warning非空时报告空Type3字形、缺失的ExtGState资源及未保留的内容语义，其他解析错误仍返回错误
-// OptionalContent可覆盖XObject的可选内容状态，缺省使用文档默认配置
+// OptionalContent可覆盖内容区段及XObject的可选内容状态，缺省使用文档默认配置
 // Reference可提供引用表单的目标页面，缺省或返回nil时绘制代理内容
 // ColorantDevice声明输出设备，保留其可用色料，实际分色求值与合成由访问器完成
 // Halftones提供只读设备命名网屏，优先于文件中的同名备用定义
+// Form可保留普通表单边界，缺省直接展开；透明表单仍由Group接收
+// Form的子访问器接收已变换并裁剪的图元，不应再次应用表单矩阵
+// Form的子访问器未指定内容标记、可选内容及警告回调时沿用上层回调
 type Visitor struct {
 	Path            func(PathMark) error
 	Text            func(TextMark) error
 	Image           func(ImageMark) error
+	Form            func(FormMark, func(Visitor) error) error
 	Group           func(GroupMark, func(Visitor) error) error
 	MarkedContent   func(MarkedContentMark) error
 	OptionalContent func(Object) (bool, error)
@@ -203,6 +213,12 @@ type graphicsState struct {
 	fillColor, strokeColor                                *graphicsColorSpace
 }
 
+// markedContentState 保存标记名称及进入区段前的可见性
+type markedContentState struct {
+	tag    Name
+	hidden bool
+}
+
 // pageInterpreter 按内容顺序解释页面或表单
 type pageInterpreter struct {
 	reader                 *Reader
@@ -212,7 +228,8 @@ type pageInterpreter struct {
 	ctx                    context.Context
 	state                  graphicsState
 	stack                  []graphicsState
-	marked                 []Name
+	marked                 []markedContentState
+	hidden                 bool
 	textClips              []*TextClip
 	textMatrix, lineMatrix Matrix
 	inText                 bool
@@ -560,18 +577,21 @@ func (p *pageInterpreter) run(data []byte) error {
 	return nil
 }
 
-// markedContent 解析内容标记并向调用方交付其语义属性
+// markedContent 更新可选区段可见性并交付内容标记
 // 入参: op 内容标记操作
 // 返回: error 错误信息
 func (p *pageInterpreter) markedContent(op Operation) error {
 	mark := MarkedContentMark{Operator: op.Operator}
+	optional := false
 	if op.Operator == "EMC" {
 		if len(op.Operands) != 0 || len(p.marked) == 0 {
 			return fmt.Errorf("unmatched marked content end")
 		}
-		mark.Tag = p.marked[len(p.marked)-1]
+		state := p.marked[len(p.marked)-1]
+		mark.Tag, p.hidden = state.tag, state.hidden
 		p.marked = p.marked[:len(p.marked)-1]
 	} else {
+		hidden := p.hidden
 		count := 1
 		if op.Operator == "BDC" || op.Operator == "DP" {
 			count = 2
@@ -601,15 +621,29 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 			if !ok {
 				return fmt.Errorf("invalid marked content properties")
 			}
+			if mark.Tag == "OC" {
+				kind, err := p.reader.Resolve(mark.Properties["Type"])
+				if err != nil {
+					return err
+				}
+				optional = kind == Name("OCG") || kind == Name("OCMD")
+				if optional && op.Operator == "BDC" {
+					visible, err := p.optionalVisible(object)
+					if err != nil {
+						return err
+					}
+					p.hidden = hidden || !visible
+				}
+			}
 		}
 		if op.Operator == "BMC" || op.Operator == "BDC" {
-			p.marked = append(p.marked, mark.Tag)
+			p.marked = append(p.marked, markedContentState{mark.Tag, hidden})
 		}
 	}
 	if p.visitor.MarkedContent != nil {
 		return p.visitor.MarkedContent(mark)
 	}
-	if op.Operator != "EMC" {
+	if op.Operator != "EMC" && !optional {
 		if p.visitor.Warning == nil {
 			return &UnsupportedError{Feature: "marked content requiring semantic preservation"}
 		}
@@ -1265,7 +1299,9 @@ func (p *pageInterpreter) showText(data []byte) error {
 	}
 	mode := p.state.mode
 	if p.state.font.Subtype == "Type3" {
-		if mode != 3 {
+		if p.hidden {
+			mode = 3
+		} else if mode != 3 {
 			mode = 0
 		}
 	} else {
@@ -1310,7 +1346,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 			advance.X += (glyph.Width/1000*p.state.fontSize + spacing) * p.state.hscale
 		}
 	}
-	if len(glyphs) > 0 {
+	if len(glyphs) > 0 && (!p.hidden || mode >= 4) {
 		if err := p.ctx.Err(); err != nil {
 			return err
 		}
@@ -1335,10 +1371,13 @@ func (p *pageInterpreter) showText(data []byte) error {
 	return nil
 }
 
-// visiblePaint 排除None分色的着色操作，不改变图形状态中的透明度或裁剪
+// visiblePaint 排除隐藏区段及None分色的着色，不改变透明度或裁剪
 // 入参: fill 填充标志, stroke 描边标志
 // 返回: bool 是否填充, bool 是否描边
 func (p *pageInterpreter) visiblePaint(fill, stroke bool) (bool, bool) {
+	if p.hidden {
+		return false, false
+	}
 	fill, stroke = fill && p.paintVisible(p.state.style.Fill), stroke && p.paintVisible(p.state.style.Stroke)
 	if s := p.state.fillPatternBase; p.state.fillSpace == "Pattern" && s != nil && s.invisible {
 		fill = fill && p.state.style.Fill.Colorant != nil && p.paintVisible(p.state.style.Fill)
@@ -1381,6 +1420,9 @@ func (p *pageInterpreter) xobject(a []Object) error {
 	if !ok {
 		return fmt.Errorf("invalid XObject name")
 	}
+	if p.hidden {
+		return nil
+	}
 	object, err := p.resource("XObject", name)
 	if err != nil {
 		return err
@@ -1413,6 +1455,9 @@ func (p *pageInterpreter) xobject(a []Object) error {
 // 入参: stream 图像数据流
 // 返回: error 解析或访问错误
 func (p *pageInterpreter) image(stream *Stream) error {
+	if p.hidden {
+		return nil
+	}
 	visible, err := p.optionalVisible(stream.Dictionary["OC"])
 	if err != nil || !visible {
 		return err
@@ -1493,6 +1538,9 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 // 入参: stream 表单内容流
 // 返回: error 解析或访问错误
 func (p *pageInterpreter) form(stream *Stream) error {
+	if p.hidden {
+		return nil
+	}
 	subtype, err := p.reader.Resolve(stream.Dictionary["Subtype2"])
 	if err != nil {
 		return err
@@ -1640,6 +1688,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	child.stack = nil
 	child.compatibility = 0
 	child.marked = nil
+	child.hidden = false
 	child.path = Path{}
 	child.pathPoints = nil
 	child.hasPoint = false
@@ -1708,6 +1757,31 @@ func (p *pageInterpreter) form(stream *Stream) error {
 			}
 			group.visitor = visitor
 			return walk(&group)
+		})
+	}
+	if groupMark == nil && p.visitor.Form != nil {
+		return p.visitor.Form(FormMark{Bounds: box, Matrix: m}, func(visitor Visitor) error {
+			form := child
+			if visitor.MarkedContent == nil {
+				visitor.MarkedContent = child.visitor.MarkedContent
+			}
+			if visitor.OptionalContent == nil {
+				visitor.OptionalContent = child.visitor.OptionalContent
+			}
+			if visitor.Warning == nil {
+				visitor.Warning = child.visitor.Warning
+			}
+			if visitor.Reference == nil {
+				visitor.Reference = child.visitor.Reference
+			}
+			if visitor.ColorantDevice == nil {
+				visitor.ColorantDevice = child.visitor.ColorantDevice
+			}
+			if visitor.Halftones == nil {
+				visitor.Halftones = child.visitor.Halftones
+			}
+			form.visitor = visitor
+			return walk(&form)
 		})
 	}
 	return walk(&child)

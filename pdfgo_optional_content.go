@@ -29,6 +29,9 @@ func (r *Reader) OptionalContentVisible(object Object) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if properties == nil {
+		return true, nil
+	}
 	config, err := r.optionalDictionary(properties["D"])
 	if err != nil {
 		return false, err
@@ -91,7 +94,11 @@ func (r *Reader) optionalContentVisible(object Object, config Dictionary, depth 
 	if !ok {
 		return false, fmt.Errorf("invalid optional content object")
 	}
-	switch dict["Type"] {
+	kind, err := r.Resolve(dict["Type"])
+	if err != nil {
+		return false, err
+	}
+	switch kind {
 	case Name("OCG"):
 		return r.optionalGroupState(object, dict, config)
 	case Name("OCMD"):
@@ -224,7 +231,7 @@ func (r *Reader) optionalGroupState(object Object, group, config Dictionary) (bo
 	return state, nil
 }
 
-// optionalVisible 使用调用方状态或默认配置判断XObject是否绘制
+// optionalVisible 使用调用方状态或默认配置判断可选内容是否绘制
 // 入参: object 可选内容属性
 // 返回: bool 是否可见, error 配置错误
 func (p *pageInterpreter) optionalVisible(object Object) (bool, error) {

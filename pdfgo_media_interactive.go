@@ -21,17 +21,26 @@ import (
 
 // ThreeD 保存3D数据、视图和激活参数，不解码模型或执行脚本
 type ThreeD struct {
-	Stream        *Stream
-	Format        Name
-	Views         []Dictionary
-	DefaultView   Object
-	SelectedView  Dictionary
-	Activation    Dictionary
-	Resources     Object
-	OnInstantiate *Stream
-	Animation     Dictionary
-	Interactive   bool
-	Dictionary    Dictionary
+	Stream           *Stream
+	Format           Name
+	Views            []Dictionary
+	DefaultView      Object
+	SelectedView     Dictionary
+	Activation       Dictionary
+	ActivationPolicy ThreeDActivation
+	AnimationStyle   ThreeDAnimation
+	Projection       *ThreeDProjection
+	Camera           ThreeDCamera
+	Background       ThreeDBackground
+	Lighting         ThreeDLighting
+	Presentation     ThreeDPresentation
+	AnnotationBox    Rectangle
+	ViewBox          Rectangle
+	Resources        Object
+	OnInstantiate    *Stream
+	Animation        Dictionary
+	Interactive      bool
+	Dictionary       Dictionary
 }
 
 // RichMedia 保存富媒体资源、配置、视图和播放设置，不执行脚本
@@ -133,7 +142,7 @@ func (r *Reader) ReadThreeD(annotation Annotation) (ThreeD, error) {
 		}
 	}
 	stream, ok := value.(*Stream)
-	if !ok {
+	if !ok || stream == nil {
 		return result, fmt.Errorf("invalid 3D stream")
 	}
 	result.Stream = stream
@@ -256,6 +265,44 @@ func (r *Reader) ReadThreeD(annotation Annotation) (ThreeD, error) {
 			return result, fmt.Errorf("invalid 3D interactive flag")
 		}
 		result.Interactive = bool(flag)
+	}
+	result.ActivationPolicy, err = r.ReadThreeDActivation(result.Activation)
+	if err != nil {
+		return result, err
+	}
+	result.AnimationStyle, err = r.ReadThreeDAnimation(result.Animation)
+	if err != nil {
+		return result, err
+	}
+	result.ViewBox, err = r.ReadThreeDViewBox(annotation)
+	if err != nil {
+		return result, err
+	}
+	width := max(annotation.Rect.XMax-annotation.Rect.XMin, annotation.Rect.XMin-annotation.Rect.XMax)
+	height := max(annotation.Rect.YMax-annotation.Rect.YMin, annotation.Rect.YMin-annotation.Rect.YMax)
+	result.AnnotationBox = Rectangle{-width / 2, -height / 2, width / 2, height / 2}
+	if result.SelectedView != nil {
+		projection, err := r.ReadThreeDProjection(result.SelectedView["P"])
+		if err != nil {
+			return result, err
+		}
+		result.Projection = &projection
+	}
+	result.Camera, err = r.ReadThreeDCamera(result.SelectedView)
+	if err != nil {
+		return result, err
+	}
+	result.Background, err = r.ReadThreeDBackground(result.SelectedView["BG"])
+	if err != nil {
+		return result, err
+	}
+	result.Lighting, err = r.ReadThreeDLighting(result.SelectedView["LS"])
+	if err != nil {
+		return result, err
+	}
+	result.Presentation, err = r.ReadThreeDPresentation(result.SelectedView)
+	if err != nil {
+		return result, err
 	}
 	return result, nil
 }
