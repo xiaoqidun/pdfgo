@@ -486,15 +486,23 @@ func (i *Image) jpxSamplesSizeContext(ctx context.Context, data []byte, cmyk boo
 		return nil, err
 	}
 	bounds := image.Rect(0, 0, i.Width, i.Height)
+	x0, y0 := int64(binary.BigEndian.Uint32(stream[16:20])), int64(binary.BigEndian.Uint32(stream[20:24]))
 	if reduce != 0 {
-		bounds = image.Rect(0, 0, components[0].W, components[0].H)
+		scale := int64(1) << reduce
+		x1, y1 := int64(binary.BigEndian.Uint32(stream[8:12])), int64(binary.BigEndian.Uint32(stream[12:16]))
+		x0, y0 = (x0+scale-1)/scale, (y0+scale-1)/scale
+		x1, y1 = (x1+scale-1)/scale, (y1+scale-1)/scale
+		bounds = image.Rect(0, 0, int(x1-x0), int(y1-y0))
 		for _, plane := range components {
-			if plane.W != bounds.Dx() || plane.H != bounds.Dy() || plane.XRsiz != 1 || plane.YRsiz != 1 {
+			xr, yr := int64(plane.XRsiz), int64(plane.YRsiz)
+			w := (x1+xr-1)/xr - (x0+xr-1)/xr
+			h := (y1+yr-1)/yr - (y0+yr-1)/yr
+			if int64(plane.W) != w || int64(plane.H) != h {
 				return nil, fmt.Errorf("inconsistent reduced JPEG2000 component dimensions")
 			}
 		}
 	}
-	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: bounds, x0: int64(binary.BigEndian.Uint32(stream[16:20])), y0: int64(binary.BigEndian.Uint32(stream[20:24])), cmyk: count == 4, ycc: ycc}
+	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: bounds, x0: x0, y0: y0, cmyk: count == 4, ycc: ycc}
 	if ycc {
 		for n := range out.chroma {
 			precision := out.precision(channels[n+1])
@@ -507,18 +515,12 @@ func (i *Image) jpxSamplesSizeContext(ctx context.Context, data []byte, cmyk boo
 	return out, nil
 }
 
-// jpxReduction 为同采样分量选择不低于两轴需求的分辨率，不裁减调色板索引
+// jpxReduction 按参考网格选择不低于两轴需求的分辨率，保留非空分量与调色板索引
 // 入参: ctx 取消上下文, data 容器数据, stream 已校验码流, size 像素需求
 // 返回: int 裁减层数, error 容器错误
 func jpxReduction(ctx context.Context, data, stream []byte, size image.Point) (int, error) {
 	if size.X <= 0 || size.Y <= 0 {
 		return 0, nil
-	}
-	count := int(binary.BigEndian.Uint16(stream[40:42]))
-	for n := range count {
-		if stream[43+3*n] != 1 || stream[44+3*n] != 1 {
-			return 0, nil
-		}
 	}
 	palette := false
 	if !bytes.HasPrefix(data, []byte{255, 79}) {
@@ -542,12 +544,27 @@ func jpxReduction(ctx context.Context, data, stream []byte, size image.Point) (i
 	}
 	x, y := uint64(binary.BigEndian.Uint32(stream[8:12])), uint64(binary.BigEndian.Uint32(stream[12:16]))
 	x0, y0 := uint64(binary.BigEndian.Uint32(stream[16:20])), uint64(binary.BigEndian.Uint32(stream[20:24]))
+	count := int(binary.BigEndian.Uint16(stream[40:42]))
 	reduce := 0
 	for n := 1; n <= 30; n++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		scale := uint64(1) << n
 		w := (x+scale-1)/scale - (x0+scale-1)/scale
 		h := (y+scale-1)/scale - (y0+scale-1)/scale
 		if w < uint64(size.X) || h < uint64(size.Y) {
+			break
+		}
+		empty := false
+		for c := range count {
+			sx, sy := scale*uint64(stream[43+3*c]), scale*uint64(stream[44+3*c])
+			if (x+sx-1)/sx == (x0+sx-1)/sx || (y+sy-1)/sy == (y0+sy-1)/sy {
+				empty = true
+				break
+			}
+		}
+		if empty {
 			break
 		}
 		reduce = n
@@ -559,11 +576,13 @@ func jpxReduction(ctx context.Context, data, stream []byte, size image.Point) (i
 	return min(reduce, limit), err
 }
 
-// jpxReductionLimit 读取默认分解层数，有分量或图块覆盖时保留完整解码
+// jpxReductionLimit 按默认、分量和图块编码样式的最小分解层数限制裁减
 // 入参: ctx 取消上下文, stream 已校验尺寸的码流
-// 返回: int 可裁减层数, error 标记段边界错误
+// 返回: int 可裁减层数, error 标记段、编码参数或取消错误
 func jpxReductionLimit(ctx context.Context, stream []byte) (int, error) {
-	levels, tileEnd := 0, 0
+	levels, tileEnd := 32, 0
+	defaultCoding := false
+	count := int(binary.BigEndian.Uint16(stream[40:42]))
 	for pos := 2; pos < len(stream); {
 		if err := ctx.Err(); err != nil {
 			return 0, err
@@ -573,7 +592,7 @@ func jpxReductionLimit(ctx context.Context, stream []byte) (int, error) {
 		}
 		marker := stream[pos+1]
 		if marker == 0xd9 {
-			return levels, nil
+			break
 		}
 		if marker == 0x93 {
 			if tileEnd <= pos || tileEnd > len(stream) {
@@ -591,15 +610,28 @@ func jpxReductionLimit(ctx context.Context, stream []byte) (int, error) {
 		}
 		switch marker {
 		case 0x52:
-			if tileEnd != 0 {
-				return 0, nil
-			}
 			if length < 12 || stream[pos+9] > 32 {
 				return 0, fmt.Errorf("invalid JPEG2000 coding style")
 			}
-			levels = int(stream[pos+9])
+			defaultCoding = defaultCoding || tileEnd == 0
+			levels = min(levels, int(stream[pos+9]))
 		case 0x53:
-			return 0, nil
+			indexBytes := 1
+			if count >= 257 {
+				indexBytes = 2
+			}
+			if length < 8+indexBytes {
+				return 0, fmt.Errorf("invalid JPEG2000 component coding style")
+			}
+			index := int(stream[pos+4])
+			if indexBytes == 2 {
+				index = int(binary.BigEndian.Uint16(stream[pos+4:]))
+			}
+			componentLevels := int(stream[pos+5+indexBytes])
+			if index >= count || componentLevels > 32 {
+				return 0, fmt.Errorf("invalid JPEG2000 component coding style")
+			}
+			levels = min(levels, componentLevels)
 		case 0x90:
 			if length != 10 || tileEnd != 0 {
 				return 0, fmt.Errorf("invalid JPEG2000 tile-part header")
@@ -614,6 +646,9 @@ func jpxReductionLimit(ctx context.Context, stream []byte) (int, error) {
 			}
 		}
 		pos += length + 2
+	}
+	if !defaultCoding {
+		return 0, nil
 	}
 	return levels, nil
 }

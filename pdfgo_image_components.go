@@ -38,6 +38,7 @@ type ImageComponents struct {
 	Tints         []uint16
 	ColorantAlpha []uint16
 	view          *imageComponentView
+	processOnly   bool
 }
 
 // ColorantSpace 读取图像或索引基础空间的只读色料定义及独立专色变换
@@ -116,9 +117,13 @@ func (i *ImageComponents) ResolveColorantsInGroupAt(x, y int, group *ColorantGro
 	if err != nil || result.Process == nil && result.Spots == nil && len(result.Alternates) == 0 {
 		return result, 0, err
 	}
-	alpha := i.Pix[offset*(i.Space.Components()+1)+i.Space.Components()]
+	var alpha uint16
 	if i.ColorantAlpha != nil {
 		alpha = i.ColorantAlpha[offset]
+	} else if i.processOnly {
+		alpha = 65535
+	} else {
+		alpha = i.Pix[offset*(i.Space.Components()+1)+i.Space.Components()]
 	}
 	return result, float64(alpha) / 65535, nil
 }
@@ -133,7 +138,10 @@ func (i *ImageComponents) colorantSampleOffset(x, y int) (int, error) {
 		return 0, fmt.Errorf("invalid image colorant layout")
 	}
 	pixels, channels := width*height, i.Space.Components()+1
-	if pixels > maximum/count || pixels > maximum/channels || len(i.Tints) != pixels*count || len(i.Pix) != pixels*channels || i.ColorantAlpha != nil && len(i.ColorantAlpha) != pixels {
+	if pixels > maximum/count || !i.processOnly && pixels > maximum/channels || len(i.Tints) != pixels*count || i.ColorantAlpha != nil && len(i.ColorantAlpha) != pixels {
+		return 0, fmt.Errorf("invalid image colorant buffers")
+	}
+	if i.processOnly && len(i.Pix) != 0 || !i.processOnly && len(i.Pix) != pixels*channels {
 		return 0, fmt.Errorf("invalid image colorant buffers")
 	}
 	return (y-i.Rect.Min.Y)*width + x - i.Rect.Min.X, nil

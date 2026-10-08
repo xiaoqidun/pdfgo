@@ -14,13 +14,51 @@
 
 package pdfgo
 
-import "image"
+import (
+	"context"
+	"image"
+)
 
 // ImageProcess 保存已校验的原生图像采样，源分量和色料定义在使用期间须保持只读
 // 不复制像素缓冲，可并发采样，不执行备用变换或图像插值
 type ImageProcess struct {
 	source  *ImageComponents
 	process *ColorantProcess
+}
+
+// DecodeProcess 只解码设备可直接使用的原生过程通道，不生成备用颜色缓冲
+// 入参: device 输出设备, group 组混合空间，nil继承设备, softMask 是否用于软蒙版
+// 返回: *ImageProcess 原生采样，需要备用色时为nil, error 解码或布局错误
+func (i *Image) DecodeProcess(device *ColorantDevice, group *ColorSpace, softMask bool) (*ImageProcess, error) {
+	return i.DecodeProcessContext(context.Background(), device, group, softMask)
+}
+
+// DecodeProcessContext 共用源样本和遮罩解码，保留16位浓度及源透明度
+// 入参: ctx 解码取消上下文, device 输出设备, group 组混合空间，nil继承设备, softMask 是否用于软蒙版
+// 返回: *ImageProcess 独立只读采样，需要备用色时为nil, error 解码或取消错误
+func (i *Image) DecodeProcessContext(ctx context.Context, device *ColorantDevice, group *ColorSpace, softMask bool) (*ImageProcess, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	colorants, err := i.ColorantSpace()
+	if err != nil {
+		return nil, err
+	}
+	process := colorants.PrepareProcess(device, group, softMask)
+	if process == nil || process.Mask() == ([4]bool{}) {
+		return nil, nil
+	}
+	source := &ImageComponents{processOnly: true}
+	if _, err := i.decodeImage(ctx, source, false); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := source.colorantSampleOffset(source.Rect.Min.X, source.Rect.Min.Y); err != nil {
+		return nil, err
+	}
+	return &ImageProcess{source: source, process: process}, nil
 }
 
 // PrepareProcess 校验图像布局并编译原生过程通道，原始浓度与源透明度独立于备用色
@@ -81,6 +119,9 @@ func (p *ImageProcess) ValuesAt(x, y int) ([4]float64, float64) {
 	}
 	if i.ColorantAlpha != nil {
 		return values, float64(i.ColorantAlpha[offset]) / 65535
+	}
+	if i.processOnly {
+		return values, 1
 	}
 	channels := i.Space.Components() + 1
 	return values, float64(i.Pix[offset*channels+channels-1]) / 65535

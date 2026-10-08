@@ -1050,10 +1050,12 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 			target.view = &imageComponentView{source: samples, mask: mask, channels: components, ranges: ranges, keys: keys, matte: matte, inverted: inverted, embedded: embeddedMask != 0, maximum: float64((uint32(1) << i.BitsPerComponent) - 1)}
 			return nil, nil
 		}
-		stride := target.Space.Components() + 1
-		_, size, err := imageSampleSize(bounds.Dx(), bounds.Dy(), stride, 16)
-		if err != nil {
-			return nil, err
+		size := 0
+		if !target.processOnly {
+			_, size, err = imageSampleSize(bounds.Dx(), bounds.Dy(), target.Space.Components()+1, 16)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if len(target.Colorants) > 0 {
 			_, tintSize, err := imageSampleSize(bounds.Dx(), bounds.Dy(), len(target.Colorants), 16)
@@ -1061,11 +1063,17 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 				return nil, err
 			}
 			target.Tints = make([]uint16, tintSize/2)
-			if palette != nil && palette.colors[0].A == 0 || deviceN != nil && deviceN.none || separation != nil && separation.none {
+			alphaRequired := palette != nil && palette.colors[0].A == 0 || deviceN != nil && deviceN.none || separation != nil && separation.none
+			if target.processOnly {
+				alphaRequired = mask != nil || embeddedMask != 0 || len(keys) != 0
+			}
+			if alphaRequired {
 				target.ColorantAlpha = make([]uint16, bounds.Dx()*bounds.Dy())
 			}
 		}
-		target.Pix = make([]uint16, size/2)
+		if !target.processOnly {
+			target.Pix = make([]uint16, size/2)
+		}
 	}
 	maximum := float64((uint32(1) << i.BitsPerComponent) - 1)
 	var componentBuffer [4]float64
@@ -1196,6 +1204,9 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 						coverage = 0
 					}
 					target.ColorantAlpha[y*bounds.Dx()+x] = coverage
+				}
+				if target.processOnly {
+					continue
 				}
 			}
 			if deviceN != nil {
