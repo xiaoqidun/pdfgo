@@ -52,6 +52,21 @@ type Image struct {
 	effectiveColorSpace bool
 }
 
+// HasMask 判断模板、显式、色键及JPEG2000内嵌遮罩，空引用不构成遮罩
+// 不解码像素，也不判断遮罩是否全不透明
+// 返回: bool 是否具有生效遮罩, error 引用或遮罩参数错误
+func (i *Image) HasMask() (bool, error) {
+	if i.ImageMask {
+		return true, nil
+	}
+	mode, err := i.jpxMaskMode()
+	if err != nil || mode != 0 {
+		return mode != 0, err
+	}
+	object, _, err := i.maskObject()
+	return object != nil, err
+}
+
 // HasSoftMask 判断显式及JPEG2000内嵌软遮罩，不将硬遮罩当作软遮罩
 // 返回: bool 是否具有软遮罩, error 引用或遮罩参数错误
 func (i *Image) HasSoftMask() (bool, error) {
@@ -145,8 +160,12 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if i.ImageMask || i.BitsPerComponent != 1 || i.ColorSpace != Name("DeviceGray") || len(i.Decode) != 0 || i.Mask != nil || i.SoftMask != nil || i.Stream.Dictionary["SMaskInData"] != nil || i.Stream.Dictionary["Matte"] != nil {
+	if i.ImageMask || i.BitsPerComponent != 1 || i.ColorSpace != Name("DeviceGray") || len(i.Decode) != 0 || i.Stream.Dictionary["Matte"] != nil {
 		return nil, nil
+	}
+	masked, err := i.HasMask()
+	if err != nil || masked {
+		return nil, err
 	}
 	encoded, params, err := i.encodedFileContext(ctx, "JBIG2Decode")
 	if err != nil {

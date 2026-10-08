@@ -65,8 +65,12 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if i.ImageMask || len(i.Decode) != 0 || i.Mask != nil || i.SoftMask != nil || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB") {
+	if i.ImageMask || len(i.Decode) != 0 || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB") {
 		return nil, nil
+	}
+	masked, err := i.HasMask()
+	if err != nil || masked {
+		return nil, err
 	}
 	data, params, err := i.encodedFileContext(ctx, "DCTDecode")
 	if err != nil {

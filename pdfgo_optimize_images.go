@@ -37,8 +37,8 @@ func (r *Reader) optimizeJPXImage(ctx context.Context, stream *Stream, options C
 	if err != nil {
 		return stream, ctx.Err()
 	}
-	mode, err := source.jpxMaskMode()
-	if err != nil || mode != 0 || source.ImageMask || source.Mask != nil || source.SoftMask != nil || source.ColorSpace != Name("DeviceRGB") && source.ColorSpace != Name("DeviceGray") {
+	masked, err := source.HasMask()
+	if err != nil || masked || source.ColorSpace != Name("DeviceRGB") && source.ColorSpace != Name("DeviceGray") {
 		return stream, ctx.Err()
 	}
 	scale := math.Max(float64(size.X)/float64(source.Width), float64(size.Y)/float64(source.Height))
