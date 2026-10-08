@@ -20,12 +20,13 @@ import (
 	"math"
 )
 
-// MeshSampler 复用网格颜色函数的精确输入结果，缓存最多1024项
+// MeshSampler 复用网格颜色函数，备用色与原始浓度各缓存最多1024项
 // 使用期间网格应保持只读；并发采样应分别创建采样器
 type MeshSampler struct {
-	mesh    *MeshGradient
-	seed    maphash.Seed
-	entries []meshSampleEntry
+	mesh      *MeshGradient
+	seed      maphash.Seed
+	entries   []meshSampleEntry
+	colorants []meshSampleEntry
 }
 
 // meshSampleEntry 保存函数输入的位模式及成功求值的颜色分量
@@ -61,8 +62,10 @@ func (s *MeshSampler) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 		return [4]float64{}, err
 	}
 	if s.entries == nil {
+		if s.colorants == nil {
+			s.seed = maphash.MakeSeed()
+		}
 		s.entries = make([]meshSampleEntry, 1024)
-		s.seed = maphash.MakeSeed()
 	}
 	input := math.Float64bits(x)
 	entry := &s.entries[maphash.Comparable(s.seed, input)%uint64(len(s.entries))]
@@ -74,4 +77,53 @@ func (s *MeshSampler) ValuesAt(patch int, u, v float64) ([4]float64, error) {
 		*entry = meshSampleEntry{input: input, values: values, valid: true}
 	}
 	return values, err
+}
+
+// ColorantValuesAt 复用常见色料函数的精确输入结果，不混用备用颜色缓存
+// 入参: patch 网格序号, u 横向参数, v 纵向参数, out 与色料数等长的输出缓冲
+// 返回: error 非色料渐变、参数或函数错误，错误时不保证缓冲内容
+func (s *MeshSampler) ColorantValuesAt(patch int, u, v float64, out []float64) error {
+	if s == nil || s.mesh == nil {
+		return fmt.Errorf("invalid mesh sampler")
+	}
+	g := s.mesh
+	space := g.ColorantSpace()
+	if space == nil || len(out) != len(space.Names) {
+		return fmt.Errorf("invalid mesh colorant component count")
+	}
+	if g.function == nil || len(out) > 4 {
+		return g.ColorantValuesAt(patch, u, v, out)
+	}
+	weights, colors, err := g.sourceColorsAt(patch, u, v)
+	if err != nil {
+		return err
+	}
+	x, err := meshFunctionInput(weights, colors)
+	if err != nil {
+		return err
+	}
+	if len(g.function.parts) != len(out) {
+		return fmt.Errorf("invalid mesh colorant component count")
+	}
+	if s.colorants == nil {
+		if s.entries == nil {
+			s.seed = maphash.MakeSeed()
+		}
+		s.colorants = make([]meshSampleEntry, 1024)
+	}
+	input := math.Float64bits(x)
+	entry := &s.colorants[maphash.Comparable(s.seed, input)%uint64(len(s.colorants))]
+	if entry.valid && entry.input == input {
+		copy(out, entry.values[:])
+		return nil
+	}
+	if err := g.function.calculate(x, out); err != nil {
+		return err
+	}
+	if err := clampColorantValues(out); err != nil {
+		return err
+	}
+	*entry = meshSampleEntry{input: input, valid: true}
+	copy(entry.values[:], out)
+	return nil
 }

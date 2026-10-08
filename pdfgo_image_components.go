@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"os"
 )
 
 // ImageComponents 保存应用Decode、索引映射及遮罩后的16位非预乘颜色分量
@@ -47,6 +48,37 @@ func (i *Image) ColorantSpace() (*ColorantSpace, error) {
 		return nil, err
 	}
 	return i.reader.readColorantSpace(object, i.effectiveColorSpace)
+}
+
+// ColorSpaceFamily 读取源颜色空间族，不将索引基础空间或分色备用空间替代源定义
+// 返回: Name 空间族，模板或未取得空间时为空, error 引用或空间类型错误
+func (i *Image) ColorSpaceFamily() (Name, error) {
+	if i == nil || i.reader == nil {
+		return "", fmt.Errorf("invalid image reader")
+	}
+	if i.reader.closed {
+		return "", os.ErrClosed
+	}
+	if i.ImageMask {
+		return "", nil
+	}
+	value, err := i.reader.resolveColorSpace(i.ColorSpace)
+	if err != nil || value == nil {
+		return "", err
+	}
+	if array, ok := value.(Array); ok && len(array) != 0 {
+		value = array[0]
+	}
+	family, ok := value.(Name)
+	if !ok {
+		return "", fmt.Errorf("invalid image color space family")
+	}
+	switch family {
+	case "DeviceGray", "DeviceRGB", "DeviceCMYK", "CalGray", "CalRGB", "Lab", "ICCBased", "Indexed", "Separation", "DeviceN":
+		return family, nil
+	default:
+		return "", fmt.Errorf("invalid image color space family %q", family)
+	}
 }
 
 // ResolveColorantsAt 按输出设备求值像素的源色料，透明度使用源遮罩而非备用色覆盖
@@ -157,6 +189,15 @@ func (i *Image) ProcessColorants() (*ProcessColorants, error) {
 // colorantSpace 读取图像的源色料空间，索引图像使用基础空间
 // 返回: Object 色料定义, error 颜色空间引用错误
 func (i *Image) colorantSpace() (Object, error) {
+	if i == nil || i.reader == nil {
+		return nil, fmt.Errorf("invalid image reader")
+	}
+	if i.reader.closed {
+		return nil, os.ErrClosed
+	}
+	if i.ImageMask {
+		return nil, nil
+	}
 	object, err := i.reader.resolveColorSpace(i.ColorSpace)
 	if err != nil {
 		return nil, err

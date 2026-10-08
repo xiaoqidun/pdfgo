@@ -47,6 +47,7 @@ type pngImageEncoder struct {
 	output     pngContextWriter
 	chunks     pngChunkWriter
 	compressed *zlib.Writer
+	optimized  bool
 	row        []byte
 	previous   []byte
 	filters    [2][]byte
@@ -169,6 +170,13 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 // 入参: ctx 取消上下文, writer 输出流, bounds 图像边界, depth 位深, channels 通道数, kind 颜色类型
 // 返回: *pngImageEncoder 行编码器, error 参数或写入错误
 func newPNGImageEncoder(ctx context.Context, writer io.Writer, bounds image.Rectangle, depth, channels, kind int) (*pngImageEncoder, error) {
+	return newPNGImageEncoderWithCompression(ctx, writer, bounds, depth, channels, kind, false)
+}
+
+// newPNGImageEncoderWithCompression 建立独立行编码器，按用途选择压缩缓冲池
+// 入参: ctx 取消上下文, writer 输出流, bounds 图像边界, depth 位深, channels 通道数, kind 颜色类型, optimized 是否使用最高无损压缩
+// 返回: *pngImageEncoder 行编码器, error 参数或写入错误
+func newPNGImageEncoderWithCompression(ctx context.Context, writer io.Writer, bounds image.Rectangle, depth, channels, kind int, optimized bool) (*pngImageEncoder, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -179,7 +187,7 @@ func newPNGImageEncoder(ctx context.Context, writer io.Writer, bounds image.Rect
 	if err != nil || stride >= imageBufferLimit()/4 {
 		return nil, fmt.Errorf("PNG row exceeds platform buffer range")
 	}
-	s := &pngImageEncoder{output: pngContextWriter{ctx: ctx, writer: writer}, pixelBytes: max(1, channels*depth/8)}
+	s := &pngImageEncoder{output: pngContextWriter{ctx: ctx, writer: writer}, pixelBytes: max(1, channels*depth/8), optimized: optimized}
 	s.row, s.previous = make([]byte, stride), make([]byte, stride)
 	for n := range s.filters {
 		s.filters[n] = make([]byte, stride+1)
@@ -195,7 +203,11 @@ func newPNGImageEncoder(ctx context.Context, writer io.Writer, bounds image.Rect
 		return nil, err
 	}
 	s.chunks = pngChunkWriter{writer: s.output, data: make([]byte, 0, 32768)}
-	s.compressed = imageCompressor(&s.chunks)
+	if optimized {
+		s.compressed = optimizationCompressor(&s.chunks)
+	} else {
+		s.compressed = imageCompressor(&s.chunks)
+	}
 	return s, nil
 }
 
@@ -238,7 +250,11 @@ func (s *pngImageEncoder) finish() error {
 // release 解除输出引用并归还压缩器，取消或写入失败后同样释放
 func (s *pngImageEncoder) release() {
 	if s.compressed != nil {
-		releaseImageCompressor(s.compressed)
+		if s.optimized {
+			releaseOptimizationCompressor(s.compressed)
+		} else {
+			releaseImageCompressor(s.compressed)
+		}
 		s.compressed = nil
 	}
 }

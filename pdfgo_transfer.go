@@ -268,6 +268,28 @@ func transferChannel(colorant Name) (int, bool) {
 	return 3, false
 }
 
+// SelectChannels 保留不透明通道的函数，其余通道使用恒等设备默认值
+// 入参: channels 红绿蓝灰通道选择，四色设备依次对应青品黄黑
+// 返回: *TransferFunction 只读函数，未改变时复用原对象，全恒等时为空
+func (f *TransferFunction) SelectChannels(channels [4]bool) *TransferFunction {
+	if f == nil {
+		return nil
+	}
+	var result TransferFunction
+	for i, selected := range channels {
+		if selected {
+			result.functions[i] = f.functions[i]
+		}
+	}
+	if result.functions == ([4]*ColorFunction{}) {
+		return nil
+	}
+	if result.functions == f.functions {
+		return f
+	}
+	return &result
+}
+
 // Evaluate 计算指定通道的加色分量，输出裁切至单位范围
 // 入参: value 单位输入值, channel 红绿蓝灰通道序号0至3
 // 返回: float64 加色输出值, error 输入或求值错误

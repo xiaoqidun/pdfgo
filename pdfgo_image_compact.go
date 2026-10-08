@@ -162,6 +162,9 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 			return nil, err
 		}
 		if !byteExact {
+			if _, gray := img.(*pngGrayAlphaImage); gray {
+				return compactPNGGrayAlpha(ctx, img, 16, best)
+			}
 			if _, gray := img.(*image.Gray16); gray || img.Bounds().Dx() != config.Width || img.Bounds().Dy() != config.Height {
 				return compactPNGImage(ctx, img, best, &buffers)
 			}
@@ -175,7 +178,7 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 	}
 	palette := color.Palette{}
 	indices := make(map[color.NRGBA]uint8)
-	gray := true
+	gray, opaque := true, true
 	levels := (1 << uint(4+options.ImageQuality()*4/100)) - 1
 	quant := func(v uint8) uint8 { return uint8(((int(v)*levels + 127) / 255) * 255 / levels) }
 	for y := b.Min.Y; y < b.Max.Y; y++ {
@@ -195,7 +198,8 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 			if !reused || options.Mode == CompressionLossy {
 				pixels.SetNRGBA(x, y, c)
 			}
-			gray = gray && c.R == c.G && c.G == c.B && c.A == 255
+			gray = gray && c.R == c.G && c.G == c.B
+			opaque = opaque && c.A == 255
 			if len(palette) <= 256 {
 				if _, ok := indices[c]; !ok {
 					indices[c] = uint8(len(palette))
@@ -222,7 +226,13 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 			return nil, err
 		}
 	}
-	if gray {
+	if gray && !opaque {
+		best, err = compactPNGGrayAlpha(ctx, pixels, 8, best)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if gray && opaque {
 		g, ok := img.(*image.Gray)
 		if !ok || options.Mode == CompressionLossy {
 			g = image.NewGray(b)
@@ -269,12 +279,12 @@ func compactPNGStorage(ctx context.Context, img image.Image) (*image.NRGBA, bool
 	return image.NewNRGBA(img.Bounds()), false, nil
 }
 
-// compactPNGPrecision 检查16位分量能否精确降位，或以不透明灰度减少通道
+// compactPNGPrecision 检查16位分量能否精确降位，或以灰度减少通道
 // 入参: ctx 取消上下文, img 图像
 // 返回: image.Image 等价图像, bool 是否能精确表示为8位, error 取消错误
 func compactPNGPrecision(ctx context.Context, img image.Image) (image.Image, bool, error) {
 	bounds := img.Bounds()
-	byteExact, gray := true, true
+	byteExact, gray, opaque := true, true, true
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			if (x-bounds.Min.X)&4095 == 0 {
@@ -284,7 +294,8 @@ func compactPNGPrecision(ctx context.Context, img image.Image) (image.Image, boo
 			}
 			c := imageNRGBA64At(img, x, y)
 			byteExact = byteExact && c.R%257 == 0 && c.G%257 == 0 && c.B%257 == 0 && c.A%257 == 0
-			gray = gray && c.R == c.G && c.G == c.B && c.A == 65535
+			gray = gray && c.R == c.G && c.G == c.B
+			opaque = opaque && c.A == 65535
 			if !byteExact && !gray {
 				return img, false, ctx.Err()
 			}
@@ -292,6 +303,9 @@ func compactPNGPrecision(ctx context.Context, img image.Image) (image.Image, boo
 	}
 	if byteExact {
 		return img, true, ctx.Err()
+	}
+	if !opaque {
+		return &pngGrayAlphaImage{img}, false, ctx.Err()
 	}
 	if _, ok := img.(*image.Gray16); ok {
 		return img, false, ctx.Err()
