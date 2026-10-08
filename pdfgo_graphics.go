@@ -1489,8 +1489,18 @@ func (p *pageInterpreter) image(stream *Stream) error {
 	if p.visitor.Image == nil {
 		return fmt.Errorf("image visitor missing")
 	}
+	style := p.state.style
+	if style.SoftMask != nil {
+		soft, err := image.HasSoftMask()
+		if err != nil {
+			return err
+		}
+		if soft {
+			style.SoftMask = nil
+		}
+	}
 	image.Warning = p.visitor.Warning
-	return p.visitor.Image(ImageMark{image, p.state.matrix, p.state.style})
+	return p.visitor.Image(ImageMark{image, p.state.matrix, style})
 }
 
 // validatePaint 检查实际使用的颜色状态，避免未指定图案或未支持的色彩意图被静默替换

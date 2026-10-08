@@ -399,12 +399,16 @@ func validateASCII85(ctx context.Context, data []byte) ([]byte, error) {
 	return encoded, nil
 }
 
-// decodeRunLength 解码游程压缩，分段检查取消
+// decodeRunLength 按校验后的长度一次分配解码缓冲，分段检查取消
 // 入参: ctx 取消上下文, data 编码数据
 // 返回: []byte 解码数据, error 编码或取消错误
 func decodeRunLength(ctx context.Context, data []byte) ([]byte, error) {
-	var out []byte
-	checkpoint := 0
+	size, err := runLengthSize(ctx, data)
+	if err != nil || size == 0 {
+		return nil, err
+	}
+	out := make([]byte, size)
+	position, checkpoint := 0, 0
 	for i := 0; i < len(data); {
 		if i >= checkpoint {
 			if err := ctx.Err(); err != nil {
@@ -415,7 +419,41 @@ func decodeRunLength(ctx context.Context, data []byte) ([]byte, error) {
 		n := int(data[i])
 		i++
 		if n == 128 {
-			return out, nil
+			return out, ctx.Err()
+		}
+		count := n + 1
+		if n < 128 {
+			copy(out[position:], data[i:i+count])
+			i += count
+		} else {
+			count = 257 - n
+			for j := range count {
+				out[position+j] = data[i]
+			}
+			i++
+		}
+		position += count
+	}
+	return nil, fmt.Errorf("missing RunLength terminator")
+}
+
+// runLengthSize 校验游程边界、结束标记及解码长度，不分配展开样本
+// 入参: ctx 取消上下文, data 编码数据
+// 返回: int 解码字节数, error 编码、溢出或取消错误
+func runLengthSize(ctx context.Context, data []byte) (int, error) {
+	size := 0
+	checkpoint := 0
+	for i := 0; i < len(data); {
+		if i >= checkpoint {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			checkpoint = i + min(4096, len(data)-i)
+		}
+		n := int(data[i])
+		i++
+		if n == 128 {
+			return size, ctx.Err()
 		}
 		count := n + 1
 		if n > 128 {
@@ -423,21 +461,21 @@ func decodeRunLength(ctx context.Context, data []byte) ([]byte, error) {
 		}
 		if n < 128 {
 			if count > len(data)-i {
-				return nil, io.ErrUnexpectedEOF
+				return 0, io.ErrUnexpectedEOF
 			}
-			out = append(out, data[i:i+count]...)
 			i += count
 		} else {
 			if i == len(data) {
-				return nil, io.ErrUnexpectedEOF
-			}
-			for range count {
-				out = append(out, data[i])
+				return 0, io.ErrUnexpectedEOF
 			}
 			i++
 		}
+		if count > int(^uint(0)>>1)-size {
+			return 0, fmt.Errorf("RunLength decoded length overflow")
+		}
+		size += count
 	}
-	return nil, fmt.Errorf("missing RunLength terminator")
+	return 0, fmt.Errorf("missing RunLength terminator")
 }
 
 // integerDefault 读取整数属性或使用缺省值

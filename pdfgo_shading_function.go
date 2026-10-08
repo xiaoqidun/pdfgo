@@ -133,7 +133,9 @@ func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
 					}
 					for _, mapped := range mappedStops {
 						mapped.Position = gradientPosition(previous.Position, stop.Position, mapped.Position)
-						result = append(result, mapped)
+						if len(result) == 0 || result[len(result)-1] != mapped {
+							result = append(result, mapped)
+						}
 					}
 				} else {
 					mappedStops := tint.linear([2]float64{stop.Values[0], stop.Values[0]})
@@ -141,10 +143,13 @@ func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
 						return nil
 					}
 					values := gradientValue(mappedStops, 0)
-					result = append(result, GradientStop{Position: stop.Position, Values: values})
+					mapped := GradientStop{Position: stop.Position, Values: values}
+					if len(result) == 0 || result[len(result)-1] != mapped {
+						result = append(result, mapped)
+					}
 				}
 			}
-			return slices.Compact(result)
+			return result
 		}
 	}
 	return f

@@ -32,7 +32,7 @@ import (
 
 var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 
-// Image 保存图像原始属性，颜色空间和遮罩保持为PDF对象
+// Image 保存图像有效属性及原始数据流，颜色空间和遮罩使用PDF对象
 // Warning非空时允许按声明尺寸读取含多余样本的图像，并报告恢复原因
 // Intent为空时继承绘图状态，单独解码使用相对色度
 type Image struct {
@@ -60,7 +60,7 @@ func (i *Image) HasSoftMask() (bool, error) {
 		return mode != 0, err
 	}
 	value, err := i.reader.Resolve(i.SoftMask)
-	return value != nil, err
+	return value != nil && value != Name("None"), err
 }
 
 // deviceSampleImage 按需组合设备色或索引色样本与遮罩，不重复展开像素缓冲
@@ -222,7 +222,7 @@ func (i *Image) encodedFileContext(ctx context.Context, terminal Name) ([]byte, 
 	return data, dict, nil
 }
 
-// ReadImage 读取图像XObject描述，不隐式转换颜色或丢弃遮罩
+// ReadImage 读取图像XObject描述，按标准选择生效属性，不隐式转换颜色
 // 入参: object 图像对象或引用
 // 返回: *Image 图像描述, error 错误信息
 func (r *Reader) ReadImage(object Object) (*Image, error) {
@@ -300,12 +300,18 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	if mask && bits != 1 {
 		return nil, fmt.Errorf("invalid stencil component depth")
 	}
-	space, err := r.resolveColorSpace(dict["ColorSpace"])
-	if err != nil {
-		return nil, err
-	}
-	if space == nil {
-		space = embeddedSpace
+	var space Object
+	imageMask := dict["Mask"]
+	if mask {
+		imageMask = nil
+	} else {
+		space, err = r.resolveColorSpace(dict["ColorSpace"])
+		if err != nil {
+			return nil, err
+		}
+		if space == nil {
+			space = embeddedSpace
+		}
 	}
 	var decodeObject Object
 	if jpxDepth == 0 {
@@ -338,7 +344,7 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		}
 		intent = normalizeRenderingIntent(intent)
 	}
-	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Intent: intent, Decode: decode, ImageMask: mask, Interpolate: interpolate == Boolean(true), Mask: dict["Mask"], SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
+	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Intent: intent, Decode: decode, ImageMask: mask, Interpolate: interpolate == Boolean(true), Mask: imageMask, SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
 }
 
 // ReadImageWithResources 读取图像并按当前资源解析颜色空间及默认设备色
@@ -904,8 +910,16 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 			ranges[n] = v
 		}
 	}
-	if target != nil || i.ImageMask || i.Mask != nil || i.SoftMask != nil || palette != nil || deviceN != nil || separation != nil {
+	if target != nil || i.ImageMask || palette != nil || deviceN != nil || separation != nil {
 		size = image.Point{}
+	} else if size.X > 0 && size.Y > 0 && embeddedMask == 0 {
+		mask, _, err := i.maskObject()
+		if err != nil {
+			return nil, err
+		}
+		if mask != nil {
+			size = image.Point{}
+		}
 	}
 	samples, err := i.decodeSamplesSizeContext(ctx, size)
 	if err != nil {
@@ -1625,16 +1639,9 @@ func (i *Image) decodeMask(ctx context.Context, components int) (*imageResample,
 	if err := ctx.Err(); err != nil {
 		return nil, nil, false, nil, err
 	}
-	object, err := i.reader.Resolve(i.SoftMask)
+	object, soft, err := i.maskObject()
 	if err != nil {
 		return nil, nil, false, nil, err
-	}
-	soft := object != nil && object != Name("None")
-	if !soft {
-		object, err = i.reader.Resolve(i.Mask)
-		if err != nil {
-			return nil, nil, false, nil, err
-		}
 	}
 	if object == nil {
 		return nil, nil, false, nil, nil
@@ -1695,6 +1702,23 @@ func (i *Image) decodeMask(ctx context.Context, components int) (*imageResample,
 		return nil, nil, false, nil, err
 	}
 	return &imageResample{source: decoded, bounds: decoded.Bounds(), interpolate: mask.Interpolate}, nil, !soft, matte, nil
+}
+
+// maskObject 解析生效的外部遮罩，软遮罩优先，空引用不构成遮罩
+// 返回: Object 遮罩流或颜色键, bool 是否软遮罩, error 引用解析错误
+func (i *Image) maskObject() (Object, bool, error) {
+	object, err := i.reader.Resolve(i.SoftMask)
+	if err != nil {
+		return nil, false, err
+	}
+	if object != nil && object != Name("None") {
+		return object, true, nil
+	}
+	if i.ImageMask {
+		return nil, false, nil
+	}
+	object, err = i.reader.Resolve(i.Mask)
+	return object, false, err
 }
 
 // ccittSamples 按PDF参数解码CCITT传真样本，保留黑白映射及行边界

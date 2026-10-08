@@ -74,15 +74,6 @@ func (i *Image) jpxMaskMode() (int, error) {
 	if !ok || mode < 0 || mode > 2 {
 		return 0, fmt.Errorf("invalid JPEG2000 SMaskInData")
 	}
-	if mode != 0 {
-		mask, err := i.reader.Resolve(i.SoftMask)
-		if err != nil {
-			return 0, err
-		}
-		if mask != nil {
-			return 0, fmt.Errorf("JPEG2000 SMaskInData conflicts with SMask")
-		}
-	}
 	return int(mode), nil
 }
 
@@ -481,9 +472,12 @@ func (i *Image) jpxSamplesSizeContext(ctx context.Context, data []byte, cmyk boo
 	if err != nil {
 		return nil, err
 	}
-	_, ycc, err := i.reader.jpxColorSpace(data, i.Stream.Dictionary, len(components))
-	if err != nil {
-		return nil, err
+	var ycc bool
+	if !i.ImageMask {
+		_, ycc, err = i.reader.jpxColorSpace(data, i.Stream.Dictionary, len(components))
+		if err != nil {
+			return nil, err
+		}
 	}
 	bounds := image.Rect(0, 0, i.Width, i.Height)
 	x0, y0 := int64(binary.BigEndian.Uint32(stream[16:20])), int64(binary.BigEndian.Uint32(stream[20:24]))
