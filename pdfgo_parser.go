@@ -30,11 +30,15 @@ type objectParser struct {
 }
 
 // isSpace 判断PDF空白字节
+// 入参: b 待检查的字节
+// 返回: bool 是否为空白字节
 func isSpace(b byte) bool {
 	return b == 0 || b == 9 || b == 10 || b == 12 || b == 13 || b == 32
 }
 
-// isDelimiter 判断PDF对象分隔符
+// isDelimiter 判断PDF空白字节或对象分隔符
+// 入参: b 待检查的字节
+// 返回: bool 是否为词法边界
 func isDelimiter(b byte) bool {
 	switch b {
 	case '(', ')', '<', '>', '[', ']', '{', '}', '/', '%':
@@ -60,11 +64,14 @@ func (p *objectParser) skipSpace() {
 }
 
 // fail 创建当前偏移位置的语法错误
+// 入参: message 错误描述
+// 返回: error 包含字节偏移的语法错误
 func (p *objectParser) fail(message string) error {
 	return &SyntaxError{Offset: p.base + int64(p.pos), Message: message}
 }
 
 // token 读取非分隔符组成的词法单元
+// 返回: string 词法单元，遇到分隔符或输入末尾时为空
 func (p *objectParser) token() string {
 	p.skipSpace()
 	start := p.pos
@@ -78,6 +85,7 @@ func (p *objectParser) token() string {
 }
 
 // object 读取单个PDF对象
+// 返回: Object 对象，null对应nil, error 语法错误
 func (p *objectParser) object() (Object, error) {
 	p.skipSpace()
 	if p.pos == len(p.data) {
@@ -143,6 +151,8 @@ func (p *objectParser) object() (Object, error) {
 }
 
 // validNumber 检查不含指数形式的PDF数字语法
+// 入参: s 数字文本
+// 返回: bool 是否符合数字语法
 func validNumber(s string) bool {
 	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
 		s = s[1:]
@@ -161,6 +171,7 @@ func validNumber(s string) bool {
 }
 
 // name 读取名称并解除十六进制转义
+// 返回: Object 名称对象, error 语法错误
 func (p *objectParser) name() (Object, error) {
 	p.pos++
 	start := p.pos
@@ -194,6 +205,7 @@ func (p *objectParser) name() (Object, error) {
 }
 
 // literalString 读取括号字符串并处理嵌套与转义
+// 返回: Object 字符串对象, error 语法错误
 func (p *objectParser) literalString() (Object, error) {
 	p.pos++
 	level := 1
@@ -255,6 +267,7 @@ func (p *objectParser) literalString() (Object, error) {
 }
 
 // hexString 读取十六进制字符串
+// 返回: Object 字符串对象, error 语法错误
 func (p *objectParser) hexString() (Object, error) {
 	p.pos++
 	var digits []byte
@@ -279,6 +292,7 @@ func (p *objectParser) hexString() (Object, error) {
 }
 
 // dictionary 读取字典并拒绝有歧义的重复键
+// 返回: Object 字典对象, error 语法错误
 func (p *objectParser) dictionary() (Object, error) {
 	p.pos += 2
 	value := Dictionary{}

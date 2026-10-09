@@ -83,19 +83,15 @@ func (s *mappedGrayImage) RGBA64At(x, y int) color.RGBA64 {
 	return color.RGBA64{R: value, G: value, B: value, A: 65535}
 }
 
-// decodeGrayImage 在独立灰度样本缓冲上应用Decode，不扩展为RGBA
-// 入参: samples 解码器创建的样本, lower 映射起点, upper 映射终点
-// 返回: image.Image 保留精度的灰度图像，不支持的样本类型为空, error 尺寸错误
-func decodeGrayImage(samples image.Image, lower, upper float64) (image.Image, error) {
-	return decodeGrayImageContext(context.Background(), samples, lower, upper)
-}
-
 // decodeGrayImageContext 应用灰度映射，紧凑样本保持延迟展开
 // 入参: ctx 取消上下文, samples 独立样本, lower 映射起点, upper 映射终点
 // 返回: image.Image 灰度图像，不支持的样本类型为空, error 尺寸或取消错误
 func decodeGrayImageContext(ctx context.Context, samples image.Image, lower, upper float64) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if source, ok := samples.(*jpxSampleImage); ok && source.rows != nil {
+		return &rowGrayImage{source: source, lower: lower, upper: upper, byteExact: imageByteExact(source) && (lower == 0 && upper == 1 || lower == 1 && upper == 0)}, nil
 	}
 	bounds := samples.Bounds()
 	if source, ok := samples.(*image.Gray16); ok {

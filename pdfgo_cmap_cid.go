@@ -113,13 +113,6 @@ func ParseCIDMapContext(ctx context.Context, data []byte) (CIDMap, error) {
 	return result, nil
 }
 
-// parseCIDCMap 读取编码元数据及映射，不执行PostScript程序
-// 入参: data CMap数据
-// 返回: *cidCMap 本层映射, error 格式错误
-func parseCIDCMap(data []byte) (*cidCMap, error) {
-	return parseCIDCMapContext(context.Background(), data)
-}
-
 // parseCIDCMapContext 解析CID元数据和范围，取消时不保留部分映射
 // 入参: ctx 取消上下文, data CMap数据
 // 返回: *cidCMap 本层映射, error 格式或取消错误
@@ -370,13 +363,6 @@ func (c *cidCMap) undefined(raw []byte) uint16 {
 	return 0
 }
 
-// readCIDCMap 读取命名或文档内嵌编码，处理流字典中的继承关系
-// 入参: object 编码对象, active 当前流继承链
-// 返回: *cidCMap 编码映射, error 解析错误
-func (r *Reader) readCIDCMap(object Object, active map[*Stream]bool) (*cidCMap, error) {
-	return r.readCIDCMapContext(context.Background(), object, active)
-}
-
 // readCIDCMapContext 读取文档编码并沿用本次上下文解析继承流
 // 入参: ctx 取消上下文, object 编码对象, active 当前流继承链
 // 返回: *cidCMap 完整映射, error 解析或取消错误
@@ -440,13 +426,6 @@ func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, active m
 		return nil, err
 	}
 	return mapping, nil
-}
-
-// readUnicodeCMap 读取ToUnicode流及基础映射，派生映射覆盖同码定义
-// 入参: object 映射对象, active 当前流继承链
-// 返回: UnicodeMap 独立映射, error 解析错误
-func (r *Reader) readUnicodeCMap(object Object, active map[*Stream]bool) (UnicodeMap, error) {
-	return r.readUnicodeCMapContext(context.Background(), object, active)
 }
 
 // readUnicodeCMapContext 读取独立Unicode映射，流继承及合并均检查取消

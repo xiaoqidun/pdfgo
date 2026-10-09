@@ -209,6 +209,8 @@ func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error
 }
 
 // readPage 解析继承属性并检查页面尺寸
+// 入参: ref 页面引用, dict 页面字典, attrs 已继承的页面属性
+// 返回: *Page 页面, error 页面属性错误
 func (r *Reader) readPage(ref Reference, dict Dictionary, attrs pageAttributes) (*Page, error) {
 	media, err := r.rectangle(attrs.mediaBox)
 	if err != nil {
@@ -253,6 +255,8 @@ func (r *Reader) readPage(ref Reference, dict Dictionary, attrs pageAttributes) 
 }
 
 // number 解析直接或间接数字对象
+// 入参: object 数字对象或间接引用
+// 返回: float64 数值, error 引用或类型错误
 func (r *Reader) number(object Object) (float64, error) {
 	value, err := r.Resolve(object)
 	if err != nil {
@@ -269,6 +273,8 @@ func (r *Reader) number(object Object) (float64, error) {
 }
 
 // rectangle 读取并规范化矩形顶点顺序
+// 入参: object 矩形数组或间接引用
+// 返回: Rectangle 矩形, error 引用、类型或坐标错误
 func (r *Reader) rectangle(object Object) (Rectangle, error) {
 	value, err := r.Resolve(object)
 	if err != nil {

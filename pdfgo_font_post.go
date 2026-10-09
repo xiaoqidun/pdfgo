@@ -86,13 +86,6 @@ func (p *fontPostMapping) lookupContext(ctx context.Context, name string) (uint1
 	return p.glyphs[name], p.err
 }
 
-// fontPostGlyphs 读取TrueType名称表，只有实际使用名称回退时才报告错误
-// 入参: data SFNT字体数据
-// 返回: map[string]uint16 名称对应的字形编号, error 名称表错误
-func fontPostGlyphs(data []byte) (map[string]uint16, error) {
-	return fontPostGlyphsContext(context.Background(), data)
-}
-
 // fontPostGlyphsContext 解析字形名称表，检查数组及名称展开的取消
 // 入参: ctx 取消上下文, data SFNT字体数据
 // 返回: map[string]uint16 完整名称映射, error 解析或取消错误

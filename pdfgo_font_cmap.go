@@ -73,13 +73,6 @@ func fontTableContext(ctx context.Context, data []byte, tag string) ([]byte, err
 	return table, nil
 }
 
-// fontCmap 读取指定TrueType字符表，不把ToUnicode当作字形索引
-// 入参: data 字体数据, symbolic 是否为符号字体
-// 返回: []byte 字符映射表, Name 映射编码, error 解析错误
-func fontCmap(data []byte, symbolic bool) ([]byte, Name, error) {
-	return fontCmapContext(context.Background(), data, symbolic)
-}
-
 // fontCmapContext 选择并校验TrueType字符表，检查目录及分组解析的取消
 // 入参: ctx 取消上下文, data 字体数据, symbolic 是否为符号字体
 // 返回: []byte 已校验字符表, Name 映射编码, error 解析或取消错误
@@ -319,13 +312,6 @@ func validateFontCmap(ctx context.Context, table []byte) error {
 		return &UnsupportedError{Feature: fmt.Sprintf("TrueType cmap format %d", format)}
 	}
 	return ctx.Err()
-}
-
-// simpleGlyph 按TrueType内嵌字符表选择字形，名称无法映射时使用post表
-// 入参: code 原始单字节字符码, name 非符号字体的编码名称
-// 返回: uint16 字形编号，未定义字符为零, error 字符表或名称表错误
-func (f *Font) simpleGlyph(code uint32, name string) (uint16, error) {
-	return f.simpleGlyphContext(context.Background(), code, name)
 }
 
 // simpleGlyphContext 按字符表或字形名称选择字形，名称解析响应本次取消

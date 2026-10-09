@@ -23,6 +23,7 @@ import (
 	"unicode/utf16"
 )
 
+// errInvalidUnicodeSurrogate 表示Unicode映射中的代理项配对无效
 var errInvalidUnicodeSurrogate = errors.New("invalid Unicode surrogate")
 
 // UnicodeMap 保存字符码到Unicode文本的映射，不将字符码等同于字形编号
@@ -43,13 +44,6 @@ func ParseUnicodeMapContext(ctx context.Context, data []byte) (UnicodeMap, error
 		return nil, fmt.Errorf("invalid CMap context")
 	}
 	return parseUnicodeMapContext(ctx, data, nil)
-}
-
-// parseUnicodeMap 读取Unicode映射并展开命名基础资源
-// 入参: data 映射数据, active 当前命名继承链
-// 返回: UnicodeMap 独立映射, error 解析错误
-func parseUnicodeMap(data []byte, active map[Name]bool) (UnicodeMap, error) {
-	return parseUnicodeMapContext(context.Background(), data, active)
 }
 
 // parseUnicodeMapContext 读取映射及命名继承，取消时不返回部分结果
@@ -225,6 +219,8 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 }
 
 // codeNumber 将最多4字节的字符码解释为无符号整数
+// 入参: code 高位字节在前的字符码
+// 返回: uint64 字符码数值
 func codeNumber(code []byte) uint64 {
 	var value uint64
 	for _, b := range code {
@@ -234,6 +230,8 @@ func codeNumber(code []byte) uint64 {
 }
 
 // unicodeBytes 严格解析CMap使用的UTF-16BE文本
+// 入参: data UTF-16BE编码数据
+// 返回: string Unicode文本, error 编码错误
 func unicodeBytes(data []byte) (string, error) {
 	if len(data)%2 != 0 {
 		return "", fmt.Errorf("invalid UTF-16BE mapping")

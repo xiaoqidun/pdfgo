@@ -573,13 +573,6 @@ func (p *pageInterpreter) shadingColorSpace(object Object) (Object, error) {
 	return p.reader.resourceColorSpace(object, p.resources)
 }
 
-// readShadingSpace 读取着色源颜色空间，专色及Lab保留各自的转换规则
-// 入参: object 已解析的颜色空间定义
-// 返回: *ColorSpace 输出空间, *deviceNSpace 专色变换, *labSpace Lab变换, int 源分量数, error 格式或能力错误
-func (r *Reader) readShadingSpace(object Object) (*ColorSpace, *deviceNSpace, *labSpace, int, error) {
-	return r.readShadingColorSpace(object, false)
-}
-
 // readShadingColorSpace 读取原始或已按资源校验的着色源空间
 // 入参: object 颜色空间, effective 是否已按资源校验并替换
 // 返回: *ColorSpace 输出空间, *deviceNSpace 专色变换, *labSpace Lab变换, int 源分量数, error 格式或能力错误
@@ -650,13 +643,6 @@ func shadingColorValues(space *ColorSpace, tint *deviceNSpace, lab *labSpace, in
 		values[i] = math.Max(0, math.Min(1, value))
 	}
 	return values, nil
-}
-
-// deviceNGradient 组合多色渐变与着色函数，仅为可精确表示的函数展开分段
-// 入参: space 多色定义, function 渐变函数, domain 输入区间
-// 返回: []GradientStop 备用空间分段, *ColorSpace 备用空间, *gradientFunction 颜色函数, error 能力或格式错误
-func (r *Reader) deviceNGradient(space Array, function Object, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	return r.readDeviceNGradient(space, function, domain, false)
 }
 
 // readDeviceNGradient 组合原始或已按资源校验的多色渐变，不线性化非线性嵌套
@@ -755,24 +741,6 @@ func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
 		}
 	}
 	return slices.Compact(result)
-}
-
-// linearGradientStops 返回可精确展开的函数分段，不近似非线性函数
-// 入参: object 函数对象, interval 输入区间, channels 分量数, depth 嵌套深度
-// 返回: []GradientStop 精确分段, error 解析或非线性错误
-func (r *Reader) linearGradientStops(object Object, interval [2]float64, channels, depth int) ([]GradientStop, error) {
-	f, err := r.readGradientFunction(object, channels, depth)
-	if err != nil {
-		return nil, err
-	}
-	if f.linear == nil {
-		return nil, &UnsupportedError{Feature: "nonlinear gradient function"}
-	}
-	stops := clipGradientValues(f.linear(interval), gradientUnitBounds(channels))
-	if len(stops) == 0 {
-		return nil, &UnsupportedError{Feature: "unrepresentable gradient function stops"}
-	}
-	return stops, nil
 }
 
 // gradientUnitBounds 返回设备或ICC分量的单位区间

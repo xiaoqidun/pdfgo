@@ -335,6 +335,8 @@ func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
 }
 
 // type1EncodingSpace 判断PostScript空白字节
+// 入参: value 待检查的字节
+// 返回: bool 是否为空白字节
 func type1EncodingSpace(value byte) bool {
 	return value == ' ' || value == '\t' || value == '\r' || value == '\n' || value == '\f' || value == 0
 }

@@ -182,13 +182,6 @@ func (r *Reader) readSingleDeviceN(space Array, effective bool, depth int) (*dev
 	return result, nil
 }
 
-// readDeviceN 解析单分量函数或多分量采样与计算器专色变换
-// 入参: space 颜色空间数组
-// 返回: *deviceNSpace 着色定义, error 格式或能力错误
-func (r *Reader) readDeviceN(space Array) (*deviceNSpace, error) {
-	return r.readDeviceNSpace(space, false, 0)
-}
-
 // readDeviceNSpace 读取原始多色或已校验的默认空间替换，限制嵌套深度
 // 入参: space 多色数组, effective 是否已按资源校验并替换, depth 嵌套深度
 // 返回: *deviceNSpace 专色变换, error 定义或函数错误

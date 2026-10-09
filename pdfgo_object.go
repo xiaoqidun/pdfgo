@@ -44,11 +44,26 @@ type Reference struct {
 	Generation int64
 }
 
-func (Boolean) pdfObject()    {}
-func (Integer) pdfObject()    {}
-func (Real) pdfObject()       {}
-func (Name) pdfObject()       {}
-func (String) pdfObject()     {}
-func (Array) pdfObject()      {}
+// pdfObject 将布尔值标记为PDF对象
+func (Boolean) pdfObject() {}
+
+// pdfObject 将整数标记为PDF对象
+func (Integer) pdfObject() {}
+
+// pdfObject 将实数标记为PDF对象
+func (Real) pdfObject() {}
+
+// pdfObject 将名称标记为PDF对象
+func (Name) pdfObject() {}
+
+// pdfObject 将字符串标记为PDF对象
+func (String) pdfObject() {}
+
+// pdfObject 将数组标记为PDF对象
+func (Array) pdfObject() {}
+
+// pdfObject 将字典标记为PDF对象
 func (Dictionary) pdfObject() {}
-func (Reference) pdfObject()  {}
+
+// pdfObject 将间接引用标记为PDF对象
+func (Reference) pdfObject() {}

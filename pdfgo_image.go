@@ -24,12 +24,11 @@ import (
 	"io"
 	"math"
 
-	_ "github.com/mububoki/jpeg2000/j2k"
-	_ "github.com/mububoki/jpeg2000/jp2"
 	"github.com/xiaoqidun/jbig2"
 	"golang.org/x/image/ccitt"
 )
 
+// jbig2FileHeader 为顺序组织且页数未知的JBIG2文件头
 var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 
 // Image 保存图像有效属性及原始数据流，颜色空间和遮罩使用PDF对象
@@ -605,7 +604,7 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 }
 
 // DecodeSamplesContext 解码原始样本，在流读取及样本处理之间检查取消
-// JBIG2及JPEG2000解码器的内部运算完成后才检查取消
+// JPEG2000解码过程中可取消，JBIG2内部运算完成后检查取消
 // 入参: ctx 取消上下文
 // 返回: image.Image 独立原始样本, error 解码或取消错误
 func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
@@ -616,6 +615,13 @@ func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
 // 入参: ctx 取消上下文, size 像素需求
 // 返回: image.Image 原始样本, error 解码或取消错误
 func (i *Image) decodeSamplesSizeContext(ctx context.Context, size image.Point) (image.Image, error) {
+	return i.decodeSamplesRowsContext(ctx, size, nil)
+}
+
+// decodeSamplesRowsContext 解码原始样本，行输出时为JPEG2000保留有界解码窗口
+// 入参: ctx 取消上下文, size 像素需求, rows 可选行解码资源
+// 返回: image.Image 原始样本, error 解码或取消错误
+func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, rows *imageRowContext) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -694,7 +700,7 @@ func (i *Image) decodeSamplesSizeContext(ctx context.Context, size image.Point) 
 		}
 	case "JPXDecode":
 		cmyk := i.ColorSpace == Name("DeviceCMYK")
-		result, err = i.jpxSamplesSizeContext(ctx, data, cmyk, size)
+		result, err = i.jpxSamplesRowsContext(ctx, data, cmyk, size, rows)
 	default:
 		result, err = i.rawSamples(ctx, data)
 	}
@@ -798,6 +804,22 @@ func (i *Image) decodeImageSize(ctx context.Context, target *ImageComponents, sa
 // 入参: ctx 取消上下文, target 可选分量输出, sampled 延迟分量采样, size 显式像素需求, writer 可选PNG输出流
 // 返回: image.Image 显示图像，分量或行输出模式下为空, error 解码或写入错误
 func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, sampled bool, size image.Point, writer io.Writer) (image.Image, error) {
+	var rows *imageRowContext
+	if writer != nil {
+		rows = &imageRowContext{}
+		defer rows.close()
+	}
+	result, err := i.decodeImageRows(ctx, target, sampled, size, writer, rows)
+	if err != nil || result == nil || writer == nil {
+		return result, err
+	}
+	return nil, EncodePNG(ctx, writer, result)
+}
+
+// decodeImageRows 共用颜色和遮罩处理，行输出及其遮罩共享解码资源
+// 入参: ctx 取消上下文, target 可选分量输出, sampled 延迟分量采样, size 像素需求, writer 可选PNG输出流, rows 可选行解码资源
+// 返回: image.Image 显示图像，直接输出时为空, error 解码或写入错误
+func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sampled bool, size image.Point, writer io.Writer, rows *imageRowContext) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -940,7 +962,7 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 			size = image.Point{}
 		}
 	}
-	samples, err := i.decodeSamplesSizeContext(ctx, size)
+	samples, err := i.decodeSamplesRowsContext(ctx, size, rows)
 	if err != nil {
 		return nil, err
 	}
@@ -948,7 +970,7 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 	var keys, matte []float64
 	var inverted bool
 	if embeddedMask == 0 {
-		mask, keys, inverted, matte, err = i.decodeMask(ctx, components)
+		mask, keys, inverted, matte, err = i.decodeMaskRows(ctx, components, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -968,7 +990,7 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 	if mask != nil {
 		bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
 	}
-	if target == nil && i.ColorSpace == Name("DeviceGray") && !i.ImageMask && embeddedMask == 0 && mask == nil && len(keys) == 0 && len(matte) == 0 {
+	if target == nil && (i.ColorSpace == Name("DeviceGray") && !i.ImageMask || rows != nil && i.ImageMask) && embeddedMask == 0 && mask == nil && len(keys) == 0 && len(matte) == 0 {
 		gray, err := decodeGrayImageContext(ctx, samples, ranges[0], ranges[1])
 		if err != nil {
 			return nil, err
@@ -1121,6 +1143,14 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 	for y := 0; y < bounds.Dy(); y++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if err := prepareImageRows(ctx, samples, y, y+1); err != nil {
+			return nil, err
+		}
+		if mask != nil {
+			if err := prepareImageRows(ctx, mask, y, y+1); err != nil {
+				return nil, err
+			}
 		}
 		for x := 0; x < bounds.Dx(); x++ {
 			if x&4095 == 0 {
@@ -1391,6 +1421,8 @@ func imageByteExact(source image.Image) bool {
 		return s.depth <= 8
 	case *mappedGrayImage:
 		return s.byteExact
+	case *rowGrayImage:
+		return s.byteExact
 	case *deviceSampleImage:
 		return s.byteExact
 	case *jpxSampleImage:
@@ -1651,10 +1683,10 @@ func (i *Image) palette() (*imagePalette, error) {
 	return result, nil
 }
 
-// decodeMask 读取有效遮罩，软遮罩优先于显式遮罩和色键遮罩
-// 入参: ctx 取消上下文, components 原始图像分量数
-// 返回: *imageResample 遮罩图像, []float64 色键范围, bool 是否反转遮罩灰度, []float64 预混合底色, error 错误信息
-func (i *Image) decodeMask(ctx context.Context, components int) (*imageResample, []float64, bool, []float64, error) {
+// decodeMaskRows 解析有效遮罩，行输出时复用JPEG2000解码窗口
+// 入参: ctx 取消上下文, components 原始图像分量数, rows 可选行解码资源
+// 返回: *imageResample 遮罩图像, []float64 色键范围, bool 是否反转灰度, []float64 预混合底色, error 错误信息
+func (i *Image) decodeMaskRows(ctx context.Context, components int, rows *imageRowContext) (*imageResample, []float64, bool, []float64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -1716,7 +1748,7 @@ func (i *Image) decodeMask(ctx context.Context, components int) (*imageResample,
 			}
 		}
 	}
-	decoded, err := mask.DecodeImageContext(ctx)
+	decoded, err := mask.decodeImageRows(ctx, nil, false, image.Point{}, nil, rows)
 	if err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -1738,13 +1770,6 @@ func (i *Image) maskObject() (Object, bool, error) {
 	}
 	object, err = i.reader.Resolve(i.Mask)
 	return object, false, err
-}
-
-// ccittSamples 按PDF参数解码CCITT传真样本，保留黑白映射及行边界
-// 入参: data 编码数据, params 解码参数
-// 返回: image.Image 样本图像, error 错误信息
-func (i *Image) ccittSamples(data []byte, params Dictionary) (image.Image, error) {
-	return i.ccittSamplesContext(context.Background(), data, params)
 }
 
 // ccittSamplesContext 按行边界读取CCITT样本并检查取消

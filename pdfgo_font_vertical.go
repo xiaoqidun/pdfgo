@@ -25,13 +25,6 @@ type VerticalMetrics struct {
 	Origin  Point
 }
 
-// readVerticalMetrics 读取CID字体的默认竖排度量及逐字覆盖值
-// 入参: font 字体资源, metrics CID字体字典
-// 返回: error 错误信息
-func (r *Reader) readVerticalMetrics(font *Font, metrics Dictionary) error {
-	return r.readVerticalMetricsContext(context.Background(), font, metrics)
-}
-
 // readVerticalMetricsContext 展开竖排度量并响应本次取消
 // 入参: ctx 取消上下文, font 字体资源, metrics CID字体字典
 // 返回: error 读取或取消错误

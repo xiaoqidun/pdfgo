@@ -127,12 +127,8 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 	return data, nil
 }
 
+// pdfObject 将流标记为PDF对象
 func (*Stream) pdfObject() {}
-
-// decodeASCIIHex 解码十六进制流，忽略空白并为末尾单个半字节补零
-func decodeASCIIHex(data []byte) ([]byte, error) {
-	return decodeASCIIHexContext(context.Background(), data)
-}
 
 // decodeASCIIHexContext 解码十六进制流，分段检查取消
 // 入参: ctx 取消上下文, data 编码数据
@@ -265,14 +261,6 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 		return filters[1:], params[1:], nil
 	}
 	return filters, params, nil
-}
-
-// decodeLZW 解码高位优先的PDF变长字典编码，支持两种码宽增长规则
-// 入参: data 压缩数据, early 提前增长标志
-// 返回: []byte 解码数据, error 错误信息
-func decodeLZW(data []byte, early int64) ([]byte, error) {
-	out, _, err := decodeLZWBytes(data, early)
-	return out, err
 }
 
 // decodeLZWBytes 解码LZW并返回结束码占用的字节数，供内联图像界定数据边界
@@ -491,13 +479,6 @@ func integerDefault(dict Dictionary, key Name, fallback int64) (int64, error) {
 		return 0, fmt.Errorf("%s is not an integer", key)
 	}
 	return int64(n), nil
-}
-
-// decodePredictor 还原TIFF或PNG预测后的样本字节
-// 入参: data 预测后的数据, params 预测参数
-// 返回: []byte 还原的样本数据, error 错误信息
-func decodePredictor(data []byte, params Dictionary) ([]byte, error) {
-	return decodePredictorContext(context.Background(), data, params)
 }
 
 // decodePredictorContext 还原TIFF及PNG预测样本，逐行检查取消

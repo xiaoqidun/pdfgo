@@ -353,6 +353,8 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 }
 
 // readRange 按需读取对象片段并检查文件边界和平台整数溢出
+// 入参: offset 起始字节偏移, length 读取字节数
+// 返回: []byte 读取的数据, error 范围或读取错误
 func (r *Reader) readRange(offset, length int64) ([]byte, error) {
 	if offset < 0 || length < 0 || offset > r.size || length > r.size-offset || uint64(length) > uint64(^uint(0)>>1) {
 		return nil, fmt.Errorf("invalid file range")
@@ -363,6 +365,8 @@ func (r *Reader) readRange(offset, length int64) ([]byte, error) {
 }
 
 // parseAt 按需扩展单个对象的解析窗口，不复制整个源文件
+// 入参: offset 对象起始字节偏移, parse 解析回调，窗口扩展后从头重试
+// 返回: error 读取或解析错误
 func (r *Reader) parseAt(offset int64, parse func(*objectParser) error) error {
 	if offset < 0 || offset >= r.size {
 		return fmt.Errorf("object offset outside file")
@@ -394,6 +398,8 @@ func (r *Reader) parseAt(offset int64, parse func(*objectParser) error) error {
 }
 
 // indirect 从文件偏移读取完整间接对象
+// 入参: offset 对象起始字节偏移
+// 返回: Reference 对象引用, Object 对象内容, error 读取或解析错误
 func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 	var p objectParser
 	var ref Reference
@@ -463,6 +469,8 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 }
 
 // readXref 读取传统或流式交叉引用区段
+// 入参: offset 交叉引用区段的字节偏移
+// 返回: Dictionary 尾字典或交叉引用流字典, map[int64]xrefEntry 交叉引用条目, error 读取或解析错误
 func (r *Reader) readXref(offset int64) (Dictionary, map[int64]xrefEntry, error) {
 	if offset < 0 || offset >= r.size {
 		return nil, nil, fmt.Errorf("cross-reference offset outside file")
@@ -486,6 +494,8 @@ func (r *Reader) readXref(offset int64) (Dictionary, map[int64]xrefEntry, error)
 }
 
 // classicXref 解析传统交叉引用及其尾字典
+// 入参: p 位于xref关键字的解析器
+// 返回: Dictionary 尾字典, map[int64]xrefEntry 交叉引用条目, error 语法错误
 func (r *Reader) classicXref(p *objectParser) (Dictionary, map[int64]xrefEntry, error) {
 	p.token()
 	entries := map[int64]xrefEntry{}
@@ -530,6 +540,8 @@ func (r *Reader) classicXref(p *objectParser) (Dictionary, map[int64]xrefEntry, 
 }
 
 // readXrefStream 读取交叉引用流并检查字段边界
+// 入参: offset 交叉引用流对象的字节偏移
+// 返回: Dictionary 交叉引用流字典, map[int64]xrefEntry 交叉引用条目, error 读取或解析错误
 func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, error) {
 	ref, object, err := r.indirect(offset)
 	if err != nil {
@@ -622,6 +634,8 @@ func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, 
 }
 
 // compressedObject 从对象流读取指定压缩对象
+// 入参: ref 对象引用, entry 对应的交叉引用条目
+// 返回: Object 解压后的对象, error 读取或解析错误
 func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error) {
 	containerEntry, ok := r.xref[entry.position]
 	if !ok || containerEntry.kind != 1 {

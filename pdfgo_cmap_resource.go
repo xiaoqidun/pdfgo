@@ -73,13 +73,6 @@ func cmapResource(name Name) ([]byte, string, error) {
 	return data, file, err
 }
 
-// loadCIDCMap 按需解析Adobe编码映射及其基础映射
-// 入参: name 资源名称, active 当前继承链
-// 返回: *cidCMap 只读映射, error 读取或继承错误
-func loadCIDCMap(name Name, active map[Name]bool) (*cidCMap, error) {
-	return loadCIDCMapContext(context.Background(), name, active)
-}
-
 // loadCIDCMapContext 读取只读编码资源，缓存命中及继承过程仍检查取消
 // 入参: ctx 取消上下文, name 资源名称, active 当前继承链
 // 返回: *cidCMap 完整映射, error 读取、继承或取消错误
@@ -124,13 +117,6 @@ func loadCIDCMapContext(ctx context.Context, name Name, active map[Name]bool) (*
 	}
 	cached, _ := predefinedCIDMaps.LoadOrStore(name, mapping)
 	return cached.(*cidCMap), nil
-}
-
-// loadUnicodeCMap 按需解析命名Unicode资源，不混用其他目标编码
-// 入参: name 资源名称, active 当前继承链
-// 返回: UnicodeMap 只读映射, error 读取或继承错误
-func loadUnicodeCMap(name Name, active map[Name]bool) (UnicodeMap, error) {
-	return loadUnicodeCMapContext(context.Background(), name, active)
 }
 
 // loadUnicodeCMapContext 读取命名Unicode资源，仅缓存解析完整的映射

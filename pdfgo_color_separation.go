@@ -45,13 +45,6 @@ type tintFunction struct {
 	sampled                             bool
 }
 
-// readSeparation 读取分色颜色空间及其着色函数
-// 入参: space 分色颜色空间数组
-// 返回: *separationSpace 分色定义, error 错误信息
-func (r *Reader) readSeparation(space Array) (*separationSpace, error) {
-	return r.readSeparationSpace(space, false, 0)
-}
-
 // readSeparationSpace 读取原始分色或已校验的默认空间替换，限制嵌套深度
 // 入参: space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
 // 返回: *separationSpace 分色变换, error 定义或函数错误

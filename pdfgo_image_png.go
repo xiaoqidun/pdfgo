@@ -124,6 +124,9 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := sampler.prepare(ctx, y); err != nil {
+			return err
+		}
 		row := encoder.row
 		if gray != nil {
 			if err := pngGrayRow(ctx, row, gray, y, depth, &grayBytes); err != nil {
@@ -135,9 +138,6 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 				return err
 			}
 			if !written {
-				if err := sampler.prepare(ctx, y); err != nil {
-					return err
-				}
 				for start := bounds.Min.X; start < bounds.Max.X; {
 					if err := ctx.Err(); err != nil {
 						return err
@@ -261,7 +261,7 @@ func (s *pngImageEncoder) release() {
 
 // pngJPXRow 直接读取等横向采样的分量行，保持通道排序、调色板及透明度精度
 // 入参: ctx 取消上下文, row 输出行, source 图像, y 行坐标, depth 输出位深, channels 输出通道数
-// 返回: bool 是否完成直接采样, error 取消错误
+// 返回: bool 是否完成直接采样, error 读取或取消错误
 func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, channels int) (bool, error) {
 	var samples *jpxSampleImage
 	embedded := true
@@ -294,36 +294,31 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 			index = samples.mapping[index].component
 		}
 		plane := samples.planes[index]
-		if plane.XRsiz != 1 || width > plane.W {
+		if plane.Info().XStep != 1 || width > plane.Bounds().Dx() {
 			return false, nil
 		}
 	}
 	stride := channels * depth / 8
+	var data [4096]int64
 	for channel, index := range indices[:channels] {
-		var data []int32
-		var data8 []byte
-		var data16 []uint16
 		var palette []uint16
 		var bias int64
 		var maximum, step uint64
+		var origin image.Point
 		if index >= 0 {
 			if len(samples.mapping) != 0 {
 				palette = samples.mapping[index].palette
 				index = samples.mapping[index].component
 			}
 			plane := samples.planes[index]
-			ratio := int64(plane.YRsiz)
-			sy := min(plane.H-1, max(0, int((int64(y)+samples.y0)/ratio-(samples.y0+ratio-1)/ratio)))
-			offset := sy * plane.W
-			if len(samples.samples8) != 0 && samples.samples8[index] != nil {
-				data8 = samples.samples8[index][offset : offset+width]
-			} else if len(samples.samples16) != 0 && samples.samples16[index] != nil {
-				data16 = samples.samples16[index][offset : offset+width]
-			} else {
-				data = plane.Samples[offset : offset+width]
+			spec, bounds := plane.Info(), samples.planeBounds(index)
+			ratio := int64(spec.YStep)
+			sy := min(bounds.Dy()-1, max(0, int((int64(y)+samples.y0)/ratio-(samples.y0+ratio-1)/ratio)))
+			origin = bounds.Min.Add(image.Pt(0, sy))
+			if spec.Signed {
+				bias = int64(1) << (spec.Precision - 1)
 			}
-			bias = int64(1) << (plane.Precision - 1)
-			maximum = uint64(1)<<plane.Precision - 1
+			maximum = uint64(1)<<spec.Precision - 1
 			if 65535%maximum == 0 {
 				step = 65535 / maximum
 			}
@@ -332,17 +327,15 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
+			if index >= 0 {
+				if err := samples.planes[index].ReadSamples(data[:min(4096, width-start)], origin.X+start, origin.Y); err != nil {
+					return false, err
+				}
+			}
 			for x := start; x < min(start+4096, width); x++ {
 				value := uint16(65535)
 				if index >= 0 {
-					var raw uint64
-					if data8 != nil {
-						raw = uint64(data8[x])
-					} else if data16 != nil {
-						raw = uint64(data16[x])
-					} else {
-						raw = uint64(int64(data[x]) + bias)
-					}
+					raw := uint64(data[x-start] + bias)
 					switch {
 					case palette != nil:
 						value = palette[min(raw, uint64(len(palette)-1))]
@@ -637,6 +630,9 @@ func newPNGResampleRows(r *imageResample) (*pngResampleRows, error) {
 // 入参: ctx 取消上下文, y 输出行坐标
 // 返回: error 取消错误
 func (s *pngRowSampler) prepare(ctx context.Context, y int) error {
+	if err := prepareImageRows(ctx, s.source, y, y+1); err != nil {
+		return err
+	}
 	if s.colors != nil {
 		if err := s.colors.prepare(ctx, y); err != nil {
 			return err

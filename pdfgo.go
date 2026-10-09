@@ -37,11 +37,13 @@ type UnsupportedError struct {
 }
 
 // Error 返回错误信息
+// 返回: string 错误描述
 func (e *SyntaxError) Error() string {
 	return fmt.Sprintf("offset %d: %s", e.Offset, e.Message)
 }
 
 // Error 返回错误信息
+// 返回: string 错误描述
 func (e *UnsupportedError) Error() string {
 	return "unsupported " + e.Feature
 }

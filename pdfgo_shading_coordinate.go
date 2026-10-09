@@ -103,13 +103,6 @@ func (f *coordinateFunction) evaluate(point [2]float64, out []float64) error {
 	return nil
 }
 
-// readCoordinateFunction 解析二输入函数，验证每个函数的定义域包含着色定义域
-// 入参: object 函数或函数数组, outputs 输出分量数, domain 着色定义域
-// 返回: *coordinateFunction 函数定义, error 格式或能力错误
-func (r *Reader) readCoordinateFunction(object Object, outputs int, domain Rectangle) (*coordinateFunction, error) {
-	return r.readCoordinateFunctionContext(context.Background(), object, outputs, domain)
-}
-
 // readCoordinateFunctionContext 在本次取消上下文内读取二维函数及独立分量
 // 入参: ctx 取消上下文, object 函数或函数数组, outputs 输出分量数, domain 着色定义域
 // 返回: *coordinateFunction 函数定义, error 格式、解码或取消错误

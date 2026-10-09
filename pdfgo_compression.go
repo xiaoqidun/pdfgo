@@ -16,12 +16,14 @@ package pdfgo
 
 import "fmt"
 
+// 输出压缩模式：默认、无损和有损
 const (
 	CompressionUnchanged CompressionMode = iota
 	CompressionLossless
 	CompressionLossy
 )
 
+// 有损压缩预设：轻压、均衡和强压
 const (
 	CompressionLight CompressionLevel = iota
 	CompressionMedium

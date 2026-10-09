@@ -99,13 +99,6 @@ func (r *Reader) ignoredTintSpace(space Array) error {
 	}
 }
 
-// colorantNone 判断颜色空间是否丢弃全部输出，索引色沿用底层色料
-// 入参: object 颜色空间
-// 返回: bool 是否不产生输出, error 色料定义错误
-func (r *Reader) colorantNone(object Object) (bool, error) {
-	return r.colorSpaceNone(object, false)
-}
-
 // colorSpaceNone 判断原始或已按资源校验的空间是否完全不绘制
 // 入参: object 颜色空间, effective 是否已按资源校验并替换
 // 返回: bool 是否不产生输出, error 色料或变换错误

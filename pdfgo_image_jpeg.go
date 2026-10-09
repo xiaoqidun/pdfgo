@@ -102,13 +102,6 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	return nil, nil
 }
 
-// jpegTransform 解析PDF的DCT颜色规则，Adobe标记优先于解码字典
-// 入参: data JPEG数据, params DCT参数
-// 返回: jpegFrame 采样布局, bool 是否进行颜色变换, bool 是否有Adobe标记, error 参数错误
-func (i *Image) jpegTransform(data []byte, params Dictionary) (jpegFrame, bool, bool, error) {
-	return i.jpegTransformContext(context.Background(), data, params)
-}
-
 // jpegTransformContext 解析DCT颜色规则并检查标记扫描取消
 // 入参: ctx 取消上下文, data JPEG数据, params DCT参数
 // 返回: jpegFrame 采样布局, bool 颜色变换, bool Adobe标记, error 参数或取消错误
@@ -135,13 +128,6 @@ func (i *Image) jpegTransformContext(ctx context.Context, data []byte, params Di
 		transform = value == Integer(1)
 	}
 	return frame, transform, tagged, nil
-}
-
-// jpegSamples 按PDF的DCT颜色规则解码，Adobe标记优先于解码字典
-// 入参: data JPEG数据, params DCT解码参数
-// 返回: image.Image 原始颜色样本, error 参数或解码错误
-func (i *Image) jpegSamples(data []byte, params Dictionary) (image.Image, error) {
-	return i.jpegSamplesContext(context.Background(), data, params)
 }
 
 // jpegSamplesContext 按PDF的DCT颜色规则解码，在读取和逐行变换间检查取消
@@ -221,13 +207,6 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 		}
 	}
 	return out, nil
-}
-
-// jpegColorInfo 读取分量数与Adobe变换标记，正确跨过渐进扫描中的转义及重启标记
-// 入参: data JPEG数据
-// 返回: jpegFrame 采样布局, byte Adobe变换值, bool 是否有Adobe标记, error 格式错误
-func jpegColorInfo(data []byte) (jpegFrame, byte, bool, error) {
-	return jpegColorInfoContext(context.Background(), data)
 }
 
 // jpegColorInfoContext 分段扫描JPEG标记及渐进数据，限制取消检查间隔
@@ -377,13 +356,6 @@ func jpegDisplayFileContext(ctx context.Context, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return output, nil
-}
-
-// jpegMetadata 保留扫描前后的应用与注释段，识别Adobe颜色变换标记
-// 入参: data JPEG数据
-// 返回: []byte 元数据段, bool 是否包含Adobe标记, error 解析错误
-func jpegMetadata(data []byte) ([]byte, bool, error) {
-	return jpegMetadataContext(context.Background(), data)
 }
 
 // jpegMetadataContext 扫描完整编码并按原顺序保留元数据，分段检查取消

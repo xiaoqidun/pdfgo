@@ -28,6 +28,7 @@ import (
 	"io"
 )
 
+// optimizationBufferLimit 限制图片压缩候选的缓冲大小，单位为字节
 const optimizationBufferLimit = 64 << 20
 
 // pngOptimizationChunk 引用已校验的原PNG块，不复制编码内容
