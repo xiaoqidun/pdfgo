@@ -96,7 +96,7 @@ func (d *annotationRichDecorations) add(glyph annotationRichGlyph, state graphic
 	}
 }
 
-// annotationRichDecorationDefaults 保留默认外观的填充颜色及意图，不在文字对象外重放文字操作
+// annotationRichDecorationDefaults 保留默认外观的填充状态，不在文字对象外重放文字操作
 // 入参: ctx 取消上下文, defaults 默认外观操作
 // 返回: string 默认绘制操作, error 操作或取消错误
 func annotationRichDecorationDefaults(ctx context.Context, defaults string) (string, error) {
@@ -104,7 +104,7 @@ func annotationRichDecorationDefaults(ctx context.Context, defaults string) (str
 	content.WriteString("0 g\n")
 	err := WalkOperations(ctx, []byte(defaults), func(op Operation) error {
 		switch op.Operator {
-		case "g", "rg", "k", "cs", "sc", "scn", "ri":
+		case "g", "rg", "k", "cs", "sc", "scn", "ri", "gs", "i":
 			for _, operand := range op.Operands {
 				if err := writeAnnotationOperand(&content, operand); err != nil {
 					return err
@@ -118,15 +118,17 @@ func annotationRichDecorationDefaults(ctx context.Context, defaults string) (str
 	return content.String(), err
 }
 
-// writeAnnotationRichDecorations 写入字号比例的装饰矩形，不继承文字裁剪或描边参数
-// 入参: ctx 取消上下文, content 外观内容, spans 装饰片段, defaults 默认填充操作
+// writeAnnotationRichDecorations 按字号绘制填充装饰，保留透明度且不继承文字裁剪
+// 入参: ctx 取消上下文, content 外观内容, spans 装饰片段, defaults 默认填充操作, matrix 文字变换
 // 返回: error 取消或范围溢出
-func writeAnnotationRichDecorations(ctx context.Context, content *strings.Builder, spans []annotationRichDecorationSpan, defaults string) error {
+func writeAnnotationRichDecorations(ctx context.Context, content *strings.Builder, spans []annotationRichDecorationSpan, defaults string, matrix Matrix) error {
 	for _, span := range spans {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		content.WriteString("q\n")
 		content.WriteString(defaults)
+		writeAnnotationOperation(content, "cm", matrix[:]...)
 		if color := span.origin.color; color != nil {
 			writeAnnotationOperation(content, "rg", color[0], color[1], color[2])
 		}
@@ -146,6 +148,7 @@ func writeAnnotationRichDecorations(ctx context.Context, content *strings.Builde
 			}
 			writeAnnotationOperation(content, "re f", span.x, y, span.width, thickness)
 		}
+		content.WriteString("Q\n")
 	}
 	return nil
 }

@@ -32,7 +32,7 @@ import (
 var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 
 // Image 保存图像有效属性及原始数据流，颜色空间和遮罩使用PDF对象
-// Warning非空时允许按声明尺寸读取含多余样本的图像，并报告恢复原因
+// Warning非空时允许恢复多余样本、JPEG2000分段总数及TLM索引不一致，并报告原因
 // Intent为空时继承绘图状态，单独解码使用相对色度
 type Image struct {
 	Width               int

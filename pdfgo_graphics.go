@@ -180,7 +180,7 @@ type MarkedContentMark struct {
 // Halftones提供只读设备命名网屏，优先于文件中的同名备用定义
 // Form可保留普通表单边界，缺省直接展开；透明表单仍由Group接收
 // Form的子访问器接收已变换并裁剪的图元，不应再次应用表单矩阵
-// Form的子访问器未指定内容标记、可选内容及警告回调时沿用上层回调
+// Form及Group的子访问器未指定内容标记、可选内容及警告回调时沿用上层回调
 type Visitor struct {
 	Path            func(PathMark) error
 	Text            func(TextMark) error
@@ -1756,6 +1756,15 @@ func (p *pageInterpreter) form(stream *Stream) error {
 	if groupMark != nil && p.visitor.Group != nil {
 		return p.visitor.Group(*groupMark, func(visitor Visitor) error {
 			group := child
+			if visitor.MarkedContent == nil {
+				visitor.MarkedContent = child.visitor.MarkedContent
+			}
+			if visitor.OptionalContent == nil {
+				visitor.OptionalContent = child.visitor.OptionalContent
+			}
+			if visitor.Warning == nil {
+				visitor.Warning = child.visitor.Warning
+			}
 			if visitor.Reference == nil {
 				visitor.Reference = child.visitor.Reference
 			}

@@ -33,6 +33,7 @@ type imageRowContext struct {
 type jpxRowReader struct {
 	decoder *j2kgo.Decoder
 	info    j2kgo.Info
+	planes  []image.Rectangle
 	ready   image.Rectangle
 	margin  int
 }
@@ -50,6 +51,7 @@ func (s *imageRowContext) close() {
 	for _, source := range s.sources {
 		source.rows.decoder.Close()
 		source.rows.decoder = nil
+		source.rows.planes = nil
 		clear(source.planes)
 		source.planes = nil
 	}
@@ -61,8 +63,12 @@ func (s *imageRowContext) close() {
 // 返回: *jpxRowReader 行读取器
 func newJPXRowReader(decoder *j2kgo.Decoder) *jpxRowReader {
 	s := &jpxRowReader{decoder: decoder, info: decoder.Info()}
-	for _, component := range s.info.Components {
+	s.planes = make([]image.Rectangle, len(s.info.Components))
+	bounds := s.info.Bounds
+	for n, component := range s.info.Components {
 		s.margin = max(s.margin, int(component.YStep))
+		x, y := int64(component.XStep), int64(component.YStep)
+		s.planes[n] = image.Rect(int((int64(bounds.Min.X)+x-1)/x), int((int64(bounds.Min.Y)+y-1)/y), int((int64(bounds.Max.X)+x-1)/x), int((int64(bounds.Max.Y)+y-1)/y))
 	}
 	return s
 }
@@ -75,7 +81,7 @@ func (s *jpxRowReader) read(ctx context.Context, first, last int) (*j2kgo.Raster
 	if s.decoder == nil || first < 0 || last <= first || last > height {
 		return nil, fmt.Errorf("invalid JPEG2000 row request")
 	}
-	start := max(0, first/64*64-s.margin)
+	start := max(0, first-s.margin)
 	end := max(last, first+min(64, height-first))
 	end += min(s.margin, height-end)
 	bounds := image.Rect(s.info.Bounds.Min.X, s.info.Bounds.Min.Y+start, s.info.Bounds.Max.X, s.info.Bounds.Min.Y+end)
@@ -119,9 +125,7 @@ func (s *jpxSampleImage) planeBounds(index int) image.Rectangle {
 	if s.rows == nil {
 		return s.planes[index].Bounds()
 	}
-	info, bounds := s.rows.info.Components[index], s.rows.info.Bounds
-	x, y := int64(info.XStep), int64(info.YStep)
-	return image.Rect(int((int64(bounds.Min.X)+x-1)/x), int((int64(bounds.Min.Y)+y-1)/y), int((int64(bounds.Max.X)+x-1)/x), int((int64(bounds.Max.Y)+y-1)/y))
+	return s.rows.planes[index]
 }
 
 // prepareImageRows 在颜色取样前加载原始行及重采样邻域

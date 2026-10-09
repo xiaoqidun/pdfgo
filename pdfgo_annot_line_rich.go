@@ -114,7 +114,7 @@ func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption
 			for end < len(line.glyphs) && line.glyphs[end].font == glyph.font && line.glyphs[end].style == glyph.style {
 				end++
 			}
-			if err := writeAnnotationRichRun(ctx, content, line.glyphs[start:end], state, "", annotationCaptionSize, left, baseline); err != nil {
+			if err := writeAnnotationRichRun(ctx, content, line.glyphs[start:end], state, "", Identity(), annotationCaptionSize, left, baseline); err != nil {
 				return err
 			}
 			runLeft := left
@@ -129,7 +129,7 @@ func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption
 	content.WriteString("ET\n")
 	if decorated {
 		content.WriteString("Q\n")
-		return writeAnnotationRichDecorations(ctx, content, decorations.spans, "0 g\n")
+		return writeAnnotationRichDecorations(ctx, content, decorations.spans, "0 g\n", Identity())
 	}
 	return nil
 }

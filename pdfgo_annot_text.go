@@ -392,14 +392,19 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if p.state.font == nil || p.state.fontSize < 0 || p.state.hscale <= 0 {
 		return fmt.Errorf("invalid variable text font")
 	}
-	if p.state.font.Vertical || p.textMatrix[0] != 1 || p.textMatrix[1] != 0 || p.textMatrix[2] != 0 || p.textMatrix[3] != 1 {
-		return &UnsupportedError{Feature: "generated transformed text"}
+	if p.state.font.Vertical {
+		return &UnsupportedError{Feature: "generated vertical text"}
 	}
 	w, h := frame.XMax-frame.XMin, frame.YMax-frame.YMin
 	inset := math.Min(math.Max(1, border.width)+1, math.Min(w, h)/2)
 	x, y, width, height := frame.XMin+inset, frame.YMin+inset, w-2*inset, h-2*inset
 	if width <= 0 || height <= 0 {
 		return nil
+	}
+	clipWidth, clipHeight := width, height
+	matrix, width, height, err := annotationTextLayout(p.textMatrix, x, y, width, height)
+	if err != nil {
+		return err
 	}
 	letters, err := annotationLetters(ctx, p.state.font, text)
 	if err != nil {
@@ -462,23 +467,29 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if size <= 0 {
 		return fmt.Errorf("invalid automatic font size")
 	}
-	fmt.Fprintf(content, "q %g %g %g %g re W n\n", x, y, width, height)
+	content.WriteString("q\n")
+	writeAnnotationOperation(content, "re W n", x, y, clipWidth, clipHeight)
 	leading := p.state.leading
 	if leading <= 0 {
 		leading = size * 1.2
 	}
 	if list {
+		content.WriteString("q\n")
+		writeAnnotationOperation(content, "cm", matrix[:]...)
 		for _, selected := range choice.Selected {
 			row := selected - choice.TopIndex
 			if row >= 0 && float64(row)*leading < height {
-				fmt.Fprintf(content, "q 0.153 0.392 0.714 rg %g %g %g %g re f Q\n", x, y+height-float64(row+1)*leading, width, leading)
+				content.WriteString("q 0.153 0.392 0.714 rg\n")
+				writeAnnotationOperation(content, "re f Q", x, y+height-float64(row+1)*leading, width, leading)
 			}
 		}
+		content.WriteString("Q\n")
 	}
 	if !free {
 		content.WriteString("/Tx BMC\n")
 	}
-	fmt.Fprintf(content, "BT\n%s\n/%s %g Tf\n", stateContent, escapeAnnotationName(fontName), size)
+	fmt.Fprintf(content, "BT\n%s\n/%s ", stateContent, escapeAnnotationName(fontName))
+	writeAnnotationOperation(content, "Tf", size)
 	lineWidth := width
 	if list {
 		lineWidth = math.Inf(1)
@@ -497,7 +508,8 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		}
 		for i, letter := range letters {
 			left := x + (float64(start+i)+.5)*width/float64(comb) - letter.width*size*p.state.hscale/2000
-			fmt.Fprintf(content, "1 0 0 1 %g %g Tm <%x> Tj\n", left, baseline, letter.code)
+			writeAnnotationTextMatrix(content, matrix, left, baseline)
+			fmt.Fprintf(content, "<%x> Tj\n", letter.code)
 		}
 	} else {
 		for i, line := range lines {
@@ -511,7 +523,8 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 				}
 			}
 			left := x + float64(align)*(width-annotationLineWidth(line, p.state, size))/2
-			fmt.Fprintf(content, "1 0 0 1 %g %g Tm <", left, baseline-float64(i)*leading)
+			writeAnnotationTextMatrix(content, matrix, left, baseline-float64(i)*leading)
+			content.WriteByte('<')
 			for _, letter := range line {
 				fmt.Fprintf(content, "%x", letter.code)
 			}
@@ -563,10 +576,12 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 	var fontName Name
 	var stateContent strings.Builder
 	matrices := 0
+	hasFont := false
 	err = WalkOperations(ctx, appearance, func(op Operation) error {
 		auto := false
 		switch op.Operator {
 		case "Tf":
+			hasFont = true
 			if len(op.Operands) == 2 {
 				fontName, _ = op.Operands[0].(Name)
 				if size, err := numbers(op.Operands[1:], 1); err == nil && size[0] == 0 {
@@ -579,7 +594,7 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 			if matrices > 1 {
 				return fmt.Errorf("multiple default appearance text matrices")
 			}
-		case "Tc", "Tw", "Tz", "TL", "Tr", "Ts", "g", "G", "rg", "RG", "k", "K", "w", "J", "j", "M", "d", "ri", "cs", "CS", "sc", "SC", "scn", "SCN":
+		case "Tc", "Tw", "Tz", "TL", "Tr", "Ts", "g", "G", "rg", "RG", "k", "K", "w", "J", "j", "M", "d", "ri", "cs", "CS", "sc", "SC", "scn", "SCN", "gs", "i":
 		default:
 			return &UnsupportedError{Feature: "default appearance operator " + op.Operator}
 		}
@@ -588,6 +603,16 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 		}
 		if auto {
 			p.state.fontSize = 0
+		}
+		if op.Operator == "gs" {
+			name, rewritten, err := r.annotationTextGraphicsState(p, op)
+			if err != nil {
+				return err
+			}
+			if name != "" {
+				fontName = name
+			}
+			op = rewritten
 		}
 		if op.Operator != "Tf" && op.Operator != "Tm" {
 			for _, operand := range op.Operands {
@@ -600,6 +625,9 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 		}
 		return nil
 	})
+	if err == nil && !hasFont {
+		err = fmt.Errorf("missing default appearance font operator")
+	}
 	return p, fontName, stateContent.String(), err
 }
 

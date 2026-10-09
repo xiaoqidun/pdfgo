@@ -40,6 +40,10 @@ func (c *imageColorCache) entry(values [4]uint16, alpha uint16) (*imageColorEntr
 		return nil, [5]uint16{}
 	}
 	key := [5]uint16{values[0], values[1], values[2], values[3], alpha}
-	index := maphash.Comparable(c.seed, key) % uint64(len(c.entries))
+	packed := struct {
+		components uint64
+		alpha      uint16
+	}{uint64(values[0]) | uint64(values[1])<<16 | uint64(values[2])<<32 | uint64(values[3])<<48, alpha}
+	index := maphash.Comparable(c.seed, packed) % uint64(len(c.entries))
 	return &c.entries[index], key
 }

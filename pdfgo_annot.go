@@ -329,7 +329,6 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if err != nil {
 		return err
 	}
-	provided := value != nil
 	if value == nil && !annotation.IsStandard() {
 		return ctx.Err()
 	}
@@ -444,7 +443,6 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if errors.Is(err, ErrInvalidAnnotationAppearance) && annotation.Subtype == "Widget" && visitor.Warning != nil {
 		stream, err = r.widgetAppearance(ctx, page, annotation)
 		if err == nil {
-			provided = false
 			visitor.Warning(Diagnostic{Message: "invalid PDF widget appearance replaced from field properties"})
 		}
 	}
@@ -461,7 +459,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		visitor.Warning(Diagnostic{Message: "PDF annotation appearance missing Form subtype; form appearance retained"})
 	}
-	if provided && visitor.Group != nil {
+	if visitor.Group != nil {
 		group, err := r.Resolve(stream.Dictionary["Group"])
 		if err != nil {
 			return err

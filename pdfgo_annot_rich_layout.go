@@ -89,8 +89,13 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 	if p.state.font == nil || p.state.fontSize < 0 || p.state.hscale <= 0 {
 		return fmt.Errorf("invalid rich text default font")
 	}
-	if p.state.font.Vertical || p.textMatrix[0] != 1 || p.textMatrix[1] != 0 || p.textMatrix[2] != 0 || p.textMatrix[3] != 1 {
-		return &UnsupportedError{Feature: "generated transformed rich text"}
+	if p.state.font.Vertical {
+		return &UnsupportedError{Feature: "generated vertical rich text"}
+	}
+	clipWidth, clipHeight := width, height
+	matrix, width, height, err := annotationTextLayout(p.textMatrix, x, y, width, height)
+	if err != nil {
+		return err
 	}
 	fonts, err := r.newAnnotationRichFonts(ctx, resources, p.state.font, name, paragraphs)
 	if err != nil {
@@ -164,7 +169,7 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 		return err
 	}
 	content.WriteString("q\n")
-	writeAnnotationOperation(content, "re W n", x, y, width, height)
+	writeAnnotationOperation(content, "re W n", x, y, clipWidth, clipHeight)
 	decorated := annotationRichDecorated(lines)
 	var decorations annotationRichDecorations
 	var decorationDefaults string
@@ -205,7 +210,7 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 					continue
 				}
 			}
-			if err := writeAnnotationRichRun(ctx, content, line.glyphs[start:end], p.state, stateContent, size, left, baseline); err != nil {
+			if err := writeAnnotationRichRun(ctx, content, line.glyphs[start:end], p.state, stateContent, matrix, size, left, baseline); err != nil {
 				return err
 			}
 			runLeft := left
@@ -220,7 +225,7 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 	content.WriteString("ET\n")
 	if decorated {
 		content.WriteString("Q\n")
-		if err := writeAnnotationRichDecorations(ctx, content, decorations.spans, decorationDefaults); err != nil {
+		if err := writeAnnotationRichDecorations(ctx, content, decorations.spans, decorationDefaults, matrix); err != nil {
 			return err
 		}
 	}
@@ -263,9 +268,9 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 }
 
 // writeAnnotationRichRun 写入同一字体及样式的字符，保留原始编码和默认外观状态
-// 入参: ctx 取消上下文, content 内容, glyphs 字符, state 默认状态, defaults 默认操作, size 默认字号, x 横坐标, y 基线
+// 入参: ctx 取消上下文, content 内容, glyphs 字符, state 默认状态, defaults 默认操作, matrix 定位矩阵, size 默认字号, x 横坐标, y 基线
 // 返回: error 取消错误
-func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, state graphicsState, defaults string, size, x, y float64) error {
+func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, state graphicsState, defaults string, matrix Matrix, size, x, y float64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -278,7 +283,7 @@ func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyph
 		color := glyph.style.color
 		writeAnnotationOperation(content, "rg", color[0], color[1], color[2])
 	}
-	writeAnnotationOperation(content, "Tm", 1, 0, 0, 1, x, y)
+	writeAnnotationTextMatrix(content, matrix, x, y)
 	content.WriteByte('<')
 	for _, current := range glyphs {
 		if err := ctx.Err(); err != nil {
