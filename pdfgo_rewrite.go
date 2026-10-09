@@ -29,12 +29,14 @@ import (
 // 图像及页面引用须指向原文件的间接对象；空配置原样写出，不修改源对象
 // 大纲通过原节点引用定位，标题使用UTF-8文字
 // OutlineActions替换整个动作序列，空序列移除动作及目标，不可与同节点的OutlineDestinations同时指定
+// LinkActions按相同规则替换链接动作，不可与同位置的LinkDestinations同时指定
 // Optimization在同次写出中处理压缩及制作软件，默认不优化
 type RewriteOptions struct {
 	Images              map[Reference]image.Image
 	ImageOptions        ImageWriteOptions
 	LinkRegions         map[AnnotationLocation]LinkRegion
 	LinkDestinations    map[AnnotationLocation]Destination
+	LinkActions         map[AnnotationLocation][]NavigationAction
 	OutlineDestinations map[Reference]Destination
 	OutlineTitles       map[Reference]string
 	OutlineActions      map[Reference][]NavigationAction
@@ -118,9 +120,9 @@ func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
 }
 
 // linkReplacements 按页面复制链接及注解数组，不影响其他页面共享的注解
-// 入参: ctx 取消上下文, regions 注解位置与目标区域, destinations 链接跳转目标, result 已有替换对象
+// 入参: ctx 取消上下文, regions 注解位置与目标区域, destinations 链接导航修改, result 已有替换对象
 // 返回: error 引用或区域错误
-func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLocation]LinkRegion, destinations map[AnnotationLocation]Array, result map[Reference]Object) error {
+func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLocation]LinkRegion, destinations map[AnnotationLocation]linkNavigation, result map[Reference]Object) error {
 	if len(regions) == 0 && len(destinations) == 0 {
 		return nil
 	}
@@ -241,8 +243,16 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 			}
 		}
 		if destination, ok := destinations[location]; ok {
-			if err := r.replaceDestination(updated, destination); err != nil {
-				return err
+			if destination.replaceActions {
+				delete(updated, "Dest")
+				delete(updated, "A")
+				if destination.action != nil {
+					updated["A"] = destination.action
+				}
+			} else {
+				if err := r.replaceDestination(updated, destination.destination); err != nil {
+					return err
+				}
 			}
 		}
 		if !indirect || uses[annotationRef] != 1 {

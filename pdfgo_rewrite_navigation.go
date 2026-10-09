@@ -30,15 +30,27 @@ type NavigationAction struct {
 	URI         string
 }
 
+// linkNavigation 保存链接目标替换或完整动作序列替换
+type linkNavigation struct {
+	destination    Array
+	action         Dictionary
+	replaceActions bool
+}
+
 // navigationReplacements 校验导航修改并按实际层级更新大纲节点
 // 入参: ctx 取消上下文, options 替换配置, result 已有替换对象
-// 返回: map[AnnotationLocation]Array 链接目标, error 页面、目标或大纲错误
-func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOptions, result map[Reference]Object) (map[AnnotationLocation]Array, error) {
-	if len(options.LinkDestinations) == 0 && len(options.OutlineDestinations) == 0 && len(options.OutlineTitles) == 0 && len(options.OutlineActions) == 0 {
+// 返回: map[AnnotationLocation]linkNavigation 链接导航修改, error 页面、目标或大纲错误
+func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOptions, result map[Reference]Object) (map[AnnotationLocation]linkNavigation, error) {
+	if len(options.LinkDestinations) == 0 && len(options.LinkActions) == 0 && len(options.OutlineDestinations) == 0 && len(options.OutlineTitles) == 0 && len(options.OutlineActions) == 0 {
 		return nil, nil
 	}
 	pages := make(map[Reference]bool)
-	needsPages := len(options.LinkDestinations) != 0 || len(options.OutlineDestinations) != 0
+	needsPages := len(options.LinkDestinations) != 0 || len(options.LinkActions) != 0 || len(options.OutlineDestinations) != 0
+	for location := range options.LinkActions {
+		if _, exists := options.LinkDestinations[location]; exists {
+			return nil, fmt.Errorf("conflicting PDF link actions and destination")
+		}
+	}
 	for ref, actions := range options.OutlineActions {
 		if _, exists := options.OutlineDestinations[ref]; exists {
 			return nil, fmt.Errorf("conflicting PDF outline actions and destination")
@@ -55,7 +67,7 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 			return nil, err
 		}
 	}
-	links := make(map[AnnotationLocation]Array, len(options.LinkDestinations))
+	links := make(map[AnnotationLocation]linkNavigation, len(options.LinkDestinations)+len(options.LinkActions))
 	for location, dest := range options.LinkDestinations {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -67,7 +79,20 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 		if err != nil {
 			return nil, err
 		}
-		links[location] = array
+		links[location] = linkNavigation{destination: array}
+	}
+	for location, actions := range options.LinkActions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !pages[location.Page] {
+			return nil, fmt.Errorf("PDF link page is not in the page tree")
+		}
+		action, err := r.navigationAction(ctx, actions, pages)
+		if err != nil {
+			return nil, err
+		}
+		links[location] = linkNavigation{action: action, replaceActions: true}
 	}
 	if len(options.OutlineDestinations) == 0 && len(options.OutlineTitles) == 0 && len(options.OutlineActions) == 0 {
 		return links, nil
