@@ -74,7 +74,7 @@ func (r *Reader) encodeLosslessPixels(ctx context.Context, source *Stream, img i
 	return best, nil
 }
 
-// optimizeImagePixels 比较预测编码与精确索引色，保留颜色解释和透明蒙版
+// optimizeImagePixels 比较预测编码、精确灰度与索引色，保留颜色解释和透明蒙版
 // 入参: ctx 取消上下文, stream 原始图片流
 // 返回: *Stream 更小的流, error 取消或编码错误
 func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stream, error) {
@@ -139,46 +139,15 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		zw := optimizationCompressor(limit)
 		defer releaseOptimizationCompressor(zw)
 		prior := make([]byte, row)
-		candidate := make([]byte, row+1)
-		selected := make([]byte, row+1)
+		filters := [2][]byte{make([]byte, row+1), make([]byte, row+1)}
 		for start := 0; start < len(data); start += row {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			line := data[start : start+row]
-			bestScore := int64(1 << 62)
-			for filter := byte(0); filter <= 4; filter++ {
-				candidate[0] = filter
-				score := int64(0)
-				for i, v := range line {
-					var left, upLeft byte
-					if i >= bpp {
-						left = line[i-bpp]
-						upLeft = prior[i-bpp]
-					}
-					prediction := byte(0)
-					switch filter {
-					case 1:
-						prediction = left
-					case 2:
-						prediction = prior[i]
-					case 3:
-						prediction = byte((int(left) + int(prior[i])) / 2)
-					case 4:
-						prediction = paeth(left, prior[i], upLeft)
-					}
-					v -= prediction
-					candidate[i+1] = v
-					if v < 128 {
-						score += int64(v)
-					} else {
-						score += int64(256 - int(v))
-					}
-				}
-				if score < bestScore {
-					bestScore = score
-					copy(selected, candidate)
-				}
+			selected, err := pngFilterRowOrder(ctx, line, prior, bpp, &filters, [4]byte{1, 2, 3, 4})
+			if err != nil {
+				return err
 			}
 			if _, err := zw.Write(selected); err != nil {
 				zw.Close()
@@ -187,7 +156,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 				}
 				return err
 			}
-			copy(prior, line)
+			prior = line
 		}
 		if err := zw.Close(); err != nil {
 			if limit.exceeded {
@@ -226,27 +195,35 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 	if err := encode(pixels, int(w)*channels, channels, 8, channels, d["ColorSpace"]); err != nil {
 		return nil, err
 	}
+	if channels == 1 && d["Mask"] == nil {
+		packed, bits, err := compactGrayPixels(ctx, pixels, int(w), int(h))
+		if err != nil {
+			return nil, err
+		}
+		if packed != nil {
+			if err := encode(packed, (int(w)*bits+7)/8, 1, bits, 1, space); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if channels == 3 && d["Decode"] == nil && d["Mask"] == nil && d["SMask"] == nil {
-		palette := make(map[[3]byte]byte)
+		palette := make(map[uint32]byte)
 		var table []byte
-		indices := make([]byte, int(w*h))
-		for i := range indices {
+		for i := 0; i < len(pixels); i += 3 {
 			if i%65536 == 0 {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
 			}
-			key := [3]byte(pixels[i*3 : i*3+3])
-			index, ok := palette[key]
+			key := uint32(pixels[i]) | uint32(pixels[i+1])<<8 | uint32(pixels[i+2])<<16
+			_, ok := palette[key]
 			if !ok {
 				if len(palette) == 256 {
 					return best, ctx.Err()
 				}
-				index = byte(len(palette))
-				palette[key] = index
-				table = append(table, key[:]...)
+				palette[key] = byte(len(palette))
+				table = append(table, pixels[i:i+3]...)
 			}
-			indices[i] = index
 		}
 		bits := 8
 		if len(palette) <= 2 {
@@ -263,7 +240,9 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 				return nil, err
 			}
 			for x := 0; x < int(w); x++ {
-				packed[y*row+x*bits/8] |= indices[y*int(w)+x] << uint(8-bits-x*bits%8)
+				i := (y*int(w) + x) * 3
+				key := uint32(pixels[i]) | uint32(pixels[i+1])<<8 | uint32(pixels[i+2])<<16
+				packed[y*row+x*bits/8] |= palette[key] << uint(8-bits-x*bits%8)
 			}
 		}
 		if err := encode(packed, row, 1, bits, 1, Array{Name("Indexed"), space, Integer(len(palette) - 1), String(table)}); err != nil {
@@ -271,4 +250,42 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		}
 	}
 	return best, ctx.Err()
+}
+
+// compactGrayPixels 将八位灰度精确打包为一、二或四位样本，不改变归一化值
+// 入参: ctx 取消上下文, pixels 已校验的灰度样本, width 宽度, height 高度
+// 返回: []byte 打包结果，不能降位深时为空, int 位深, error 取消错误
+func compactGrayPixels(ctx context.Context, pixels []byte, width, height int) ([]byte, int, error) {
+	step := byte(255)
+	bits := 1
+	for i, value := range pixels {
+		if i&65535 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+		}
+		if value%step == 0 {
+			continue
+		}
+		if step == 255 && value%85 == 0 {
+			step, bits = 85, 2
+		} else if value%17 == 0 {
+			step, bits = 17, 4
+		} else {
+			return nil, 8, ctx.Err()
+		}
+	}
+	row := (width*bits + 7) / 8
+	packed := make([]byte, row*height)
+	for y := range height {
+		for x := range width {
+			if x&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, 0, err
+				}
+			}
+			packed[y*row+x*bits/8] |= (pixels[y*width+x] / step) << uint(8-bits-x*bits%8)
+		}
+	}
+	return packed, bits, ctx.Err()
 }

@@ -474,6 +474,13 @@ func pngGrayRow(ctx context.Context, row []byte, source *mappedGrayImage, y, dep
 // 入参: ctx 取消上下文, row 当前行, previous 上一行, pixelBytes 像素字节数, filters 复用缓冲
 // 返回: []byte 带过滤器编号的样本行, error 取消错误
 func pngFilterRow(ctx context.Context, row, previous []byte, pixelBytes int, filters *[2][]byte) ([]byte, error) {
+	return pngFilterRowOrder(ctx, row, previous, pixelBytes, filters, [4]byte{2, 1, 4, 3})
+}
+
+// pngFilterRowOrder 按指定顺序比较PNG预测器，得分相同时保留先选结果
+// 入参: ctx 取消上下文, row 当前行, previous 上一行, pixelBytes 像素字节数, filters 复用缓冲, order 非零预测器顺序
+// 返回: []byte 带预测器编号的样本行, error 取消错误
+func pngFilterRowOrder(ctx context.Context, row, previous []byte, pixelBytes int, filters *[2][]byte, order [4]byte) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -501,7 +508,7 @@ func pngFilterRow(ctx context.Context, row, previous []byte, pixelBytes int, fil
 			score += uint64(min(int(value), 256-int(value)))
 		}
 	}
-	for _, kind := range [4]int{2, 1, 4, 3} {
+	for _, kind := range order {
 		if score == 0 {
 			break
 		}
