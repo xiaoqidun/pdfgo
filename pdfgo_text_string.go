@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"bytes"
 	"fmt"
+	"unicode/utf16"
 	"unicode/utf8"
 )
 
@@ -31,6 +32,30 @@ var pdfDocCharacters = map[byte]rune{
 	0x94: 0xfb02, 0x95: 0x0141, 0x96: 0x0152, 0x97: 0x0160, 0x98: 0x0178,
 	0x99: 0x017d, 0x9a: 0x0131, 0x9b: 0x0142, 0x9c: 0x0153, 0x9d: 0x0161,
 	0x9e: 0x017e, 0x9f: 0, 0xa0: 0x20ac, 0xad: 0,
+}
+
+// EncodeTextString 将Unicode文字编码为PDFDocEncoding或带字节序标记的UTF-16BE
+// 入参: value UTF-8文字
+// 返回: String PDF文本串, error 无效UTF-8编码
+func EncodeTextString(value string) (String, error) {
+	if !utf8.ValidString(value) {
+		return nil, fmt.Errorf("invalid UTF-8 text string")
+	}
+	ascii := true
+	for _, code := range []byte(value) {
+		if code < 0x20 && code != '\t' && code != '\n' && code != '\r' || code >= 0x7f {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return String(value), nil
+	}
+	result := String{0xfe, 0xff}
+	for _, unit := range utf16.Encode([]rune(value)) {
+		result = append(result, byte(unit>>8), byte(unit))
+	}
+	return result, nil
 }
 
 // DecodeTextString 按PDF标准表D.2及Unicode文本串编码读取文字

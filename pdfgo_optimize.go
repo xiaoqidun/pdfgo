@@ -410,7 +410,30 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 	}
 	version := r.Version
+	if newInfo != nil && version < "1.2" {
+		version = "1.2"
+	}
 	for _, value := range replacements {
+		if dict, ok := value.(Dictionary); ok {
+			if title, ok := dict["Title"].(String); ok && bytes.HasPrefix(title, []byte{0xfe, 0xff}) && version < "1.2" {
+				version = "1.2"
+			}
+			dest, _ := dict["Dest"].(Array)
+			if action, ok := dict["A"].(Dictionary); ok {
+				if version < "1.1" {
+					version = "1.1"
+				}
+				if action["Next"] != nil && version < "1.2" {
+					version = "1.2"
+				}
+			}
+			if action, ok := dict["A"].(Dictionary); ok && action["S"] == Name("GoTo") {
+				dest, _ = action["D"].(Array)
+			}
+			if len(dest) >= 2 && version < "1.1" && (dest[1] == Name("FitB") || dest[1] == Name("FitBH") || dest[1] == Name("FitBV")) {
+				version = "1.1"
+			}
+		}
 		if dict, ok := value.(Dictionary); ok && dict["Subtype"] == Name("Link") && dict["QuadPoints"] != nil && version < "1.6" {
 			version = "1.6"
 		}

@@ -25,12 +25,20 @@ import (
 	"slices"
 )
 
-// RewriteOptions 批量替换图像和链接区域，不改变其他对象或原加密配置
+// RewriteOptions 批量替换图像、链接区域和导航信息，保留原加密配置
 // 图像及页面引用须指向原文件的间接对象；空配置原样写出，不修改源对象
+// 大纲通过原节点引用定位，标题使用UTF-8文字
+// OutlineActions替换整个动作序列，空序列移除动作及目标，不可与同节点的OutlineDestinations同时指定
+// Optimization在同次写出中处理压缩及制作软件，默认不优化
 type RewriteOptions struct {
-	Images       map[Reference]image.Image
-	ImageOptions ImageWriteOptions
-	LinkRegions  map[AnnotationLocation]LinkRegion
+	Images              map[Reference]image.Image
+	ImageOptions        ImageWriteOptions
+	LinkRegions         map[AnnotationLocation]LinkRegion
+	LinkDestinations    map[AnnotationLocation]Destination
+	OutlineDestinations map[Reference]Destination
+	OutlineTitles       map[Reference]string
+	OutlineActions      map[Reference][]NavigationAction
+	Optimization        OptimizeOptions
 }
 
 // AnnotationLocation 通过页面引用和从零开始的注解索引定位页面注解
@@ -47,8 +55,10 @@ type LinkRegion struct {
 	Quads [][4]Point
 }
 
-// RewriteTo 一次写出图像及链接区域替换，保留链接动作、外观和未知属性
+// RewriteTo 一次写出图像、链接区域及导航修改，保留外观和未知属性
+// 指定目标时替换原主动作；已有GoTo动作保留后续动作，其他动作整体替换
 // 独占链接保留原引用；共享链接按页面复制，带结构标记的共享链接不能单独拆分
+// 修改大纲时按实际层级修正父节点引用，不改变节点顺序及显示样式
 // 不修改签名文件；出错时应丢弃本次输出，调用期间源数据和替换图像须保持可读
 // 入参: ctx 取消上下文, writer 输出流, options 替换配置
 // 返回: OptimizeReport 写出结果, error 参数、编码或写入错误
@@ -65,24 +75,63 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if writer == nil {
 		return OptimizeReport{}, fmt.Errorf("missing output writer")
 	}
+	if err := options.Optimization.Compression.Validate(); err != nil {
+		return OptimizeReport{}, err
+	}
 	replacements, err := r.imageReplacements(ctx, options.Images, options.ImageOptions)
 	if err != nil {
 		return OptimizeReport{}, err
 	}
-	if err := r.linkReplacements(ctx, options.LinkRegions, replacements); err != nil {
+	destinations, err := r.navigationReplacements(ctx, options, replacements)
+	if err != nil {
 		return OptimizeReport{}, err
 	}
-	return r.rewriteTo(ctx, writer, OptimizeOptions{}, replacements)
+	if err := r.linkReplacements(ctx, options.LinkRegions, destinations, replacements); err != nil {
+		return OptimizeReport{}, err
+	}
+	if len(replacements) != 0 && options.Optimization.Compression.Mode != CompressionUnchanged {
+		r = r.rewriteReader(replacements)
+	}
+	return r.rewriteTo(ctx, writer, options.Optimization, replacements)
+}
+
+// rewriteReader 建立替换后的独立读取视图，供压缩与资源去重读取一致的对象
+// 视图不接管源文件和加密密钥，仅在本次写出期间使用
+// 入参: replacements 替换对象
+// 返回: *Reader 独立对象缓存的读取视图
+func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
+	cache := maps.Clone(r.cache)
+	maps.Copy(cache, replacements)
+	return &Reader{
+		Version:        r.Version,
+		Trailer:        r.Trailer,
+		source:         r.source,
+		size:           r.size,
+		originalSource: r.originalSource,
+		originalSize:   r.originalSize,
+		xref:           r.xref,
+		cache:          cache,
+		loading:        make(map[Reference]bool),
+		security:       r.security,
+		warning:        r.warning,
+	}
 }
 
 // linkReplacements 按页面复制链接及注解数组，不影响其他页面共享的注解
-// 入参: ctx 取消上下文, regions 注解位置与目标区域, result 已有替换对象
+// 入参: ctx 取消上下文, regions 注解位置与目标区域, destinations 链接跳转目标, result 已有替换对象
 // 返回: error 引用或区域错误
-func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLocation]LinkRegion, result map[Reference]Object) error {
-	if len(regions) == 0 {
+func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLocation]LinkRegion, destinations map[AnnotationLocation]Array, result map[Reference]Object) error {
+	if len(regions) == 0 && len(destinations) == 0 {
 		return nil
 	}
-	uses, err := r.linkReferenceUses(ctx, regions)
+	selected := make(map[AnnotationLocation]struct{}, len(regions)+len(destinations))
+	for location := range regions {
+		selected[location] = struct{}{}
+	}
+	for location := range destinations {
+		selected[location] = struct{}{}
+	}
+	uses, err := r.linkReferenceUses(ctx, selected)
 	if err != nil {
 		return err
 	}
@@ -93,10 +142,10 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 	for ref := range result {
 		maximum = max(maximum, ref.Number)
 	}
-	if maximum > math.MaxInt32-int64(len(regions))-1024 {
+	if maximum > math.MaxInt32-int64(len(selected))-1024 {
 		return fmt.Errorf("PDF object number exceeds output limit")
 	}
-	locations := slices.Collect(maps.Keys(regions))
+	locations := slices.Collect(maps.Keys(selected))
 	slices.SortFunc(locations, func(a, b AnnotationLocation) int {
 		if a.Page.Number != b.Page.Number {
 			if a.Page.Number < b.Page.Number {
@@ -122,7 +171,7 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		ref, region := location.Page, regions[location]
+		ref := location.Page
 		if ref.Number <= 0 || ref.Generation < 0 || ref.Generation > 65535 {
 			return fmt.Errorf("invalid PDF page reference")
 		}
@@ -178,16 +227,23 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 		if subtype != Name("Link") {
 			return fmt.Errorf("replacement object is not a PDF link")
 		}
-		points, err := region.quadPoints(ctx)
-		if err != nil {
-			return err
-		}
 		updated := maps.Clone(dict)
 		updated["Subtype"], updated["P"] = Name("Link"), ref
-		updated["Rect"] = Array{Real(region.Rect.XMin), Real(region.Rect.YMin), Real(region.Rect.XMax), Real(region.Rect.YMax)}
-		delete(updated, "QuadPoints")
-		if len(points) != 0 {
-			updated["QuadPoints"] = points
+		if region, ok := regions[location]; ok {
+			points, err := region.quadPoints(ctx)
+			if err != nil {
+				return err
+			}
+			updated["Rect"] = Array{Real(region.Rect.XMin), Real(region.Rect.YMin), Real(region.Rect.XMax), Real(region.Rect.YMax)}
+			delete(updated, "QuadPoints")
+			if len(points) != 0 {
+				updated["QuadPoints"] = points
+			}
+		}
+		if destination, ok := destinations[location]; ok {
+			if err := r.replaceDestination(updated, destination); err != nil {
+				return err
+			}
 		}
 		if !indirect || uses[annotationRef] != 1 {
 			if dict["StructParent"] != nil {
@@ -203,11 +259,11 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 }
 
 // linkReferenceUses 统计待修改链接的页面引用次数，独占链接保持原结构树引用
-// 入参: ctx 取消上下文, regions 待修改的注解位置
+// 入参: ctx 取消上下文, locations 待修改的注解位置
 // 返回: map[Reference]int 引用次数, error 页面或引用错误
-func (r *Reader) linkReferenceUses(ctx context.Context, regions map[AnnotationLocation]LinkRegion) (map[Reference]int, error) {
+func (r *Reader) linkReferenceUses(ctx context.Context, locations map[AnnotationLocation]struct{}) (map[Reference]int, error) {
 	uses := make(map[Reference]int)
-	for location := range regions {
+	for location := range locations {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
