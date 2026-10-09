@@ -250,7 +250,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		if signed {
 			if len(replacements) != 0 {
-				return report, fmt.Errorf("cannot replace images in a signed PDF")
+				return report, fmt.Errorf("cannot rewrite objects in a signed PDF")
 			}
 			return report, copySource()
 		}
@@ -411,6 +411,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	}
 	version := r.Version
 	for _, value := range replacements {
+		if dict, ok := value.(Dictionary); ok && dict["Subtype"] == Name("Link") && dict["QuadPoints"] != nil && version < "1.6" {
+			version = "1.6"
+		}
 		if stream, ok := value.(*Stream); ok {
 			if stream.Dictionary["SMask"] != nil && version < "1.4" {
 				version = "1.4"

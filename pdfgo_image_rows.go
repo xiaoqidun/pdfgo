@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -23,6 +24,9 @@ import (
 
 	"github.com/xiaoqidun/j2kgo"
 )
+
+// jpxRowMemoryLimit 设置条带样本与小波重建缓冲的估算内存目标
+const jpxRowMemoryLimit = 8 << 20
 
 // imageRowContext 管理一次图像导出使用的区域解码器
 type imageRowContext struct {
@@ -36,6 +40,7 @@ type jpxRowReader struct {
 	planes  []image.Rectangle
 	ready   image.Rectangle
 	margin  int
+	height  int
 }
 
 // rowGrayImage 按需映射灰度样本，避免展开整幅遮罩
@@ -58,22 +63,25 @@ func (s *imageRowContext) close() {
 	s.sources = nil
 }
 
-// newJPXRowReader 记录原始网格及稀疏采样需要的行邻域
+// newJPXRowReader 按分量宽度估算条带高度，保留原始网格与采样邻域
 // 入参: decoder 区域解码器
 // 返回: *jpxRowReader 行读取器
 func newJPXRowReader(decoder *j2kgo.Decoder) *jpxRowReader {
 	s := &jpxRowReader{decoder: decoder, info: decoder.Info()}
 	s.planes = make([]image.Rectangle, len(s.info.Components))
 	bounds := s.info.Bounds
+	var memory uint64
 	for n, component := range s.info.Components {
 		s.margin = max(s.margin, int(component.YStep))
 		x, y := int64(component.XStep), int64(component.YStep)
 		s.planes[n] = image.Rect(int((int64(bounds.Min.X)+x-1)/x), int((int64(bounds.Min.Y)+y-1)/y), int((int64(bounds.Max.X)+x-1)/x), int((int64(bounds.Max.Y)+y-1)/y))
+		memory += uint64(s.planes[n].Dx()) * (8 + uint64((component.Precision+7)/8))
 	}
+	s.height = max(1, int(min(256, jpxRowMemoryLimit/max(memory, 1)))-2*s.margin)
 	return s
 }
 
-// read 解码覆盖指定行的完整横向条带，并保留采样邻域
+// read 解码覆盖指定行及采样邻域的横向条带，预算不足时缩小预读范围
 // 入参: ctx 取消上下文, first 起始行, last 结束行，不包含该行
 // 返回: *j2kgo.Raster 原始行样本, error 解码或取消错误
 func (s *jpxRowReader) read(ctx context.Context, first, last int) (*j2kgo.Raster, error) {
@@ -82,15 +90,23 @@ func (s *jpxRowReader) read(ctx context.Context, first, last int) (*j2kgo.Raster
 		return nil, fmt.Errorf("invalid JPEG2000 row request")
 	}
 	start := max(0, first-s.margin)
-	end := max(last, first+min(64, height-first))
-	end += min(s.margin, height-end)
-	bounds := image.Rect(s.info.Bounds.Min.X, s.info.Bounds.Min.Y+start, s.info.Bounds.Max.X, s.info.Bounds.Min.Y+end)
-	raster, err := s.decoder.DecodeRegion(ctx, bounds)
-	if err != nil {
-		return nil, err
+	span := min(s.height, height-first)
+	for {
+		end := max(last, first+span)
+		end += min(s.margin, height-end)
+		bounds := image.Rect(s.info.Bounds.Min.X, s.info.Bounds.Min.Y+start, s.info.Bounds.Max.X, s.info.Bounds.Min.Y+end)
+		raster, err := s.decoder.DecodeRegion(ctx, bounds)
+		if err == nil {
+			s.ready = image.Rect(0, first, s.info.Bounds.Dx(), end)
+			return raster, nil
+		}
+		var limit *j2kgo.LimitError
+		if first+span <= last || !errors.As(err, &limit) {
+			return nil, err
+		}
+		span = max(1, span/2)
+		s.height = span
 	}
-	s.ready = image.Rect(0, first, s.info.Bounds.Dx(), end)
-	return raster, nil
 }
 
 // prepareRows 更新区域样本，解码错误直接返回调用方

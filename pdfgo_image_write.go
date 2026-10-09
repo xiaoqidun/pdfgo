@@ -71,15 +71,6 @@ func (r *Reader) CreateImage(ctx context.Context, source image.Image, options ..
 // 入参: ctx 取消上下文, writer 输出流, images 图像引用与替换像素, options 可选替换参数，至多一项
 // 返回: OptimizeReport 写出结果, error 参数、编码或写入错误
 func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images map[Reference]image.Image, options ...ImageWriteOptions) (OptimizeReport, error) {
-	if r.closed {
-		return OptimizeReport{}, os.ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return OptimizeReport{}, err
-	}
-	if writer == nil {
-		return OptimizeReport{}, fmt.Errorf("missing output writer")
-	}
 	if len(options) > 1 {
 		return OptimizeReport{}, fmt.Errorf("too many image write options")
 	}
@@ -87,12 +78,23 @@ func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images m
 	if len(options) == 1 {
 		settings = options[0]
 	}
+	return r.RewriteTo(ctx, writer, RewriteOptions{Images: images, ImageOptions: settings})
+}
+
+// imageReplacements 编码替换图像并为软遮罩分配独立引用，不修改源对象
+// 入参: ctx 取消上下文, images 替换图像, settings 编码参数
+// 返回: map[Reference]Object 替换对象, error 参数或编码错误
+func (r *Reader) imageReplacements(ctx context.Context, images map[Reference]image.Image, settings ImageWriteOptions) (map[Reference]Object, error) {
+	replacements := make(map[Reference]Object, len(images)*2)
+	if len(images) == 0 {
+		return replacements, nil
+	}
 	maximum := int64(0)
 	for number := range r.xref {
 		maximum = max(maximum, number)
 	}
 	if maximum > math.MaxInt32-int64(len(images))-1024 {
-		return OptimizeReport{}, fmt.Errorf("PDF object number exceeds output limit")
+		return nil, fmt.Errorf("PDF object number exceeds output limit")
 	}
 	refs := slices.Collect(maps.Keys(images))
 	slices.SortFunc(refs, func(a, b Reference) int {
@@ -110,24 +112,23 @@ func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images m
 		}
 		return 0
 	})
-	replacements := make(map[Reference]Object, len(images)*2)
 	for _, ref := range refs {
 		if err := ctx.Err(); err != nil {
-			return OptimizeReport{}, err
+			return nil, err
 		}
 		if ref.Number <= 0 || ref.Generation < 0 || ref.Generation > 65535 {
-			return OptimizeReport{}, fmt.Errorf("invalid image reference")
+			return nil, fmt.Errorf("invalid image reference")
 		}
 		original, err := r.ReadImage(ref)
 		if err != nil {
-			return OptimizeReport{}, err
+			return nil, err
 		}
 		if original.ImageMask {
-			return OptimizeReport{}, fmt.Errorf("cannot replace a stencil image")
+			return nil, fmt.Errorf("cannot replace a stencil image")
 		}
 		stream, mask, err := encodePDFImage(ctx, images[ref], settings)
 		if err != nil {
-			return OptimizeReport{}, err
+			return nil, err
 		}
 		dict := maps.Clone(original.Stream.Dictionary)
 		for _, key := range []Name{"Length", "Filter", "DecodeParms", "Decode", "Mask", "SMask", "SMaskInData", "ImageMask", "Matte", "F", "FFilter", "FDecodeParms", "Alternates"} {
@@ -144,7 +145,7 @@ func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images m
 		}
 		replacements[ref] = stream
 	}
-	return r.rewriteTo(ctx, writer, OptimizeOptions{}, replacements)
+	return replacements, nil
 }
 
 // encodePDFImage 逐行编码设备色像素和独立软遮罩，不分配整图样本缓冲
