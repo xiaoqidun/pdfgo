@@ -33,21 +33,21 @@ func jpegQualitySufficient(ctx context.Context, data []byte, quality int) (bool,
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	scan, err := readJPEGScan(data)
+	scan, err := readJPEGScan(ctx, data)
 	if err != nil || scan == nil {
 		return false, err
 	}
-	tables, components, ok := jpegQualityTables(scan.header)
+	tables, components, ok := jpegQualityTables(ctx, scan.header)
 	if !ok || len(components) != 1 && len(components) != 3 {
-		return false, nil
+		return false, ctx.Err()
 	}
 	var encoded bytes.Buffer
 	if err := jpeg.Encode(&encoded, image.NewYCbCr(image.Rect(0, 0, 1, 1), image.YCbCrSubsampleRatio420), &jpeg.Options{Quality: quality}); err != nil {
 		return false, err
 	}
-	target, _, ok := jpegQualityTables(encoded.Bytes())
+	target, _, ok := jpegQualityTables(ctx, encoded.Bytes())
 	if !ok {
-		return false, nil
+		return false, ctx.Err()
 	}
 	var ids byte
 	for _, component := range components {
@@ -71,19 +71,25 @@ func jpegQualitySufficient(ctx context.Context, data []byte, quality int) (bool,
 }
 
 // jpegQualityTables 读取扫描前的量化表与基线分量，保留表内原始顺序
-// 入参: data JPEG数据或移除霍夫曼表的扫描头
+// 入参: ctx 取消上下文, data JPEG数据或移除霍夫曼表的扫描头
 // 返回: [4][64]uint16 量化表, []jpegQualityComponent 分量, bool 可安全比较
-func jpegQualityTables(data []byte) ([4][64]uint16, []jpegQualityComponent, bool) {
+func jpegQualityTables(ctx context.Context, data []byte) ([4][64]uint16, []jpegQualityComponent, bool) {
 	var tables [4][64]uint16
 	var components []jpegQualityComponent
 	if len(data) < 2 || data[0] != 255 || data[1] != 216 {
 		return tables, nil, false
 	}
 	for pos := 2; pos < len(data); {
+		if ctx.Err() != nil {
+			return tables, nil, false
+		}
 		if data[pos] != 255 {
 			return tables, nil, false
 		}
 		for pos < len(data) && data[pos] == 255 {
+			if pos&4095 == 0 && ctx.Err() != nil {
+				return tables, nil, false
+			}
 			pos++
 		}
 		if len(data)-pos < 3 {

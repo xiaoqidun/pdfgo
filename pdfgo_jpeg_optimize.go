@@ -28,6 +28,7 @@ type jpegHuffman struct {
 	values []byte
 	codes  [256]uint16
 	length [256]uint8
+	lookup [256]uint16
 	min    [17]int
 	max    [17]int
 	base   [17]int
@@ -68,7 +69,7 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	scan, err := readJPEGScan(data)
+	scan, err := readJPEGScan(ctx, data)
 	if err != nil || scan == nil {
 		return data, err
 	}
@@ -113,9 +114,12 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 }
 
 // readJPEGScan 读取可优化的扫描头，其他合法JPEG编码留给原始字节直通
-// 入参: data JPEG数据
-// 返回: *jpegScan 扫描配置，nil表示无需优化, error 解析错误
-func readJPEGScan(data []byte) (*jpegScan, error) {
+// 入参: ctx 取消上下文, data JPEG数据
+// 返回: *jpegScan 扫描配置，nil表示无需优化, error 解析或取消错误
+func readJPEGScan(ctx context.Context, data []byte) (*jpegScan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(data) < 4 || data[0] != 0xff || data[1] != 0xd8 {
 		return nil, fmt.Errorf("invalid JPEG header")
 	}
@@ -126,11 +130,19 @@ func readJPEGScan(data []byte) (*jpegScan, error) {
 	var components []component
 	width, height, maxH, maxV := 0, 0, 0, 0
 	for pos := 2; pos+4 <= len(data); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		begin := pos
 		if data[pos] != 0xff {
 			return nil, fmt.Errorf("invalid JPEG marker")
 		}
 		for pos < len(data) && data[pos] == 0xff {
+			if pos&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			pos++
 		}
 		if pos+3 > len(data) {
@@ -159,6 +171,9 @@ func readJPEGScan(data []byte) (*jpegScan, error) {
 			}
 		case 0xc4:
 			for len(value) > 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				if len(value) < 17 || value[0]&0xec != 0 {
 					return nil, fmt.Errorf("invalid JPEG Huffman table")
 				}
@@ -249,6 +264,12 @@ func (h *jpegHuffman) prepare() error {
 				return fmt.Errorf("duplicate JPEG Huffman symbol")
 			}
 			h.codes[symbol], h.length[symbol] = uint16(code), uint8(length+1)
+			if length < 8 {
+				start := code << (7 - length)
+				for suffix := range 1 << (7 - length) {
+					h.lookup[start+suffix] = uint16(symbol)<<8 | uint16(length+1)
+				}
+			}
 			code++
 			index++
 		}
@@ -280,15 +301,35 @@ func (r *jpegEntropy) take(n uint) (uint32, error) {
 	return r.bits >> r.n & ((1 << n) - 1), nil
 }
 
-// symbol 按规范霍夫曼表读取符号
+// symbol 查表解码短码，长码及扫描末尾逐位查找，不提前消费标记
 // 入参: h 霍夫曼码表
 // 返回: byte 符号, error 解码错误
 func (r *jpegEntropy) symbol(h *jpegHuffman) (byte, error) {
 	if len(h.values) == 0 {
 		return 0, fmt.Errorf("missing JPEG Huffman table")
 	}
-	code := 0
-	for length := 1; length <= 16; length++ {
+	code, length := 0, 1
+	bits, available := r.bits, r.n
+	if available < 8 && r.pos < len(r.data) {
+		value := r.data[r.pos]
+		if value != 0xff || r.pos+1 < len(r.data) && r.data[r.pos+1] == 0 {
+			bits = bits<<8 | uint32(value)
+			available += 8
+		}
+	}
+	if available >= 8 {
+		prefix := bits >> (available - 8) & 255
+		entry := h.lookup[prefix]
+		if n := uint(entry & 255); n != 0 {
+			_, err := r.take(n)
+			return byte(entry >> 8), err
+		}
+		if _, err := r.take(8); err != nil {
+			return 0, err
+		}
+		code, length = int(prefix), 9
+	}
+	for ; length <= 16; length++ {
 		bit, err := r.take(1)
 		if err != nil {
 			return 0, err

@@ -16,7 +16,7 @@ package pdfgo
 
 import "fmt"
 
-// 输出压缩模式：默认、无损和有损
+// 输出压缩模式：原始、无损和有损
 const (
 	CompressionUnchanged CompressionMode = iota
 	CompressionLossless
@@ -30,13 +30,13 @@ const (
 	CompressionStrong
 )
 
-// CompressionMode 选择默认、无损或有损输出策略
+// CompressionMode 选择原始、无损或有损输出策略
 type CompressionMode uint8
 
 // CompressionLevel 选择轻压、均衡或强压，仅用于有损模式
 type CompressionLevel uint8
 
-// CompressionOptions 配置输出压缩，默认模式沿用现有输出策略，不额外优化
+// CompressionOptions 配置输出压缩，原始模式沿用现有输出策略，不额外优化
 // Quality为有损质量1至100，0按Level使用85、60或40
 // MaxDPI为图片降采样目标1至9600，0按Level使用不限、150或96，不改变页面尺寸
 type CompressionOptions struct {

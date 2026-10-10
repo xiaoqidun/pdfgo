@@ -38,7 +38,7 @@ import (
 )
 
 // OptimizeOptions 配置原生PDF重写，不经过页面渲染
-// 默认模式或包含签名时保留源文件；加密文档保留原安全处理器、密码和权限
+// 原始模式或包含签名时保留源文件；加密文档保留原安全处理器、密码和权限
 // Creator非空时设置重写结果的制作软件；OnProgress回报scan、compress、write阶段，支持取消
 type OptimizeOptions struct {
 	Compression CompressionOptions
