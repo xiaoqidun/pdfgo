@@ -165,7 +165,7 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 	return best, ctx.Err()
 }
 
-// optimizePNG 先比较图像表示，再按最小候选体积限制IDAT重压缩
+// optimizePNG 比较图像表示并按整图体积限制IDAT重压缩，保留原数据校验
 // 入参: ctx 取消上下文, data PNG数据, options 压缩配置, size 像素上限, resource 是否允许更换格式
 // 返回: []byte 优化数据, error 编码错误
 func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, size image.Point, resource bool) ([]byte, error) {
@@ -232,19 +232,29 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		return nil, err
 	}
 	var packed bytes.Buffer
-	output := &optimizationBuffer{buffer: &packed, limit: min(len(best), optimizationBufferLimit)}
+	budget := min(len(best)-1, optimizationBufferLimit) - 8 - 12
+	for _, chunk := range chunks {
+		if chunk.kind != "IDAT" {
+			budget -= len(chunk.data)
+		}
+	}
+	output := &optimizationBuffer{buffer: &packed, limit: max(0, budget)}
 	encoder := optimizationCompressor(output)
 	defer releaseOptimizationCompressor(encoder)
-	n, err := io.Copy(encoder, io.LimitReader(&contextInput{ctx: ctx, reader: input}, 512<<20+1))
+	source := &io.LimitedReader{R: &contextInput{ctx: ctx, reader: input}, N: 512<<20 + 1}
+	_, err = io.Copy(encoder, source)
+	if output.exceeded {
+		_, err = io.Copy(io.Discard, source)
+	}
 	input.Close()
 	closeErr := encoder.Close()
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	if n > 512<<20 {
+	if source.N == 0 {
 		return data, nil
 	}
-	if err != nil && !output.exceeded {
+	if err != nil {
 		return nil, err
 	}
 	if closeErr != nil && !output.exceeded {
