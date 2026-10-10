@@ -39,9 +39,11 @@ type MovieActivation struct {
 }
 
 // MovieAction 保存视频目标和播放操作，Activation中的显式值覆盖目标注解的参数
-// Annotation和Title仅指定一种目标；未声明参数需由调用方结合目标注解解析
+// Annotation和Title指定原有目标，Target用于写入时引用本次新增的视频注解，不可同时指定
+// 未声明参数需由调用方结合目标注解解析
 type MovieAction struct {
 	Annotation Reference
+	Target     *MovieAnnotation
 	Title      string
 	Operation  Name
 	Activation Dictionary

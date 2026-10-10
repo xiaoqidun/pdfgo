@@ -53,14 +53,14 @@ func imageSampleSize(width, height, components, depth int) (int, int, error) {
 	if depth != 1 && depth != 2 && depth != 4 {
 		return 0, 0, fmt.Errorf("invalid image component depth")
 	}
-	if width <= 0 || height <= 0 || components <= 0 || width > int(^uint(0)>>1)/components {
+	if width <= 0 || height <= 0 || components <= 0 || uint64(width) > uint64(1<<63-1)/uint64(components) {
 		return 0, 0, fmt.Errorf("image sample size exceeds platform buffer range")
 	}
-	samples := width * components
-	perByte := 8 / depth
+	samples := int64(width) * int64(components)
+	perByte := int64(8 / depth)
 	stride := samples/perByte + min(1, samples%perByte)
-	if stride > imageBufferLimit()/height {
+	if stride > int64(imageBufferLimit()/height) {
 		return 0, 0, fmt.Errorf("image sample size exceeds platform buffer range")
 	}
-	return stride, stride * height, nil
+	return int(stride), int(stride) * height, nil
 }

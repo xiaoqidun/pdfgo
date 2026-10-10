@@ -52,7 +52,7 @@ func (r *Reader) writeAnnotationPushButton(ctx context.Context, annotation Annot
 	}
 	caption := ""
 	if position != 1 {
-		caption, err = r.ReadAnnotationText(Annotation{Dictionary: mk}, "CA", nil)
+		caption, err = r.ReadAnnotationTextContext(ctx, Annotation{Dictionary: mk}, "CA", nil)
 		if err != nil {
 			return err
 		}
@@ -152,7 +152,7 @@ func (r *Reader) writeAnnotationToggleButton(ctx context.Context, annotation Ann
 		return err
 	}
 	if caption != nil {
-		text, err := r.ReadAnnotationText(Annotation{Dictionary: mk}, "CA", nil)
+		text, err := r.ReadAnnotationTextContext(ctx, Annotation{Dictionary: mk}, "CA", nil)
 		if err != nil || text == "" {
 			return err
 		}

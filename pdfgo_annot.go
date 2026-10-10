@@ -347,7 +347,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		value = Dictionary{"N": stream}
 	}
 	if value == nil && annotation.Subtype == "FreeText" {
-		text, err := r.ReadAnnotationText(annotation, "Contents", visitor.Warning)
+		text, err := r.ReadAnnotationTextContext(ctx, annotation, "Contents", visitor.Warning)
 		if err != nil {
 			return err
 		}

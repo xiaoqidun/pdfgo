@@ -760,7 +760,7 @@ func (s *packedCMYKImage) sample(x, y int) cmykSample {
 	line := s.data[(y-s.rect.Min.Y)*s.stride:]
 	var sample cmykSample
 	for c := range sample {
-		value := uint32(packedSample(line, (x-s.rect.Min.X)*4+c, s.depth))
+		value := uint32(packedSample(line, int64(x-s.rect.Min.X)*4+int64(c), s.depth))
 		sample[c] = uint16(value * 65535 / ((uint32(1) << s.depth) - 1))
 	}
 	return sample
@@ -782,7 +782,7 @@ func (s *packedGrayImage) At(x, y int) color.Color {
 		return color.Gray16{}
 	}
 	line := s.data[(y-s.rect.Min.Y)*s.stride:]
-	value := uint32(packedSample(line, x-s.rect.Min.X, s.depth))
+	value := uint32(packedSample(line, int64(x-s.rect.Min.X), s.depth))
 	return color.Gray16{Y: uint16(value * 65535 / ((uint32(1) << s.depth) - 1))}
 }
 
@@ -1990,7 +1990,7 @@ func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error
 			for x := 0; x < i.Width; x++ {
 				var values [3]uint16
 				for c := 0; c < components; c++ {
-					values[c] = uint16(uint32(packedSample(line, x*components+c, i.BitsPerComponent)) * 65535 / maximum)
+					values[c] = uint16(uint32(packedSample(line, int64(x)*int64(components)+int64(c), i.BitsPerComponent)) * 65535 / maximum)
 				}
 				out.SetNRGBA64(x, y, color.NRGBA64{R: values[0], G: values[1], B: values[2], A: 65535})
 			}

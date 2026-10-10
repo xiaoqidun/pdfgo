@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"context"
 	"fmt"
+	"reflect"
 )
 
 // Rendition 保存媒体呈现及有序候选树，不自行选择播放器或执行脚本
@@ -47,17 +48,34 @@ type MediaClip struct {
 	Dictionary  Dictionary
 }
 
+// mediaReadEntry 记录已解析资源及其最大嵌套层数，空值表示正在解析
+type mediaReadEntry[T any] struct {
+	value  *T
+	height int
+}
+
+// mediaReader 在一次解析中复用共享呈现及片段，同时检查循环与嵌套深度
+type mediaReader struct {
+	*Reader
+	renditions map[uintptr]mediaReadEntry[Rendition]
+	clips      map[uintptr]mediaReadEntry[MediaClip]
+}
+
 // ReadRendition 读取媒体呈现及选择器候选树，保留必须遵守与尽力处理的约束
 // 入参: ctx 取消上下文, object 呈现字典或间接引用
 // 返回: *Rendition 媒体呈现, error 定义或循环引用错误
 func (r *Reader) ReadRendition(ctx context.Context, object Object) (*Rendition, error) {
-	return r.readRendition(ctx, object, 0)
+	if r == nil || ctx == nil {
+		return nil, fmt.Errorf("invalid rendition context")
+	}
+	state := mediaReader{Reader: r, renditions: make(map[uintptr]mediaReadEntry[Rendition]), clips: make(map[uintptr]mediaReadEntry[MediaClip])}
+	return state.readRendition(ctx, object, 0)
 }
 
 // readRendition 递归读取呈现树，不将未知子类型误判为可播放媒体
 // 入参: ctx 取消上下文, object 呈现对象, depth 嵌套深度
 // 返回: *Rendition 呈现对象, error 引用或定义错误
-func (r *Reader) readRendition(ctx context.Context, object Object, depth int) (*Rendition, error) {
+func (r *mediaReader) readRendition(ctx context.Context, object Object, depth int) (*Rendition, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -68,6 +86,15 @@ func (r *Reader) readRendition(ctx context.Context, object Object, depth int) (*
 	if err != nil {
 		return nil, err
 	}
+	id := reflect.ValueOf(dict).Pointer()
+	if cached, exists := r.renditions[id]; exists {
+		if cached.value == nil || depth+cached.height > 32 {
+			return nil, fmt.Errorf("cyclic or excessively nested rendition")
+		}
+		return cached.value, nil
+	}
+	r.renditions[id] = mediaReadEntry[Rendition]{}
+	height := 1
 	result := &Rendition{Dictionary: dict}
 	result.Subtype, result.Name, err = r.mediaHeader(dict, "Rendition")
 	if err != nil {
@@ -96,10 +123,13 @@ func (r *Reader) readRendition(ctx context.Context, object Object, depth int) (*
 				return nil, err
 			}
 			result.Alternatives = append(result.Alternatives, candidate)
+			height = max(height, 1+r.renditions[reflect.ValueOf(candidate.Dictionary).Pointer()].height)
 		}
+		r.renditions[id] = mediaReadEntry[Rendition]{value: result, height: height}
 		return result, nil
 	}
 	if result.Subtype != "MR" {
+		r.renditions[id] = mediaReadEntry[Rendition]{value: result, height: height}
 		return result, nil
 	}
 	if dict["C"] != nil {
@@ -139,20 +169,25 @@ func (r *Reader) readRendition(ctx context.Context, object Object, depth int) (*
 			return nil, fmt.Errorf("media rendition has no input or player")
 		}
 	}
-	return result, nil
+	r.renditions[id] = mediaReadEntry[Rendition]{value: result, height: height}
+	return result, ctx.Err()
 }
 
 // ReadMediaClip 读取媒体数据或连续片段，不访问外部文件或网络
 // 入参: ctx 取消上下文, object 媒体片段字典或间接引用
 // 返回: *MediaClip 媒体片段, error 定义或循环引用错误
 func (r *Reader) ReadMediaClip(ctx context.Context, object Object) (*MediaClip, error) {
-	return r.readMediaClip(ctx, object, 0)
+	if r == nil || ctx == nil {
+		return nil, fmt.Errorf("invalid media clip context")
+	}
+	state := mediaReader{Reader: r, clips: make(map[uintptr]mediaReadEntry[MediaClip])}
+	return state.readMediaClip(ctx, object, 0)
 }
 
 // readMediaClip 读取片段链，保留时间、帧和标记偏移的原始字典
 // 入参: ctx 取消上下文, object 片段对象, depth 嵌套深度
 // 返回: *MediaClip 片段信息, error 引用或定义错误
-func (r *Reader) readMediaClip(ctx context.Context, object Object, depth int) (*MediaClip, error) {
+func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth int) (*MediaClip, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -163,6 +198,14 @@ func (r *Reader) readMediaClip(ctx context.Context, object Object, depth int) (*
 	if err != nil {
 		return nil, err
 	}
+	id := reflect.ValueOf(dict).Pointer()
+	if cached, exists := r.clips[id]; exists {
+		if cached.value == nil || depth+cached.height > 32 {
+			return nil, fmt.Errorf("cyclic or excessively nested media clip")
+		}
+		return cached.value, nil
+	}
+	r.clips[id] = mediaReadEntry[MediaClip]{}
 	result := &MediaClip{Dictionary: dict}
 	result.Subtype, result.Name, err = r.mediaHeader(dict, "MediaClip")
 	if err != nil {
@@ -178,9 +221,13 @@ func (r *Reader) readMediaClip(ctx context.Context, object Object, depth int) (*
 	}
 	if result.Subtype == "MCS" {
 		result.Section, err = r.readMediaClip(ctx, dict["D"], depth+1)
+		if err == nil {
+			r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1 + r.clips[reflect.ValueOf(result.Section.Dictionary).Pointer()].height}
+		}
 		return result, err
 	}
 	if result.Subtype != "MCD" {
+		r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1}
 		return result, nil
 	}
 	value, err := r.Resolve(dict["D"])
@@ -239,6 +286,9 @@ func (r *Reader) readMediaClip(ctx context.Context, object Object, depth int) (*
 		return nil, err
 	}
 	result.Players, err = r.mediaParameters(dict["PL"], "MediaPlayers")
+	if err == nil {
+		r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1}
+	}
 	return result, err
 }
 
@@ -296,20 +346,24 @@ func (r *Reader) mediaHeader(dict Dictionary, kind Name) (Name, string, error) {
 	return subtype, text, err
 }
 
-// Select 按深度优先顺序选择首个可用呈现，回调也检查选择器自身的约束
+// Select 按深度优先顺序选择首个可用呈现，单次选择只检查每个共享节点一次
+// 回调也检查选择器自身的约束，同次选择应使用一致的运行环境
 // 入参: ctx 取消上下文, viable 调用方对设备、播放器和必须遵守约束的检查
 // 返回: *Rendition 可用媒体呈现，无匹配返回空值, error 取消或检查错误
 func (m *Rendition) Select(ctx context.Context, viable func(*Rendition) (bool, error)) (*Rendition, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid rendition selection context")
+	}
 	if viable == nil {
 		return nil, fmt.Errorf("missing rendition viability check")
 	}
-	return m.selectRendition(ctx, viable, 0)
+	return m.selectRendition(ctx, viable, 0, make(map[*Rendition]bool))
 }
 
 // selectRendition 遍历候选树，跳过不可用选择器的整个分支
-// 入参: ctx 取消上下文, viable 可用性检查, depth 嵌套深度
+// 入参: ctx 取消上下文, viable 可用性检查, depth 嵌套深度, seen 已访问节点，值为true表示检查结束
 // 返回: *Rendition 可用媒体呈现, error 循环、取消或检查错误
-func (m *Rendition) selectRendition(ctx context.Context, viable func(*Rendition) (bool, error), depth int) (*Rendition, error) {
+func (m *Rendition) selectRendition(ctx context.Context, viable func(*Rendition) (bool, error), depth int, seen map[*Rendition]bool) (*Rendition, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -319,8 +373,16 @@ func (m *Rendition) selectRendition(ctx context.Context, viable func(*Rendition)
 	if m == nil || m.Subtype != "MR" && m.Subtype != "SR" {
 		return nil, nil
 	}
+	if complete, exists := seen[m]; exists {
+		if !complete {
+			return nil, fmt.Errorf("cyclic rendition selection")
+		}
+		return nil, nil
+	}
+	seen[m] = false
 	ok, err := viable(m)
 	if err != nil || !ok {
+		seen[m] = true
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -330,10 +392,11 @@ func (m *Rendition) selectRendition(ctx context.Context, viable func(*Rendition)
 		return m, nil
 	}
 	for _, child := range m.Alternatives {
-		selected, err := child.selectRendition(ctx, viable, depth+1)
+		selected, err := child.selectRendition(ctx, viable, depth+1, seen)
 		if err != nil || selected != nil {
 			return selected, err
 		}
 	}
+	seen[m] = true
 	return nil, nil
 }

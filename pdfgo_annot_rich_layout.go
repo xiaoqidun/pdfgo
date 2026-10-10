@@ -89,9 +89,6 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 	if p.state.font == nil || p.state.fontSize < 0 || p.state.hscale <= 0 {
 		return fmt.Errorf("invalid rich text default font")
 	}
-	if p.state.font.Vertical {
-		return &UnsupportedError{Feature: "generated vertical rich text"}
-	}
 	clipWidth, clipHeight := width, height
 	matrix, width, height, err := annotationTextLayout(p.textMatrix, x, y, width, height)
 	if err != nil {
@@ -131,6 +128,14 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 	if comb > 0 {
 		state.spacing, state.wordSpacing = 0, 0
 	}
+	if p.state.font.Vertical {
+		layout := annotationRichVertical{
+			glyphs: glyphs, paragraphs: paragraphs, state: state, defaults: stateContent, matrix: matrix,
+			frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
+			multiline: multiline, comb: comb, align: int(align),
+		}
+		return layout.write(ctx, content)
+	}
 	size := p.state.fontSize
 	if size == 0 {
 		low, high := 0.0, height
@@ -139,7 +144,7 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 				return err
 			}
 			candidate := (low + high) / 2
-			lines, total, err := annotationRichLayout(glyphs, paragraphs, state, candidate, width, multiline)
+			lines, total, err := annotationRichLayout(ctx, glyphs, paragraphs, state, candidate, width, multiline)
 			if err != nil {
 				return err
 			}
@@ -164,7 +169,7 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 			size = min(12, height)
 		}
 	}
-	lines, total, err := annotationRichLayout(glyphs, paragraphs, state, size, width, multiline)
+	lines, total, err := annotationRichLayout(ctx, glyphs, paragraphs, state, size, width, multiline)
 	if err != nil {
 		return err
 	}
@@ -186,6 +191,9 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 		top = y + (height+total)/2
 	}
 	for _, line := range lines {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		left := x + float64(line.style.align)*(width-line.width)/2
 		baseline := top - line.ascent
 		firstCell := 0
@@ -200,6 +208,9 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 			glyph := line.glyphs[start]
 			end := start + 1
 			for comb == 0 && end < len(line.glyphs) && line.glyphs[end].font == glyph.font && line.glyphs[end].style == glyph.style {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				end++
 			}
 			fontSize := annotationRichSize(glyph, size)
@@ -210,7 +221,7 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 					continue
 				}
 			}
-			if err := writeAnnotationRichRun(ctx, content, line.glyphs[start:end], p.state, stateContent, matrix, size, left, baseline); err != nil {
+			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], p.state, stateContent, matrix, size, left, baseline); err != nil {
 				return err
 			}
 			runLeft := left
@@ -230,7 +241,7 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 		}
 	}
 	content.WriteString("Q\n")
-	return nil
+	return ctx.Err()
 }
 
 // annotationRichGlyphs 按富文本样式选择源编码，分格可保留零字号字符的位置
@@ -245,6 +256,7 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 			if zero && !keepZero {
 				continue
 			}
+			start := len(glyphs[i])
 			for _, ch := range run.text {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -258,7 +270,18 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 				}
 				font, letter, err := fonts.selectLetter(run.style, ch)
 				if err != nil {
-					return nil, err
+					if keepZero {
+						return nil, err
+					}
+					font, letters, err := fonts.selectText(run.style, run.text)
+					if err != nil {
+						return nil, err
+					}
+					glyphs[i] = glyphs[i][:start]
+					for _, letter := range letters {
+						glyphs[i] = append(glyphs[i], annotationRichGlyph{letter, font, &run.style})
+					}
+					break
 				}
 				glyphs[i] = append(glyphs[i], annotationRichGlyph{letter, font, &run.style})
 			}
@@ -267,9 +290,39 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 	return glyphs, nil
 }
 
+// writeAnnotationRichHorizontalRun 在横排行内定位文字，竖排字体按原点向量逐字补偿
+// 入参: ctx 取消上下文, content 内容, glyphs 字符, state 默认状态, defaults 默认操作, matrix 定位矩阵, size 默认字号, x 横坐标, y 基线
+// 返回: error 度量或取消错误
+func writeAnnotationRichHorizontalRun(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, state graphicsState, defaults string, matrix Matrix, size, x, y float64) error {
+	if !glyphs[0].font.font.Vertical {
+		return writeAnnotationRichRun(ctx, content, glyphs, state, defaults, matrix, size, x, y)
+	}
+	for i, glyph := range glyphs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if glyph.letter.vertical == nil {
+			return fmt.Errorf("missing vertical rich text metrics")
+		}
+		n := annotationRichSize(glyph, size) / 1000
+		origin := glyph.letter.vertical.Origin
+		var err error
+		if i == 0 {
+			err = writeAnnotationRichRun(ctx, content, glyphs[i:i+1], state, defaults, matrix, size, x+origin.X*n*state.hscale, y+origin.Y*n)
+		} else {
+			err = writeAnnotationRichCodes(ctx, content, glyphs[i:i+1], matrix, x+origin.X*n*state.hscale, y+origin.Y*n)
+		}
+		if err != nil {
+			return err
+		}
+		x += annotationRichAdvance(glyph, state, size, true)
+	}
+	return ctx.Err()
+}
+
 // writeAnnotationRichRun 写入同一字体及样式的字符，保留原始编码和默认外观状态
 // 入参: ctx 取消上下文, content 内容, glyphs 字符, state 默认状态, defaults 默认操作, matrix 定位矩阵, size 默认字号, x 横坐标, y 基线
-// 返回: error 取消错误
+// 返回: error 定位或取消错误
 func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, state graphicsState, defaults string, matrix Matrix, size, x, y float64) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -282,6 +335,20 @@ func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyph
 	if glyph.style.color != nil {
 		color := glyph.style.color
 		writeAnnotationOperation(content, "rg", color[0], color[1], color[2])
+	}
+	return writeAnnotationRichCodes(ctx, content, glyphs, matrix, x, y)
+}
+
+// writeAnnotationRichCodes 写入文字位置和原始编码，连续定位复用已设置的文字状态
+// 入参: ctx 取消上下文, content 内容, glyphs 字符, matrix 定位矩阵, x 横坐标, y 基线
+// 返回: error 定位或取消错误
+func writeAnnotationRichCodes(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, matrix Matrix, x, y float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	point := matrix.Apply(Point{x, y})
+	if math.IsNaN(point.X) || math.IsInf(point.X, 0) || math.IsNaN(point.Y) || math.IsInf(point.Y, 0) {
+		return fmt.Errorf("rich text position overflow")
 	}
 	writeAnnotationTextMatrix(content, matrix, x, y)
 	content.WriteByte('<')
@@ -320,13 +387,19 @@ func annotationRichAdvance(glyph annotationRichGlyph, state graphicsState, size 
 }
 
 // annotationRichLayout 按段落、词边界及混合字号计算排版行
-// 入参: paragraphs 段落字符, styles 段落样式, state 文字状态, size 默认字号, width 行宽, multiline 是否折行
-// 返回: []annotationRichLine 排版行, float64 总高度, error 度量溢出
-func annotationRichLayout(paragraphs [][]annotationRichGlyph, styles []annotationRichParagraph, state graphicsState, size, width float64, multiline bool) ([]annotationRichLine, float64, error) {
+// 入参: ctx 取消上下文, paragraphs 段落字符, styles 段落样式, state 文字状态, size 默认字号, width 行宽, multiline 是否折行
+// 返回: []annotationRichLine 排版行, float64 总高度, error 度量或取消错误
+func annotationRichLayout(ctx context.Context, paragraphs [][]annotationRichGlyph, styles []annotationRichParagraph, state graphicsState, size, width float64, multiline bool) ([]annotationRichLine, float64, error) {
 	var lines []annotationRichLine
 	for p, glyphs := range paragraphs {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
 		start, lastBreak, advance := 0, -1, 0.0
 		for i := 0; i < len(glyphs); i++ {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
 			next := annotationRichAdvance(glyphs[i], state, size, false)
 			if i > start {
 				next += annotationRichAdvance(glyphs[i-1], state, size, true) - annotationRichAdvance(glyphs[i-1], state, size, false)
@@ -338,10 +411,16 @@ func annotationRichLayout(paragraphs [][]annotationRichGlyph, styles []annotatio
 				}
 				lineEnd := end
 				for lineEnd > start && glyphs[lineEnd-1].letter.text == ' ' {
+					if err := ctx.Err(); err != nil {
+						return nil, 0, err
+					}
 					lineEnd--
 				}
 				lines = append(lines, annotationRichLine{glyphs: glyphs[start:lineEnd], style: &styles[p].style})
 				for end < len(glyphs) && glyphs[end].letter.text == ' ' {
+					if err := ctx.Err(); err != nil {
+						return nil, 0, err
+					}
 					end++
 				}
 				start, lastBreak, advance, i = end, -1, 0, end-1
@@ -356,6 +435,9 @@ func annotationRichLayout(paragraphs [][]annotationRichGlyph, styles []annotatio
 	}
 	total := 0.0
 	for i := range lines {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
 		line := &lines[i]
 		largest := size
 		if line.style.size != nil {
@@ -365,6 +447,9 @@ func annotationRichLayout(paragraphs [][]annotationRichGlyph, styles []annotatio
 			largest = 0
 		}
 		for j, glyph := range line.glyphs {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
 			n := annotationRichSize(glyph, size)
 			largest = max(largest, n)
 			line.width += annotationRichAdvance(glyph, state, size, j+1 < len(line.glyphs))
@@ -395,5 +480,5 @@ func annotationRichLayout(paragraphs [][]annotationRichGlyph, styles []annotatio
 			}
 		}
 	}
-	return lines, total, nil
+	return lines, total, ctx.Err()
 }

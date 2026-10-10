@@ -194,7 +194,7 @@ func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters,
 			input.Close()
 			if err == nil && len(data) <= optimizationBufferLimit {
 				dict, _ := params[i].(Dictionary)
-				data, err = decodePredictorContext(ctx, data, dict)
+				data, err = restorePredictorContext(ctx, data, dict)
 			}
 		case Name("ASCIIHexDecode"), Name("ASCII85Decode"):
 			wrapper := &Stream{Dictionary: Dictionary{"Filter": filter, "DecodeParms": params[i]}, Data: data}

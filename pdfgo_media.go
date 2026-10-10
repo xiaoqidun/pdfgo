@@ -29,6 +29,8 @@ type Movie struct {
 }
 
 // Sound 保存音频采样参数和数据流，不执行播放或格式转换
+// 写出时File优先，其他情况解码Stream通用过滤器并按显式采样参数写出；CP从Stream字典复制
+// File按名称、说明、文件系统和内嵌内容写出，Dictionary不参与写出
 type Sound struct {
 	Stream      *Stream
 	Rate        float64

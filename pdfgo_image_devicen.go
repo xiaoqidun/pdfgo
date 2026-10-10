@@ -74,7 +74,7 @@ func (s *packedDeviceNImage) At(x, y int) color.Color {
 // 返回: uint16 样本值
 func (s packedDeviceNSample) component(channel int) uint16 {
 	line := s.source.data[(s.y-s.source.rect.Min.Y)*s.source.stride:]
-	value := packedSample(line, (s.x-s.source.rect.Min.X)*s.source.channels+channel, s.source.depth)
+	value := packedSample(line, int64(s.x-s.source.rect.Min.X)*int64(s.source.channels)+int64(channel), s.source.depth)
 	return uint16(uint32(value) * 65535 / ((uint32(1) << s.source.depth) - 1))
 }
 

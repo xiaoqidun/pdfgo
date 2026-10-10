@@ -58,13 +58,13 @@ type annotationRichParagraph struct {
 // 入参: ctx 取消上下文, object 富文本对象, defaults 默认样式字符串, align 默认对齐
 // 返回: []annotationRichParagraph 段落, error XML、样式或引用错误
 func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults Object, align int) ([]annotationRichParagraph, error) {
-	text, err := r.annotationTextString(object)
+	text, err := r.annotationTextString(ctx, object)
 	if err != nil {
 		return nil, err
 	}
 	style := annotationRichStyle{align: align}
 	if defaults != nil {
-		value, err := r.ReadAnnotationText(Annotation{Dictionary: Dictionary{"DS": defaults}}, "DS", nil)
+		value, err := r.ReadAnnotationTextContext(ctx, Annotation{Dictionary: Dictionary{"DS": defaults}}, "DS", nil)
 		if err != nil {
 			return nil, err
 		}
@@ -73,7 +73,7 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 			return nil, err
 		}
 	}
-	decoder := xml.NewDecoder(strings.NewReader(text))
+	decoder := xml.NewDecoder(&contextInput{ctx: ctx, reader: strings.NewReader(text)})
 	decoder.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
 		switch strings.ToLower(charset) {
 		case "utf-16", "utf-16be", "utf-16le", "us-ascii":
@@ -95,6 +95,9 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 			break
 		}
 		if err != nil {
+			if canceled := ctx.Err(); canceled != nil {
+				return nil, canceled
+			}
 			return nil, fmt.Errorf("invalid rich text XML: %w", err)
 		}
 		switch token := token.(type) {
@@ -184,7 +187,14 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 			if !space {
 				space = strings.HasSuffix(p.runs[len(p.runs)-1].text, " ")
 			}
-			for _, ch := range string(token) {
+			check := 0
+			for index, ch := range string(token) {
+				if index >= check {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					check = index + 4096
+				}
 				if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
 					if !space {
 						normalized.WriteByte(' ')

@@ -18,11 +18,11 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
-	"encoding/ascii85"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/bits"
 )
 
 // Stream 保存流字典及未经解码的数据
@@ -91,15 +91,7 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 		case "ASCIIHexDecode":
 			data, err = decodeASCIIHexContext(ctx, data)
 		case "ASCII85Decode":
-			end := bytes.Index(data, []byte("~>"))
-			if end < 0 {
-				return nil, fmt.Errorf("missing ASCII85 terminator")
-			}
-			encoded, validateErr := validateASCII85(ctx, data[:end])
-			if validateErr != nil {
-				return nil, validateErr
-			}
-			data, err = io.ReadAll(&contextInput{ctx: ctx, reader: ascii85.NewDecoder(bytes.NewReader(encoded))})
+			data, err = decodeASCII85Context(ctx, data)
 		case "RunLengthDecode":
 			data, err = decodeRunLength(ctx, data)
 		default:
@@ -109,7 +101,7 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 			return nil, err
 		}
 		if name == "FlateDecode" || name == "LZWDecode" {
-			data, err = decodePredictorContext(ctx, data, dict)
+			data, err = restorePredictorContext(ctx, data, dict)
 			if err != nil {
 				return nil, err
 			}
@@ -130,29 +122,17 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 // pdfObject 将流标记为PDF对象
 func (*Stream) pdfObject() {}
 
-// decodeASCIIHexContext 解码十六进制流，分段检查取消
+// decodeASCIIHexContext 按校验后的长度解码十六进制流，补齐末尾半字节
 // 入参: ctx 取消上下文, data 编码数据
 // 返回: []byte 解码数据, error 编码或取消错误
 func decodeASCIIHexContext(ctx context.Context, data []byte) ([]byte, error) {
-	end := bytes.IndexByte(data, '>')
-	if end < 0 {
-		return nil, fmt.Errorf("missing ASCIIHex terminator")
+	end, size, err := asciiHexSize(ctx, data)
+	if err != nil {
+		return nil, err
 	}
-	data = data[:end]
-	count := 0
-	for n, b := range data {
-		if n&4095 == 0 {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-		}
-		if !isSpace(b) {
-			count++
-		}
-	}
-	out := make([]byte, count/2+count%2)
+	out := make([]byte, size)
 	index := 0
-	for n, b := range data {
+	for n, b := range data[:end] {
 		if n&4095 == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -166,10 +146,8 @@ func decodeASCIIHexContext(ctx context.Context, data []byte) ([]byte, error) {
 			value = b - 'a' + 10
 		case 'A' <= b && b <= 'F':
 			value = b - 'A' + 10
-		case isSpace(b):
-			continue
 		default:
-			return nil, hex.InvalidByteError(b)
+			continue
 		}
 		if index%2 == 0 {
 			out[index/2] = value << 4
@@ -178,7 +156,37 @@ func decodeASCIIHexContext(ctx context.Context, data []byte) ([]byte, error) {
 		}
 		index++
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// asciiHexSize 校验十六进制字符和结束标记，计算解码长度
+// 入参: ctx 取消上下文, data 编码数据
+// 返回: int 结束标记位置, int 解码字节数, error 编码或取消错误
+func asciiHexSize(ctx context.Context, data []byte) (int, int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	digits := 0
+	for n, b := range data {
+		if n&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, 0, err
+			}
+		}
+		switch {
+		case '0' <= b && b <= '9', 'a' <= b && b <= 'f', 'A' <= b && b <= 'F':
+			digits++
+		case b == '>':
+			return n, digits/2 + digits%2, ctx.Err()
+		case isSpace(b):
+		default:
+			return 0, 0, hex.InvalidByteError(b)
+		}
+	}
+	return 0, 0, fmt.Errorf("missing ASCIIHex terminator")
 }
 
 // filterChain 解析过滤器及解码参数的间接引用，不修改源字典
@@ -335,56 +343,109 @@ func decodeLZWBytesContext(ctx context.Context, data []byte, early int64) ([]byt
 	}
 }
 
-// validateASCII85 检查编码分组并移除空白，分段检查取消
-// 入参: ctx 取消上下文, data 编码数据
-// 返回: []byte 有效编码数据, error 编码或取消错误
-func validateASCII85(ctx context.Context, data []byte) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
+// decodeASCII85Context 按校验后的长度解码ASCII85，不复制编码数据
+// 入参: ctx 取消上下文, data 带结束标记的编码数据
+// 返回: []byte 独立解码数据, error 编码、溢出或取消错误
+func decodeASCII85Context(ctx context.Context, data []byte) ([]byte, error) {
+	end, size, err := ascii85Size(ctx, data)
+	if err != nil {
 		return nil, err
 	}
-	encoded := make([]byte, 0, len(data))
-	var value uint64
-	digits := 0
-	for n, b := range data {
+	out := make([]byte, size)
+	var value uint32
+	digits, position := 0, 0
+	for n, b := range data[:end] {
 		if n&4095 == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
+		if '!' <= b && b <= 'u' {
+			value = value*85 + uint32(b-'!')
+			digits++
+			if digits == 5 {
+				binary.BigEndian.PutUint32(out[position:], value)
+				position += 4
+				value, digits = 0, 0
+			}
+		} else if b == 'z' {
+			position += 4
+		}
+	}
+	if digits > 0 {
+		for n := digits; n < 5; n++ {
+			value = value*85 + 84
+		}
+		for n := 0; n < digits-1; n++ {
+			out[position+n] = byte(value >> uint(24-8*n))
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ascii85Size 校验ASCII85分组和结束标记，计算解码长度
+// 入参: ctx 取消上下文, data 编码数据
+// 返回: int 结束标记位置, int 解码字节数, error 编码、溢出或取消错误
+func ascii85Size(ctx context.Context, data []byte) (int, int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	var value uint64
+	digits, size := 0, 0
+	for n, b := range data {
+		if n&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, 0, err
+			}
+		}
 		if isSpace(b) {
 			continue
 		}
-		encoded = append(encoded, b)
+		if b == '~' && n+1 < len(data) && data[n+1] == '>' {
+			if digits == 1 {
+				return 0, 0, fmt.Errorf("incomplete ASCII85 group")
+			}
+			if digits > 1 {
+				for j := digits; j < 5; j++ {
+					value = value*85 + 84
+				}
+				if value > 1<<32-1 {
+					return 0, 0, fmt.Errorf("ASCII85 group overflow")
+				}
+				if digits-1 > int(^uint(0)>>1)-size {
+					return 0, 0, fmt.Errorf("ASCII85 decoded length overflow")
+				}
+				size += digits - 1
+			}
+			return n, size, ctx.Err()
+		}
 		if b == 'z' {
 			if digits != 0 {
-				return nil, fmt.Errorf("misplaced ASCII85 zero group")
+				return 0, 0, fmt.Errorf("misplaced ASCII85 zero group")
 			}
-			continue
-		}
-		if b < '!' || b > 'u' {
-			return nil, fmt.Errorf("invalid ASCII85 character")
-		}
-		value = value*85 + uint64(b-'!')
-		digits++
-		if digits == 5 {
+		} else {
+			if b < '!' || b > 'u' {
+				return 0, 0, fmt.Errorf("invalid ASCII85 character")
+			}
+			value = value*85 + uint64(b-'!')
+			digits++
+			if digits < 5 {
+				continue
+			}
 			if value > 1<<32-1 {
-				return nil, fmt.Errorf("ASCII85 group overflow")
+				return 0, 0, fmt.Errorf("ASCII85 group overflow")
 			}
 			digits, value = 0, 0
 		}
-	}
-	if digits == 1 {
-		return nil, fmt.Errorf("incomplete ASCII85 group")
-	}
-	if digits > 1 {
-		for ; digits < 5; digits++ {
-			value = value*85 + 84
+		if size > int(^uint(0)>>1)-4 {
+			return 0, 0, fmt.Errorf("ASCII85 decoded length overflow")
 		}
-		if value > 1<<32-1 {
-			return nil, fmt.Errorf("ASCII85 group overflow")
-		}
+		size += 4
 	}
-	return encoded, nil
+	return 0, 0, fmt.Errorf("missing ASCII85 terminator")
 }
 
 // decodeRunLength 按校验后的长度一次分配解码缓冲，分段检查取消
@@ -481,10 +542,10 @@ func integerDefault(dict Dictionary, key Name, fallback int64) (int64, error) {
 	return int64(n), nil
 }
 
-// decodePredictorContext 还原TIFF及PNG预测样本，逐行检查取消
-// 入参: ctx 取消上下文, data 预测样本, params 预测参数
-// 返回: []byte 还原数据, error 参数或取消错误
-func decodePredictorContext(ctx context.Context, data []byte, params Dictionary) ([]byte, error) {
+// restorePredictorContext 在独占缓冲中还原TIFF及PNG预测样本，原位移除PNG滤波字节
+// 入参: ctx 取消上下文, data 本次解压所得的可写缓冲, params 预测参数
+// 返回: []byte 引用原缓冲的还原数据, error 参数或取消错误
+func restorePredictorContext(ctx context.Context, data []byte, params Dictionary) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -519,7 +580,7 @@ func decodePredictorContext(ctx context.Context, data []byte, params Dictionary)
 		if int64(len(data))%row != 0 {
 			return nil, io.ErrUnexpectedEOF
 		}
-		out := bytes.Clone(data)
+		out := data
 		for start := int64(0); start < int64(len(out)); start += row {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -527,16 +588,26 @@ func decodePredictorContext(ctx context.Context, data []byte, params Dictionary)
 			line := out[start : start+row]
 			if bits == 8 {
 				for x := int(colors); x < len(line); x++ {
+					if x&4095 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					line[x] += line[x-int(colors)]
 				}
 				continue
 			}
-			for x := int(colors); x < int(columns*colors); x++ {
-				value := packedSample(line, x, int(bits)) + packedSample(line, x-int(colors), int(bits))
+			for x := colors; x < columns*colors; x++ {
+				if x&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				value := packedSample(line, x, int(bits)) + packedSample(line, x-colors, int(bits))
 				setPackedSample(line, x, int(bits), value)
 			}
 		}
-		return out, nil
+		return out, ctx.Err()
 	}
 	if predictor < 10 || predictor > 15 {
 		return nil, fmt.Errorf("invalid predictor")
@@ -545,7 +616,7 @@ func decodePredictorContext(ctx context.Context, data []byte, params Dictionary)
 		return nil, io.ErrUnexpectedEOF
 	}
 	rows := int64(len(data)) / (row + 1)
-	out := make([]byte, rows*row)
+	out := data[: rows*row : rows*row]
 	var previous []byte
 	for y := int64(0); y < rows; y++ {
 		if err := ctx.Err(); err != nil {
@@ -563,6 +634,11 @@ func decodePredictorContext(ctx context.Context, data []byte, params Dictionary)
 				filter = 0
 			case 3:
 				for x := int(bpp); x < len(line); x++ {
+					if x&4095 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					line[x] += line[x-int(bpp)] / 2
 				}
 				filter = 0
@@ -573,14 +649,29 @@ func decodePredictorContext(ctx context.Context, data []byte, params Dictionary)
 		switch filter {
 		case 1:
 			for x := int(bpp); x < len(line); x++ {
+				if x&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				line[x] += line[x-int(bpp)]
 			}
 		case 2:
 			for x := range line {
+				if x&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				line[x] += previous[x]
 			}
 		case 3:
 			for x := range line {
+				if x&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				var left byte
 				if x >= int(bpp) {
 					left = line[x-int(bpp)]
@@ -589,6 +680,11 @@ func decodePredictorContext(ctx context.Context, data []byte, params Dictionary)
 			}
 		case 4:
 			for x := range line {
+				if x&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				var left, corner byte
 				if x >= int(bpp) {
 					left, corner = line[x-int(bpp)], previous[x-int(bpp)]
@@ -598,7 +694,7 @@ func decodePredictorContext(ctx context.Context, data []byte, params Dictionary)
 		}
 		previous = line
 	}
-	return out, nil
+	return out, ctx.Err()
 }
 
 // Read 检查取消状态后读取数据
@@ -612,28 +708,28 @@ func (r *contextInput) Read(p []byte) (int, error) {
 }
 
 // packedSample 读取按高位优先排列的图像分量
-// 入参: data 行数据, index 分量索引, bits 分量位深
+// 入参: data 行数据, index 分量索引, depth 分量位深
 // 返回: uint16 分量值
-func packedSample(data []byte, index, bits int) uint16 {
-	if bits == 16 {
+func packedSample(data []byte, index int64, depth int) uint16 {
+	if depth == 16 {
 		return binary.BigEndian.Uint16(data[index*2:])
 	}
-	perByte := 8 / bits
-	shift := uint(8 - bits - index%perByte*bits)
-	return uint16(data[index/perByte]>>shift) & uint16((1<<bits)-1)
+	byteShift := uint(4 - bits.Len8(uint8(depth)))
+	shift := uint(8-depth) - uint(index&int64(1<<byteShift-1))*uint(depth)
+	return uint16(data[index>>byteShift]>>shift) & uint16((1<<depth)-1)
 }
 
 // setPackedSample 写入图像分量，保留同字节其他分量和行尾填充
-// 入参: data 行数据, index 分量索引, bits 分量位深, value 分量值
-func setPackedSample(data []byte, index, bits int, value uint16) {
-	if bits == 16 {
+// 入参: data 行数据, index 分量索引, depth 分量位深, value 分量值
+func setPackedSample(data []byte, index int64, depth int, value uint16) {
+	if depth == 16 {
 		binary.BigEndian.PutUint16(data[index*2:], value)
 		return
 	}
-	perByte := 8 / bits
-	shift := uint(8 - bits - index%perByte*bits)
-	mask := byte((1<<bits)-1) << shift
-	data[index/perByte] = data[index/perByte]&^mask | byte(value<<shift)&mask
+	byteShift := uint(4 - bits.Len8(uint8(depth)))
+	shift := uint(8-depth) - uint(index&int64(1<<byteShift-1))*uint(depth)
+	mask := byte((1<<depth)-1) << shift
+	data[index>>byteShift] = data[index>>byteShift]&^mask | byte(value<<shift)&mask
 }
 
 // paeth 按相邻端点区间计算PNG预测值，保持等距离时的标准选择顺序

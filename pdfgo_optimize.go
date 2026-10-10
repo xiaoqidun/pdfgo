@@ -180,7 +180,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 				}
 			}
 			if !protecting && !preservingData {
-				for _, key := range []Name{"JS", "EF"} {
+				for _, key := range []Name{"JS", "EF", "Sound"} {
 					if v[key] != nil {
 						dataRoots = append(dataRoots, v[key])
 					}
@@ -294,7 +294,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		ref := dataRefs[i]
 		if replacements[ref] != nil {
-			return report, fmt.Errorf("cannot replace a stream shared with original file data")
+			if _, original := r.xref[ref.Number]; original {
+				return report, fmt.Errorf("cannot replace a stream shared with original file data")
+			}
 		}
 		value, found := metadata[ref]
 		if !found {
@@ -415,18 +417,37 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	}
 	for _, value := range replacements {
 		if dict, ok := value.(Dictionary); ok {
+			if dict["Subtype"] == Name("Movie") {
+				version = max(version, "1.2")
+			}
+			if dict["Subtype"] == Name("Screen") || dict["Type"] == Name("Rendition") {
+				version = max(version, "1.5")
+			}
+			if dict["Type"] == Name("Filespec") && dict["UF"] != nil {
+				version = max(version, "1.7")
+			}
 			if title, ok := dict["Title"].(String); ok && bytes.HasPrefix(title, []byte{0xfe, 0xff}) && version < "1.2" {
 				version = "1.2"
 			}
 			dest, _ := dict["Dest"].(Array)
-			if action, ok := dict["A"].(Dictionary); ok {
-				if version < "1.1" {
-					version = "1.1"
+			for _, key := range []Name{"A", "OpenAction"} {
+				if key == "A" && dict["Subtype"] == Name("Movie") {
+					continue
 				}
-				if action["Next"] != nil && version < "1.2" {
-					version = "1.2"
+				if _, ok := dict[key].(Dictionary); !ok {
+					continue
 				}
+				required, err := r.navigationVersion(ctx, dict[key])
+				if err != nil {
+					return report, err
+				}
+				version = max(version, required)
 			}
+			pageVersion, err := r.pageActionVersion(ctx, dict)
+			if err != nil {
+				return report, err
+			}
+			version = max(version, pageVersion)
 			if action, ok := dict["A"].(Dictionary); ok && action["S"] == Name("GoTo") {
 				dest, _ = action["D"].(Array)
 			}
@@ -927,7 +948,7 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 				}
 				if e == nil && len(pixels) <= optimizationBufferLimit {
 					dict, _ := params[0].(Dictionary)
-					pixels, e = decodePredictorContext(ctx, pixels, dict)
+					pixels, e = restorePredictorContext(ctx, pixels, dict)
 				}
 			}
 			channels := int64(3)

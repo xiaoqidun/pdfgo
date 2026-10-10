@@ -58,10 +58,16 @@ func (r *Reader) newAnnotationRichFonts(ctx context.Context, resources Dictionar
 	s := &annotationRichFonts{reader: r, ctx: ctx, fonts: maps.Clone(fonts), wanted: map[rune]bool{}}
 	for _, paragraph := range paragraphs {
 		for _, run := range paragraph.runs {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if run.style.size != nil && *run.style.size == 0 {
 				continue
 			}
 			for _, ch := range run.text {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				s.wanted[ch] = true
 			}
 		}
@@ -74,6 +80,9 @@ func (r *Reader) newAnnotationRichFonts(ctx context.Context, resources Dictionar
 	families := map[string]bool{}
 	for _, paragraph := range paragraphs {
 		for _, run := range paragraph.runs {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if run.style.size != nil && *run.style.size == 0 {
 				continue
 			}
@@ -101,16 +110,16 @@ func (r *Reader) newAnnotationRichFonts(ctx context.Context, resources Dictionar
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		family, err := r.annotationRichResourceFamily(fonts[other])
+		family, err := r.annotationRichResourceFamily(ctx, fonts[other])
+		if canceled := ctx.Err(); canceled != nil {
+			return nil, canceled
+		}
 		if err != nil || !families[strings.ToLower(family)] {
 			continue
 		}
 		font, err := r.ReadFontContext(ctx, fonts[other])
 		if err != nil {
 			return nil, err
-		}
-		if font.Vertical {
-			continue
 		}
 		if _, err := s.add(other, font); err != nil {
 			return nil, err
@@ -121,9 +130,12 @@ func (r *Reader) newAnnotationRichFonts(ctx context.Context, resources Dictionar
 }
 
 // annotationRichResourceFamily 读取字体家族元信息，不解码无关字体程序
-// 入参: object 字体资源
+// 入参: ctx 取消上下文, object 字体资源
 // 返回: string 家族, error 字典或引用错误
-func (r *Reader) annotationRichResourceFamily(object Object) (string, error) {
+func (r *Reader) annotationRichResourceFamily(ctx context.Context, object Object) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return "", err
@@ -163,9 +175,9 @@ func (r *Reader) annotationRichResourceFamily(object Object) (string, error) {
 		return "", err
 	}
 	if descriptor, ok := value.(Dictionary); ok && descriptor["FontFamily"] != nil {
-		return r.ReadAnnotationText(Annotation{Dictionary: descriptor}, "FontFamily", nil)
+		return r.ReadAnnotationTextContext(ctx, Annotation{Dictionary: descriptor}, "FontFamily", nil)
 	}
-	return family, nil
+	return family, ctx.Err()
 }
 
 // add 注册可复用字体并按描述符读取家族、字重、宽度和斜体属性
@@ -226,7 +238,7 @@ func (s *annotationRichFonts) add(name Name, font *Font) (*annotationRichFont, e
 			}
 		}
 		if descriptor["FontFamily"] != nil {
-			family, err = s.reader.ReadAnnotationText(Annotation{Dictionary: descriptor}, "FontFamily", nil)
+			family, err = s.reader.ReadAnnotationTextContext(s.ctx, Annotation{Dictionary: descriptor}, "FontFamily", nil)
 			if err != nil {
 				return nil, err
 			}
@@ -263,6 +275,51 @@ func (s *annotationRichFonts) add(name Name, font *Font) (*annotationRichFont, e
 // 入参: style 文字样式, ch 字符
 // 返回: *annotationRichFont 字体, annotationLetter 编码, error 未覆盖的字体或字形
 func (s *annotationRichFonts) selectLetter(style annotationRichStyle, ch rune) (*annotationRichFont, annotationLetter, error) {
+	font, err := s.selectFont(style, func(entry *annotationRichFont) bool {
+		_, ok := entry.letters[ch]
+		return ok
+	})
+	if err != nil {
+		return nil, annotationLetter{}, err
+	}
+	if font == nil {
+		return nil, annotationLetter{}, &UnsupportedError{Feature: fmt.Sprintf("rich text fonts have no matching face and encoding for U+%04X", ch)}
+	}
+	return font, font.letters[ch], nil
+}
+
+// selectText 为同一样式的文本复用完整源编码，不跨样式组合连字
+// 入参: style 文字样式, text 同样式原文
+// 返回: *annotationRichFont 字体, []annotationLetter 编码, error 字体、编码或取消错误
+func (s *annotationRichFonts) selectText(style annotationRichStyle, text string) (*annotationRichFont, []annotationLetter, error) {
+	encoded := make(map[*annotationRichFont][]annotationLetter)
+	font, err := s.selectFont(style, func(entry *annotationRichFont) bool {
+		letters, found := encoded[entry]
+		if !found {
+			letters, _ = annotationLetters(s.ctx, entry.font, text)
+			encoded[entry] = letters
+		}
+		return letters != nil
+	})
+	if canceled := s.ctx.Err(); canceled != nil {
+		return nil, nil, canceled
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if font == nil {
+		return nil, nil, &UnsupportedError{Feature: "rich text fonts cannot encode source text"}
+	}
+	return font, encoded[font], nil
+}
+
+// selectFont 按字体家族、样式优先级和编码覆盖选择字体
+// 入参: style 文字样式, covered 编码覆盖检查
+// 返回: *annotationRichFont 匹配字体，未找到时为空, error 字体或取消错误
+func (s *annotationRichFonts) selectFont(style annotationRichStyle, covered func(*annotationRichFont) bool) (*annotationRichFont, error) {
+	if err := s.ctx.Err(); err != nil {
+		return nil, err
+	}
 	families := style.families
 	weight, italic, stretch := style.weight, s.base.italic, style.stretch
 	if weight == 0 {
@@ -276,14 +333,17 @@ func (s *annotationRichFonts) selectLetter(style annotationRichStyle, ch rune) (
 	}
 	if len(families) == 0 {
 		if style.weight == 0 && style.italic == nil && style.stretch == 0 {
-			if letter, ok := s.base.letters[ch]; ok {
-				return s.base, letter, nil
+			if covered(s.base) {
+				return s.base, nil
 			}
-			return nil, annotationLetter{}, &UnsupportedError{Feature: fmt.Sprintf("field font has no encoding for U+%04X", ch)}
+			return nil, nil
 		}
 		families = []annotationRichFamilyName{{name: s.base.family}}
 	}
 	for _, requested := range families {
+		if err := s.ctx.Err(); err != nil {
+			return nil, err
+		}
 		family := annotationRichFamily(requested)
 		if standard := annotationRichStandardName(family, weight, italic); standard != "" {
 			exists := false
@@ -294,14 +354,14 @@ func (s *annotationRichFonts) selectLetter(style annotationRichStyle, ch rune) (
 				object := Dictionary{"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name(standard), "Encoding": Name("WinAnsiEncoding")}
 				font, err := s.reader.ReadFontContext(s.ctx, object)
 				if err != nil {
-					return nil, annotationLetter{}, err
+					return nil, err
 				}
 				name := Name(fmt.Sprintf("RichFont%d", len(s.fonts)))
 				for s.fonts[name] != nil {
 					name += "_"
 				}
 				if _, err := s.add(name, font); err != nil {
-					return nil, annotationLetter{}, err
+					return nil, err
 				}
 				s.fonts[name] = object
 			}
@@ -309,6 +369,9 @@ func (s *annotationRichFonts) selectLetter(style annotationRichStyle, ch rune) (
 		var best *annotationRichFont
 		bestWidth, bestWeight := 0, 0
 		for _, entry := range s.entries {
+			if err := s.ctx.Err(); err != nil {
+				return nil, err
+			}
 			if !strings.EqualFold(family, entry.family) || entry.italic != italic {
 				continue
 			}
@@ -317,18 +380,16 @@ func (s *annotationRichFonts) selectLetter(style annotationRichStyle, ch rune) (
 			if best == nil || widthRank < bestWidth || widthRank == bestWidth && weightRank < bestWeight {
 				best, bestWidth, bestWeight = entry, widthRank, weightRank
 			} else if widthRank == bestWidth && weightRank == bestWeight {
-				if _, ok := best.letters[ch]; !ok {
+				if !covered(best) || covered(entry) && entry.font.Vertical == s.base.font.Vertical && best.font.Vertical != s.base.font.Vertical {
 					best = entry
 				}
 			}
 		}
-		if best != nil {
-			if letter, ok := best.letters[ch]; ok {
-				return best, letter, nil
-			}
+		if best != nil && covered(best) {
+			return best, nil
 		}
 	}
-	return nil, annotationLetter{}, &UnsupportedError{Feature: fmt.Sprintf("rich text fonts have no matching face and encoding for U+%04X", ch)}
+	return nil, nil
 }
 
 // annotationRichStretchRank 为缺失宽度选择替代字体，窄类先向窄侧、宽类先向宽侧查找

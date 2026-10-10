@@ -445,8 +445,8 @@ func pngGrayRow(ctx context.Context, row []byte, source *mappedGrayImage, y, dep
 						return err
 					}
 				}
-				value := source.lookup[packedSample(input, x, source.source.depth)] / step
-				setPackedSample(row, x, depth, value)
+				value := source.lookup[packedSample(input, int64(x), source.source.depth)] / step
+				setPackedSample(row, int64(x), depth, value)
 			}
 		}
 		if remainder := width % (8 / depth) * depth; remainder != 0 {
@@ -460,7 +460,7 @@ func pngGrayRow(ctx context.Context, row []byte, source *mappedGrayImage, y, dep
 				return err
 			}
 		}
-		value := source.lookup[packedSample(input, x, source.source.depth)]
+		value := source.lookup[packedSample(input, int64(x), source.source.depth)]
 		if depth == 8 {
 			row[x] = byte(value >> 8)
 		} else {

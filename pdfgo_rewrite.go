@@ -19,17 +19,24 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"iter"
 	"maps"
 	"math"
 	"os"
 	"slices"
 )
 
-// RewriteOptions 批量替换图像、链接区域和导航信息，保留原加密配置
+// RewriteOptions 批量修改图像、文字、链接、附件和动作，保留原加密配置
 // 图像及页面引用须指向原文件的间接对象；空配置原样写出，不修改源对象
 // 大纲通过原节点引用定位，标题使用UTF-8文字
 // OutlineActions替换整个动作序列，空序列移除动作及目标，不可与同节点的OutlineDestinations同时指定
 // LinkActions按相同规则替换链接动作，不可与同位置的LinkDestinations同时指定
+// OpenActions为nil时保留文档打开行为，非nil空列表清除，非空列表替换为指定动作序列
+// PageOpenActions和PageCloseActions按页面引用替换相应事件，空列表清除，不影响其他事件
+// Attachments按名称树原始键添加或替换附件，nil值删除该键，其他位置的文件引用不变
+// MovieAnnotations按页面追加视频注解，同一注解指针只能添加一次，可由MovieAction.Target引用
+// ScreenAnnotations按页面追加屏幕注解，可由RenditionAction.Target引用
+// TextReplacements按页面内容流中的文字对象序号写入整段替换文本，不改动字形及定位
 // Optimization在同次写出中处理压缩及制作软件，默认不优化
 type RewriteOptions struct {
 	Images              map[Reference]image.Image
@@ -40,7 +47,22 @@ type RewriteOptions struct {
 	OutlineDestinations map[Reference]Destination
 	OutlineTitles       map[Reference]string
 	OutlineActions      map[Reference][]NavigationAction
+	OpenActions         []NavigationAction
+	PageOpenActions     map[Reference][]NavigationAction
+	PageCloseActions    map[Reference][]NavigationAction
+	Attachments         map[string]*EmbeddedFile
+	MovieAnnotations    map[Reference][]*MovieAnnotation
+	ScreenAnnotations   map[Reference][]*ScreenAnnotation
+	TextReplacements    map[Reference][]TextReplacement
 	Optimization        OptimizeOptions
+}
+
+// rewriteResources 保存本次写出使用的动作资源
+type rewriteResources struct {
+	attachments map[string]Object
+	sounds      map[*SoundAction]Reference
+	movies      map[*MovieAction]Dictionary
+	renditions  map[*RenditionAction]Dictionary
 }
 
 // AnnotationLocation 通过页面引用和从零开始的注解索引定位页面注解
@@ -57,7 +79,7 @@ type LinkRegion struct {
 	Quads [][4]Point
 }
 
-// RewriteTo 一次写出图像、链接区域及导航修改，保留外观和未知属性
+// RewriteTo 一次写出图像、文字、链接、附件及事件修改，保留外观和未知属性
 // 指定目标时替换原主动作；已有GoTo动作保留后续动作，其他动作整体替换
 // 独占链接保留原引用；共享链接按页面复制，带结构标记的共享链接不能单独拆分
 // 修改大纲时按实际层级修正父节点引用，不改变节点顺序及显示样式
@@ -84,17 +106,84 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if err != nil {
 		return OptimizeReport{}, err
 	}
-	destinations, err := r.navigationReplacements(ctx, options, replacements)
+	attachments, err := r.attachmentReplacements(ctx, options, replacements)
+	if err != nil {
+		return OptimizeReport{}, err
+	}
+	sounds, err := r.soundReplacements(ctx, options, replacements)
+	if err != nil {
+		return OptimizeReport{}, err
+	}
+	resources := &rewriteResources{attachments: attachments, sounds: sounds}
+	movies, err := r.movieAnnotationReplacements(ctx, options.MovieAnnotations, replacements)
+	if err != nil {
+		return OptimizeReport{}, err
+	}
+	resources.movies, err = r.movieActions(ctx, options, movies)
+	if err != nil {
+		return OptimizeReport{}, err
+	}
+	screens, err := r.screenAnnotationReplacements(ctx, options.ScreenAnnotations, replacements)
+	if err != nil {
+		return OptimizeReport{}, err
+	}
+	resources.renditions, err = r.renditionActions(ctx, options, screens, replacements)
+	if err != nil {
+		return OptimizeReport{}, err
+	}
+	if err := r.screenAnnotationActions(ctx, options, screens, replacements, resources); err != nil {
+		return OptimizeReport{}, err
+	}
+	destinations, err := r.navigationReplacements(ctx, options, replacements, resources)
 	if err != nil {
 		return OptimizeReport{}, err
 	}
 	if err := r.linkReplacements(ctx, options.LinkRegions, destinations, replacements); err != nil {
 		return OptimizeReport{}, err
 	}
-	if len(replacements) != 0 && options.Optimization.Compression.Mode != CompressionUnchanged {
+	if err := r.lifecycleReplacements(ctx, options, replacements, resources); err != nil {
+		return OptimizeReport{}, err
+	}
+	textChanged, err := r.textReplacements(ctx, options.TextReplacements, replacements)
+	if err != nil {
+		return OptimizeReport{}, err
+	}
+	if textChanged || len(replacements) != 0 && options.Optimization.Compression.Mode != CompressionUnchanged {
 		r = r.rewriteReader(replacements)
 	}
+	if textChanged {
+		r.Version = max(r.Version, "1.4")
+	}
 	return r.rewriteTo(ctx, writer, options.Optimization, replacements)
+}
+
+// actionSequences 遍历待写动作序列，不改变各序列内部顺序
+// 返回: iter.Seq[[]NavigationAction] 动作序列迭代器
+func (o RewriteOptions) actionSequences() iter.Seq[[]NavigationAction] {
+	return func(yield func([]NavigationAction) bool) {
+		if !yield(o.OpenActions) {
+			return
+		}
+		for _, group := range []map[Reference][]NavigationAction{o.OutlineActions, o.PageOpenActions, o.PageCloseActions} {
+			for _, actions := range group {
+				if !yield(actions) {
+					return
+				}
+			}
+		}
+		for _, actions := range o.LinkActions {
+			if !yield(actions) {
+				return
+			}
+		}
+		for _, annotations := range o.ScreenAnnotations {
+			for _, annotation := range annotations {
+				if annotation != nil && !yield(annotation.Actions) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // rewriteReader 建立替换后的独立读取视图，供压缩与资源去重读取一致的对象

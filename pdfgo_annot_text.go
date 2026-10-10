@@ -28,17 +28,34 @@ import (
 
 // annotationLetter 保存外观文字的原始编码与排版度量
 type annotationLetter struct {
-	text  rune
-	code  string
-	width float64
-	word  bool
+	text     rune
+	code     string
+	width    float64
+	word     bool
+	vertical *VerticalMetrics
 }
 
 // ReadAnnotationText 读取注解文本字段，RC和RV允许文本流，其他字段要求文本字符串
 // 入参: annotation 注解, field 文本字段名, warning 异常字段警告，空值使用严格检查
 // 返回: string Unicode文本, error 引用、类型或编码错误
 func (r *Reader) ReadAnnotationText(annotation Annotation, field Name, warning func(Diagnostic)) (string, error) {
+	return r.ReadAnnotationTextContext(context.Background(), annotation, field, warning)
+}
+
+// ReadAnnotationTextContext 读取注解文本并响应取消，取消错误不作为异常字段忽略
+// 入参: ctx 取消上下文, annotation 注解, field 文本字段名, warning 异常字段警告，空值使用严格检查
+// 返回: string Unicode文本, error 引用、类型、编码或取消错误
+func (r *Reader) ReadAnnotationTextContext(ctx context.Context, annotation Annotation, field Name, warning func(Diagnostic)) (string, error) {
+	if ctx == nil {
+		return "", fmt.Errorf("missing annotation text context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	value, err := r.Resolve(annotation.Dictionary[field])
+	if canceled := ctx.Err(); canceled != nil {
+		return "", canceled
+	}
 	if err != nil || value == nil {
 		return "", err
 	}
@@ -51,8 +68,12 @@ func (r *Reader) ReadAnnotationText(annotation Annotation, field Name, warning f
 			err = fmt.Errorf("invalid annotation %s: expected text string", field)
 			break
 		}
+		if value == nil {
+			err = fmt.Errorf("missing annotation text stream")
+			break
+		}
 		var decoded []byte
-		decoded, err = value.Decode()
+		decoded, err = value.DecodeContext(ctx)
 		data = String(decoded)
 	default:
 		err = fmt.Errorf("invalid annotation %s: expected text string", field)
@@ -61,12 +82,15 @@ func (r *Reader) ReadAnnotationText(annotation Annotation, field Name, warning f
 	if err == nil {
 		text, err = DecodeTextString(data)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err != nil {
 		if warning == nil {
 			return "", err
 		}
 		warning(Diagnostic{Message: fmt.Sprintf("invalid PDF annotation %s ignored; appearance retained", field)})
-		return "", nil
+		return "", ctx.Err()
 	}
 	return text, nil
 }
@@ -93,10 +117,16 @@ func (r *Reader) formDefaults() (Dictionary, error) {
 }
 
 // annotationTextString 读取文本字符串或文本流，并统一换行符
-// 入参: object 文本对象
-// 返回: string Unicode文本, error 编码或类型错误
-func (r *Reader) annotationTextString(object Object) (string, error) {
+// 入参: ctx 取消上下文, object 文本对象
+// 返回: string Unicode文本, error 引用、类型、编码或取消错误
+func (r *Reader) annotationTextString(ctx context.Context, object Object) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	value, err := r.Resolve(object)
+	if canceled := ctx.Err(); canceled != nil {
+		return "", canceled
+	}
 	if err != nil || value == nil {
 		return "", err
 	}
@@ -105,7 +135,10 @@ func (r *Reader) annotationTextString(object Object) (string, error) {
 	case String:
 		data = value
 	case *Stream:
-		data, err = value.Decode()
+		if value == nil {
+			return "", fmt.Errorf("missing annotation text stream")
+		}
+		data, err = value.DecodeContext(ctx)
 		if err != nil {
 			return "", err
 		}
@@ -114,6 +147,9 @@ func (r *Reader) annotationTextString(object Object) (string, error) {
 	}
 	text, err := DecodeTextString(data)
 	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	return strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n"), nil
@@ -353,7 +389,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	var text string
 	var err error
 	if choice == nil {
-		text, err = r.annotationTextString(textObject)
+		text, err = r.annotationTextString(ctx, textObject)
 	} else if choice.Combo {
 		if len(choice.Selected) != 0 {
 			text = choice.Options[choice.Selected[0]].Label
@@ -392,9 +428,6 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if p.state.font == nil || p.state.fontSize < 0 || p.state.hscale <= 0 {
 		return fmt.Errorf("invalid variable text font")
 	}
-	if p.state.font.Vertical {
-		return &UnsupportedError{Feature: "generated vertical text"}
-	}
 	w, h := frame.XMax-frame.XMin, frame.YMax-frame.YMin
 	inset := math.Min(math.Max(1, border.width)+1, math.Min(w, h)/2)
 	x, y, width, height := frame.XMin+inset, frame.YMin+inset, w-2*inset, h-2*inset
@@ -426,8 +459,19 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if err != nil {
 		return err
 	}
-	if comb > 0 && len(letters) > comb {
+	if comb > 0 && utf8.RuneCountInString(text) > comb {
 		return fmt.Errorf("field value exceeds comb length")
+	}
+	if comb > 0 && len(letters) != utf8.RuneCountInString(text) {
+		return &UnsupportedError{Feature: "comb field requires individual character encodings"}
+	}
+	if p.state.font.Vertical {
+		layout := annotationVerticalText{
+			letters: letters, matrix: matrix, font: fontName, defaults: stateContent,
+			frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
+			align: align, comb: comb, multiline: multiline, choice: choice, free: free,
+		}
+		return layout.write(p, content)
 	}
 	size := p.state.fontSize
 	if list && size == 0 {
@@ -654,7 +698,7 @@ func annotationLetters(ctx context.Context, font *Font, text string) ([]annotati
 		}
 		letter, ok := lookup[c]
 		if !ok {
-			return nil, &UnsupportedError{Feature: fmt.Sprintf("field font has no encoding for U+%04X", c)}
+			return annotationEncodedLetters(ctx, font, text, lookup)
 		}
 		letters = append(letters, letter)
 	}
@@ -693,10 +737,14 @@ func annotationLetterLookup(ctx context.Context, font *Font, wanted map[rune]boo
 		glyph := glyphs[0]
 		letter, _ := utf8.DecodeRuneInString(glyph.Text)
 		if wanted['\u00a0'] && !font.composite && font.encoding == "WinAnsiEncoding" && code == "\xa0" && glyph.Name == "space" && glyph.Text == " " && font.Unicode[code] == "" {
-			lookup['\u00a0'] = annotationLetter{'\u00a0', code, glyph.Width, glyph.WordSpace}
+			lookup['\u00a0'] = annotationLetter{text: '\u00a0', code: code, width: glyph.Width, word: glyph.WordSpace}
 		}
 		if _, ok := lookup[letter]; !ok && wanted[letter] {
-			lookup[letter] = annotationLetter{letter, code, glyph.Width, glyph.WordSpace}
+			entry := annotationLetter{text: letter, code: code, width: glyph.Width, word: glyph.WordSpace}
+			if font.Vertical {
+				entry.vertical = &glyph.Vertical
+			}
+			lookup[letter] = entry
 		}
 	}
 	if err := ctx.Err(); err != nil {

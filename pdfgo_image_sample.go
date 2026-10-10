@@ -96,7 +96,7 @@ func imageNRGBA64At(source image.Image, x, y int) color.NRGBA64 {
 		if !image.Pt(x, y).In(s.rect) {
 			return color.NRGBA64{}
 		}
-		value := uint32(packedSample(s.data[(y-s.rect.Min.Y)*s.stride:], x-s.rect.Min.X, s.depth))
+		value := uint32(packedSample(s.data[(y-s.rect.Min.Y)*s.stride:], int64(x-s.rect.Min.X), s.depth))
 		v := uint16(value * 65535 / ((uint32(1) << s.depth) - 1))
 		return color.NRGBA64{R: v, G: v, B: v, A: 65535}
 	case image.RGBA64Image:

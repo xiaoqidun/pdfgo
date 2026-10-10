@@ -116,8 +116,10 @@ type PathMark struct {
 // Mode保留有效绘制模式，Type3除不可见模式3外均按0交付，不产生文字裁剪
 // Object只读共享同一BT与ET边界，不同文字对象使用不同实例
 // Resources保留所在页面的只读资源，供未声明资源字典的Type3字形查找
+// Replacement保留所属替换文本区段，同一区段共享实例，不改变Glyphs中的原始字符映射
 type TextMark struct {
 	Object                *TextObject
+	Replacement           *ReplacementText
 	Font                  *Font
 	Resources             Dictionary
 	Glyphs                []Glyph
@@ -166,10 +168,22 @@ type GroupMark struct {
 }
 
 // MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标记的标签
+// Replacement在含ActualText的Span开始和结束时共享实例，Hidden表示区段当前不可见
+// Offset为当前解码内容流中的操作位置
 type MarkedContentMark struct {
-	Tag        Name
-	Properties Dictionary
-	Operator   string
+	Tag         Name
+	Properties  Dictionary
+	Operator    string
+	Offset      int64
+	Replacement *ReplacementText
+	Hidden      bool
+}
+
+// ReplacementText 保存整个内容区段的替换文本，Parent指向外层替换区段
+// Text允许为空，表示不提取该区段的原始字符；相邻区段之间不隐式增加空格
+type ReplacementText struct {
+	Text   string
+	Parent *ReplacementText
 }
 
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
@@ -213,10 +227,12 @@ type graphicsState struct {
 	fillColor, strokeColor                                *graphicsColorSpace
 }
 
-// markedContentState 保存标记名称及进入区段前的可见性
+// markedContentState 保存标记名称、可见性及替换文本作用域
 type markedContentState struct {
-	tag    Name
-	hidden bool
+	tag         Name
+	hidden      bool
+	previous    *ReplacementText
+	replacement *ReplacementText
 }
 
 // pageInterpreter 按内容顺序解释页面或表单
@@ -229,6 +245,7 @@ type pageInterpreter struct {
 	state                  graphicsState
 	stack                  []graphicsState
 	marked                 []markedContentState
+	replacement            *ReplacementText
 	hidden                 bool
 	textClips              []*TextClip
 	textMatrix, lineMatrix Matrix
@@ -524,7 +541,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if resources == nil {
 		resources = mark.Resources
 	}
-	interpreter := pageInterpreter{reader: r, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, type3: true}
+	interpreter := pageInterpreter{reader: r, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, type3: true, replacement: mark.Replacement}
 	interpreter.glyphStreams = append(append([]*Stream(nil), mark.glyphStreams...), stream)
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
@@ -581,7 +598,7 @@ func (p *pageInterpreter) run(data []byte) error {
 // 入参: op 内容标记操作
 // 返回: error 错误信息
 func (p *pageInterpreter) markedContent(op Operation) error {
-	mark := MarkedContentMark{Operator: op.Operator}
+	mark := MarkedContentMark{Operator: op.Operator, Offset: op.Offset, Hidden: p.hidden}
 	optional := false
 	if op.Operator == "EMC" {
 		if len(op.Operands) != 0 || len(p.marked) == 0 {
@@ -589,6 +606,7 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 		}
 		state := p.marked[len(p.marked)-1]
 		mark.Tag, p.hidden = state.tag, state.hidden
+		mark.Replacement, p.replacement = state.replacement, state.previous
 		p.marked = p.marked[:len(p.marked)-1]
 	} else {
 		hidden := p.hidden
@@ -637,8 +655,22 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 			}
 		}
 		if op.Operator == "BMC" || op.Operator == "BDC" {
-			p.marked = append(p.marked, markedContentState{mark.Tag, hidden})
+			if op.Operator == "BDC" && mark.Tag == "Span" {
+				var err error
+				mark.Replacement, err = p.replacementText(mark.Properties)
+				if err != nil {
+					if p.visitor.Warning == nil || p.ctx.Err() != nil {
+						return err
+					}
+					p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: "invalid PDF ActualText ignored: " + err.Error()})
+				}
+			}
+			p.marked = append(p.marked, markedContentState{tag: mark.Tag, hidden: hidden, previous: p.replacement, replacement: mark.Replacement})
+			if mark.Replacement != nil {
+				p.replacement = mark.Replacement
+			}
 		}
+		mark.Hidden = p.hidden
 	}
 	if p.visitor.MarkedContent != nil {
 		return p.visitor.MarkedContent(mark)
@@ -1353,7 +1385,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 		if p.visitor.Text == nil {
 			return fmt.Errorf("text visitor missing")
 		}
-		mark := TextMark{Object: p.textObject, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
+		mark := TextMark{Object: p.textObject, Replacement: p.replacement, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
 		if mark.Font.Subtype == "Type3" {
 			mark.Resources = p.pageResources
 		}

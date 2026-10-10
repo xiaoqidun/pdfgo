@@ -79,7 +79,7 @@ func (r *Reader) readRichLineCaption(ctx context.Context, page *Page, object Obj
 	if err != nil {
 		return nil, err
 	}
-	caption.rich, caption.height, err = annotationRichLayout(glyphs, paragraphs, graphicsState{hscale: 1}, annotationCaptionSize, math.Inf(1), true)
+	caption.rich, caption.height, err = annotationRichLayout(ctx, glyphs, paragraphs, graphicsState{hscale: 1}, annotationCaptionSize, math.Inf(1), true)
 	if err != nil {
 		return nil, err
 	}
@@ -112,9 +112,12 @@ func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption
 			glyph := line.glyphs[start]
 			end := start + 1
 			for end < len(line.glyphs) && line.glyphs[end].font == glyph.font && line.glyphs[end].style == glyph.style {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				end++
 			}
-			if err := writeAnnotationRichRun(ctx, content, line.glyphs[start:end], state, "", Identity(), annotationCaptionSize, left, baseline); err != nil {
+			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], state, "", Identity(), annotationCaptionSize, left, baseline); err != nil {
 				return err
 			}
 			runLeft := left

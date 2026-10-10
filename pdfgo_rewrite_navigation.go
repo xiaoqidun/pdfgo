@@ -23,10 +23,21 @@ import (
 	"unicode/utf8"
 )
 
-// NavigationAction 描述文档内跳转或URI导航，Destination和URI须且仅须指定一项
+// NavigationAction 描述导航或媒体播放动作，须且仅须指定一项
 // URI使用UTF-8文字或已转义地址，写出时转换为ASCII，不访问外部资源
+// External按结构化字段写出，File.Dictionary不参与写出，File.Name使用标准文件路径或URL
+// Sound的音量零值为静音，源流及文件数据在写出期间须保持可读；库不执行播放
+// Movie须指向原文件或本次新增的视频注解，跨页播放须由调用方先指定跳转动作
+// Movie未指定Annotation和Target时按Title查找原注解，允许空标题；Activation仅写出显式参数
+// Movie.Activation中的间接引用须属于当前文件
+// Rendition引用原有或本次新增的屏幕注解，不执行脚本或播放媒体
 type NavigationAction struct {
 	Destination *Destination
+	External    *ExternalGoToAction
+	Attachment  *AttachmentAction
+	Sound       *SoundAction
+	Movie       *MovieAction
+	Rendition   *RenditionAction
 	URI         string
 }
 
@@ -38,9 +49,9 @@ type linkNavigation struct {
 }
 
 // navigationReplacements 校验导航修改并按实际层级更新大纲节点
-// 入参: ctx 取消上下文, options 替换配置, result 已有替换对象
+// 入参: ctx 取消上下文, options 替换配置, result 已有替换对象, resources 动作资源
 // 返回: map[AnnotationLocation]linkNavigation 链接导航修改, error 页面、目标或大纲错误
-func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOptions, result map[Reference]Object) (map[AnnotationLocation]linkNavigation, error) {
+func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOptions, result map[Reference]Object, resources *rewriteResources) (map[AnnotationLocation]linkNavigation, error) {
 	if len(options.LinkDestinations) == 0 && len(options.LinkActions) == 0 && len(options.OutlineDestinations) == 0 && len(options.OutlineTitles) == 0 && len(options.OutlineActions) == 0 {
 		return nil, nil
 	}
@@ -88,7 +99,7 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 		if !pages[location.Page] {
 			return nil, fmt.Errorf("PDF link page is not in the page tree")
 		}
-		action, err := r.navigationAction(ctx, actions, pages)
+		action, err := r.navigationAction(ctx, actions, pages, resources)
 		if err != nil {
 			return nil, err
 		}
@@ -144,7 +155,7 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 			titleCount++
 		}
 		if changeActions {
-			action, err := r.navigationAction(ctx, actions, pages)
+			action, err := r.navigationAction(ctx, actions, pages, resources)
 			if err != nil {
 				return err
 			}
@@ -168,9 +179,9 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 }
 
 // navigationAction 按给定顺序生成导航动作链，空序列不生成动作
-// 入参: ctx 取消上下文, actions 导航序列, pages 文档页面引用
+// 入参: ctx 取消上下文, actions 动作序列, pages 文档页面引用, resources 动作资源
 // 返回: Dictionary 首个动作及后续动作, error 参数或取消错误
-func (r *Reader) navigationAction(ctx context.Context, actions []NavigationAction, pages map[Reference]bool) (Dictionary, error) {
+func (r *Reader) navigationAction(ctx context.Context, actions []NavigationAction, pages map[Reference]bool, resources *rewriteResources) (Dictionary, error) {
 	if len(actions) == 0 {
 		return nil, nil
 	}
@@ -179,7 +190,29 @@ func (r *Reader) navigationAction(ctx context.Context, actions []NavigationActio
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if (action.Destination == nil) == (action.URI == "") {
+		count := 0
+		if action.Destination != nil {
+			count++
+		}
+		if action.External != nil {
+			count++
+		}
+		if action.Attachment != nil {
+			count++
+		}
+		if action.Sound != nil {
+			count++
+		}
+		if action.Movie != nil {
+			count++
+		}
+		if action.Rendition != nil {
+			count++
+		}
+		if action.URI != "" {
+			count++
+		}
+		if count != 1 {
 			return nil, fmt.Errorf("invalid PDF navigation action")
 		}
 		if action.Destination != nil {
@@ -188,6 +221,50 @@ func (r *Reader) navigationAction(ctx context.Context, actions []NavigationActio
 				return nil, err
 			}
 			list = append(list, Dictionary{"S": Name("GoTo"), "D": dest})
+		} else if action.External != nil {
+			external, err := r.rewriteExternalGoTo(ctx, *action.External)
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, external)
+		} else if action.Attachment != nil {
+			if resources == nil {
+				return nil, fmt.Errorf("missing PDF action resources")
+			}
+			file, ok := resources.attachments[action.Attachment.Key]
+			if !ok {
+				return nil, fmt.Errorf("PDF attachment target not found")
+			}
+			dict := Dictionary{"S": Name("Launch"), "F": file}
+			if action.Attachment.NewWindow != nil {
+				dict["NewWindow"] = Boolean(*action.Attachment.NewWindow)
+			}
+			list = append(list, dict)
+		} else if action.Sound != nil {
+			if resources == nil {
+				return nil, fmt.Errorf("missing PDF action resources")
+			}
+			ref, ok := resources.sounds[action.Sound]
+			if !ok {
+				return nil, fmt.Errorf("missing PDF sound resource")
+			}
+			dict := Dictionary{"S": Name("Sound"), "Sound": ref, "Volume": Real(action.Sound.Volume), "Mix": Boolean(action.Sound.Mix)}
+			if action.Sound.Repeat {
+				dict["Repeat"] = Boolean(true)
+			} else if action.Sound.Synchronous {
+				dict["Synchronous"] = Boolean(true)
+			}
+			list = append(list, dict)
+		} else if action.Movie != nil {
+			if resources == nil || resources.movies[action.Movie] == nil {
+				return nil, fmt.Errorf("missing PDF movie action")
+			}
+			list = append(list, maps.Clone(resources.movies[action.Movie]))
+		} else if action.Rendition != nil {
+			if resources == nil || resources.renditions[action.Rendition] == nil {
+				return nil, fmt.Errorf("missing PDF rendition action")
+			}
+			list = append(list, maps.Clone(resources.renditions[action.Rendition]))
 		} else {
 			uri, err := navigationURI(action.URI)
 			if err != nil {
@@ -241,11 +318,18 @@ func (r *Reader) rewriteDestination(dest Destination, pages map[Reference]bool) 
 	if !pages[dest.Page] {
 		return nil, fmt.Errorf("%w: page is not in the page tree", ErrInvalidDestination)
 	}
-	count, known := destinationParameterCount(dest.Mode)
-	if !known || len(dest.Parameters) != count {
+	return r.rewriteDestinationArray(dest.Page, dest.Mode, dest.Parameters)
+}
+
+// rewriteDestinationArray 校验显示参数，分别保留本地页引用和远程页码
+// 入参: page 页引用或零基页码, mode 显示模式, values 显示参数
+// 返回: Array 显式目标, error 参数错误
+func (r *Reader) rewriteDestinationArray(page Object, mode Name, values Array) (Array, error) {
+	count, known := destinationParameterCount(mode)
+	if !known || len(values) != count {
 		return nil, fmt.Errorf("%w: mode or parameter count", ErrInvalidDestination)
 	}
-	array := append(Array{dest.Page, dest.Mode}, dest.Parameters...)
+	array := append(Array{page, mode}, values...)
 	mode, parameters, err := r.destinationParameters(array)
 	if err != nil {
 		return nil, err
@@ -264,7 +348,7 @@ func (r *Reader) rewriteDestination(dest Destination, pages map[Reference]bool) 
 			return nil, fmt.Errorf("%w: empty rectangle", ErrInvalidDestination)
 		}
 	}
-	return append(Array{dest.Page, mode}, parameters...), nil
+	return append(Array{page, mode}, parameters...), nil
 }
 
 // replaceDestination 更新独立目标或GoTo动作，不修改共享动作及其后续动作

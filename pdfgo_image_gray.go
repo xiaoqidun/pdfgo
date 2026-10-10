@@ -64,7 +64,7 @@ func (s *mappedGrayImage) Gray16At(x, y int) color.Gray16 {
 		return color.Gray16{}
 	}
 	line := s.source.data[(y-s.source.rect.Min.Y)*s.source.stride:]
-	return color.Gray16{Y: s.lookup[packedSample(line, x-s.source.rect.Min.X, s.source.depth)]}
+	return color.Gray16{Y: s.lookup[packedSample(line, int64(x-s.source.rect.Min.X), s.source.depth)]}
 }
 
 // NRGBA64At 直接读取非预乘颜色，避免逐像素颜色接口转换

@@ -252,7 +252,7 @@ func (r *Reader) readLineCaption(ctx context.Context, page *Page, annotation Ann
 	if value != nil {
 		return r.readRichLineCaption(ctx, page, value, caption)
 	}
-	text, err := r.ReadAnnotationText(annotation, "Contents", warning)
+	text, err := r.ReadAnnotationTextContext(ctx, annotation, "Contents", warning)
 	if err != nil || text == "" {
 		return nil, err
 	}
