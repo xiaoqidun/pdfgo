@@ -37,7 +37,7 @@ func jpegQualitySufficient(ctx context.Context, data []byte, quality int) (bool,
 	if err != nil || scan == nil {
 		return false, err
 	}
-	tables, components, ok := jpegQualityTables(ctx, scan.header)
+	tables, components, ok := jpegQualityTables(ctx, data[:scan.sos])
 	if !ok || len(components) != 1 && len(components) != 3 {
 		return false, ctx.Err()
 	}
@@ -71,7 +71,7 @@ func jpegQualitySufficient(ctx context.Context, data []byte, quality int) (bool,
 }
 
 // jpegQualityTables 读取扫描前的量化表与基线分量，保留表内原始顺序
-// 入参: ctx 取消上下文, data JPEG数据或移除霍夫曼表的扫描头
+// 入参: ctx 取消上下文, data JPEG数据或扫描头
 // 返回: [4][64]uint16 量化表, []jpegQualityComponent 分量, bool 可安全比较
 func jpegQualityTables(ctx context.Context, data []byte) ([4][64]uint16, []jpegQualityComponent, bool) {
 	var tables [4][64]uint16

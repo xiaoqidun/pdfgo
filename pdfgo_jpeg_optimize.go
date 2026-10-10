@@ -49,9 +49,9 @@ type jpegBitWriter struct {
 	n    uint
 }
 
-// jpegScan 保存单扫描顺序JPEG的组件及重启间隔
+// jpegScan 保存单扫描顺序JPEG的组件、重启间隔及原始扫描头片段
 type jpegScan struct {
-	header  []byte
+	header  [][]byte
 	sos     int
 	start   int
 	mcus    int
@@ -93,7 +93,9 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 		dht.Write(table.values)
 	}
 	var output jpegBitWriter
-	output.Write(scan.header)
+	for _, part := range scan.header {
+		output.Write(part)
+	}
 	output.Write([]byte{0xff, 0xc4, byte((dht.Len() + 2) >> 8), byte(dht.Len() + 2)})
 	output.Write(dht.Bytes())
 	output.Write(data[scan.sos:scan.start])
@@ -124,8 +126,7 @@ func readJPEGScan(ctx context.Context, data []byte) (*jpegScan, error) {
 		return nil, fmt.Errorf("invalid JPEG header")
 	}
 	s := &jpegScan{}
-	var header bytes.Buffer
-	header.Write(data[:2])
+	headerStart := 0
 	type component struct{ id, h, v byte }
 	var components []component
 	width, height, maxH, maxV := 0, 0, 0, 0
@@ -170,6 +171,10 @@ func readJPEGScan(ctx context.Context, data []byte) (*jpegScan, error) {
 				maxH, maxV = max(maxH, int(c.h)), max(maxV, int(c.v))
 			}
 		case 0xc4:
+			if headerStart < begin {
+				s.header = append(s.header, data[headerStart:begin])
+			}
+			headerStart = stop
 			for len(value) > 0 {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -233,15 +238,14 @@ func readJPEGScan(ctx context.Context, data []byte) (*jpegScan, error) {
 			s.mcus = ((width + maxH*8 - 1) / (maxH * 8)) * ((height + maxV*8 - 1) / (maxV * 8))
 			s.start = stop
 			s.sos = begin
-			s.header = header.Bytes()
+			if headerStart < begin {
+				s.header = append(s.header, data[headerStart:begin])
+			}
 			return s, nil
 		default:
 			if marker >= 0xc1 && marker <= 0xcf && marker != 0xc4 {
 				return nil, nil
 			}
-		}
-		if marker != 0xc4 {
-			header.Write(data[begin:stop])
 		}
 		pos = stop
 	}
