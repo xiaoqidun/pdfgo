@@ -42,11 +42,13 @@ type jpegEntropy struct {
 	n    uint
 }
 
-// jpegBitWriter 写出JPEG扫描位流及字节转义
+// jpegBitWriter 写出JPEG扫描位流及字节转义，按需限制候选体积
 type jpegBitWriter struct {
 	bytes.Buffer
-	bits uint32
-	n    uint
+	bits     uint32
+	n        uint
+	limit    int
+	exceeded bool
 }
 
 // jpegScan 保存单扫描顺序JPEG的组件、重启间隔及原始扫描头片段
@@ -74,8 +76,10 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 		return data, err
 	}
 	var frequencies [8][256]uint64
+	var bitCount uint64
 	end, err := scan.walk(ctx, data, func(table int, symbol byte, bits uint32, n uint) {
 		frequencies[table][symbol]++
+		bitCount += uint64(n)
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -91,14 +95,25 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 		dht.WriteByte(byte(i%4) | byte(i/4)<<4)
 		dht.Write(table.counts[:])
 		dht.Write(table.values)
+		for _, symbol := range table.values {
+			bitCount += frequency[symbol] * uint64(table.length[symbol])
+		}
 	}
-	var output jpegBitWriter
+	limit := end - (scan.start - scan.sos) - 4 - dht.Len() - 1
 	for _, part := range scan.header {
-		output.Write(part)
+		limit -= len(part)
 	}
-	output.Write([]byte{0xff, 0xc4, byte((dht.Len() + 2) >> 8), byte(dht.Len() + 2)})
-	output.Write(dht.Bytes())
-	output.Write(data[scan.sos:scan.start])
+	if limit <= 0 {
+		return data, ctx.Err()
+	}
+	output := jpegBitWriter{limit: limit}
+	maxEntropy := 2 * ((bitCount + 7) / 8)
+	if scan.restart > 0 {
+		maxEntropy += 4 * uint64((scan.mcus-1)/scan.restart)
+	}
+	overhead := len(data) - 1 - limit
+	capacity := min(uint64(limit), maxEntropy) + min(uint64(overhead), maxEntropy)
+	output.Grow(int(min(uint64(len(data)-1), capacity)))
 	_, err = scan.walk(ctx, data, func(table int, symbol byte, bits uint32, n uint) {
 		code := &tables[table]
 		output.put(uint32(code.codes[symbol]), uint(code.length[symbol]))
@@ -108,11 +123,27 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	output.flush()
-	output.Write(data[end:])
-	if output.Len() >= len(data) {
-		return data, nil
+	if output.exceeded {
+		return data, ctx.Err()
 	}
-	return output.Bytes(), nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	entropy := output.Len()
+	output.Grow(overhead)
+	output.Write(output.AvailableBuffer()[:overhead])
+	result := output.Bytes()
+	prefix := overhead - (len(data) - end)
+	copy(result[prefix:], result[:entropy])
+	pos := 0
+	for _, part := range scan.header {
+		pos += copy(result[pos:], part)
+	}
+	pos += copy(result[pos:], []byte{0xff, 0xc4, byte((dht.Len() + 2) >> 8), byte(dht.Len() + 2)})
+	pos += copy(result[pos:], dht.Bytes())
+	pos += copy(result[pos:], data[scan.sos:scan.start])
+	copy(result[pos+entropy:], data[end:])
+	return result, nil
 }
 
 // readJPEGScan 读取可优化的扫描头，其他合法JPEG编码留给原始字节直通
@@ -346,13 +377,16 @@ func (r *jpegEntropy) symbol(h *jpegHuffman) (byte, error) {
 	return 0, fmt.Errorf("invalid JPEG Huffman code")
 }
 
-// walk 扫描量化系数符号，统计与写出共用同一遍历
+// walk 遍历量化系数符号，重编码候选超限时提前结束
 // 入参: ctx 取消上下文, data JPEG数据, visit 符号访问回调, output 可选输出
 // 返回: int 扫描后片段偏移, error 扫描错误
 func (s *jpegScan) walk(ctx context.Context, data []byte, visit func(int, byte, uint32, uint), output *jpegBitWriter) (int, error) {
 	r := jpegEntropy{data: data, pos: s.start}
 	restart := byte(0)
 	for mcu := 0; mcu < s.mcus; mcu++ {
+		if output != nil && output.exceeded {
+			return 0, ctx.Err()
+		}
 		if mcu%256 == 0 {
 			if err := ctx.Err(); err != nil {
 				return 0, err
@@ -369,7 +403,7 @@ func (s *jpegScan) walk(ctx context.Context, data []byte, visit func(int, byte, 
 			r.pos += 2
 			if output != nil {
 				output.flush()
-				output.Write([]byte{0xff, 0xd0 + restart})
+				output.write([]byte{0xff, 0xd0 + restart})
 			}
 			restart = (restart + 1) & 7
 		}
@@ -546,11 +580,22 @@ func optimalJPEGHuffman(frequency [256]uint64) jpegHuffman {
 // put 写入高位优先的编码位
 // 入参: value 编码值, n 位数
 func (w *jpegBitWriter) put(value uint32, n uint) {
+	if w.exceeded {
+		return
+	}
 	w.bits = w.bits<<n | value&((1<<n)-1)
 	w.n += n
 	for w.n >= 8 {
 		w.n -= 8
 		b := byte(w.bits >> w.n)
+		size := 1
+		if b == 0xff {
+			size++
+		}
+		if w.limit > 0 && size > w.limit-w.Len() {
+			w.exceeded = true
+			return
+		}
 		w.WriteByte(b)
 		if b == 0xff {
 			w.WriteByte(0)
@@ -558,9 +603,22 @@ func (w *jpegBitWriter) put(value uint32, n uint) {
 	}
 }
 
+// write 写入未转义的标记，超出候选上限时停止输出
+// 入参: data 标记数据
+func (w *jpegBitWriter) write(data []byte) {
+	if w.exceeded {
+		return
+	}
+	if w.limit > 0 && len(data) > w.limit-w.Len() {
+		w.exceeded = true
+		return
+	}
+	w.Write(data)
+}
+
 // flush 用全1位补齐最后一个字节
 func (w *jpegBitWriter) flush() {
-	if w.n > 0 {
+	if w.n > 0 && !w.exceeded {
 		w.put((1<<(8-w.n))-1, 8-w.n)
 	}
 	w.bits = 0
