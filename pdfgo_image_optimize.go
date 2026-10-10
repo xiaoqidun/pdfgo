@@ -251,9 +251,12 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		return nil, closeErr
 	}
 	encoded := packed.Bytes()
-	assemble := func(idat, header []byte, lossy bool) []byte {
+	assemble := func(idat [][]byte, header []byte, lossy bool) []byte {
 		var out bytes.Buffer
-		length := uint64(8 + 12 + len(idat))
+		length := uint64(8 + 12)
+		for _, part := range idat {
+			length += uint64(len(part))
+		}
 		for _, c := range chunks {
 			if c.kind != "IDAT" && !(lossy && (c.kind == "PLTE" || c.kind == "tRNS" || c.kind == "hIST" || c.kind == "sBIT")) {
 				length += uint64(len(c.data))
@@ -275,7 +278,7 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 				}
 			case "IDAT":
 				if !written {
-					writePNGChunk(&out, "IDAT", idat)
+					writePNGChunk(&out, "IDAT", idat...)
 					written = true
 				}
 			case "PLTE", "tRNS", "hIST", "sBIT":
@@ -289,7 +292,7 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		return out.Bytes()
 	}
 	if !output.exceeded {
-		if candidate := assemble(encoded, nil, false); len(candidate) < len(best) {
+		if candidate := assemble([][]byte{encoded}, nil, false); len(candidate) < len(best) {
 			best = candidate
 		}
 	}
@@ -342,17 +345,13 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 			return nil, err
 		}
 		candidate := b.Bytes()
-		var ids []pngOptimizationChunk
+		var idat [][]byte
 		for pos := 33; pos < len(candidate); {
 			n := int(binary.BigEndian.Uint32(candidate[pos:]))
 			if string(candidate[pos+4:pos+8]) == "IDAT" {
-				ids = append(ids, pngOptimizationChunk{kind: "IDAT", data: candidate[pos : pos+12+n]})
+				idat = append(idat, candidate[pos+8:pos+8+n])
 			}
 			pos += n + 12
-		}
-		idat, err := io.ReadAll(&pngIDATReader{chunks: ids})
-		if err != nil {
-			return nil, err
 		}
 		if result := assemble(idat, candidate[8:33], true); len(result) < len(best) {
 			best = result
@@ -361,18 +360,27 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	return best, ctx.Err()
 }
 
-// writePNGChunk 写入带校验的PNG块
-// 入参: w 输出流, kind 块类型, data 块内容
+// writePNGChunk 将分段数据写为一个带校验的PNG块，不复制合并数据
+// 入参: w 输出流, kind 块类型, data 按序排列的块内容片段
 // 返回: error 写入错误
-func writePNGChunk(w io.Writer, kind string, data []byte) error {
+func writePNGChunk(w io.Writer, kind string, data ...[]byte) error {
+	var length uint64
+	for _, part := range data {
+		length += uint64(len(part))
+		if length > 1<<31-1 {
+			return fmt.Errorf("invalid PNG chunk length")
+		}
+	}
 	var header [8]byte
-	binary.BigEndian.PutUint32(header[:4], uint32(len(data)))
+	binary.BigEndian.PutUint32(header[:4], uint32(length))
 	copy(header[4:], kind)
 	hash := crc32.Update(0, crc32.IEEETable, header[4:])
-	hash = crc32.Update(hash, crc32.IEEETable, data)
+	for _, part := range data {
+		hash = crc32.Update(hash, crc32.IEEETable, part)
+	}
 	var checksum [4]byte
 	binary.BigEndian.PutUint32(checksum[:], hash)
-	for _, part := range [][]byte{header[:], data, checksum[:]} {
+	write := func(part []byte) error {
 		n, err := w.Write(part)
 		if err != nil {
 			return err
@@ -380,6 +388,15 @@ func writePNGChunk(w io.Writer, kind string, data []byte) error {
 		if n != len(part) {
 			return io.ErrShortWrite
 		}
+		return nil
 	}
-	return nil
+	if err := write(header[:]); err != nil {
+		return err
+	}
+	for _, part := range data {
+		if err := write(part); err != nil {
+			return err
+		}
+	}
+	return write(checksum[:])
 }
