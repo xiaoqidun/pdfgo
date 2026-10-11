@@ -25,7 +25,6 @@ import (
 	"math"
 
 	"github.com/xiaoqidun/jbig2"
-	"golang.org/x/image/ccitt"
 )
 
 // jbig2FileHeader 为顺序组织且页数未知的JBIG2文件头
@@ -1783,7 +1782,7 @@ func (i *Image) ccittSamplesContext(ctx context.Context, data []byte, params Dic
 	if err != nil {
 		return nil, err
 	}
-	reader, endOfBlock, err := ccittImageReader(bytes.NewReader(data), i.Width, i.Height, params)
+	reader, endOfBlock, err := ccittImageReader(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, i.Width, i.Height, params)
 	if err != nil {
 		return nil, err
 	}
@@ -1843,30 +1842,25 @@ func ccittImageReader(source io.Reader, width, height int, params Dictionary) (i
 	if endOfLine && k < 0 {
 		return nil, false, &UnsupportedError{Feature: "CCITT Group 4 end-of-line markers"}
 	}
-	if k >= 0 {
-		damage := int64(0)
-		if endOfLine {
-			damage, err = integerDefault(params, "DamagedRowsBeforeError", 0)
-			if err != nil || damage < 0 || uint64(damage) > uint64(^uint(0)>>1) {
-				return nil, false, fmt.Errorf("invalid CCITT DamagedRowsBeforeError")
-			}
+	damage := int64(0)
+	if k >= 0 && endOfLine {
+		damage, err = integerDefault(params, "DamagedRowsBeforeError", 0)
+		if err != nil || damage < 0 || uint64(damage) > uint64(^uint(0)>>1) {
+			return nil, false, fmt.Errorf("invalid CCITT DamagedRowsBeforeError")
 		}
-		if !endOfBlock && rows != 0 {
-			if uint64(rows) > uint64(^uint(0)>>1) {
-				return nil, false, fmt.Errorf("invalid CCITT Rows")
-			}
-			height = int(rows)
+	}
+	if !endOfBlock && rows != 0 {
+		if uint64(rows) > uint64(^uint(0)>>1) {
+			return nil, false, fmt.Errorf("invalid CCITT Rows")
 		}
-		row := make([]byte, width/8+min(1, width%8))
-		return &faxGroup3Reader{source: source, width: width, height: height, row: row, previous: make([]byte, len(row)), offset: len(row), changes: []int{width}, mixed: k > 0, eol: endOfLine, align: align, invert: invert, eob: endOfBlock, allowDamage: int(damage)}, endOfBlock, nil
+		height = int(rows)
 	}
-	if !endOfBlock && rows != 0 && rows != int64(height) {
-		return nil, false, &UnsupportedError{Feature: "CCITT Rows differing from image height"}
+	row := make([]byte, width/8+min(1, width%8))
+	var previous []byte
+	if damage != 0 {
+		previous = make([]byte, len(row))
 	}
-	if endOfBlock {
-		height = ccitt.AutoDetectHeight
-	}
-	return ccitt.NewReader(source, ccitt.MSB, ccitt.Group4, width, height, &ccitt.Options{Align: align, Invert: invert}), endOfBlock, nil
+	return &faxReader{source: source, width: width, height: height, row: row, previous: previous, offset: len(row), changes: []int{width}, mixed: k > 0, group4: k < 0, eol: endOfLine, align: align, invert: invert, eob: endOfBlock, allowDamage: int(damage)}, endOfBlock, nil
 }
 
 // rawSamples 接管独立解压缓冲，将设备色彩样本或颜色索引解释为图像

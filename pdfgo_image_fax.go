@@ -27,14 +27,15 @@ type faxNode struct {
 	run  int
 }
 
-// faxGroup3Reader 按行读取T.4编码，保留二维参考行和精确输入边界
-type faxGroup3Reader struct {
+// faxReader 按行读取T.4与T.6编码，保留二维参考行和精确输入边界
+type faxReader struct {
 	source                         io.Reader
 	bits                           uint64
 	available                      uint
 	byte                           [1]byte
 	width, height, rows, offset    int
 	mixed, eol, align, invert, eob bool
+	group4                         bool
 	allowDamage, damage            int
 	previousDamaged                bool
 	done                           bool
@@ -91,7 +92,7 @@ func faxCodebook(codes string) []faxNode {
 // peek 逐字节取得编码位，不越过当前码字所需的输入边界
 // 入参: count 所需位数
 // 返回: uint64 未消费的编码位, error 输入错误
-func (r *faxGroup3Reader) peek(count uint) (uint64, error) {
+func (r *faxReader) peek(count uint) (uint64, error) {
 	for r.available < count {
 		if _, err := io.ReadFull(r.source, r.byte[:]); err != nil {
 			return 0, err
@@ -105,7 +106,7 @@ func (r *faxGroup3Reader) peek(count uint) (uint64, error) {
 // take 消费指定数量的编码位
 // 入参: count 位数
 // 返回: uint64 编码值, error 输入错误
-func (r *faxGroup3Reader) take(count uint) (uint64, error) {
+func (r *faxReader) take(count uint) (uint64, error) {
 	v, err := r.peek(count)
 	if err == nil {
 		r.available -= count
@@ -117,7 +118,7 @@ func (r *faxGroup3Reader) take(count uint) (uint64, error) {
 // marker 读取可选或必需的EOL及其前导填充位
 // 入参: required 是否必须存在EOL
 // 返回: bool 是否读取标记, error 编码错误
-func (r *faxGroup3Reader) marker(required bool) (bool, error) {
+func (r *faxReader) marker(required bool) (bool, error) {
 	if !required {
 		for count := uint(1); count < 12; count++ {
 			v, err := r.peek(count)
@@ -159,7 +160,7 @@ func (r *faxGroup3Reader) marker(required bool) (bool, error) {
 // run 解码一个颜色行程，累加补充码直到终止码
 // 入参: black 是否读取黑色行程, remaining 剩余像素数
 // 返回: int 行程长度或未压缩模式标记-1, error 编码错误
-func (r *faxGroup3Reader) run(black bool, remaining int) (int, error) {
+func (r *faxReader) run(black bool, remaining int) (int, error) {
 	book := faxCodes[0]
 	if black {
 		book = faxCodes[1]
@@ -205,9 +206,9 @@ func (r *faxGroup3Reader) run(black bool, remaining int) (int, error) {
 	}
 }
 
-// mode 解码T.4二维模式，水平为4、跳过为5、未压缩为6，其余为垂直偏移
+// mode 解码传真二维模式，水平为4、跳过为5、未压缩为6，其余为垂直偏移
 // 返回: int 模式, error 编码错误
-func (r *faxGroup3Reader) mode() (int, error) {
+func (r *faxReader) mode() (int, error) {
 	code := uint64(0)
 	for n := 1; n <= 7; n++ {
 		bit, err := r.take(1)
@@ -246,7 +247,7 @@ func (r *faxGroup3Reader) mode() (int, error) {
 // uncompressed 读取T.4表5的图像片段和退出颜色标记
 // 入参: x 当前像素, black 当前行程颜色, changes 已解码的变化位置
 // 返回: int 下一像素, bool 下一行程颜色, []int 变化位置, error 编码错误
-func (r *faxGroup3Reader) uncompressed(x int, black bool, changes []int) (int, bool, []int, error) {
+func (r *faxReader) uncompressed(x int, black bool, changes []int) (int, bool, []int, error) {
 	for {
 		zeros := 0
 		for {
@@ -299,12 +300,12 @@ func (r *faxGroup3Reader) uncompressed(x int, black bool, changes []int) (int, b
 
 // black 将黑色行程写入逐行字节对齐的图像样本
 // 入参: start 起始像素, end 结束像素
-func (r *faxGroup3Reader) black(start, end int) {
+func (r *faxReader) black(start, end int) {
 	for start < end && start%8 != 0 {
 		r.row[start/8] &^= 1 << (7 - start%8)
 		start++
 	}
-	for start+8 <= end {
+	for end-start >= 8 {
 		r.row[start/8] = 0
 		start += 8
 	}
@@ -317,11 +318,11 @@ func (r *faxGroup3Reader) black(start, end int) {
 // decodeRow 按一维行程或二维参考行生成当前行
 // 入参: oneD 是否为一维编码
 // 返回: []int 当前行变化位置, error 编码错误
-func (r *faxGroup3Reader) decodeRow(oneD bool) ([]int, error) {
+func (r *faxReader) decodeRow(oneD bool) ([]int, error) {
 	changes := r.pending[:0]
 	x, black := 0, false
 	for steps := 0; x < r.width; steps++ {
-		if steps > 2*r.width+2 {
+		if uint64(steps) > 2*uint64(r.width)+2 {
 			return nil, fmt.Errorf("CCITT row does not advance")
 		}
 		if oneD {
@@ -411,9 +412,71 @@ func (r *faxGroup3Reader) decodeRow(oneD bool) ([]int, error) {
 	return changes, nil
 }
 
-// nextRow 处理行边界、RTC和标准允许的坏行替换
+// rowMode 识别行编码模式及RTC、EOFB终止标记，不越过有效编码边界
+// 返回: bool 是否为一维编码, error 编码结束或错误
+func (r *faxReader) rowMode() (bool, error) {
+	if r.group4 {
+		for count := uint(1); count < 12; count++ {
+			value, err := r.peek(count)
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return false, nil
+			}
+			if err != nil || value != 0 {
+				return false, err
+			}
+		}
+		value, err := r.take(24)
+		if err != nil {
+			return false, err
+		}
+		if value != 0x001001 {
+			return false, fmt.Errorf("invalid CCITT end-of-block marker")
+		}
+		r.done = true
+		return false, io.EOF
+	}
+	marked, err := r.marker(r.eol || r.mixed)
+	if err != nil {
+		return false, err
+	}
+	oneD := true
+	if r.mixed {
+		bit, err := r.take(1)
+		if err != nil {
+			return false, err
+		}
+		oneD = bit != 0
+	}
+	if marked {
+		for markers := 1; markers < 6; markers++ {
+			more, err := r.marker(false)
+			if err != nil {
+				return false, err
+			}
+			if !more {
+				if markers != 1 {
+					return false, fmt.Errorf("incomplete CCITT return-to-control marker")
+				}
+				break
+			}
+			if r.mixed {
+				bit, err := r.take(1)
+				if err != nil || bit != 1 || !oneD {
+					return false, fmt.Errorf("invalid CCITT return-to-control tag")
+				}
+			}
+			if markers == 5 {
+				r.done = true
+				return false, io.EOF
+			}
+		}
+	}
+	return oneD, nil
+}
+
+// nextRow 处理行边界、结束标记和标准允许的坏行替换
 // 返回: error 编码结束或错误
-func (r *faxGroup3Reader) nextRow() (result error) {
+func (r *faxReader) nextRow() (result error) {
 	defer func() {
 		if result == io.EOF && !r.done {
 			result = io.ErrUnexpectedEOF
@@ -428,41 +491,9 @@ func (r *faxGroup3Reader) nextRow() (result error) {
 			return err
 		}
 	}
-	marked, err := r.marker(r.eol || r.mixed)
+	oneD, err := r.rowMode()
 	if err != nil {
 		return err
-	}
-	oneD := true
-	if r.mixed {
-		bit, err := r.take(1)
-		if err != nil {
-			return err
-		}
-		oneD = bit != 0
-	}
-	if marked {
-		for markers := 1; markers < 6; markers++ {
-			more, err := r.marker(false)
-			if err != nil {
-				return err
-			}
-			if !more {
-				if markers != 1 {
-					return fmt.Errorf("incomplete CCITT return-to-control marker")
-				}
-				break
-			}
-			if r.mixed {
-				bit, err := r.take(1)
-				if err != nil || bit != 1 || !oneD {
-					return fmt.Errorf("invalid CCITT return-to-control tag")
-				}
-			}
-			if markers == 5 {
-				r.done = true
-				return io.EOF
-			}
-		}
 	}
 	for n := range r.row {
 		r.row[n] = 255
@@ -512,7 +543,7 @@ func (r *faxGroup3Reader) nextRow() (result error) {
 // Read 输出逐行字节对齐的传真图像样本
 // 入参: p 输出缓冲区
 // 返回: int 输出字节数, error 编码结束或错误
-func (r *faxGroup3Reader) Read(p []byte) (int, error) {
+func (r *faxReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}

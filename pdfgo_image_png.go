@@ -79,6 +79,18 @@ type pngSampleColumn struct {
 	weight float64
 }
 
+// pngPrecisionImage 提供直接十六位采样，避免高精度调色板被量化为八位颜色
+type pngPrecisionImage struct {
+	image.Image
+}
+
+// NRGBA64At 读取非预乘颜色及独立透明度
+// 入参: x 横坐标, y 纵坐标
+// 返回: color.NRGBA64 十六位颜色
+func (p *pngPrecisionImage) NRGBA64At(x, y int) color.NRGBA64 {
+	return imageNRGBA64At(p.Image, x, y)
+}
+
 // EncodePNG 按行无损编码图像，保留颜色精度及透明度，不展开整幅延迟图像
 // 图像解码由调用方完成，取消或写入失败时输出可能不完整
 // 入参: ctx 取消上下文, writer 输出流, source 已解码图像
@@ -96,6 +108,24 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	bounds := source.Bounds()
 	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
 		return fmt.Errorf("invalid PNG dimensions")
+	}
+	if palette, ok := source.ColorModel().(color.Palette); ok {
+		precise := false
+		for _, entry := range palette {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if entry == nil {
+				return fmt.Errorf("invalid PNG palette color")
+			}
+			pixel := imageNRGBASample(entry)
+			if pixel.R%257 != 0 || pixel.G%257 != 0 || pixel.B%257 != 0 || pixel.A%257 != 0 {
+				precise = true
+			}
+		}
+		if precise {
+			source = &pngPrecisionImage{source}
+		}
 	}
 	output := pngContextWriter{ctx: ctx, writer: writer}
 	_, direct := source.(interface{ NRGBA64At(int, int) color.NRGBA64 })
