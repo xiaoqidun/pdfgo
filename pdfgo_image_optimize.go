@@ -166,7 +166,7 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 	return best, ctx.Err()
 }
 
-// optimizePNG 比较图像表示并按整图体积限制IDAT重压缩，保留原数据校验
+// optimizePNG 比较图像表示并限制IDAT重压缩体积，按块复制规则保留附加信息
 // 入参: ctx 取消上下文, data PNG数据, options 压缩配置, size 像素上限, resource 是否允许更换格式
 // 返回: []byte 优化数据, error 编码错误
 func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, size image.Point, resource bool) ([]byte, error) {
@@ -177,6 +177,8 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	ended := false
 	var density []byte
 	imageData := false
+	imageDataEnded := false
+	palette := false
 	for pos := 8; pos < len(data); {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -190,8 +192,39 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		}
 		raw := data[pos : pos+12+int(n)]
 		kind := string(raw[4:8])
+		for _, letter := range raw[4:8] {
+			if letter < 'A' || letter > 'Z' && letter < 'a' || letter > 'z' {
+				return nil, fmt.Errorf("invalid PNG chunk type")
+			}
+		}
+		if raw[6]&32 != 0 || pos == 8 && kind != "IHDR" {
+			return nil, fmt.Errorf("invalid PNG chunk type or order")
+		}
 		if crc32.ChecksumIEEE(raw[4:len(raw)-4]) != binary.BigEndian.Uint32(raw[len(raw)-4:]) {
 			return nil, fmt.Errorf("invalid PNG checksum")
+		}
+		switch kind {
+		case "IHDR":
+			if pos != 8 || n != 13 {
+				return nil, fmt.Errorf("invalid PNG header")
+			}
+		case "PLTE":
+			if palette || imageData || n == 0 || n > 768 || n%3 != 0 || data[25] == 0 || data[25] == 4 || data[25] == 3 && n/3 > 1<<data[24] {
+				return nil, fmt.Errorf("invalid PNG palette")
+			}
+			palette = true
+		case "IDAT":
+			if imageDataEnded || data[25] == 3 && !palette {
+				return nil, fmt.Errorf("invalid PNG image data order")
+			}
+		case "IEND":
+			if !imageData || n != 0 {
+				return nil, fmt.Errorf("invalid PNG end")
+			}
+		default:
+			if raw[4]&32 == 0 {
+				return nil, fmt.Errorf("unsupported PNG critical chunk %s", kind)
+			}
 		}
 		chunks = append(chunks, pngOptimizationChunk{kind, raw})
 		if kind != "IHDR" && kind != "IDAT" && kind != "IEND" && kind != "PLTE" && kind != "tRNS" && kind != "pHYs" {
@@ -203,17 +236,17 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 			}
 			density = raw
 		}
+		imageDataEnded = imageDataEnded || imageData && kind != "IDAT"
 		imageData = imageData || kind == "IDAT"
 		switch kind {
 		case "IHDR", "IDAT", "IEND", "PLTE", "tRNS", "hIST", "sBIT", "cHRM", "gAMA", "iCCP", "sRGB", "cICP", "mDCV", "cLLI", "bKGD", "pHYs", "tIME", "tEXt", "zTXt", "iTXt", "eXIf":
+		case "acTL", "fcTL", "fdAT":
+			unsafeMetadata = true
 		default:
-			unsafeMetadata = unsafeMetadata || raw[4]&32 == 0 || raw[7]&32 == 0
+			unsafeMetadata = unsafeMetadata || raw[7]&32 == 0
 		}
 		if kind == "IHDR" {
 			eligible = n == 13 && raw[16] == 8 && (raw[17] == 2 || raw[17] == 6)
-		}
-		if kind == "acTL" {
-			return data, nil
 		}
 		pos += len(raw)
 		if kind == "IEND" {
@@ -226,6 +259,9 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	}
 	if !ended {
 		return nil, fmt.Errorf("missing PNG end")
+	}
+	if unsafeMetadata {
+		return data, ctx.Err()
 	}
 	best := data
 	if plain {
@@ -334,7 +370,7 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 			best = candidate
 		}
 	}
-	if !plain && options.Mode == CompressionLossy && eligible && !unsafeMetadata && (options.ImageQuality() < 100 || size.X > 0 && size.Y > 0) {
+	if !plain && options.Mode == CompressionLossy && eligible && (options.ImageQuality() < 100 || size.X > 0 && size.Y > 0) {
 		config, err := png.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 		if err != nil {
 			return nil, err
