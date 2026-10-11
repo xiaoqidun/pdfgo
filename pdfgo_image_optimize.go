@@ -26,6 +26,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 )
 
 // optimizationBufferLimit 限制图片压缩候选的缓冲大小，单位为字节
@@ -174,6 +175,8 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	plain := true
 	unsafeMetadata := false
 	ended := false
+	var density []byte
+	imageData := false
 	for pos := 8; pos < len(data); {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -191,9 +194,16 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 			return nil, fmt.Errorf("invalid PNG checksum")
 		}
 		chunks = append(chunks, pngOptimizationChunk{kind, raw})
-		if kind != "IHDR" && kind != "IDAT" && kind != "IEND" && kind != "PLTE" && kind != "tRNS" {
+		if kind != "IHDR" && kind != "IDAT" && kind != "IEND" && kind != "PLTE" && kind != "tRNS" && kind != "pHYs" {
 			plain = false
 		}
+		if kind == "pHYs" {
+			if n != 9 || density != nil || imageData || raw[16] > 1 || binary.BigEndian.Uint32(raw[8:]) > math.MaxInt32 || binary.BigEndian.Uint32(raw[12:]) > math.MaxInt32 {
+				return nil, fmt.Errorf("invalid PNG physical dimensions")
+			}
+			density = raw
+		}
+		imageData = imageData || kind == "IDAT"
 		switch kind {
 		case "IHDR", "IDAT", "IEND", "PLTE", "tRNS", "hIST", "sBIT", "cHRM", "gAMA", "iCCP", "sRGB", "cICP", "mDCV", "cLLI", "bKGD", "pHYs", "tIME", "tEXt", "zTXt", "iTXt", "eXIf":
 		default:
@@ -219,7 +229,13 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 	}
 	best := data
 	if plain {
-		candidate, err := compactPNG(ctx, data, best, options, size, resource)
+		var candidate []byte
+		var err error
+		if density == nil {
+			candidate, err = compactPNG(ctx, data, best, options, size, resource)
+		} else {
+			candidate, err = compactPNGPhysical(ctx, data, best, density, options, size)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -295,6 +311,18 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 				if !lossy {
 					out.Write(c.data)
 				}
+			case "pHYs":
+				chunk := c.data
+				if header != nil {
+					before := image.Pt(int(binary.BigEndian.Uint32(data[16:])), int(binary.BigEndian.Uint32(data[20:])))
+					after := image.Pt(int(binary.BigEndian.Uint32(header[8:])), int(binary.BigEndian.Uint32(header[12:])))
+					var ok bool
+					chunk, ok = resizePNGPhysical(chunk, before, after)
+					if !ok {
+						return best
+					}
+				}
+				out.Write(chunk)
 			default:
 				out.Write(c.data)
 			}

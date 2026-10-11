@@ -116,7 +116,7 @@ func photographicImage(ctx context.Context, img image.Image) (bool, error) {
 }
 
 // compactPNG 共用一次解码和降采样，优先比较JPEG、索引色和灰度候选
-// 入参: ctx 取消上下文, data 无附加块的PNG, best 已有候选, options 压缩配置, size 像素需求, resource 是否允许更换格式
+// 入参: ctx 取消上下文, data 待重编码的PNG, best 已有候选, options 压缩配置, size 像素需求, resource 是否允许更换格式
 // 返回: []byte 更小的图片编码, error 编码错误
 func compactPNG(ctx context.Context, data, best []byte, options CompressionOptions, size image.Point, resource bool) ([]byte, error) {
 	var buffers pngOptimizationBuffers
