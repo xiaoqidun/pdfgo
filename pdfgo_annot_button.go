@@ -296,7 +296,7 @@ func (r *Reader) writeAnnotationButtonCaption(ctx context.Context, annotation An
 		return err
 	}
 	if value == nil {
-		_, _, object, err := r.annotationCaptionFont(ctx, resources, caption)
+		encoded, err := r.annotationCaptionFont(ctx, resources, caption)
 		if err != nil {
 			return err
 		}
@@ -316,7 +316,7 @@ func (r *Reader) writeAnnotationButtonCaption(ctx context.Context, annotation An
 		for i := 1; fonts[name] != nil; i++ {
 			name = Name(fmt.Sprintf("ButtonCaption%d", i))
 		}
-		fonts[name] = object
+		fonts[name] = encoded.object
 		resources["Font"] = fonts
 		annotation.Dictionary = maps.Clone(annotation.Dictionary)
 		annotation.Dictionary["DA"] = String("/" + escapeAnnotationName(name) + " 0 Tf 0 g")

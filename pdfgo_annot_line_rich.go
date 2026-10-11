@@ -47,7 +47,7 @@ func (r *Reader) readRichLineCaption(ctx context.Context, page *Page, object Obj
 	if !visible {
 		return nil, nil
 	}
-	base, _, object, err := r.annotationCaptionFont(ctx, page.Resources, plain.String())
+	encoded, err := r.annotationCaptionFont(ctx, page.Resources, plain.String())
 	if err != nil {
 		return nil, err
 	}
@@ -69,9 +69,9 @@ func (r *Reader) readRichLineCaption(ctx context.Context, page *Page, object Obj
 	for fonts[name] != nil {
 		name += "_"
 	}
-	fonts[name] = object
+	fonts[name] = encoded.object
 	resources := Dictionary{"Font": fonts}
-	selector, err := r.newAnnotationRichFonts(ctx, resources, base, name, paragraphs)
+	selector, err := r.newAnnotationRichFonts(ctx, resources, encoded.font, name, paragraphs)
 	if err != nil {
 		return nil, err
 	}

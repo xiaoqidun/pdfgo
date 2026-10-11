@@ -23,6 +23,9 @@ import (
 	"unicode/utf8"
 )
 
+// annotationRichGlyphCapacity 限制单段字形缓冲的初始容量，超出后按需增长
+const annotationRichGlyphCapacity = 1 << 16
+
 // annotationRichGlyph 保存富文本字符及实际选用的字体和样式
 type annotationRichGlyph struct {
 	letter annotationLetter
@@ -250,6 +253,21 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, paragraphs []annotationRichParagraph, keepZero bool) ([][]annotationRichGlyph, error) {
 	glyphs := make([][]annotationRichGlyph, len(paragraphs))
 	for i := range paragraphs {
+		capacity := 0
+		for _, run := range paragraphs[i].runs {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if keepZero || run.style.size == nil || *run.style.size != 0 {
+				capacity += min(annotationRichGlyphCapacity-capacity, utf8.RuneCountInString(run.text))
+			}
+			if capacity == annotationRichGlyphCapacity {
+				break
+			}
+		}
+		if capacity != 0 {
+			glyphs[i] = make([]annotationRichGlyph, 0, capacity)
+		}
 		for j := range paragraphs[i].runs {
 			run := &paragraphs[i].runs[j]
 			zero := run.style.size != nil && *run.style.size == 0
@@ -257,6 +275,7 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 				continue
 			}
 			start := len(glyphs[i])
+			selection := annotationRichFontSelection{source: fonts, style: &run.style}
 			for _, ch := range run.text {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -268,7 +287,7 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 				if unicode.IsMark(ch) || unicode.IsLetter(ch) && !unicode.In(ch, unicode.Latin, unicode.Greek, unicode.Cyrillic, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
 					return nil, &UnsupportedError{Feature: "generated complex-script rich text"}
 				}
-				font, letter, err := fonts.selectLetter(run.style, ch)
+				font, letter, err := selection.letter(ch)
 				if err != nil {
 					if keepZero {
 						return nil, err

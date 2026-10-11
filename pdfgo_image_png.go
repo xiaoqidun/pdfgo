@@ -259,7 +259,7 @@ func (s *pngImageEncoder) release() {
 	}
 }
 
-// pngJPXRow 直接读取等横向采样的分量行，保持通道排序、调色板及透明度精度
+// pngJPXRow 批量读取分量行并按采样间隔展开，保留通道顺序、调色板及透明度精度
 // 入参: ctx 取消上下文, row 输出行, source 图像, y 行坐标, depth 输出位深, channels 输出通道数
 // 返回: bool 是否完成直接采样, error 读取或取消错误
 func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, channels int) (bool, error) {
@@ -294,7 +294,7 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 			index = samples.mapping[index].component
 		}
 		plane := samples.planes[index]
-		if plane.Info().XStep != 1 || width > plane.Bounds().Dx() {
+		if plane.Info().XStep == 1 && width > plane.Bounds().Dx() {
 			return false, nil
 		}
 	}
@@ -305,6 +305,7 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 		var bias int64
 		var maximum, step uint64
 		var origin image.Point
+		xStep, xBase, xLast := int64(1), int64(0), int64(width-1)
 		if index >= 0 {
 			if len(samples.mapping) != 0 {
 				palette = samples.mapping[index].palette
@@ -312,6 +313,9 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 			}
 			plane := samples.planes[index]
 			spec, bounds := plane.Info(), samples.planeBounds(index)
+			xStep = int64(spec.XStep)
+			xBase = (samples.x0 + xStep - 1) / xStep
+			xLast = int64(bounds.Dx() - 1)
 			ratio := int64(spec.YStep)
 			sy := min(bounds.Dy()-1, max(0, int((int64(y)+samples.y0)/ratio-(samples.y0+ratio-1)/ratio)))
 			origin = bounds.Min.Add(image.Pt(0, sy))
@@ -327,12 +331,32 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
+			end := min(start+4096, width)
 			if index >= 0 {
-				if err := samples.planes[index].ReadSamples(data[:min(4096, width-start)], origin.X+start, origin.Y); err != nil {
+				first, last := start, end-1
+				if xStep != 1 {
+					first = int(min(xLast, max(0, (int64(start)+samples.x0)/xStep-xBase)))
+					last = int(min(xLast, max(0, (int64(end-1)+samples.x0)/xStep-xBase)))
+				}
+				if err := samples.planes[index].ReadSamples(data[:last-first+1], origin.X+first, origin.Y); err != nil {
 					return false, err
 				}
+				if xStep != 1 {
+					for x := end - 1; x >= start; {
+						sample := min(xLast, max(0, (int64(x)+samples.x0)/xStep-xBase))
+						begin := start
+						if sample != 0 {
+							begin = max(start, int((sample+xBase)*xStep-samples.x0))
+						}
+						value := data[int(sample)-first]
+						for x >= begin {
+							data[x-start] = value
+							x--
+						}
+					}
+				}
 			}
-			for x := start; x < min(start+4096, width); x++ {
+			for x := start; x < end; x++ {
 				value := uint16(65535)
 				if index >= 0 {
 					raw := uint64(data[x-start] + bias)

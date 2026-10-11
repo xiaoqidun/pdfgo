@@ -43,6 +43,38 @@ type annotationRichFonts struct {
 	base    *annotationRichFont
 }
 
+// annotationRichFontSelection 缓存同一样式的重复字符选字结果，字体资源增加时重新选择
+type annotationRichFontSelection struct {
+	source     *annotationRichFonts
+	style      *annotationRichStyle
+	generation int
+	characters [128]rune
+	fonts      [128]*annotationRichFont
+}
+
+// letter 复用当前样式的字符字体，缓存冲突时仍按完整规则选择
+// 入参: ch Unicode字符
+// 返回: *annotationRichFont 字体, annotationLetter 编码和度量, error 字体或取消错误
+func (s *annotationRichFontSelection) letter(ch rune) (*annotationRichFont, annotationLetter, error) {
+	if err := s.source.ctx.Err(); err != nil {
+		return nil, annotationLetter{}, err
+	}
+	index := uint32(ch) % uint32(len(s.fonts))
+	if s.generation == len(s.source.entries) && s.fonts[index] != nil && s.characters[index] == ch {
+		font := s.fonts[index]
+		return font, font.letters[ch], nil
+	}
+	font, letter, err := s.source.selectLetter(*s.style, ch)
+	if s.generation != len(s.source.entries) {
+		clear(s.fonts[:])
+		s.generation = len(s.source.entries)
+	}
+	if err == nil {
+		s.characters[index], s.fonts[index] = ch, font
+	}
+	return font, letter, err
+}
+
 // newAnnotationRichFonts 建立外观独立的字体字典及字符映射
 // 入参: ctx 取消上下文, resources 外观资源, base 默认字体, name 默认字体名, paragraphs 富文本
 // 返回: *annotationRichFonts 字体选择器, error 字体或资源错误

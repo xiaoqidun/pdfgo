@@ -35,6 +35,14 @@ type annotationLetter struct {
 	vertical *VerticalMetrics
 }
 
+// annotationCaptionText 保存标题字体、源编码及可选的段落整形结果
+type annotationCaptionText struct {
+	font    *Font
+	object  Object
+	letters []annotationLetter
+	shaper  *annotationShaper
+}
+
 // ReadAnnotationText 读取注解文本字段，RC和RV允许文本流，其他字段要求文本字符串
 // 入参: annotation 注解, field 文本字段名, warning 异常字段警告，空值使用严格检查
 // 返回: string Unicode文本, error 引用、类型或编码错误
@@ -297,32 +305,32 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 	return stream, nil
 }
 
-// annotationCaptionFont 选择可编码标题的横排字体，不修改源资源
+// annotationCaptionFont 选择能够编码或整形标题的横排字体，不修改源资源
 // 入参: ctx 取消上下文, resources 可用资源, text 标题文字
-// 返回: *Font 字体, []annotationLetter 编码, Object 字体资源, error 字体或编码错误
-func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary, text string) (*Font, []annotationLetter, Object, error) {
+// 返回: *annotationCaptionText 字体与文字, error 字体或编码错误
+func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary, text string) (*annotationCaptionText, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	standard := Dictionary{"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica"), "Encoding": Name("WinAnsiEncoding")}
 	font, err := r.ReadFontContext(ctx, standard)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
-	letters, encodingErr := annotationLetters(ctx, font, text)
+	encoded, encodingErr := r.encodeAnnotationCaption(ctx, font, standard, text)
 	if encodingErr == nil {
-		return font, letters, standard, nil
+		return encoded, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	value, err := r.Resolve(resources["Font"])
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	fonts, ok := value.(Dictionary)
 	if value != nil && !ok {
-		return nil, nil, nil, fmt.Errorf("invalid caption font resources")
+		return nil, fmt.Errorf("invalid caption font resources")
 	}
 	names := make([]Name, 0, len(fonts))
 	for name := range fonts {
@@ -331,21 +339,49 @@ func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary
 	slices.Sort(names)
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, err
+			return nil, err
 		}
 		font, err := r.ReadFontContext(ctx, fonts[name])
 		if err != nil || font.Vertical {
 			continue
 		}
-		letters, err := annotationLetters(ctx, font, text)
+		encoded, err := r.encodeAnnotationCaption(ctx, font, fonts[name], text)
 		if err == nil {
-			return font, letters, fonts[name], nil
+			return encoded, nil
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
-	return nil, nil, nil, encodingErr
+	return nil, encodingErr
+}
+
+// encodeAnnotationCaption 使用源字体生成标题字形与编码，复杂文字通过整形后端定位
+// 入参: ctx 取消上下文, font 源字体, object 字体资源, text 标题原文
+// 返回: *annotationCaptionText 字体与文字, error 整形、编码或取消错误
+func (r *Reader) encodeAnnotationCaption(ctx context.Context, font *Font, object Object, text string) (*annotationCaptionText, error) {
+	result := &annotationCaptionText{font: font, object: object}
+	if r.textShaper != nil && annotationNeedsShaping(text) {
+		s := &annotationShaper{ctx: ctx, shape: r.textShaper, font: font, cache: make(map[annotationShapeKey]*annotationShapedLine), entries: make(map[uint16]fontEncodedGlyph)}
+		if _, err := s.prepare(text); err != nil {
+			return nil, err
+		}
+		resource, err := s.fontResource()
+		if err != nil {
+			return nil, err
+		}
+		if resource != nil {
+			result.object = resource.Dictionary
+		}
+		result.shaper = s
+	} else {
+		var err error
+		result.letters, err = annotationLetters(ctx, font, text)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, ctx.Err()
 }
 
 // writeAnnotationText 按字段值和默认外观生成裁剪后的文字内容
@@ -439,10 +475,6 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if err != nil {
 		return err
 	}
-	letters, err := annotationLetters(ctx, p.state.font, text)
-	if err != nil {
-		return err
-	}
 	align := Integer(0)
 	if !free && dict["FT"] == Name("Btn") {
 		align = 1
@@ -461,6 +493,24 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	}
 	if comb > 0 && utf8.RuneCountInString(text) > comb {
 		return fmt.Errorf("field value exceeds comb length")
+	}
+	if list && !p.state.font.Vertical {
+		text, err = annotationChoiceVisibleText(ctx, text, p.state, height)
+		if err != nil {
+			return err
+		}
+	}
+	if r.textShaper != nil && !p.state.font.Vertical && comb == 0 && annotationNeedsShaping(text) {
+		layout := annotationShapedText{
+			text: text, matrix: matrix, font: fontName, defaults: stateContent,
+			frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
+			align: align, multiline: multiline, free: free, choice: choice,
+		}
+		return layout.write(ctx, r.textShaper, p, resources, content)
+	}
+	letters, err := annotationLetters(ctx, p.state.font, text)
+	if err != nil {
+		return err
 	}
 	if comb > 0 && len(letters) != utf8.RuneCountInString(text) {
 		return &UnsupportedError{Feature: "comb field requires individual character encodings"}
@@ -562,6 +612,8 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 					break
 				}
 				content.WriteString("0 g\n" + stateContent)
+				fmt.Fprintf(content, "/%s ", escapeAnnotationName(fontName))
+				writeAnnotationOperation(content, "Tf", size)
 				if _, selected := slices.BinarySearch(choice.Selected, choice.TopIndex+i); selected {
 					content.WriteString("1 g\n")
 				}
@@ -581,6 +633,39 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	}
 	content.WriteString("Q\n")
 	return nil
+}
+
+// annotationChoiceVisibleText 截取横排列表可见选项，避免隐藏项触发字体解析或整形
+// 入参: ctx 取消上下文, text 首个可见项起的文字, state 默认文字状态, height 可用高度
+// 返回: string 可见项文字, error 行距或取消错误
+func annotationChoiceVisibleText(ctx context.Context, text string, state graphicsState, height float64) (string, error) {
+	size := state.fontSize
+	if size == 0 {
+		size = min(12, height)
+	}
+	leading := state.leading
+	if leading <= 0 {
+		leading = size * 1.2
+	}
+	if leading <= 0 || math.IsNaN(leading) || math.IsInf(leading, 0) {
+		return "", fmt.Errorf("invalid choice field line spacing")
+	}
+	rows := math.Ceil(height / leading)
+	start := 0
+	for row := 1.0; ; row++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		end := strings.IndexByte(text[start:], '\n')
+		if end < 0 {
+			return text, nil
+		}
+		end += start
+		if row >= rows {
+			return text[:end], nil
+		}
+		start = end + 1
+	}
 }
 
 // annotationComb 读取文本字段有效的分格数量，忽略不适用的标志
@@ -679,11 +764,11 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 // 入参: ctx 取消上下文, font 字体, text 文本
 // 返回: []annotationLetter 编码与度量, error 缺字或字体错误
 func annotationLetters(ctx context.Context, font *Font, text string) ([]annotationLetter, error) {
+	if annotationNeedsShaping(text) {
+		return nil, &UnsupportedError{Feature: "generated complex-script text"}
+	}
 	wanted := map[rune]bool{}
 	for _, c := range text {
-		if unicode.IsMark(c) || unicode.IsLetter(c) && !unicode.In(c, unicode.Latin, unicode.Greek, unicode.Cyrillic, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
-			return nil, &UnsupportedError{Feature: "generated complex-script text"}
-		}
 		wanted[c] = true
 	}
 	lookup, err := annotationLetterLookup(ctx, font, wanted)
@@ -709,43 +794,20 @@ func annotationLetters(ctx context.Context, font *Font, text string) ([]annotati
 // 入参: ctx 取消上下文, font 字体, wanted 所需字符
 // 返回: map[rune]annotationLetter 字符编码, error 取消错误
 func annotationLetterLookup(ctx context.Context, font *Font, wanted map[rune]bool) (map[rune]annotationLetter, error) {
-	codes := make([]string, 0, len(wanted)+256)
-	for code, value := range font.Unicode {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		c, n := utf8.DecodeRuneInString(value)
-		if n == len(value) && wanted[c] {
-			codes = append(codes, code)
-		}
+	entries, err := font.characterLookup(ctx, wanted)
+	if err != nil {
+		return nil, err
 	}
-	if !font.composite {
-		for i := 0; i < 256; i++ {
-			codes = append(codes, string([]byte{byte(i)}))
-		}
-	}
-	slices.Sort(codes)
 	lookup := map[rune]annotationLetter{}
-	for _, code := range slices.Compact(codes) {
+	for ch, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		glyphs, err := font.DecodeContext(ctx, []byte(code))
-		if err != nil || len(glyphs) != 1 || utf8.RuneCountInString(glyphs[0].Text) != 1 {
-			continue
+		letter := annotationLetter{text: ch, code: entry.code, width: entry.glyph.Width, word: entry.glyph.WordSpace}
+		if font.Vertical {
+			letter.vertical = &entry.glyph.Vertical
 		}
-		glyph := glyphs[0]
-		letter, _ := utf8.DecodeRuneInString(glyph.Text)
-		if wanted['\u00a0'] && !font.composite && font.encoding == "WinAnsiEncoding" && code == "\xa0" && glyph.Name == "space" && glyph.Text == " " && font.Unicode[code] == "" {
-			lookup['\u00a0'] = annotationLetter{text: '\u00a0', code: code, width: glyph.Width, word: glyph.WordSpace}
-		}
-		if _, ok := lookup[letter]; !ok && wanted[letter] {
-			entry := annotationLetter{text: letter, code: code, width: glyph.Width, word: glyph.WordSpace}
-			if font.Vertical {
-				entry.vertical = &glyph.Vertical
-			}
-			lookup[letter] = entry
-		}
+		lookup[ch] = letter
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

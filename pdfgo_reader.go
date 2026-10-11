@@ -47,15 +47,18 @@ type Reader struct {
 	objectStreams      [4]*objectStream
 	security           *standardSecurity
 	warning            func(Diagnostic)
+	textShaper         TextShaper
 	closed             bool
 }
 
-// ReaderOptions 设置密码编码及可恢复结构错误的诊断接收方式
+// ReaderOptions 设置密码编码、结构诊断及生成注释外观时的文字整形
 // Warning非空时允许恢复错误Size声明及异常ToUnicode，不重建对象或猜测字符映射
+// ShapeText用于横排纯文本字段、列表选项及注释标题，空值不生成需要整形的外观，已有外观不受影响
 type ReaderOptions struct {
 	Password     []byte
 	PasswordUTF8 bool
 	Warning      func(Diagnostic)
+	ShapeText    TextShaper
 }
 
 // objectStream 保存对象流索引、解码数据及实际缓存字节数
@@ -127,7 +130,7 @@ func NewReaderWithUTF8Password(source io.ReaderAt, size int64, password []byte) 
 }
 
 // NewReaderWithOptions 按读取选项打开PDF，源读取器仍由调用方管理
-// 入参: source 随机读取器, size 文件字节数, options 密码及诊断选项
+// 入参: source 随机读取器, size 文件字节数, options 读取及外观选项
 // 返回: *Reader 阅读器, error 错误信息
 func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions) (*Reader, error) {
 	if size < 8 {
@@ -153,6 +156,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: map[Reference]Object{}, loading: map[Reference]bool{}}
 	r.originalSource, r.originalSize = source, size
 	r.warning = options.Warning
+	r.textShaper = options.ShapeText
 	var err error
 	for length := min(r.size, int64(4096)); ; length = min(r.size, length+min(length, r.size-length)) {
 		data, err = r.readRange(r.size-length, length)

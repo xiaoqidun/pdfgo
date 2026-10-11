@@ -31,6 +31,7 @@ const (
 type annotationLineCaption struct {
 	font          Object
 	lines         [][]annotationLetter
+	shaper        *annotationShaper
 	widths        []float64
 	rich          []annotationRichLine
 	resources     Dictionary
@@ -185,22 +186,38 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 			}
 		} else {
 			resources = Dictionary{"Font": Dictionary{"CaptionFont": caption.font}}
+			if caption.shaper != nil {
+				actual, err := EncodeTextString(caption.shaper.input)
+				if err != nil {
+					return nil, err
+				}
+				fmt.Fprintf(&content, "/Span << /ActualText <%x> >> BDC\n", []byte(actual))
+			}
 			content.WriteString("BT\n/CaptionFont ")
 			writeAnnotationOperation(&content, "Tf", annotationCaptionSize)
 			content.WriteString("0 g\n")
-			baseline := caption.height/2 - (caption.height - float64(len(caption.lines)-1)*annotationCaptionLeading) - caption.descent
-			for i, line := range caption.lines {
+			baseline := caption.height/2 - (caption.height - float64(len(caption.widths)-1)*annotationCaptionLeading) - caption.descent
+			for i := range caption.widths {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
+				if caption.shaper != nil {
+					if err := caption.shaper.writeLine(&content, caption.shaper.paragraphs[i].line, graphicsState{hscale: 1}, annotationCaptionSize, Identity(), -caption.widths[i]/2, baseline-float64(i)*annotationCaptionLeading); err != nil {
+						return nil, err
+					}
+					continue
+				}
 				writeAnnotationOperation(&content, "Tm", 1, 0, 0, 1, -caption.widths[i]/2, baseline-float64(i)*annotationCaptionLeading)
 				content.WriteByte('<')
-				for _, letter := range line {
+				for _, letter := range caption.lines[i] {
 					fmt.Fprintf(&content, "%x", letter.code)
 				}
 				content.WriteString("> Tj\n")
 			}
 			content.WriteString("ET\n")
+			if caption.shaper != nil {
+				content.WriteString("EMC\n")
+			}
 		}
 		content.WriteString("Q\n")
 	}
@@ -257,24 +274,33 @@ func (r *Reader) readLineCaption(ctx context.Context, page *Page, annotation Ann
 		return nil, err
 	}
 	text = strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(text)
-	font, letters, object, err := r.annotationCaptionFont(ctx, page.Resources, text)
+	encoded, err := r.annotationCaptionFont(ctx, page.Resources, text)
 	if err != nil {
 		return nil, err
 	}
-	caption.font = object
+	caption.font, caption.shaper = encoded.object, encoded.shaper
 	state := graphicsState{hscale: 1}
-	caption.lines = annotationLines(letters, state, annotationCaptionSize, math.Inf(1), true)
-	caption.widths = make([]float64, len(caption.lines))
-	for i, line := range caption.lines {
-		caption.widths[i] = annotationLineWidth(line, state, annotationCaptionSize)
+	if caption.shaper != nil {
+		caption.widths = make([]float64, len(caption.shaper.paragraphs))
+		for i, paragraph := range caption.shaper.paragraphs {
+			caption.widths[i] = paragraph.line.width(state, annotationCaptionSize)
+		}
+	} else {
+		caption.lines = annotationLines(encoded.letters, state, annotationCaptionSize, math.Inf(1), true)
+		caption.widths = make([]float64, len(caption.lines))
+		for i, line := range caption.lines {
+			caption.widths[i] = annotationLineWidth(line, state, annotationCaptionSize)
+		}
+	}
+	for i := range caption.widths {
 		caption.width = math.Max(caption.width, caption.widths[i])
 	}
 	ascent, descent := annotationCaptionSize*.8, -annotationCaptionSize*.2
-	if box := font.BoundingBox; box != nil && box.YMin < box.YMax {
+	if box := encoded.font.BoundingBox; box != nil && box.YMin < box.YMax {
 		ascent, descent = box.YMax*annotationCaptionSize/1000, box.YMin*annotationCaptionSize/1000
 	}
 	caption.descent = descent
-	caption.height = ascent - descent + float64(len(caption.lines)-1)*annotationCaptionLeading
+	caption.height = ascent - descent + float64(len(caption.widths)-1)*annotationCaptionLeading
 	if math.IsNaN(caption.width) || math.IsInf(caption.width, 0) || math.IsNaN(caption.height) || math.IsInf(caption.height, 0) {
 		return nil, fmt.Errorf("annotation caption dimensions overflow")
 	}

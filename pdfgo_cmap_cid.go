@@ -347,6 +347,44 @@ func (c *cidCMap) mapped(raw []byte) (uint16, bool) {
 	return cid, order >= 0
 }
 
+// characterCodes 反查指定CID的有效字符码，不展开无关映射区间
+// 入参: ctx 取消上下文, cids 升序排列的字符标识
+// 返回: []string 字符码, error 取消错误
+func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, error) {
+	var codes []string
+	for current := c; current != nil && len(cids) != 0; current = current.base {
+		for _, entry := range current.ranges {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			start, _ := slices.BinarySearch(cids, entry.cid)
+			last := uint64(entry.cid) + entry.last - entry.first
+			for _, cid := range cids[start:] {
+				if uint64(cid) > last {
+					break
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				code := entry.first + uint64(cid-entry.cid)
+				var raw [4]byte
+				size := int(code >> 32)
+				for i := 0; i < size; i++ {
+					raw[size-i-1] = byte(code >> (i * 8))
+				}
+				data := raw[:size]
+				if n, valid := c.next(data); valid && n == size && c.lookup(data, true) == cid {
+					codes = append(codes, string(data))
+				}
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return codes, nil
+}
+
 // undefined 查找未定义字符的替代标识
 // 入参: raw 字符码
 // 返回: uint16 替代标识，未提供时为零
