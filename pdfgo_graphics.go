@@ -304,10 +304,11 @@ func (m Matrix) Inverse() (Matrix, bool) {
 			return Matrix{}, false
 		}
 	}
-	a, b := m[0]*m[3], m[1]*m[2]
-	d := a - b
-	if d != 0 && !math.IsInf(d, 0) && math.Abs(d) >= 0x1p-1022 && math.Abs(d) >= 0x1p-48*math.Max(math.Abs(a), math.Abs(b)) {
-		n := Matrix{m[3] / d, -m[1] / d, -m[2] / d, m[0] / d, (m[2]*m[5] - m[3]*m[4]) / d, (m[1]*m[4] - m[0]*m[5]) / d}
+	d, ds := matrixProductDifference(m[0], m[3], m[1], m[2])
+	x, xs := matrixProductDifference(m[2], m[5], m[3], m[4])
+	y, ys := matrixProductDifference(m[1], m[4], m[0], m[5])
+	if d != 0 && ds && xs && ys {
+		n := Matrix{m[3] / d, -m[1] / d, -m[2] / d, m[0] / d, x / d, y / d}
 		valid := true
 		for _, value := range n {
 			valid = valid && !math.IsNaN(value) && !math.IsInf(value, 0)
@@ -344,6 +345,18 @@ func (m Matrix) MaxScale() float64 {
 	}
 	a, b, c, d := m[0]/scale, m[1]/scale, m[2]/scale, m[3]/scale
 	return scale * ((math.Hypot(a+d, b-c) + math.Hypot(a-d, b+c)) / 2)
+}
+
+// matrixProductDifference 计算两个乘积之差，检查溢出、下溢及相消造成的精度损失
+// 入参: a 第一个乘数, b 第二个乘数, c 第三个乘数, d 第四个乘数
+// 返回: float64 乘积之差, bool 是否可直接用于求逆
+func matrixProductDifference(a, b, c, d float64) (float64, bool) {
+	x, y := a*b, c*d
+	value := x - y
+	if math.IsNaN(value) || math.IsInf(value, 0) || x == 0 && a != 0 && b != 0 || y == 0 && c != 0 && d != 0 {
+		return value, false
+	}
+	return value, x == 0 && y == 0 || math.Abs(value) >= 0x1p-1022 && math.Abs(value) >= 0x1p-48*math.Max(math.Abs(x), math.Abs(y))
 }
 
 // matrixProductSum 以尾数及指数累加两个乘积，保留乘法舍入残差
