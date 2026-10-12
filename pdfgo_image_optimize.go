@@ -136,6 +136,22 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 	if err != nil {
 		return nil, err
 	}
+	if len(metadata) != 0 {
+		valid, err := resizeJPEGPhysical(ctx, data, metadata, image.Pt(config.Width, config.Height), img.Bounds().Size())
+		if err != nil {
+			return nil, err
+		}
+		if !valid {
+			return best, ctx.Err()
+		}
+		metadata, valid, err = resizeJPEGExif(ctx, metadata, image.Pt(config.Width, config.Height), img.Bounds().Size())
+		if err != nil {
+			return nil, err
+		}
+		if !valid {
+			return best, ctx.Err()
+		}
+	}
 	img, err = jpegEncodingImage(ctx, img)
 	if err != nil {
 		return nil, err
