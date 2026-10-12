@@ -50,32 +50,6 @@ type Image struct {
 	effectiveColorSpace bool
 }
 
-// HasMask 判断模板、显式、色键及JPEG2000内嵌遮罩，空引用不构成遮罩
-// 不解码像素，也不判断遮罩是否全不透明
-// 返回: bool 是否具有生效遮罩, error 引用或遮罩参数错误
-func (i *Image) HasMask() (bool, error) {
-	if i.ImageMask {
-		return true, nil
-	}
-	mode, err := i.jpxMaskMode()
-	if err != nil || mode != 0 {
-		return mode != 0, err
-	}
-	object, _, err := i.maskObject()
-	return object != nil, err
-}
-
-// HasSoftMask 判断显式及JPEG2000内嵌软遮罩，不将硬遮罩当作软遮罩
-// 返回: bool 是否具有软遮罩, error 引用或遮罩参数错误
-func (i *Image) HasSoftMask() (bool, error) {
-	mode, err := i.jpxMaskMode()
-	if err != nil || mode != 0 {
-		return mode != 0, err
-	}
-	value, err := i.reader.Resolve(i.SoftMask)
-	return value != nil && value != Name("None"), err
-}
-
 // deviceSampleImage 按需组合设备色或索引色样本与遮罩，不重复展开像素缓冲
 type deviceSampleImage struct {
 	source    image.Image
@@ -125,6 +99,32 @@ type packedGrayImage struct {
 // emptySampleImage 保留None图像的声明边界，不分配无效颜色样本
 type emptySampleImage struct {
 	rect image.Rectangle
+}
+
+// HasMask 判断模板、显式、色键及JPEG2000内嵌遮罩，空引用不构成遮罩
+// 不解码像素，也不判断遮罩是否全不透明
+// 返回: bool 是否具有生效遮罩, error 引用或遮罩参数错误
+func (i *Image) HasMask() (bool, error) {
+	if i.ImageMask {
+		return true, nil
+	}
+	mode, err := i.jpxMaskMode()
+	if err != nil || mode != 0 {
+		return mode != 0, err
+	}
+	object, _, err := i.maskObject()
+	return object != nil, err
+}
+
+// HasSoftMask 判断显式及JPEG2000内嵌软遮罩，不将硬遮罩当作软遮罩
+// 返回: bool 是否具有软遮罩, error 引用或遮罩参数错误
+func (i *Image) HasSoftMask() (bool, error) {
+	mode, err := i.jpxMaskMode()
+	if err != nil || mode != 0 {
+		return mode != 0, err
+	}
+	value, err := i.reader.Resolve(i.SoftMask)
+	return value != nil && value != Name("None"), err
 }
 
 // ColorModel 返回透明图像的非预乘颜色模型

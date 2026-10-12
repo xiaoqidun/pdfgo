@@ -22,15 +22,6 @@ import (
 	"sync"
 )
 
-// fontPostMapping 延迟解析只读名称表，字体副本共用映射而不复制同步状态
-type fontPostMapping struct {
-	program []byte
-	mu      sync.RWMutex
-	ready   bool
-	glyphs  map[string]uint16
-	err     error
-}
-
 // macPostNames 保存TrueType标准Macintosh字形编号对应的名称，不等同于字符编码
 var macPostNames = func() []string {
 	names := make([]string, 0, 258)
@@ -43,6 +34,15 @@ Lslash lslash Scaron scaron Zcaron zcaron brokenbar Eth eth Yacute yacute Thorn 
 twosuperior threesuperior onehalf onequarter threequarters franc Gbreve gbreve Idotaccent Scedilla scedilla Cacute cacute Ccaron ccaron dcroat
 `)...)
 }()
+
+// fontPostMapping 延迟解析只读名称表，字体副本共用映射而不复制同步状态
+type fontPostMapping struct {
+	program []byte
+	mu      sync.RWMutex
+	ready   bool
+	glyphs  map[string]uint16
+	err     error
+}
 
 // lookup 查询名称映射，空名称表返回未定义字形
 // 入参: name 字形名称
