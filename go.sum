@@ -1,5 +1,5 @@
-github.com/xiaoqidun/j2kgo v0.0.0-20261012032935-927f385982f8 h1:OIYzaxtwTC1i0cSlNRuOxWvuWOu2VT2YWxRur+yFq/E=
-github.com/xiaoqidun/j2kgo v0.0.0-20261012032935-927f385982f8/go.mod h1:DCwAfuDzCDYqUiAlZ7BDwigTjaXw7o9L1FtEma/D1aA=
+github.com/xiaoqidun/j2kgo v1.0.0 h1:n7F3s0H8/4x8ET0d65FGScRgTfiqbYuiiiJF/5HFI1I=
+github.com/xiaoqidun/j2kgo v1.0.0/go.mod h1:DCwAfuDzCDYqUiAlZ7BDwigTjaXw7o9L1FtEma/D1aA=
 github.com/xiaoqidun/jbig2 v1.1.5 h1:QcqjDBe/Zp+JlxYtmhsiYG+Ft36jjPB6+INPlmaI/ls=
 github.com/xiaoqidun/jbig2 v1.1.5/go.mod h1:9jromqVwMqlptUDEt6Yip8vqYA5I1YjhG7FgMl/Z2dA=
 golang.org/x/image v0.47.0 h1:za/8gVz++PPZqmZJBNSISICN5Rrj5zixP/8K++fgmqo=
