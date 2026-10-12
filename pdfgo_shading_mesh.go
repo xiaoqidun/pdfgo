@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"fmt"
 	"io"
+	"math"
 )
 
 // MeshPatch 保存双三次曲面控制点及四角分量，Points按u、v索引
@@ -57,6 +58,82 @@ type meshBits struct {
 // 返回: bool 是否使用颜色函数
 func (g *MeshGradient) UsesFunction() bool {
 	return g.function != nil || g.tint != nil || g.lab != nil || g.Space != nil && g.Space.profile != nil && (g.Space.profile.ranges != nil || g.Space.profile.alternate != nil)
+}
+
+// LinearColors 返回可直接用于线性插值的三角形顶点颜色，不改变源网格
+// 入参: index 三角形索引，不计曲面数量
+// 返回: [3][4]float64 Space颜色空间分量, error 参数错误或无法确认等价转换的UnsupportedError
+func (g *MeshGradient) LinearColors(index int) ([3][4]float64, error) {
+	var result [3][4]float64
+	if g == nil || index < 0 || index >= len(g.Triangles) || g.Space == nil {
+		return result, fmt.Errorf("invalid mesh triangle")
+	}
+	if g.lab != nil || g.Space.profile != nil && (g.Space.profile.ranges != nil || g.Space.profile.alternate != nil) {
+		return result, &UnsupportedError{Feature: "nonlinear mesh color transform"}
+	}
+	components := g.Space.Components()
+	if components < 1 || components > 4 {
+		return result, fmt.Errorf("invalid mesh color component count")
+	}
+	inputs := components
+	if g.tint != nil {
+		inputs = g.tint.components
+	}
+	if g.function != nil {
+		inputs = 1
+	}
+	triangle := g.Triangles[index]
+	for i, values := range triangle.Colors {
+		if len(values) != inputs {
+			return result, fmt.Errorf("invalid mesh vertex color")
+		}
+		for c, value := range values {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return result, fmt.Errorf("nonfinite mesh vertex color")
+			}
+			if g.tint == nil {
+				result[i][c] = math.Max(0, math.Min(1, value))
+			}
+		}
+	}
+	if g.function == nil && g.tint != nil && g.tint.components != 1 {
+		return g.linearTintColors(triangle)
+	}
+	if g.function != nil || g.tint != nil {
+		lower := min(triangle.Colors[0][0], triangle.Colors[1][0], triangle.Colors[2][0])
+		upper := max(triangle.Colors[0][0], triangle.Colors[1][0], triangle.Colors[2][0])
+		if lower != upper {
+			function := g.linearFunction()
+			if function == nil || function.linear == nil {
+				return result, &UnsupportedError{Feature: "nonlinear mesh function"}
+			}
+			stops := clipGradientValues(function.linear([2]float64{lower, upper}), gradientUnitBounds(components))
+			if len(stops) != 2 || stops[0].Position != 0 || stops[1].Position != 1 {
+				return result, &UnsupportedError{Feature: "piecewise mesh function"}
+			}
+		}
+	} else {
+		for c := range components {
+			lower := min(triangle.Colors[0][c], triangle.Colors[1][c], triangle.Colors[2][c])
+			upper := max(triangle.Colors[0][c], triangle.Colors[1][c], triangle.Colors[2][c])
+			if lower < 0 && upper > 0 || lower < 1 && upper > 1 {
+				return result, &UnsupportedError{Feature: "clipped mesh color"}
+			}
+		}
+		return result, nil
+	}
+	for i, values := range triangle.Colors {
+		var err error
+		if g.function != nil {
+			result[i], err = g.functionValues(values[0])
+		} else {
+			result[i], err = g.colorValues(values)
+		}
+		if err != nil {
+			return [3][4]float64{}, err
+		}
+	}
+	return result, nil
 }
 
 // PointAt 计算单位参数域内的双三次曲面坐标
@@ -204,6 +281,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		}
 		components = 1
 	}
+	colorBounds := g.decodeColorBounds(components)
 	ranges, err := p.reader.numberArray(d["Decode"], 4+components*2)
 	if err != nil {
 		return Paint{}, err
@@ -213,7 +291,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		return Paint{}, err
 	}
 	if kind == 4 || kind == 5 {
-		g.Triangles, err = p.meshTriangleData(d, data, depths, ranges, components, kind == 5)
+		g.Triangles, err = p.meshTriangleData(d, data, depths, ranges, colorBounds, components, kind == 5)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -232,7 +310,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	var colors [4][]float64
 	decode := func(depth, index int) (float64, error) {
 		value, err := bits.read(depth)
-		return ranges[index] + float64(value)/float64(uint64(1)<<uint(depth)-1)*(ranges[index+1]-ranges[index]), err
+		return functionValue(float64(value)/float64(uint64(1)<<uint(depth)-1), ranges[index], ranges[index+1]), err
 	}
 	for bits.pos < len(data)*8 {
 		if err := p.ctx.Err(); err != nil {
@@ -272,6 +350,9 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 				if err != nil {
 					return Paint{}, err
 				}
+				if colorBounds != nil {
+					colors[i][c] = max(colorBounds[2*c], min(colorBounds[2*c+1], colors[i][c]))
+				}
 			}
 		}
 		bits.pos = (bits.pos + 7) / 8 * 8
@@ -299,9 +380,9 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 }
 
 // meshTriangleData 按边标志或格点行顺序解码三角网格，保留绘制顺序
-// 入参: dict 着色字典, data 解码数据, depths 数值位宽, ranges 解码区间, components 分量数, lattice 是否为格点网格
+// 入参: dict 着色字典, data 解码数据, depths 数值位宽, ranges 解码区间, colorBounds 顶点颜色范围，函数参数不设此范围, components 分量数, lattice 是否为格点网格
 // 返回: []MeshTriangle 三角形, error 结构或取消错误
-func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths [3]int, ranges []float64, components int, lattice bool) ([]MeshTriangle, error) {
+func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths [3]int, ranges, colorBounds []float64, components int, lattice bool) ([]MeshTriangle, error) {
 	type vertex struct {
 		point Point
 		color []float64
@@ -327,13 +408,17 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 			if err != nil {
 				return v, 0, err
 			}
-			value := ranges[index*2] + float64(n)/float64(uint64(1)<<uint(depth)-1)*(ranges[index*2+1]-ranges[index*2])
+			value := functionValue(float64(n)/float64(uint64(1)<<uint(depth)-1), ranges[index*2], ranges[index*2+1])
 			switch index {
 			case 0:
 				v.point.X = value
 			case 1:
 				v.point.Y = value
 			default:
+				if colorBounds != nil {
+					c := index - 2
+					value = max(colorBounds[2*c], min(colorBounds[2*c+1], value))
+				}
 				v.color[index-2] = value
 			}
 		}
@@ -408,6 +493,27 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 		return nil, fmt.Errorf("empty mesh shading")
 	}
 	return result, nil
+}
+
+// decodeColorBounds 返回网格顶点解码后的颜色范围，着色函数的输入参数不按颜色裁切
+// 入参: components 源分量数
+// 返回: []float64 各分量上下界，函数参数返回nil
+func (g *MeshGradient) decodeColorBounds(components int) []float64 {
+	if g.function != nil {
+		return nil
+	}
+	bounds := gradientUnitBounds(components)
+	if g.tint != nil {
+		return bounds
+	}
+	if g.lab != nil {
+		bounds[1] = 100
+		copy(bounds[2:], g.lab.rangeAB[:])
+	} else if g.Space != nil && g.Space.profile != nil {
+		ranges := g.Space.profile.sourceRanges()
+		copy(bounds, ranges[:])
+	}
+	return bounds
 }
 
 // completeCoons 按双线性边界混合补齐Coons曲面的内部控制点

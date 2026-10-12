@@ -660,6 +660,18 @@ func (r *Reader) readDeviceNGradient(space Array, function Object, domain [2]flo
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	mapped := deviceNColorFunction(source, tint)
+	var stops []GradientStop
+	if mapped.linear != nil {
+		stops = clipGradientValues(mapped.linear(domain), gradientUnitBounds(tint.alternate.Components()))
+	}
+	return stops, tint.alternate, mapped, nil
+}
+
+// deviceNColorFunction 组合渐变与专色变换，保留可精确展开的分段及专色分量
+// 入参: source 渐变函数, tint 专色定义
+// 返回: *gradientFunction 备用颜色空间函数
+func deviceNColorFunction(source *gradientFunction, tint *deviceNSpace) *gradientFunction {
 	mapped := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
 		values, err := source.evaluate(x)
 		if err != nil {
@@ -675,11 +687,7 @@ func (r *Reader) readDeviceNGradient(space Array, function Object, domain [2]flo
 		mapped.linear = composed.linear
 	}
 	mapped.colorants, mapped.colorant = tint.colorants, gradientColorantFunction(source, tint.components)
-	var stops []GradientStop
-	if mapped.linear != nil {
-		stops = clipGradientValues(mapped.linear(domain), gradientUnitBounds(tint.alternate.Components()))
-	}
-	return stops, tint.alternate, mapped, nil
+	return mapped
 }
 
 // clipGradientValues 增加截断断点，无法保留边界位置时不生成分段

@@ -37,6 +37,72 @@ type pngOptimizationBuffers struct {
 	buffer *png.EncoderBuffer
 }
 
+// pngCompactImage 将灰度或索引色图像作为八位RGB候选编码，不展开像素缓冲
+type pngCompactImage struct {
+	image.Image
+	opaque bool
+}
+
+// pngCompactGrayImage 复用已确认灰度且不透明的八位像素，避免另建灰度缓冲
+type pngCompactGrayImage struct {
+	image.Image
+}
+
+// pngCompactPaletteImage 按扫描顺序映射已有像素，不分配整幅索引缓冲
+type pngCompactPaletteImage struct {
+	image.Image
+	palette color.Palette
+	indices map[color.NRGBA]uint8
+}
+
+// ColorModel 返回本次编码的调色板
+// 返回: color.Model 索引色模型
+func (p *pngCompactPaletteImage) ColorModel() color.Model {
+	return p.palette
+}
+
+// ColorIndexAt 读取像素对应的调色板索引
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: uint8 颜色索引，坐标越界时为0
+func (p *pngCompactPaletteImage) ColorIndexAt(x, y int) uint8 {
+	if !image.Pt(x, y).In(p.Bounds()) {
+		return 0
+	}
+	return p.indices[imageNRGBAAt(p.Image, x, y)]
+}
+
+// ColorModel 返回八位灰度模型
+// 返回: color.Model 灰度颜色模型
+func (p *pngCompactGrayImage) ColorModel() color.Model {
+	return color.GrayModel
+}
+
+// At 读取已确认灰度的像素分量
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 八位灰度颜色
+func (p *pngCompactGrayImage) At(x, y int) color.Color {
+	return color.Gray{Y: imageNRGBAAt(p.Image, x, y).R}
+}
+
+// ColorModel 返回候选编码的非预乘颜色模型
+// 返回: color.Model 八位非预乘颜色模型
+func (p *pngCompactImage) ColorModel() color.Model {
+	return color.NRGBAModel
+}
+
+// Opaque 返回颜色扫描得到的不透明状态
+// 返回: bool 图像是否完全不透明
+func (p *pngCompactImage) Opaque() bool {
+	return p.opaque
+}
+
+// NRGBAAt 直接读取原始像素，避免通过颜色接口分配临时值
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.NRGBA 八位非预乘颜色
+func (p *pngCompactImage) NRGBAAt(x, y int) color.NRGBA {
+	return imageNRGBAAt(p.Image, x, y)
+}
+
 // Get 取出本次优化的编码缓冲
 // 返回: *png.EncoderBuffer 可复用缓冲或空值
 func (p *pngOptimizationBuffers) Get() *png.EncoderBuffer {
@@ -163,7 +229,7 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 		}
 		if !byteExact {
 			if _, gray := img.(*pngGrayAlphaImage); gray {
-				return compactPNGGrayAlpha(ctx, img, 16, best)
+				return compactPNGGray(ctx, img, 16, true, best)
 			}
 			if _, gray := img.(*image.Gray16); gray || img.Bounds().Dx() != config.Width || img.Bounds().Dy() != config.Height {
 				return compactPNGImage(ctx, img, best, &buffers)
@@ -172,9 +238,25 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 		}
 	}
 	b := img.Bounds()
-	pixels, reused, err := compactPNGStorage(ctx, img)
-	if err != nil {
-		return nil, err
+	var pixels image.Image
+	var writable *image.NRGBA
+	reused := true
+	if options.Mode != CompressionLossy {
+		switch img.(type) {
+		case *image.Gray, *image.Paletted:
+			pixels = compactPNGView(img, false)
+		}
+	}
+	if pixels == nil {
+		writable, reused, err = compactPNGStorage(ctx, img)
+		if err != nil {
+			return nil, err
+		}
+		pixels = writable
+	}
+	source := img
+	if writable == nil {
+		source = pixels
 	}
 	palette := color.Palette{}
 	indices := make(map[color.NRGBA]uint8)
@@ -191,12 +273,12 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 					return nil, err
 				}
 			}
-			c := imageNRGBAAt(img, x, y)
+			c := imageNRGBAAt(source, x, y)
 			if options.Mode == CompressionLossy {
 				c.R, c.G, c.B = quant(c.R), quant(c.G), quant(c.B)
 			}
 			if !reused || options.Mode == CompressionLossy {
-				pixels.SetNRGBA(x, y, c)
+				writable.SetNRGBA(x, y, c)
 			}
 			gray = gray && c.R == c.G && c.G == c.B
 			opaque = opaque && c.A == 255
@@ -212,49 +294,71 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 		}
 	}
 	if len(palette) <= 256 {
-		p := image.NewPaletted(b, palette)
-		for y := b.Min.Y; y < b.Max.Y; y++ {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			for x := b.Min.X; x < b.Max.X; x++ {
-				p.SetColorIndex(x, y, indices[pixels.NRGBAAt(x, y)])
-			}
-		}
+		p := &pngCompactPaletteImage{Image: pixels, palette: palette, indices: indices}
 		best, err = compactPNGImage(ctx, p, best, &buffers)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if gray && !opaque {
-		best, err = compactPNGGrayAlpha(ctx, pixels, 8, best)
+		best, err = compactPNGGray(ctx, pixels, 8, true, best)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if gray && opaque {
-		g, ok := img.(*image.Gray)
-		if !ok || options.Mode == CompressionLossy {
-			g = image.NewGray(b)
-			for y := b.Min.Y; y < b.Max.Y; y++ {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-				for x := b.Min.X; x < b.Max.X; x++ {
-					g.SetGray(x, y, color.Gray{Y: pixels.NRGBAAt(x, y).R})
-				}
+		depth := 1
+		for _, entry := range palette {
+			value := entry.(color.NRGBA).R
+			if value%17 != 0 {
+				depth = 8
+				break
 			}
+			if value%85 != 0 {
+				depth = 4
+			} else if value%255 != 0 {
+				depth = max(depth, 2)
+			}
+		}
+		if depth < 8 {
+			best, err = compactPNGGray(ctx, pixels, depth, false, best)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var g image.Image = &pngCompactGrayImage{Image: pixels}
+		if source, ok := img.(*image.Gray); ok && options.Mode != CompressionLossy {
+			g = source
 		}
 		best, err = compactPNGImage(ctx, g, best, &buffers)
 		if err != nil {
 			return nil, err
 		}
 	}
+	if writable == nil {
+		pixels.(*pngCompactImage).opaque = opaque
+	}
 	best, err = compactPNGImage(ctx, pixels, best, &buffers)
 	if err != nil {
 		return nil, err
 	}
 	return best, ctx.Err()
+}
+
+// compactPNGView 复用八位像素并转换调色板，避免RGB编码时逐像素分配颜色
+// 入参: img 灰度或索引色图像, opaque 已检查的不透明状态
+// 返回: image.Image 只读RGB候选
+func compactPNGView(img image.Image, opaque bool) image.Image {
+	if source, ok := img.(*image.Paletted); ok {
+		view := *source
+		view.Palette = make(color.Palette, len(source.Palette))
+		for i, entry := range source.Palette {
+			c := imageNRGBASample(entry)
+			view.Palette[i] = color.NRGBA{R: uint8(c.R >> 8), G: uint8(c.G >> 8), B: uint8(c.B >> 8), A: uint8(c.A >> 8)}
+		}
+		img = &view
+	}
+	return &pngCompactImage{Image: img, opaque: opaque}
 }
 
 // compactPNGStorage 复用本次解码的非预乘像素，其余颜色模型分配独立缓冲
