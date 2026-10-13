@@ -780,20 +780,13 @@ func (s *pngResampleRows) sample(x int) color.NRGBA64 {
 	})
 }
 
-// red 读取遮罩插值后的预乘灰度，不对不透明灰度执行多余颜色计算
+// red 直接读取遮罩插值后的预乘灰度，避免反预乘往返的舍入损失
 // 入参: x 输出横向坐标
 // 返回: uint16 遮罩覆盖率
 func (s *pngResampleRows) red(x int) uint16 {
 	column := s.x[x-s.resample.bounds.Min.X]
 	a, b, c, d := s.rows[0][column.left], s.rows[0][column.right], s.rows[1][column.left], s.rows[1][column.right]
-	red := pngInterpolate(a.R, b.R, c.R, d.R, column.weight, s.weightY)
-	if a.A == 65535 && b.A == 65535 && c.A == 65535 && d.A == 65535 {
-		return red
-	}
-	alpha := pngInterpolate(a.A, b.A, c.A, d.A, column.weight, s.weightY)
-	pixel := imageUnpremultiply(color.RGBA64{R: red, A: alpha})
-	value, _, _, _ := pixel.RGBA()
-	return uint16(value)
+	return pngInterpolate(a.R, b.R, c.R, d.R, column.weight, s.weightY)
 }
 
 // pngInterpolate 按原有累加顺序插值非负样本，保留半值向上舍入

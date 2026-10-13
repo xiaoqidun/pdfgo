@@ -1159,11 +1159,10 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			}
 			alpha := uint16(65535)
 			if mask != nil {
-				value, _, _, _ := mask.At(x, y).RGBA()
+				alpha = imageRGBA64At(mask, x, y).R
 				if inverted {
-					value = 65535 - value
+					alpha = 65535 - alpha
 				}
-				alpha = uint16(value)
 			}
 			var sampleColor color.Color
 			var samplePixel color.NRGBA64

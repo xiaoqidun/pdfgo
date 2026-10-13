@@ -145,19 +145,38 @@ func (s *imageResample) NRGBA64At(x, y int) color.NRGBA64 {
 		return imageNRGBA64At(s.source, x, y)
 	}
 	if s.interpolate {
+		return imageUnpremultiply(s.RGBA64At(x, y))
+	}
+	sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
+	sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
+	return imageNRGBA64At(s.source, b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
+}
+
+// RGBA64At 直接重采样预乘颜色，不经过反预乘往返，保留原始四色和专色插值
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.RGBA64 预乘颜色
+func (s *imageResample) RGBA64At(x, y int) color.RGBA64 {
+	if !image.Pt(x, y).In(s.bounds) {
+		return color.RGBA64{}
+	}
+	b := s.source.Bounds()
+	if b == s.bounds {
+		return imageRGBA64At(s.source, x, y)
+	}
+	if s.interpolate {
 		switch source := s.source.(type) {
 		case *image.CMYK, *packedCMYKImage, *packedDeviceNImage, *imageResample:
-			return imageNRGBASample(s.At(x, y))
+			return color.RGBA64Model.Convert(s.At(x, y)).(color.RGBA64)
 		case *jpxSampleImage:
 			if source.cmyk || len(source.channels) > 4 {
-				return imageNRGBASample(s.At(x, y))
+				return color.RGBA64Model.Convert(s.At(x, y)).(color.RGBA64)
 			}
 		}
 	}
 	sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
 	sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
 	if !s.interpolate {
-		return imageNRGBA64At(s.source, b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
+		return imageRGBA64At(s.source, b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
 	}
 	x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
 	fx, fy := sx-float64(x0), sy-float64(y0)
@@ -177,5 +196,5 @@ func (s *imageResample) NRGBA64At(x, y int) color.NRGBA64 {
 			}
 		}
 	}
-	return imageUnpremultiply(color.RGBA64{R: uint16(math.Round(values[0])), G: uint16(math.Round(values[1])), B: uint16(math.Round(values[2])), A: uint16(math.Round(values[3]))})
+	return color.RGBA64{R: uint16(math.Round(values[0])), G: uint16(math.Round(values[1])), B: uint16(math.Round(values[2])), A: uint16(math.Round(values[3]))}
 }
