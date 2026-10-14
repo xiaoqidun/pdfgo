@@ -186,6 +186,13 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 // 入参: ctx 取消上下文, data PNG数据, options 压缩配置, size 像素上限, resource 是否允许更换格式
 // 返回: []byte 优化数据, error 编码错误
 func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, size image.Point, resource bool) ([]byte, error) {
+	return optimizePNGSource(ctx, data, options, size, resource, nil)
+}
+
+// optimizePNGSource 比较PNG编码候选，内部编码入口可复用与编码一致的只读像素
+// 入参: ctx 取消上下文, data PNG数据, options 压缩配置, size 像素上限, resource 是否允许更换格式, pixels 已编码像素或空值
+// 返回: []byte 优化数据, error 编码错误
+func optimizePNGSource(ctx context.Context, data []byte, options CompressionOptions, size image.Point, resource bool, pixels image.Image) ([]byte, error) {
 	var chunks []pngOptimizationChunk
 	eligible := false
 	plain := true
@@ -284,7 +291,7 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 		var candidate []byte
 		var err error
 		if density == nil {
-			candidate, err = compactPNG(ctx, data, best, options, size, resource)
+			candidate, err = compactPNGSource(ctx, data, best, options, size, resource, pixels)
 		} else {
 			candidate, err = compactPNGPhysical(ctx, data, best, density, options, size)
 		}

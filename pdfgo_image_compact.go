@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -146,6 +147,62 @@ func OptimizeImageResource(ctx context.Context, data []byte, options Compression
 	return OptimizeImageSize(ctx, data, options, size)
 }
 
+// EncodePNGWithOptions 编码并优化固定PNG格式，共用已解码像素，不修改输入
+// 不降采样，不附加密度或色彩配置；失败时输出可能不完整
+// 编码候选超过64MiB时返回io.ErrShortBuffer
+// 入参: ctx 取消上下文, writer 输出流, source 已解码图像, options 压缩配置
+// 返回: error 参数、编码、取消或写入错误
+func EncodePNGWithOptions(ctx context.Context, writer io.Writer, source image.Image, options CompressionOptions) error {
+	if writer == nil {
+		return fmt.Errorf("missing PNG writer")
+	}
+	data, err := encodeImage(ctx, source, options, false)
+	if err != nil {
+		return err
+	}
+	_, err = (pngContextWriter{ctx: ctx, writer: writer}).Write(data)
+	return err
+}
+
+// EncodeImageResource 编码并优化资源图片，有损模式允许不透明照片采用JPEG，其余保留PNG
+// 不修改输入，不降采样，不附加密度或色彩配置；调用方须按返回数据设置格式声明
+// 编码候选超过64MiB时返回io.ErrShortBuffer，失败时不返回编码数据
+// 入参: ctx 取消上下文, source 已解码图像, options 压缩配置
+// 返回: []byte 图片编码, error 参数、编码或取消错误
+func EncodeImageResource(ctx context.Context, source image.Image, options CompressionOptions) ([]byte, error) {
+	return encodeImage(ctx, source, options, true)
+}
+
+// encodeImage 生成PNG基准候选，安全复用非预乘像素并比较压缩结果
+// 入参: ctx 取消上下文, source 已解码图像, options 压缩配置, resource 是否允许更换格式
+// 返回: []byte 图片编码, error 参数、编码或取消错误
+func encodeImage(ctx context.Context, source image.Image, options CompressionOptions, resource bool) ([]byte, error) {
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
+	var output bytes.Buffer
+	limit := &optimizationBuffer{buffer: &output, limit: optimizationBufferLimit}
+	if err := EncodePNG(ctx, limit, source); err != nil {
+		return nil, err
+	}
+	if options.Mode == CompressionUnchanged {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return output.Bytes(), nil
+	}
+	var pixels image.Image
+	switch source.(type) {
+	case *image.NRGBA, *image.NRGBA64, *image.Gray, *image.Gray16:
+		pixels = source
+	}
+	data, err := optimizePNGSource(ctx, output.Bytes(), options, image.Point{}, resource, pixels)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
 // photographicImage 保守识别连续色调图片，扫描透明度及颜色期间检查取消
 // 入参: ctx 取消上下文, img 图片
 // 返回: bool 是否适合JPEG, error 取消错误
@@ -185,6 +242,13 @@ func photographicImage(ctx context.Context, img image.Image) (bool, error) {
 // 入参: ctx 取消上下文, data 待重编码的PNG, best 已有候选, options 压缩配置, size 像素需求, resource 是否允许更换格式
 // 返回: []byte 更小的图片编码, error 编码错误
 func compactPNG(ctx context.Context, data, best []byte, options CompressionOptions, size image.Point, resource bool) ([]byte, error) {
+	return compactPNGSource(ctx, data, best, options, size, resource, nil)
+}
+
+// compactPNGSource 比较颜色表示候选，复用指定只读像素或自行解码
+// 入参: ctx 取消上下文, data PNG数据, best 已有候选, options 压缩配置, size 像素需求, resource 是否允许更换格式, source 与编码一致的像素或空值
+// 返回: []byte 更小的图片编码, error 编码错误
+func compactPNGSource(ctx context.Context, data, best []byte, options CompressionOptions, size image.Point, resource bool, source image.Image) ([]byte, error) {
 	var buffers pngOptimizationBuffers
 	config, err := png.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
@@ -198,9 +262,12 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/pixelSize {
 		return best, ctx.Err()
 	}
-	img, err := png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
-	if err != nil {
-		return nil, err
+	img := source
+	if img == nil {
+		img, err = png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
+		if err != nil {
+			return nil, err
+		}
 	}
 	photo := false
 	if resource && options.Mode == CompressionLossy {
@@ -241,20 +308,25 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 	var pixels image.Image
 	var writable *image.NRGBA
 	reused := true
-	if options.Mode != CompressionLossy {
+	quantize := options.Mode == CompressionLossy && options.ImageQuality() < 100
+	if !quantize {
 		switch img.(type) {
 		case *image.Gray, *image.Paletted:
 			pixels = compactPNGView(img, false)
 		}
 	}
 	if pixels == nil {
-		writable, reused, err = compactPNGStorage(ctx, img)
-		if err != nil {
-			return nil, err
+		if source != nil && quantize {
+			writable, reused = image.NewNRGBA(b), false
+		} else {
+			writable, reused, err = compactPNGStorage(ctx, img)
+			if err != nil {
+				return nil, err
+			}
 		}
 		pixels = writable
 	}
-	source := img
+	source = img
 	if writable == nil {
 		source = pixels
 	}
@@ -274,10 +346,10 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 				}
 			}
 			c := imageNRGBAAt(source, x, y)
-			if options.Mode == CompressionLossy {
+			if quantize {
 				c.R, c.G, c.B = quant(c.R), quant(c.G), quant(c.B)
 			}
-			if !reused || options.Mode == CompressionLossy {
+			if !reused || quantize {
 				writable.SetNRGBA(x, y, c)
 			}
 			gray = gray && c.R == c.G && c.G == c.B
@@ -327,7 +399,7 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 			}
 		}
 		var g image.Image = &pngCompactGrayImage{Image: pixels}
-		if source, ok := img.(*image.Gray); ok && options.Mode != CompressionLossy {
+		if source, ok := img.(*image.Gray); ok && !quantize {
 			g = source
 		}
 		best, err = compactPNGImage(ctx, g, best, &buffers)
@@ -361,8 +433,9 @@ func compactPNGView(img image.Image, opaque bool) image.Image {
 	return &pngCompactImage{Image: img, opaque: opaque}
 }
 
-// compactPNGStorage 复用本次解码的非预乘像素，其余颜色模型分配独立缓冲
-// 入参: ctx 取消上下文, img 内部独占图像，不得传入调用方图像
+// compactPNGStorage 复用非预乘像素，其余颜色模型分配独立缓冲
+// 输入来自调用方时，复用结果仅可读取，不得用于原地量化
+// 入参: ctx 取消上下文, img 图像
 // 返回: *image.NRGBA 可写像素, bool 是否复用原像素, error 取消错误
 func compactPNGStorage(ctx context.Context, img image.Image) (*image.NRGBA, bool, error) {
 	if err := ctx.Err(); err != nil {
