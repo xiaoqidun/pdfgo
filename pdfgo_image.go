@@ -31,7 +31,7 @@ import (
 var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 
 // Image 保存图像有效属性及原始数据流，颜色空间和遮罩使用PDF对象
-// Warning非空时允许恢复多余样本、JPEG2000分段总数及TLM索引不一致，并报告原因
+// Warning非空时允许恢复多余样本、完整压缩数据缺失的Flate校验尾部、JPEG2000分段总数及TLM索引不一致，并报告原因
 // Intent为空时继承绘图状态，单独解码使用相对色度
 type Image struct {
 	Width               int
@@ -650,7 +650,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	}
 	data := i.Stream.Data
 	if terminal == "" || len(filters) != 0 {
-		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data}).DecodeContext(ctx)
+		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data}).decodeContext(ctx, i.Warning)
 		if err != nil {
 			return nil, err
 		}

@@ -52,7 +52,7 @@ type Reader struct {
 }
 
 // ReaderOptions 设置密码编码、结构诊断及生成注释外观时的文字整形
-// Warning非空时允许恢复错误Size声明及异常ToUnicode，不重建对象或猜测字符映射
+// Warning非空时允许恢复错误Size声明、异常ToUnicode及完整压缩数据缺失的Flate校验尾部，不重建对象或猜测内容
 // ShapeText用于横排纯文本字段、列表选项及注释标题，空值不生成需要整形的外观，已有外观不受影响
 type ReaderOptions struct {
 	Password     []byte

@@ -16,11 +16,13 @@ package pdfgo
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/zlib"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash/adler32"
 	"io"
 	"math/bits"
 )
@@ -52,6 +54,17 @@ func (s *Stream) Decode() ([]byte, error) {
 // 入参: ctx 取消上下文
 // 返回: []byte 独立解码数据, error 解码或取消错误
 func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
+	var warning func(Diagnostic)
+	if s.reader != nil {
+		warning = s.reader.warning
+	}
+	return s.decodeContext(ctx, warning)
+}
+
+// decodeContext 按调用方诊断策略解码流，图像使用自身的宽容读取配置
+// 入参: ctx 取消上下文, warning 恢复诊断，空值表示严格解码
+// 返回: []byte 独立解码数据, error 解码或取消错误
+func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -73,6 +86,7 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 				return nil, &UnsupportedError{Feature: "stream crypt filter"}
 			}
 		case "FlateDecode":
+			encoded := data
 			var reader io.ReadCloser
 			reader, err = zlib.NewReader(bytes.NewReader(data))
 			if err == nil {
@@ -80,6 +94,10 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 				closeErr := reader.Close()
 				if err == nil {
 					err = closeErr
+				}
+				if err == io.ErrUnexpectedEOF && warning != nil && completeFlatePayload(ctx, encoded, data) {
+					warning(Diagnostic{Message: "Flate checksum truncated; complete compressed data retained"})
+					err = nil
 				}
 			}
 		case "LZWDecode":
@@ -96,6 +114,9 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 			data, err = decodeRunLength(ctx, data)
 		default:
 			return nil, &UnsupportedError{Feature: "stream filter " + string(name)}
+		}
+		if canceled := ctx.Err(); canceled != nil {
+			return nil, canceled
 		}
 		if err != nil {
 			return nil, err
@@ -117,6 +138,26 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+// completeFlatePayload 验证完整压缩块及残留校验前缀，不恢复截断数据或错误校验值
+// 入参: ctx 取消上下文, encoded 压缩数据, decoded 已解码数据
+// 返回: bool 是否仅缺失末尾校验字节
+func completeFlatePayload(ctx context.Context, encoded, decoded []byte) bool {
+	if len(encoded) < 2 || encoded[1]&0x20 != 0 {
+		return false
+	}
+	source := bytes.NewReader(encoded[2:])
+	reader := flate.NewReader(source)
+	checksum := adler32.New()
+	count, err := io.Copy(checksum, &contextInput{ctx: ctx, reader: reader})
+	closeErr := reader.Close()
+	if err != nil || closeErr != nil || ctx.Err() != nil || count != int64(len(decoded)) || source.Len() >= 4 {
+		return false
+	}
+	var expected [4]byte
+	binary.BigEndian.PutUint32(expected[:], checksum.Sum32())
+	return bytes.Equal(encoded[len(encoded)-source.Len():], expected[:source.Len()])
 }
 
 // pdfObject 将流标记为PDF对象
