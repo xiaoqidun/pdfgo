@@ -559,7 +559,7 @@ func pngFilterRowOrder(ctx context.Context, row, previous []byte, pixelBytes int
 			return nil, err
 		}
 		clear(filters[0])
-		if bytes.Count(row, []byte{0}) != len(row) {
+		if !bytes.Equal(row, filters[0][1:]) {
 			filters[0][0] = 2
 		}
 		if err := ctx.Err(); err != nil {
@@ -574,7 +574,12 @@ func pngFilterRowOrder(ctx context.Context, row, previous []byte, pixelBytes int
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		for _, value := range row[start:min(start+4096, len(row))] {
+		part := row[start:min(start+4096, len(row))]
+		for len(part) >= 8 {
+			score += pngByteScore8(binary.LittleEndian.Uint64(part))
+			part = part[8:]
+		}
+		for _, value := range part {
 			score += uint64(min(int(value), 256-int(value)))
 		}
 	}
@@ -608,18 +613,18 @@ func pngFilterRowOrder(ctx context.Context, row, previous []byte, pixelBytes int
 			switch kind {
 			case 1:
 				left := row[start-pixelBytes:][:len(current)]
-				for index, value := range current {
-					residual := value - left[index]
-					filtered[index] = residual
-					candidate += uint64(min(int(residual), 256-int(residual)))
+				if bytes.Equal(current, left) {
+					clear(filtered)
+					continue
 				}
+				candidate += pngFilterDifference(filtered, current, left)
 			case 2:
 				above := previous[start:end]
-				for index, value := range current {
-					residual := value - above[index]
-					filtered[index] = residual
-					candidate += uint64(min(int(residual), 256-int(residual)))
+				if bytes.Equal(current, above) {
+					clear(filtered)
+					continue
 				}
+				candidate += pngFilterDifference(filtered, current, above)
 			case 3:
 				left, above := row[start-pixelBytes:][:len(current)], previous[start:end]
 				for index, value := range current {
@@ -645,6 +650,38 @@ func pngFilterRowOrder(ctx context.Context, row, previous []byte, pixelBytes int
 		return nil, err
 	}
 	return filters[0], nil
+}
+
+// pngByteScore8 按独立字节计算八个有符号残差的绝对值之和
+// 入参: value 八字节残差
+// 返回: uint64 过滤得分
+func pngByteScore8(value uint64) uint64 {
+	sign := (value & 0x8080808080808080) >> 7
+	magnitude := (value ^ (sign * 255)) + sign
+	sum := (magnitude & 0x00ff00ff00ff00ff) + (magnitude >> 8 & 0x00ff00ff00ff00ff)
+	sum = (sum & 0x0000ffff0000ffff) + (sum >> 16 & 0x0000ffff0000ffff)
+	return (sum & 0xffffffff) + (sum >> 32)
+}
+
+// pngFilterDifference 按独立字节批量生成模256残差，不跨字节借位
+// 入参: output 残差缓冲, current 当前样本, predictor 预测样本
+// 返回: uint64 残差得分
+func pngFilterDifference(output, current, predictor []byte) uint64 {
+	var score uint64
+	for len(current) >= 8 {
+		a, b := binary.LittleEndian.Uint64(current), binary.LittleEndian.Uint64(predictor)
+		const high = uint64(0x8080808080808080)
+		residual := ((a | high) - (b &^ high)) ^ ((a ^ b ^ high) & high)
+		binary.LittleEndian.PutUint64(output, residual)
+		score += pngByteScore8(residual)
+		current, predictor, output = current[8:], predictor[8:], output[8:]
+	}
+	for i, value := range current {
+		residual := value - predictor[i]
+		output[i] = residual
+		score += uint64(min(int(residual), 256-int(residual)))
+	}
+	return score
 }
 
 // newPNGRowSampler 为颜色及遮罩建立独立缓存，其他图像保留直接采样
