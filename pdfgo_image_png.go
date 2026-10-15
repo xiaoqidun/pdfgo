@@ -129,7 +129,8 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	}
 	output := pngContextWriter{ctx: ctx, writer: writer}
 	_, direct := source.(interface{ NRGBA64At(int, int) color.NRGBA64 })
-	if _, packed := source.(*packedGrayImage); !direct && !packed {
+	nrgba, _ := source.(*image.NRGBA)
+	if _, packed := source.(*packedGrayImage); !direct && !packed && nrgba == nil {
 		return png.Encode(output, source)
 	}
 	depth, channels, kind, err := pngSampleFormat(ctx, source)
@@ -158,7 +159,22 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 			return err
 		}
 		row := encoder.row
-		if gray != nil {
+		if nrgba != nil {
+			start := nrgba.PixOffset(bounds.Min.X, y)
+			input := nrgba.Pix[start : start+bounds.Dx()*4]
+			if channels == 4 {
+				copy(row, input)
+			} else {
+				for x := 0; x < bounds.Dx(); x++ {
+					if x&4095 == 0 {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+					}
+					copy(row[x*3:x*3+3], input[x*4:x*4+3])
+				}
+			}
+		} else if gray != nil {
 			if err := pngGrayRow(ctx, row, gray, y, depth, &grayBytes); err != nil {
 				return err
 			}
@@ -439,7 +455,7 @@ func pngSampleFormat(ctx context.Context, source image.Image) (int, int, int, er
 		return depth, 1, 0, nil
 	}
 	switch s := source.(type) {
-	case *image.NRGBA64:
+	case *image.NRGBA, *image.NRGBA64:
 		opaque, err := imageOpaqueContext(ctx, s)
 		if err != nil {
 			return 0, 0, 0, err
