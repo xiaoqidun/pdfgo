@@ -82,6 +82,78 @@ func (i *Image) ColorSpaceFamily() (Name, error) {
 	}
 }
 
+// ColorSpaceComponents 读取源样本通道数，Indexed为1，不包含透明度或备用空间通道
+// 仅校验通道定义，不解码图像、ICC配置或颜色变换；资源空间由ReadImageWithResources解析
+// 返回: int 源通道数，模板为1，未取得空间时为0, error 引用或通道定义错误
+func (i *Image) ColorSpaceComponents() (int, error) {
+	if i == nil || i.reader == nil {
+		return 0, fmt.Errorf("invalid image reader")
+	}
+	if i.reader.closed {
+		return 0, os.ErrClosed
+	}
+	if i.ImageMask {
+		return 1, nil
+	}
+	value, err := i.reader.resolveColorSpace(i.ColorSpace)
+	if err != nil || value == nil {
+		return 0, err
+	}
+	space, ok := value.(Array)
+	if !ok {
+		space = Array{value}
+	}
+	if len(space) == 0 {
+		return 0, fmt.Errorf("invalid image color space")
+	}
+	if len(space) == 1 {
+		switch space[0] {
+		case Name("DeviceGray"):
+			return 1, nil
+		case Name("DeviceRGB"):
+			return 3, nil
+		case Name("DeviceCMYK"):
+			return 4, nil
+		}
+	}
+	switch space[0] {
+	case Name("ICCBased"):
+		_, count, err := i.reader.iccProfileStream(space)
+		return int(count), err
+	case Name("DeviceN"):
+		names, _, err := i.reader.deviceNColorants(space)
+		return len(names), err
+	case Name("Indexed"):
+		if len(space) == 4 {
+			return 1, nil
+		}
+	case Name("Separation"):
+		if len(space) == 4 {
+			name, err := i.reader.Resolve(space[1])
+			if err != nil {
+				return 0, err
+			}
+			if _, ok := name.(Name); ok {
+				return 1, nil
+			}
+		}
+	case Name("CalGray"), Name("CalRGB"), Name("Lab"):
+		if len(space) == 2 {
+			params, err := i.reader.Resolve(space[1])
+			if err != nil {
+				return 0, err
+			}
+			if _, ok := params.(Dictionary); ok {
+				if space[0] == Name("CalGray") {
+					return 1, nil
+				}
+				return 3, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("invalid image color space components")
+}
+
 // ResolveColorantsAt 按输出设备求值像素的源色料，透明度使用源遮罩而非备用色覆盖
 // 入参: x 横坐标, y 纵坐标, device 输出设备, intent 渲染意图, softMask 是否用于软蒙版组
 // 返回: ColorantResult 原生和备用色料, float64 源透明度, error 色料或变换错误

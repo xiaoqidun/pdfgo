@@ -464,7 +464,7 @@ func (d *ColorantDevice) native(names []Name, tints []float64, intent Name) (Col
 // 入参: values 过程分量, space 过程空间, intent 渲染意图
 // 返回: Paint 原生画刷, error 颜色变换错误
 func colorantProcessPaint(values [4]float64, space *ColorSpace, intent Name) (Paint, error) {
-	rgb, err := space.RGB(values[:space.Components()], intent)
+	rgb, err := space.SRGB(values[:space.Components()], intent)
 	if err != nil {
 		return Paint{}, err
 	}

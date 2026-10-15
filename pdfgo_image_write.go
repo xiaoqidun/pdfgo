@@ -171,6 +171,9 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 	switch source := img.(type) {
 	case *packedCMYKImage:
 		channels, space = 4, Name("DeviceCMYK")
+		if source.depth <= 8 {
+			bits = 8
+		}
 	case *jpxSampleImage:
 		if source.cmyk {
 			channels, space = 4, Name("DeviceCMYK")

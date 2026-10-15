@@ -67,7 +67,7 @@ func (s *deviceNSpace) alternatePaint(tints []float64, intent Name) (Paint, erro
 	if err != nil {
 		return Paint{}, err
 	}
-	rgb, err := s.alternate.RGB(values[:s.alternate.Components()], intent)
+	rgb, err := s.alternate.SRGB(values[:s.alternate.Components()], intent)
 	if err != nil {
 		return Paint{}, err
 	}

@@ -90,6 +90,11 @@ func imageNRGBA64At(source image.Image, x, y int) color.NRGBA64 {
 	case *image.NRGBA:
 		c := s.NRGBAAt(x, y)
 		return color.NRGBA64{R: uint16(c.R) * 257, G: uint16(c.G) * 257, B: uint16(c.B) * 257, A: uint16(c.A) * 257}
+	case *image.CMYK:
+		if !image.Pt(x, y).In(s.Bounds()) {
+			return color.NRGBA64{}
+		}
+		return imageNRGBASample(s.CMYKAt(x, y))
 	case *image.Paletted:
 		return imageNRGBASample(s.At(x, y))
 	case *packedGrayImage:
@@ -111,6 +116,10 @@ func imageNRGBA64At(source image.Image, x, y int) color.NRGBA64 {
 // 入参: source 图像, x 横向坐标, y 纵向坐标
 // 返回: color.RGBA64 预乘颜色
 func imageRGBA64At(source image.Image, x, y int) color.RGBA64 {
+	if s, ok := source.(*image.CMYK); ok {
+		pixel := imageNRGBA64At(s, x, y)
+		return color.RGBA64{R: pixel.R, G: pixel.G, B: pixel.B, A: pixel.A}
+	}
 	if s, ok := source.(image.RGBA64Image); ok {
 		return s.RGBA64At(x, y)
 	}

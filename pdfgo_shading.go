@@ -138,7 +138,7 @@ func gradientRGB(values [4]float64, err error, space *ColorSpace, intent Name) (
 	if space == nil {
 		return [3]float64{}, fmt.Errorf("invalid gradient evaluation")
 	}
-	return space.RGB(values[:space.Components()], intent)
+	return space.SRGB(values[:space.Components()], intent)
 }
 
 // numberArray 解析指定长度的数值数组
@@ -473,7 +473,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	}
 	for i := range stops {
 		stop := &stops[i]
-		stop.RGB, err = space.RGB(stop.Values[:space.Components()], p.state.style.RenderingIntent)
+		stop.RGB, err = space.SRGB(stop.Values[:space.Components()], p.state.style.RenderingIntent)
 		if err != nil {
 			return Paint{}, err
 		}

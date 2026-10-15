@@ -87,7 +87,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 				}
 				if palette.space != nil {
 					var err error
-					paint.RGB, err = palette.space.RGB(paint.Values[:palette.space.Components()], intent)
+					paint.RGB, err = palette.space.SRGB(paint.Values[:palette.space.Components()], intent)
 					return paint, err
 				}
 				return paint, nil
@@ -117,7 +117,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 			}
 		}
 		var err error
-		paint.RGB, err = space.RGB(paint.Values[:space.Components()], intent)
+		paint.RGB, err = space.SRGB(paint.Values[:space.Components()], intent)
 		if space.Model == "DeviceCMYK" && !space.Calibrated() {
 			values := paint.Values
 			paint.CMYK = &values

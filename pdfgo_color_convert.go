@@ -27,7 +27,7 @@ func (s *ColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 	if p := s.profile; p != nil {
 		return p.xyz(values, intent)
 	}
-	rgb, err := s.RGB(values, intent)
+	rgb, err := s.SRGB(values, intent)
 	if err != nil {
 		return [3]float64{}, err
 	}

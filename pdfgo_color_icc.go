@@ -392,7 +392,7 @@ func (s *iccColorSpace) paint(values []float64, intent Name) (Paint, error) {
 	paint := Paint{SourceSpace: "ICCBased", Space: &ColorSpace{Model: model, profile: s}}
 	paint.Values = s.normalize(values)
 	var err error
-	paint.RGB, err = s.color(paint.Values[:s.components()], intent)
+	paint.RGB, err = paint.Space.SRGB(paint.Values[:s.components()], intent)
 	return paint, err
 }
 

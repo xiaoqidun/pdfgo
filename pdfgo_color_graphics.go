@@ -72,6 +72,8 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 	switch {
 	case name == "DeviceCMYK":
 		paint.CMYK = &[4]float64{0, 0, 0, 1}
+		paint.Space = &ColorSpace{Model: name}
+		paint.Values = *paint.CMYK
 	case calibrated != nil:
 		values := []float64{0, 0, 0}
 		if calibrated.palette != nil || calibrated.gray {
@@ -129,22 +131,25 @@ func (p *pageInterpreter) deviceColor(operands []Object, fill bool) error {
 // 返回: error 设备空间错误
 func (p *pageInterpreter) setDeviceColor(values []float64, name Name, fill bool) error {
 	alpha := p.state.style.Fill.Alpha
+	space := p.state.style.Fill.Space
 	if !fill {
 		alpha = p.state.style.Stroke.Alpha
+		space = p.state.style.Stroke.Space
 	}
 	for i := range values {
 		values[i] = math.Max(0, math.Min(1, values[i]))
 	}
-	paint := Paint{SourceSpace: name, Alpha: alpha}
-	switch len(values) {
-	case 1:
-		paint.RGB = [3]float64{values[0], values[0], values[0]}
-	case 3:
-		copy(paint.RGB[:], values)
-	case 4:
+	if !space.Device() || space.Model != name {
+		space = &ColorSpace{Model: name}
+	}
+	rgb, err := space.SRGB(values, p.state.style.RenderingIntent)
+	if err != nil {
+		return err
+	}
+	paint := Paint{SourceSpace: name, Alpha: alpha, Space: space, RGB: rgb}
+	copy(paint.Values[:], values)
+	if len(values) == 4 {
 		paint.CMYK = &[4]float64{values[0], values[1], values[2], values[3]}
-	default:
-		return fmt.Errorf("invalid device color space")
 	}
 	if fill {
 		p.state.fillSpace, p.state.fillPatternBase, p.state.fillICC = name, nil, nil

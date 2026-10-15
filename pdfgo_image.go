@@ -539,12 +539,21 @@ func (s *imageResample) Bounds() image.Rectangle { return s.bounds }
 func (s *imageResample) At(x, y int) color.Color {
 	b := s.source.Bounds()
 	if b == s.bounds {
+		if source, ok := s.source.(*image.CMYK); ok {
+			pixel, _ := imageCMYKSample(source.CMYKAt(x, y))
+			return pixel
+		}
 		return s.source.At(x, y)
 	}
 	sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
 	sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
 	if !s.interpolate {
-		return s.source.At(b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
+		pixel := s.source.At(b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
+		if _, ok := pixel.(color.CMYK); ok {
+			sample, _ := imageCMYKSample(pixel)
+			return sample
+		}
+		return pixel
 	}
 	x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
 	fx, fy := sx-float64(x0), sy-float64(y0)
@@ -718,8 +727,9 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 // RGBA 返回不透明的设备色预览，原始分量由图像解码流程解释
 // 返回: uint32 红、绿、蓝及透明度
 func (c cmykSample) RGBA() (uint32, uint32, uint32, uint32) {
-	k := uint64(65535 - c[3])
-	return uint32(uint64(65535-c[0]) * k / 65535), uint32(uint64(65535-c[1]) * k / 65535), uint32(uint64(65535-c[2]) * k / 65535), 65535
+	values := [4]float64{float64(c[0]) / 65535, float64(c[1]) / 65535, float64(c[2]) / 65535, float64(c[3]) / 65535}
+	rgb := deviceCMYKRGB(values[:])
+	return uint32(math.Round(rgb[0] * 65535)), uint32(math.Round(rgb[1] * 65535)), uint32(math.Round(rgb[2] * 65535)), 65535
 }
 
 // ColorModel 返回保留十六位四色样本的颜色模型
@@ -734,7 +744,7 @@ func (s *packedCMYKImage) ColorModel() color.Model {
 		if white == 0 {
 			return cmykSample{0, 0, 0, 65535}
 		}
-		return cmykSample{uint16((white - r) * 65535 / white), uint16((white - g) * 65535 / white), uint16((white - b) * 65535 / white), uint16(65535 - white)}
+		return cmykSample{uint16(white - r), uint16(white - g), uint16(white - b), uint16(65535 - white)}
 	})
 }
 
@@ -902,6 +912,16 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	}
 	if components == 0 {
 		return nil, &UnsupportedError{Feature: "image color space"}
+	}
+	var displaySpace *ColorSpace
+	if palette == nil && deviceN == nil && separation == nil && lab == nil {
+		displaySpace = &ColorSpace{Model: map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[components], profile: profile}
+		if calibrated != nil {
+			displaySpace, err = i.reader.readCalibratedSpace(i.ColorSpace.(Array))
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	embeddedMask, err := i.jpxMaskMode()
 	if err != nil {
@@ -1322,7 +1342,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				index := int(math.Max(0, math.Min(float64(len(palette.colors)-1), math.Round(values[0]))))
 				pixel = palette.colors[index]
 			} else if deviceN != nil {
-				rgb, err := deviceN.alternate.RGB(values[:deviceN.alternate.Components()], intent)
+				rgb, err := deviceN.alternate.SRGB(values[:deviceN.alternate.Components()], intent)
 				if err != nil {
 					return nil, err
 				}
@@ -1335,33 +1355,21 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				if err != nil {
 					return nil, err
 				}
-				if paint.CMYK != nil {
-					rgb := deviceCMYKRGB(paint.CMYK[:])
-					pixel = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
-				} else {
-					pixel = color.NRGBA64{R: uint16(math.Round(paint.RGB[0] * 65535)), G: uint16(math.Round(paint.RGB[1] * 65535)), B: uint16(math.Round(paint.RGB[2] * 65535)), A: 65535}
-				}
+				pixel = color.NRGBA64{R: uint16(math.Round(paint.RGB[0] * 65535)), G: uint16(math.Round(paint.RGB[1] * 65535)), B: uint16(math.Round(paint.RGB[2] * 65535)), A: 65535}
 				if separation.name == "None" || separation.none {
 					pixel.A = 0
 				}
-			} else if profile != nil {
-				converted, err := profile.color(values[:components], intent)
+			} else if lab != nil {
+				pixel = lab.color(values[0], values[1], values[2])
+			} else {
+				converted, err := displaySpace.SRGB(values[:components], intent)
 				if err != nil {
 					return nil, err
 				}
 				pixel = color.NRGBA64{R: uint16(math.Round(converted[0] * 65535)), G: uint16(math.Round(converted[1] * 65535)), B: uint16(math.Round(converted[2] * 65535)), A: 65535}
-				if profile.alternate != nil && profile.alternate.invisible {
+				if profile != nil && profile.alternate != nil && profile.alternate.invisible {
 					pixel.A = 0
 				}
-			} else if calibrated != nil {
-				pixel = calibrated.color(values[0], values[1], values[2])
-			} else if lab != nil {
-				pixel = lab.color(values[0], values[1], values[2])
-			} else if components == 4 {
-				rgb := deviceCMYKRGB(values[:])
-				pixel = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
-			} else {
-				pixel = color.NRGBA64{R: uint16(math.Round(values[0] * 65535)), G: uint16(math.Round(values[1] * 65535)), B: uint16(math.Round(values[2] * 65535)), A: 65535}
 			}
 			if transparent {
 				pixel.A = 0
@@ -1595,9 +1603,6 @@ func (i *Image) palette() (*imagePalette, error) {
 				return nil, err
 			}
 			rgb := paint.RGB
-			if paint.CMYK != nil {
-				rgb = deviceCMYKRGB(paint.CMYK[:])
-			}
 			result.values[index], err = separation.values(result.tints[index][0])
 			if err != nil {
 				return nil, err
@@ -1626,7 +1631,7 @@ func (i *Image) palette() (*imagePalette, error) {
 				return nil, err
 			}
 			result.values[index] = values
-			rgb, err := deviceN.alternate.RGB(values[:deviceN.alternate.Components()], intent)
+			rgb, err := deviceN.alternate.SRGB(values[:deviceN.alternate.Components()], intent)
 			if err != nil {
 				return nil, err
 			}
@@ -1655,28 +1660,18 @@ func (i *Image) palette() (*imagePalette, error) {
 				palette[index] = color.NRGBA64{R: uint16(math.Round(paint.RGB[0] * 65535)), G: uint16(math.Round(paint.RGB[1] * 65535)), B: uint16(math.Round(paint.RGB[2] * 65535)), A: alpha}
 				continue
 			}
-			rgb, err := profile.color(values[:components], intent)
+			rgb, err := result.space.SRGB(values[:components], intent)
 			if err != nil {
 				return nil, err
 			}
 			palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
 			continue
 		}
-		switch components {
-		case 1:
-			palette[index] = color.NRGBA64{R: uint16(v[0]) * 257, G: uint16(v[0]) * 257, B: uint16(v[0]) * 257, A: 65535}
-			if calibrated != nil {
-				palette[index] = calibrated.color(float64(v[0])/255, float64(v[0])/255, float64(v[0])/255)
-			}
-		case 3:
-			palette[index] = color.NRGBA64{R: uint16(v[0]) * 257, G: uint16(v[1]) * 257, B: uint16(v[2]) * 257, A: 65535}
-			if calibrated != nil {
-				palette[index] = calibrated.color(float64(v[0])/255, float64(v[1])/255, float64(v[2])/255)
-			}
-		case 4:
-			rgb := deviceCMYKRGB(result.values[index][:])
-			palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
+		rgb, err := result.space.SRGB(result.values[index][:components], intent)
+		if err != nil {
+			return nil, err
 		}
+		palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
 	}
 	return result, nil
 }
@@ -1947,10 +1942,7 @@ func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error
 		return &packedDeviceNImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent, channels: components}, nil
 	}
 	if components == 4 {
-		if i.BitsPerComponent != 8 {
-			return &packedCMYKImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
-		}
-		return &image.CMYK{Pix: data, Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
+		return &packedCMYKImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
 	}
 	if components == 3 && i.BitsPerComponent == 8 {
 		if _, _, err := imageBufferSize(i.Width, i.Height, 4); err != nil {
@@ -2004,6 +1996,10 @@ func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error
 // 返回: color.NRGBA64 非预乘颜色
 func imageNRGBASample(pixel color.Color) color.NRGBA64 {
 	switch c := pixel.(type) {
+	case color.CMYK:
+		sample := cmykSample{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}
+		r, g, b, a := sample.RGBA()
+		return color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(a)}
 	case jpxSample:
 		if !c.cmyk {
 			return color.NRGBA64{R: c.values[0], G: c.values[1], B: c.values[2], A: c.alpha}

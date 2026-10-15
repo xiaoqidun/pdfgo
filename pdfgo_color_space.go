@@ -21,14 +21,32 @@ import (
 	"sync/atomic"
 )
 
-// ColorSpace 保存设备或校准颜色空间，不包含绘制或输出格式逻辑
+// ColorSpace 保存设备或校准颜色空间，区分源分量、空间转换与sRGB显示
 // Model为DeviceGray、DeviceRGB或DeviceCMYK，校准色保留对应模型与颜色变换
 type ColorSpace struct {
-	Model    Name
-	profile  *iccColorSpace
-	srgb     uint32
-	blending uint32
-	mapped   bool
+	Model     Name
+	profile   *iccColorSpace
+	srgbState uint32
+	blending  uint32
+	mapped    bool
+}
+
+// NewCalRGBColorSpace 以校准参数建立独立源空间，不生成或声明ICC配置
+// 入参: white XYZ白点且Y为1, black XYZ黑点, gamma 各通道解码指数, matrix 按列排列的RGB到XYZ矩阵
+// 返回: *ColorSpace 校准空间, error 参数错误
+func NewCalRGBColorSpace(white, black, gamma [3]float64, matrix [9]float64) (*ColorSpace, error) {
+	dict := Dictionary{}
+	for _, field := range []struct {
+		key    Name
+		values []float64
+	}{{"WhitePoint", white[:]}, {"BlackPoint", black[:]}, {"Gamma", gamma[:]}, {"Matrix", matrix[:]}} {
+		values := make(Array, len(field.values))
+		for n, value := range field.values {
+			values[n] = Real(value)
+		}
+		dict[field.key] = values
+	}
+	return (&Reader{}).readCalibratedSpace(Array{Name("CalRGB"), dict})
 }
 
 // Device 判断分量是否属于原始设备空间，不将校准色的RGB显示结果视为设备源色
@@ -75,7 +93,7 @@ func (s *ColorSpace) SRGBEquivalent() bool {
 	if s.profile == nil {
 		return true
 	}
-	if cached := atomic.LoadUint32(&s.srgb); cached != 0 {
+	if cached := atomic.LoadUint32(&s.srgbState); cached != 0 {
 		return cached == 2
 	}
 	equivalent := s.srgbEquivalent()
@@ -83,7 +101,7 @@ func (s *ColorSpace) SRGBEquivalent() bool {
 	if equivalent {
 		cached = 2
 	}
-	atomic.StoreUint32(&s.srgb, cached)
+	atomic.StoreUint32(&s.srgbState, cached)
 	return equivalent
 }
 
@@ -94,7 +112,7 @@ func (s *ColorSpace) srgbEquivalent() bool {
 		return false
 	}
 	check := func(input [3]float64) bool {
-		output, err := s.RGB(input[:], "RelativeColorimetric")
+		output, err := s.SRGB(input[:], "RelativeColorimetric")
 		if err != nil {
 			return false
 		}
@@ -143,20 +161,20 @@ func (s *ColorSpace) Components() int {
 	return 0
 }
 
-// RGB 将颜色空间分量转换为sRGB显示颜色
+// SRGB 将颜色空间分量转换为sRGB显示颜色
 // 入参: values 单位分量, intent 渲染意图
 // 返回: [3]float64 sRGB颜色, error 分量或变换错误
-func (s *ColorSpace) RGB(values []float64, intent Name) ([3]float64, error) {
+func (s *ColorSpace) SRGB(values []float64, intent Name) ([3]float64, error) {
 	if err := s.validate(values); err != nil {
 		return [3]float64{}, err
 	}
-	return s.rgb(values, intent)
+	return s.srgb(values, intent)
 }
 
-// rgb 转换已验证的源分量，不重复检查分量数量及范围
+// srgb 转换已验证的源分量，不重复检查分量数量及范围
 // 入参: values 源分量, intent 渲染意图
 // 返回: [3]float64 sRGB颜色, error 变换错误
-func (s *ColorSpace) rgb(values []float64, intent Name) ([3]float64, error) {
+func (s *ColorSpace) srgb(values []float64, intent Name) ([3]float64, error) {
 	if s.profile != nil {
 		return s.profile.color(values, normalizeRenderingIntent(intent))
 	}
@@ -168,7 +186,7 @@ func (s *ColorSpace) rgb(values []float64, intent Name) ([3]float64, error) {
 	case "DeviceCMYK":
 		return deviceCMYKRGB(values), nil
 	}
-	return [3]float64{}, &UnsupportedError{Feature: "blending color space " + string(s.Model)}
+	return [3]float64{}, &UnsupportedError{Feature: "source color space " + string(s.Model)}
 }
 
 // Convert 将源空间分量转换到当前颜色空间，相同校准空间保留原值
@@ -209,7 +227,7 @@ func (s *ColorSpace) convert(values []float64, source *ColorSpace, intent Name, 
 		}
 		return s.profile.fromXYZ(xyz, intent)
 	}
-	rgb, err := source.rgb(values, intent)
+	rgb, err := source.srgb(values, intent)
 	if err != nil {
 		return result, err
 	}
@@ -252,7 +270,7 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 	case "DeviceCMYK":
 		return (.3*(1-values[0]) + .59*(1-values[1]) + .11*(1-values[2])) * (1 - values[3]), nil
 	}
-	return 0, &UnsupportedError{Feature: "blending color space " + string(s.Model)}
+	return 0, &UnsupportedError{Feature: "luminosity color space " + string(s.Model)}
 }
 
 // deviceCMYKRGB 按PDF设备颜色转换规则叠加黑色分量后取补色
@@ -262,17 +280,17 @@ func deviceCMYKRGB(values []float64) [3]float64 {
 	return [3]float64{1 - math.Min(1, values[0]+values[3]), 1 - math.Min(1, values[1]+values[3]), 1 - math.Min(1, values[2]+values[3])}
 }
 
-// validate 检查混合分量数与单位范围
+// validate 检查颜色分量数与单位范围
 // 入参: values 颜色分量
 // 返回: error 无效颜色
 func (s *ColorSpace) validate(values []float64) error {
 	components := s.Components()
 	if components == 0 || len(values) != components {
-		return fmt.Errorf("invalid blending color component count")
+		return fmt.Errorf("invalid color component count")
 	}
 	for _, v := range values {
 		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
-			return fmt.Errorf("invalid blending color component")
+			return fmt.Errorf("invalid color component")
 		}
 	}
 	return nil
@@ -400,7 +418,7 @@ func (r *Reader) readCalibratedSpace(array Array) (*ColorSpace, error) {
 		cone[i] *= calibrated.adapt[i] * d50[i] / d65[i]
 	}
 	matrix.offset = [3]float64{.9869929*cone[0] - .1470543*cone[1] + .1599627*cone[2], .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2], -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]}
-	profile := &iccColorSpace{}
+	profile := &iccColorSpace{absoluteScale: [3]float64{1, 1, 1}}
 	model := Name("DeviceRGB")
 	if gray {
 		profile.gray = &iccGraySpace{matrix: matrix, curve: iccToneCurve{parameters: []float64{calibrated.gamma[0]}}}

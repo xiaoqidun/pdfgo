@@ -180,7 +180,7 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 			}
 			cmyk.Pix[n] = 255 - cmyk.Pix[n]
 		}
-		return cmyk, nil
+		return &packedCMYKImage{data: cmyk.Pix, rect: cmyk.Rect, stride: cmyk.Stride, depth: 8}, nil
 	}
 	if components != 3 {
 		return result, nil
