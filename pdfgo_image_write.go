@@ -205,17 +205,103 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 		alphaWriter = imageCompressor(&alpha)
 		defer releaseImageCompressor(alphaWriter)
 	}
-	row := make([]byte, width*channels*(bits/8))
+	var nativePixels []byte
+	var nativeStride int
+	nativeRGB := false
+	switch source := img.(type) {
+	case *image.Gray:
+		nativePixels, nativeStride = source.Pix, source.Stride
+	case *image.Gray16:
+		nativePixels, nativeStride = source.Pix, source.Stride
+	case *image.CMYK:
+		nativePixels, nativeStride = source.Pix, source.Stride
+	case *image.RGBA:
+		if opaque {
+			nativePixels, nativeStride, nativeRGB = source.Pix, source.Stride, true
+		}
+	case *image.RGBA64:
+		if opaque {
+			nativePixels, nativeStride, nativeRGB = source.Pix, source.Stride, true
+		}
+	case *image.NRGBA:
+		nativePixels, nativeStride, nativeRGB = source.Pix, source.Stride, true
+	case *image.NRGBA64:
+		nativePixels, nativeStride, nativeRGB = source.Pix, source.Stride, true
+	}
+	rowSize := width * channels * (bits / 8)
+	var row []byte
+	sampleWidth := width
+	if nativePixels == nil || nativeRGB {
+		row = make([]byte, rowSize)
+	}
+	if nativePixels != nil {
+		sampleWidth = 0
+	}
 	var maskRow []byte
 	if alphaWriter != nil {
 		maskRow = make([]byte, width*(bits/8))
 	}
 	hasAlpha := false
+	indexed, _ := img.(*image.Paletted)
+	var palette [256]color.NRGBA64
+	var paletteReady [256]bool
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		for x := 0; x < width; x++ {
+		if nativePixels != nil {
+			offset := (y - bounds.Min.Y) * nativeStride
+			if nativeRGB && bits == 8 && maskRow == nil {
+				source := nativePixels[offset : offset+width*4]
+				for x := 0; x < width; x++ {
+					if x&4095 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, nil, err
+						}
+					}
+					copy(row[x*3:x*3+3], source[x*4:x*4+3])
+				}
+			} else if nativeRGB {
+				source := nativePixels[offset : offset+width*4*(bits/8)]
+				for x := 0; x < width; x++ {
+					if x&4095 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, nil, err
+						}
+					}
+					a := uint16(65535)
+					start, end := x*3, x*3+3
+					if bits == 8 {
+						copy(row[start:end], source[x*4:x*4+3])
+						if maskRow != nil {
+							maskRow[x] = source[x*4+3]
+							a = uint16(maskRow[x]) * 257
+						}
+					} else {
+						start, end = x*6, x*6+6
+						copy(row[start:end], source[x*8:x*8+6])
+						if maskRow != nil {
+							copy(maskRow[x*2:x*2+2], source[x*8+6:x*8+8])
+							a = binary.BigEndian.Uint16(maskRow[x*2:])
+						}
+					}
+					if preblend && a == 0 {
+						for i := start; i < end; i++ {
+							row[i] = 255
+						}
+					}
+					hasAlpha = hasAlpha || a != 65535
+				}
+			} else {
+				row = nativePixels[offset : offset+rowSize]
+			}
+		}
+		var indexes []uint8
+		if indexed != nil {
+			offset := indexed.PixOffset(bounds.Min.X, y)
+			indexes = indexed.Pix[offset : offset+width]
+		}
+		for x := 0; x < sampleWidth; x++ {
 			if x&4095 == 0 {
 				if err := ctx.Err(); err != nil {
 					return nil, nil, err
@@ -238,7 +324,17 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 					a = uint16(alpha)
 				}
 			default:
-				c := imageNRGBA64At(img, bounds.Min.X+x, y)
+				var c color.NRGBA64
+				if indexes != nil {
+					index := indexes[x]
+					if !paletteReady[index] {
+						palette[index] = imageNRGBASample(indexed.Palette[index])
+						paletteReady[index] = true
+					}
+					c = palette[index]
+				} else {
+					c = imageNRGBA64At(img, bounds.Min.X+x, y)
+				}
 				values[0], values[1], values[2], a = c.R, c.G, c.B, c.A
 				if preblend && a == 0 {
 					values[0], values[1], values[2] = 65535, 65535, 65535
@@ -297,6 +393,9 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 // 入参: ctx 取消上下文, img 像素图像
 // 返回: bool 存在全透明像素且无渐变透明度, error 取消错误
 func imageBinaryAlpha(ctx context.Context, img image.Image) (bool, error) {
+	if result, native, err := imageNativeAlpha(ctx, img, true); native {
+		return result, err
+	}
 	bounds := img.Bounds()
 	transparent := false
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
@@ -308,7 +407,7 @@ func imageBinaryAlpha(ctx context.Context, img image.Image) (bool, error) {
 			}
 			a := imageNRGBA64At(img, x, y).A
 			if a != 0 && a != 65535 {
-				return false, nil
+				return false, ctx.Err()
 			}
 			transparent = transparent || a == 0
 		}

@@ -111,7 +111,7 @@ func (s *ColorSpace) compositeValues(backdrop, source [4]float64, backdropAlpha,
 	}
 	blend := s.blend(backdrop, source, mode)
 	alpha := sourceAlpha + backdropAlpha*(1-sourceAlpha)
-	for i := 0; i < s.Components(); i++ {
+	for i, components := 0, s.Components(); i < components; i++ {
 		backdrop[i] = compositeComponent(backdrop[i], source[i], blend[i], backdropAlpha, sourceAlpha, alpha)
 	}
 	return backdrop, alpha
@@ -194,7 +194,7 @@ func (s *ColorSpace) blend(backdrop, source [4]float64, mode Name) [4]float64 {
 		return result
 	}
 	var result [4]float64
-	for i := 0; i < s.Components(); i++ {
+	for i, components := 0, s.Components(); i < components; i++ {
 		b, c := backdrop[i], source[i]
 		if s.Model == "DeviceCMYK" {
 			b, c = 1-b, 1-c

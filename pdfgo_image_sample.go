@@ -32,12 +32,123 @@ func imageNRGBAAt(source image.Image, x, y int) color.NRGBA {
 	return color.NRGBA{R: uint8(c.R >> 8), G: uint8(c.G >> 8), B: uint8(c.B >> 8), A: uint8(c.A >> 8)}
 }
 
+// imageNativeAlpha 按行扫描原生透明度或调色板索引，保留十六位透明度精度
+// 入参: ctx 取消上下文, source 图像, binary 是否检查含透明像素的二值透明度
+// 返回: bool 分类结果, bool 是否支持原生扫描, error 取消错误
+func imageNativeAlpha(ctx context.Context, source image.Image, binary bool) (bool, bool, error) {
+	var pixels []byte
+	var stride, step int
+	wide := false
+	switch s := source.(type) {
+	case *pngGrayAlphaImage:
+		return imageNativeAlpha(ctx, s.Image, binary)
+	case *image.Paletted:
+		result, err := imagePalettedAlpha(ctx, s, binary)
+		return result, true, err
+	case *image.NRGBA:
+		pixels, stride, step = s.Pix, s.Stride, 4
+	case *image.RGBA:
+		pixels, stride, step = s.Pix, s.Stride, 4
+	case *image.Alpha:
+		pixels, stride, step = s.Pix, s.Stride, 1
+	case *image.NRGBA64:
+		pixels, stride, step, wide = s.Pix, s.Stride, 8, true
+	case *image.RGBA64:
+		pixels, stride, step, wide = s.Pix, s.Stride, 8, true
+	case *image.Alpha16:
+		pixels, stride, step, wide = s.Pix, s.Stride, 2, true
+	case *image.NYCbCrA:
+		pixels, stride, step = s.A, s.AStride, 1
+	default:
+		return false, false, nil
+	}
+	width, height := source.Bounds().Dx(), source.Bounds().Dy()
+	interval := 4095
+	if binary {
+		interval = 255
+	}
+	transparent := false
+	for y := 0; y < height; y++ {
+		if width == 0 {
+			break
+		}
+		row := pixels[y*stride:][:width*step]
+		for x := 0; x < width; x++ {
+			if x&interval == 0 {
+				if err := ctx.Err(); err != nil {
+					return false, true, err
+				}
+			}
+			i := x*step + step - 1
+			a := row[i]
+			if wide && row[i-1] != a {
+				return false, true, ctx.Err()
+			}
+			if a == 255 {
+				continue
+			}
+			if !binary || a != 0 {
+				return false, true, ctx.Err()
+			}
+			transparent = true
+		}
+	}
+	return !binary || transparent, true, ctx.Err()
+}
+
+// imagePalettedAlpha 扫描实际使用的调色板索引，单次调用复用各索引的透明度分类
+// 入参: ctx 取消上下文, source 索引图像, binary 是否检查含透明像素的二值透明度
+// 返回: bool 分类结果, error 取消错误
+func imagePalettedAlpha(ctx context.Context, source *image.Paletted, binary bool) (bool, error) {
+	var states [256]uint8
+	width, height := source.Rect.Dx(), source.Rect.Dy()
+	interval := 4095
+	if binary {
+		interval = 255
+	}
+	transparent := false
+	for y := 0; y < height && width != 0; y++ {
+		row := source.Pix[y*source.Stride:][:width]
+		for x, index := range row {
+			if x&interval == 0 {
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+			}
+			state := states[index]
+			if state == 0 {
+				_, _, _, alpha := source.Palette[index].RGBA()
+				switch alpha {
+				case 65535:
+					state = 1
+				case 0:
+					state = 2
+				default:
+					state = 3
+				}
+				states[index] = state
+			}
+			if state == 1 {
+				continue
+			}
+			if !binary || state == 3 {
+				return false, ctx.Err()
+			}
+			transparent = true
+		}
+	}
+	return !binary || transparent, ctx.Err()
+}
+
 // imageOpaqueContext 分段检查透明度，已知无透明通道时不扫描颜色
 // 入参: ctx 取消上下文, source 图像
 // 返回: bool 是否完全不透明, error 取消错误
 func imageOpaqueContext(ctx context.Context, source image.Image) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
+	}
+	if result, native, err := imageNativeAlpha(ctx, source, false); native {
+		return result, err
 	}
 	switch s := source.(type) {
 	case *image.Gray, *image.Gray16, *image.CMYK, *image.YCbCr, *packedGrayImage, *mappedGrayImage, *packedCMYKImage:
@@ -61,10 +172,6 @@ func imageOpaqueContext(ctx context.Context, source image.Image) (bool, error) {
 			}
 			var alpha uint16
 			switch s := source.(type) {
-			case *image.NRGBA:
-				alpha = uint16(s.NRGBAAt(x, y).A) * 257
-			case *image.RGBA:
-				alpha = uint16(s.RGBAAt(x, y).A) * 257
 			case *jpxSampleImage:
 				alpha = s.sample(s.alpha, x, y)
 			case image.RGBA64Image:

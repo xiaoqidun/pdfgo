@@ -95,9 +95,11 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			return err
 		}
 		if options.OnProgress != nil {
-			return options.OnProgress(stage, done, total)
+			if err := options.OnProgress(stage, done, total); err != nil {
+				return err
+			}
 		}
-		return nil
+		return ctx.Err()
 	}
 	copySource := func() error {
 		report.Preserved = true
@@ -662,7 +664,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	return report, progress("write", len(refs), len(refs))
 }
 
-// Write 交付输出并检查取消及短写
+// Write 写入前后检查取消，保留写入及短写错误
 // 入参: data 待写数据
 // 返回: int 已写字节数, error 写入错误
 func (w *pdfOutput) Write(data []byte) (int, error) {
@@ -673,6 +675,9 @@ func (w *pdfOutput) Write(data []byte) (int, error) {
 	w.count += int64(n)
 	if err == nil && n != len(data) {
 		err = io.ErrShortWrite
+	}
+	if err == nil {
+		err = w.ctx.Err()
 	}
 	return n, err
 }
