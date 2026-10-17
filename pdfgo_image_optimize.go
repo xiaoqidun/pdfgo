@@ -302,40 +302,52 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 			best = candidate
 		}
 	}
-	input, err := zlib.NewReader(&contextInput{ctx: ctx, reader: &pngIDATReader{chunks: chunks}})
-	if err != nil {
-		return nil, err
-	}
-	var packed bytes.Buffer
-	budget := min(len(best)-1, optimizationBufferLimit) - 8 - 12
-	for _, chunk := range chunks {
-		if chunk.kind != "IDAT" {
-			budget -= len(chunk.data)
+	var reused [][]byte
+	if len(best) < len(data) && len(best) >= 33 && (data[25] == 2 || data[25] == 6) && bytes.Equal(data[:33], best[:33]) {
+		var err error
+		reused, err = reusePNGImageData(ctx, chunks, best)
+		if err != nil {
+			return nil, err
 		}
 	}
-	output := &optimizationBuffer{buffer: &packed, limit: max(0, budget)}
-	encoder := optimizationCompressor(output)
-	defer releaseOptimizationCompressor(encoder)
-	source := &io.LimitedReader{R: &contextInput{ctx: ctx, reader: input}, N: 512<<20 + 1}
-	_, err = io.Copy(encoder, source)
-	if output.exceeded {
-		_, err = io.Copy(io.Discard, source)
+	if reused == nil {
+		input, err := zlib.NewReader(&contextInput{ctx: ctx, reader: &pngIDATReader{chunks: chunks}})
+		if err != nil {
+			return nil, err
+		}
+		var packed bytes.Buffer
+		budget := min(len(best)-1, optimizationBufferLimit) - 8 - 12
+		for _, chunk := range chunks {
+			if chunk.kind != "IDAT" {
+				budget -= len(chunk.data)
+			}
+		}
+		output := &optimizationBuffer{buffer: &packed, limit: max(0, budget)}
+		encoder := optimizationCompressor(output)
+		defer releaseOptimizationCompressor(encoder)
+		source := &io.LimitedReader{R: &contextInput{ctx: ctx, reader: input}, N: 512<<20 + 1}
+		_, err = io.Copy(encoder, source)
+		if output.exceeded {
+			_, err = io.Copy(io.Discard, source)
+		}
+		input.Close()
+		closeErr := encoder.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if source.N == 0 {
+			return data, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil && !output.exceeded {
+			return nil, closeErr
+		}
+		if !output.exceeded {
+			reused = [][]byte{packed.Bytes()}
+		}
 	}
-	input.Close()
-	closeErr := encoder.Close()
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	if source.N == 0 {
-		return data, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if closeErr != nil && !output.exceeded {
-		return nil, closeErr
-	}
-	encoded := packed.Bytes()
 	assemble := func(idat [][]byte, header []byte, lossy bool) []byte {
 		var out bytes.Buffer
 		length := uint64(8 + 12)
@@ -388,8 +400,8 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 		}
 		return out.Bytes()
 	}
-	if !output.exceeded {
-		if candidate := assemble([][]byte{encoded}, nil, false); len(candidate) < len(best) {
+	if reused != nil {
+		if candidate := assemble(reused, nil, false); len(candidate) < len(best) {
 			best = candidate
 		}
 	}
@@ -455,6 +467,67 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 		}
 	}
 	return best, ctx.Err()
+}
+
+// reusePNGImageData 逐块核对过滤后的扫描行，复用完全相同的已压缩图像流
+// 入参: ctx 取消上下文, original 原始PNG块, candidate 已生成的PNG候选
+// 返回: [][]byte 可复用的IDAT片段，不一致时为空, error 读取或取消错误
+func reusePNGImageData(ctx context.Context, original []pngOptimizationChunk, candidate []byte) ([][]byte, error) {
+	var chunks []pngOptimizationChunk
+	var parts [][]byte
+	for pos := 8; pos < len(candidate); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if len(candidate)-pos < 12 {
+			return nil, fmt.Errorf("truncated PNG chunk")
+		}
+		size := uint64(binary.BigEndian.Uint32(candidate[pos:]))
+		if size > uint64(len(candidate)-pos-12) {
+			return nil, fmt.Errorf("invalid PNG length")
+		}
+		raw := candidate[pos : pos+12+int(size)]
+		if string(raw[4:8]) == "IDAT" {
+			chunks = append(chunks, pngOptimizationChunk{kind: "IDAT", data: raw})
+			parts = append(parts, raw[8:len(raw)-4])
+		}
+		pos += len(raw)
+	}
+	left, err := zlib.NewReader(&contextInput{ctx: ctx, reader: &pngIDATReader{chunks: original}})
+	if err != nil {
+		return nil, err
+	}
+	defer left.Close()
+	right, err := zlib.NewReader(&contextInput{ctx: ctx, reader: &pngIDATReader{chunks: chunks}})
+	if err != nil {
+		return nil, err
+	}
+	defer right.Close()
+	a, b := make([]byte, 32<<10), make([]byte, 32<<10)
+	for total := 0; total <= 512<<20; {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n, leftErr := io.ReadFull(left, a)
+		m, rightErr := io.ReadFull(right, b)
+		if leftErr != nil && leftErr != io.EOF && leftErr != io.ErrUnexpectedEOF {
+			return nil, leftErr
+		}
+		if rightErr != nil && rightErr != io.EOF && rightErr != io.ErrUnexpectedEOF {
+			return nil, rightErr
+		}
+		if n != m || !bytes.Equal(a[:n], b[:m]) {
+			return nil, nil
+		}
+		total += n
+		if leftErr != nil || rightErr != nil {
+			if leftErr == rightErr && total <= 512<<20 {
+				return parts, nil
+			}
+			return nil, nil
+		}
+	}
+	return nil, nil
 }
 
 // writePNGChunk 将分段数据写为一个带校验的PNG块，不复制合并数据
