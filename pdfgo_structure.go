@@ -427,7 +427,7 @@ func (r *Reader) WalkStructureIDs(ctx context.Context, visit func(string, Struct
 }
 
 // WalkStructureParents 按父树键及MCID递增访问父元素引用，跳过标记数组中的空槽
-// 复用数字树校验，不扫描页面内容或改变结构树
+// 复用数字树校验，元素层级由WalkStructure校验，不扫描页面内容或改变结构树
 // 入参: ctx 取消上下文, visit 父元素引用访问函数
 // 返回: error 数字树、元素引用、取消或访问错误
 func (r *Reader) WalkStructureParents(ctx context.Context, visit func(StructureParent) error) error {
@@ -450,11 +450,26 @@ func (r *Reader) WalkStructureParents(ctx context.Context, visit func(StructureP
 		if !ok {
 			return fmt.Errorf("structure parent is not indirect")
 		}
-		item, err := r.structureItem(ref, Reference{}, Reference{})
+		value, err := r.Resolve(ref)
 		if err != nil {
 			return fmt.Errorf("structure parent %d %d: %w", ref.Number, ref.Generation, err)
 		}
-		if item.Type != "StructElem" {
+		dict, ok := value.(Dictionary)
+		if !ok {
+			return fmt.Errorf("structure parent is not an element")
+		}
+		kind, err := r.Resolve(dict["Type"])
+		if err != nil {
+			return err
+		}
+		if kind != nil && kind != Name("StructElem") {
+			return fmt.Errorf("structure parent is not an element")
+		}
+		tag, err := r.Resolve(dict["S"])
+		if err != nil {
+			return err
+		}
+		if _, ok := tag.(Name); !ok {
 			return fmt.Errorf("structure parent is not an element")
 		}
 		if err := visit(StructureParent{Element: ref, Key: key, MCID: mcid}); err != nil {
