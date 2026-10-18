@@ -363,7 +363,7 @@ func (p *pageInterpreter) shadingFill(operands []Object, offset int64) error {
 	if p.bounds.XMax <= p.bounds.XMin || p.bounds.YMax <= p.bounds.YMin {
 		return fmt.Errorf("missing shading bounds")
 	}
-	return p.visitor.Path(PathMark{Path: shadingRectangle(p.bounds, Identity()), Style: style, Fill: true})
+	return p.visitor.Path(PathMark{Sequence: p.sequence, Path: shadingRectangle(p.bounds, Identity()), Style: style, Fill: true})
 }
 
 // shadingRectangle 将着色边界转换为页面坐标的闭合路径

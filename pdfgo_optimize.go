@@ -71,13 +71,13 @@ type pdfOutput struct {
 // 入参: ctx 取消上下文, writer 输出流, options 优化配置
 // 返回: OptimizeReport 优化结果, error 读写错误
 func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options OptimizeOptions) (report OptimizeReport, err error) {
-	return r.rewriteTo(ctx, writer, options, nil)
+	return r.rewriteTo(ctx, writer, options, nil, nil)
 }
 
 // rewriteTo 写出资源替换与可选优化，保持原阅读器的对象和安全配置
-// 入参: ctx 取消上下文, writer 输出流, options 优化配置, replacements 替换对象
+// 入参: ctx 取消上下文, writer 输出流, options 优化配置, replacements 替换对象, information 信息字典修改
 // 返回: OptimizeReport 写出结果, error 读写错误
-func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options OptimizeOptions, replacements map[Reference]Object) (report OptimizeReport, err error) {
+func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options OptimizeOptions, replacements map[Reference]Object, information Dictionary) (report OptimizeReport, err error) {
 	if r.closed {
 		return report, os.ErrClosed
 	}
@@ -119,7 +119,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		return progress("write", 1, 1)
 	}
-	if options.Compression.Mode == CompressionUnchanged && len(replacements) == 0 {
+	if options.Compression.Mode == CompressionUnchanged && len(replacements) == 0 && len(information) == 0 {
 		return report, copySource()
 	}
 	object := func(ref Reference) (Object, error) {
@@ -131,6 +131,28 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	trailer := maps.Clone(r.Trailer)
 	for _, name := range []Name{"Prev", "XRefStm", "Type", "W", "Index", "Length", "Filter", "DecodeParms"} {
 		delete(trailer, name)
+	}
+	if len(information) != 0 {
+		value, err := r.Resolve(trailer["Info"])
+		if err != nil {
+			return report, err
+		}
+		info := Dictionary{}
+		if value != nil {
+			dict, ok := value.(Dictionary)
+			if !ok {
+				return report, fmt.Errorf("invalid document information dictionary")
+			}
+			info = maps.Clone(dict)
+		}
+		for key, value := range information {
+			if value == nil {
+				delete(info, key)
+			} else {
+				info[key] = value
+			}
+		}
+		trailer["Info"] = info
 	}
 	seen := make(map[Reference]bool)
 	metadata := make(map[Reference]Object)
@@ -251,7 +273,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			delete(r.cache, refs[i])
 		}
 		if signed {
-			if len(replacements) != 0 {
+			if len(replacements) != 0 || len(information) != 0 {
 				return report, fmt.Errorf("cannot rewrite objects in a signed PDF")
 			}
 			return report, copySource()
@@ -391,7 +413,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	}
 	infoRef, _ := trailer["Info"].(Reference)
 	var newInfo Dictionary
-	if options.Creator != "" {
+	if options.Creator != "" || len(information) != 0 {
 		value, resolveErr := r.Resolve(trailer["Info"])
 		if resolveErr != nil {
 			return report, resolveErr
@@ -405,11 +427,14 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		for _, unit := range utf16.Encode([]rune(options.Creator)) {
 			encoded = binary.BigEndian.AppendUint16(encoded, unit)
 		}
-		newInfo["Creator"], newInfo["Producer"] = String(encoded), String(encoded)
+		if options.Creator != "" {
+			newInfo["Creator"], newInfo["Producer"] = String(encoded), String(encoded)
+		}
 		if infoRef.Number == 0 {
 			maxID++
 			infoRef = Reference{Number: maxID}
 			refs = append(refs, infoRef)
+			report.Objects++
 			trailer["Info"] = infoRef
 		}
 	}

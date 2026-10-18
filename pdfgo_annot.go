@@ -459,6 +459,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		visitor.Warning(Diagnostic{Message: "PDF annotation appearance missing Form subtype; form appearance retained"})
 	}
+	source := stream
 	if visitor.Group != nil {
 		group, err := r.Resolve(stream.Dictionary["Group"])
 		if err != nil {
@@ -502,17 +503,21 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	}
 	rect := annotation.Rect
 	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
-	interpreter := pageInterpreter{reader: r, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
+	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
 	if parent != nil {
+		interpreter.sequence = parent.sequence
 		interpreter.state.matrix = parent.state.matrix.Mul(interpreter.state.matrix)
 		interpreter.state.style.Clips = append([]Path(nil), parent.state.style.Clips...)
 		interpreter.bounds = parent.bounds
 		interpreter.depth = parent.depth
 		interpreter.patternMatrix = parent.patternMatrix
 	}
-	return interpreter.form(stream)
+	if annotation.Reference != (Reference{}) && annotation.Dictionary["StructParent"] != nil {
+		interpreter.sequence = &ContentSequence{Reader: r, Page: page, Stream: source, Object: annotation.Reference, Parent: interpreter.sequence}
+	}
+	return interpreter.formContent(stream, source)
 }
 
 // ReadField 读取控件字段并补齐可继承属性，不修改原始注解字典

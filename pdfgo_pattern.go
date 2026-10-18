@@ -29,6 +29,8 @@ type TilingPattern struct {
 	YStep         float64
 	PaintType     int
 	reader        *Reader
+	page          *Page
+	stream        *Stream
 	resources     Dictionary
 	pageResources Dictionary
 	data          []byte
@@ -61,7 +63,7 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	}
 	box := p.BBox
 	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
-	child := pageInterpreter{reader: p.reader, resources: p.resources, pageResources: p.pageResources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
+	child := pageInterpreter{reader: p.reader, page: p.page, stream: p.stream, resources: p.resources, pageResources: p.pageResources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
 	child.glyphStreams = p.glyphStreams
 	child.blendingSpace, child.maskGroup = p.blendingSpace, p.maskGroup
 	child.state = p.initial
@@ -199,6 +201,7 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 		return nil, err
 	}
 	pattern := &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones}
+	pattern.page, pattern.stream = p.page, stream
 	if p.tilingPatterns == nil {
 		p.tilingPatterns = make(map[Name]*TilingPattern)
 	}

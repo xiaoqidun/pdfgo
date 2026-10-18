@@ -156,7 +156,7 @@ func (r *Reader) WalkThreeDOverlay(ctx context.Context, page *Page, source Three
 		{"L", []Point{{clip.XMin, clip.YMax}}},
 		{"C", nil},
 	}}
-	interpreter := pageInterpreter{reader: r, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: clip}
+	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: clip}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: matrix, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal", Clips: []Path{path}}}
 	return interpreter.form(stream)

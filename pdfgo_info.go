@@ -14,9 +14,14 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"fmt"
+	"maps"
+	"slices"
+)
 
 // DocumentInfo 保存信息字典中的文本、原始日期与陷印声明，不以XMP覆盖信息字典
+// Custom保存其他文本字段，每次读取返回独立映射
 type DocumentInfo struct {
 	Title        string
 	Author       string
@@ -27,6 +32,7 @@ type DocumentInfo struct {
 	CreationDate string
 	ModDate      string
 	Trapped      Name
+	Custom       map[Name]string
 }
 
 // OutputIntent 保存目标输出条件和独立ICC快照，不替代对象颜色空间或启用屏幕打样
@@ -164,40 +170,88 @@ func (r *Reader) Info() (DocumentInfo, error) {
 	if !ok {
 		return result, fmt.Errorf("invalid document information dictionary")
 	}
-	for _, field := range []struct {
-		key    Name
-		target *string
-	}{
-		{"Title", &result.Title}, {"Author", &result.Author}, {"Subject", &result.Subject},
-		{"Keywords", &result.Keywords}, {"Creator", &result.Creator}, {"Producer", &result.Producer},
-		{"CreationDate", &result.CreationDate}, {"ModDate", &result.ModDate},
-	} {
-		value, err := r.Resolve(dict[field.key])
+	for _, key := range slices.Sorted(maps.Keys(dict)) {
+		value, err := r.Resolve(dict[key])
 		if err != nil {
 			return result, err
 		}
 		if value == nil {
 			continue
 		}
+		if key == "Trapped" {
+			trapped, ok := value.(Name)
+			if !ok || trapped != "True" && trapped != "False" && trapped != "Unknown" {
+				return result, fmt.Errorf("invalid document trapping status")
+			}
+			result.Trapped = trapped
+			continue
+		}
 		text, ok := value.(String)
 		if !ok {
-			return result, fmt.Errorf("invalid document information %s", field.key)
+			return result, fmt.Errorf("invalid document information %s", key)
 		}
-		*field.target, err = DecodeTextString(text)
+		decoded, err := DecodeTextString(text)
 		if err != nil {
 			return result, err
 		}
-	}
-	value, err = r.Resolve(dict["Trapped"])
-	if err != nil {
-		return result, err
-	}
-	if value != nil {
-		trapped, ok := value.(Name)
-		if !ok || trapped != "True" && trapped != "False" && trapped != "Unknown" {
-			return result, fmt.Errorf("invalid document trapping status")
+		switch key {
+		case "Title":
+			result.Title = decoded
+		case "Author":
+			result.Author = decoded
+		case "Subject":
+			result.Subject = decoded
+		case "Keywords":
+			result.Keywords = decoded
+		case "Creator":
+			result.Creator = decoded
+		case "Producer":
+			result.Producer = decoded
+		case "CreationDate":
+			result.CreationDate = decoded
+		case "ModDate":
+			result.ModDate = decoded
+		default:
+			if result.Custom == nil {
+				result.Custom = make(map[Name]string)
+			}
+			result.Custom[key] = decoded
 		}
-		result.Trapped = trapped
 	}
 	return result, nil
+}
+
+// Metadata 读取文档目录声明的元数据流，不解码XML或与信息字典合并
+// 返回: *Stream 元数据流，未声明时为空, error 引用或定义错误
+func (r *Reader) Metadata() (*Stream, error) {
+	catalog, err := r.catalogDictionary()
+	if err != nil {
+		return nil, err
+	}
+	return r.ReadMetadata(catalog["Metadata"])
+}
+
+// ReadMetadata 读取元数据流或其引用，可用于组件及标记内容的Metadata字段
+// 返回流沿用所属阅读器的生命周期，通过DecodeContext按需解码，不修改原始XML
+// 入参: object 元数据流或引用，空值表示未声明
+// 返回: *Stream 元数据流, error 引用、类型或子类型错误
+func (r *Reader) ReadMetadata(object Object) (*Stream, error) {
+	value, err := r.Resolve(object)
+	if err != nil || value == nil {
+		return nil, err
+	}
+	stream, ok := value.(*Stream)
+	if !ok || stream == nil {
+		return nil, fmt.Errorf("invalid metadata stream")
+	}
+	for _, field := range []struct{ key, want Name }{{"Type", "Metadata"}, {"Subtype", "XML"}} {
+		value, err := r.Resolve(stream.Dictionary[field.key])
+		if err != nil {
+			return nil, err
+		}
+		if value != field.want {
+			return nil, fmt.Errorf("invalid metadata %s", field.key)
+		}
+	}
+	return stream, nil
 }

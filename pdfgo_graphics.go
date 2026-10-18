@@ -104,6 +104,7 @@ type Style struct {
 // PathMark 表示一次路径绘制，路径及裁剪坐标始终位于页面用户空间
 // StrokeMatrix非零时保留非等比描边变换，线宽及虚线参数属于其逆变换后的坐标空间
 type PathMark struct {
+	Sequence     *ContentSequence
 	Path         Path
 	Style        Style
 	Fill, Stroke bool
@@ -119,6 +120,7 @@ type PathMark struct {
 // Replacement保留所属替换文本区段，同一区段共享实例，不改变Glyphs中的原始字符映射
 type TextMark struct {
 	Object                *TextObject
+	Sequence              *ContentSequence
 	Replacement           *ReplacementText
 	Font                  *Font
 	Resources             Dictionary
@@ -130,6 +132,7 @@ type TextMark struct {
 	Style                 Style
 	Mode                  int
 	Clip                  *TextClip
+	page                  *Page
 	glyphStreams          []*Stream
 	halftones             map[string]*Halftone
 }
@@ -141,9 +144,10 @@ type TextObject struct {
 
 // ImageMark 保存图像资源及单位方形到页面坐标的变换
 type ImageMark struct {
-	Image  *Image
-	Matrix Matrix
-	Style  Style
+	Sequence *ContentSequence
+	Image    *Image
+	Matrix   Matrix
+	Style    Style
 }
 
 // FormMark 保存普通表单的局部边界及到页面坐标的变换，不代表透明组
@@ -170,13 +174,36 @@ type GroupMark struct {
 // MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标记的标签
 // Replacement在含ActualText的Span开始和结束时共享实例，Hidden表示区段当前不可见
 // Offset为当前解码内容流中的操作位置
+// Page标识来源页面，Stream为空表示页面合并内容，否则标识Form、字形或图案内容流
+// 来源对象沿用阅读器生命周期，独立构造的绘制输入可能没有Page
+// Sequence在区段开始和结束时共享实例，MP和DP不创建区段
+// Reader用于解析Properties中的间接引用，包括不创建区段的点标记
 type MarkedContentMark struct {
+	Reader      *Reader
+	Page        *Page
+	Stream      *Stream
+	Sequence    *ContentSequence
 	Tag         Name
 	Properties  Dictionary
 	Operator    string
 	Offset      int64
 	Replacement *ReplacementText
 	Hidden      bool
+}
+
+// ContentSequence 保存绘制所属的只读内容区段，Parent保留外层区段
+// PathMark、TextMark和ImageMark通过Sequence引用区段
+// 相邻区段即使标签及属性相同也使用不同实例，区段不随图形状态保存或恢复
+// Reader用于解析Properties中的间接引用，来源对象沿用阅读器生命周期
+// Object标识带StructParent的XObject调用或注解外观，此类区段没有Tag和Properties
+type ContentSequence struct {
+	Reader     *Reader
+	Page       *Page
+	Stream     *Stream
+	Object     Reference
+	Tag        Name
+	Properties Dictionary
+	Parent     *ContentSequence
 }
 
 // ReplacementText 保存整个内容区段的替换文本，Parent指向外层替换区段
@@ -227,17 +254,20 @@ type graphicsState struct {
 	fillColor, strokeColor                                *graphicsColorSpace
 }
 
-// markedContentState 保存标记名称、可见性及替换文本作用域
+// markedContentState 保存标记名称、外层区段、可见性及替换文本作用域
 type markedContentState struct {
 	tag         Name
 	hidden      bool
 	previous    *ReplacementText
 	replacement *ReplacementText
+	sequence    *ContentSequence
 }
 
 // pageInterpreter 按内容顺序解释页面或表单
 type pageInterpreter struct {
 	reader                 *Reader
+	page                   *Page
+	stream                 *Stream
 	resources              Dictionary
 	pageResources          Dictionary
 	visitor                Visitor
@@ -245,6 +275,7 @@ type pageInterpreter struct {
 	state                  graphicsState
 	stack                  []graphicsState
 	marked                 []markedContentState
+	sequence               *ContentSequence
 	replacement            *ReplacementText
 	hidden                 bool
 	textClips              []*TextClip
@@ -465,7 +496,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	if _, err := page.WriteContent(ctx, &data); err != nil {
 		return err
 	}
-	interpreter := pageInterpreter{reader: r, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
+	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
 	interpreter.blendingSpace = groupSpace
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
@@ -557,7 +588,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if resources == nil {
 		resources = mark.Resources
 	}
-	interpreter := pageInterpreter{reader: r, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, type3: true, replacement: mark.Replacement}
+	interpreter := pageInterpreter{reader: r, page: mark.page, stream: stream, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, type3: true, replacement: mark.Replacement, sequence: mark.Sequence}
 	interpreter.glyphStreams = append(append([]*Stream(nil), mark.glyphStreams...), stream)
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
@@ -614,7 +645,7 @@ func (p *pageInterpreter) run(data []byte) error {
 // 入参: op 内容标记操作
 // 返回: error 错误信息
 func (p *pageInterpreter) markedContent(op Operation) error {
-	mark := MarkedContentMark{Operator: op.Operator, Offset: op.Offset, Hidden: p.hidden}
+	mark := MarkedContentMark{Reader: p.reader, Page: p.page, Stream: p.stream, Operator: op.Operator, Offset: op.Offset, Hidden: p.hidden}
 	optional := false
 	if op.Operator == "EMC" {
 		if len(op.Operands) != 0 || len(p.marked) == 0 {
@@ -623,6 +654,7 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 		state := p.marked[len(p.marked)-1]
 		mark.Tag, p.hidden = state.tag, state.hidden
 		mark.Replacement, p.replacement = state.replacement, state.previous
+		mark.Sequence, p.sequence = p.sequence, state.sequence
 		p.marked = p.marked[:len(p.marked)-1]
 	} else {
 		hidden := p.hidden
@@ -681,7 +713,9 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 					p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: "invalid PDF ActualText ignored: " + err.Error()})
 				}
 			}
-			p.marked = append(p.marked, markedContentState{tag: mark.Tag, hidden: hidden, previous: p.replacement, replacement: mark.Replacement})
+			p.marked = append(p.marked, markedContentState{tag: mark.Tag, hidden: hidden, previous: p.replacement, replacement: mark.Replacement, sequence: p.sequence})
+			p.sequence = &ContentSequence{Reader: p.reader, Page: p.page, Stream: p.stream, Tag: mark.Tag, Properties: mark.Properties, Parent: p.sequence}
+			mark.Sequence = p.sequence
 			if mark.Replacement != nil {
 				p.replacement = mark.Replacement
 			}
@@ -927,7 +961,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if p.visitor.Path == nil {
 				return fmt.Errorf("path visitor missing")
 			}
-			if err := p.visitor.Path(PathMark{Path: p.path, Style: style, Fill: fill, Stroke: stroke, StrokeMatrix: strokeMatrix}); err != nil {
+			if err := p.visitor.Path(PathMark{Sequence: p.sequence, Path: p.path, Style: style, Fill: fill, Stroke: stroke, StrokeMatrix: strokeMatrix}); err != nil {
 				return err
 			}
 		}
@@ -1402,7 +1436,9 @@ func (p *pageInterpreter) showText(data []byte) error {
 			return fmt.Errorf("text visitor missing")
 		}
 		mark := TextMark{Object: p.textObject, Replacement: p.replacement, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
+		mark.Sequence = p.sequence
 		if mark.Font.Subtype == "Type3" {
+			mark.page = p.page
 			mark.Resources = p.pageResources
 		}
 		mark.glyphStreams = p.glyphStreams
@@ -1487,6 +1523,11 @@ func (p *pageInterpreter) xobject(a []Object) error {
 	if err != nil {
 		return err
 	}
+	if ref, ok := object.(Reference); ok && stream.Dictionary["StructParent"] != nil {
+		previous := p.sequence
+		p.sequence = &ContentSequence{Reader: p.reader, Page: p.page, Stream: stream, Object: ref, Parent: previous}
+		defer func() { p.sequence = previous }()
+	}
 	if kind == Name("Image") {
 		return p.image(stream)
 	}
@@ -1548,7 +1589,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 		}
 	}
 	image.Warning = p.visitor.Warning
-	return p.visitor.Image(ImageMark{image, p.state.matrix, style})
+	return p.visitor.Image(ImageMark{Sequence: p.sequence, Image: image, Matrix: p.state.matrix, Style: style})
 }
 
 // validatePaint 检查实际使用的颜色状态，避免未指定图案或未支持的色彩意图被静默替换
@@ -1596,6 +1637,13 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 // 入参: stream 表单内容流
 // 返回: error 解析或访问错误
 func (p *pageInterpreter) form(stream *Stream) error {
+	return p.formContent(stream, stream)
+}
+
+// formContent 解释表单绘制数据，保留原始流作为内容来源
+// 入参: stream 绘制流, source 来源流
+// 返回: error 解析或访问错误
+func (p *pageInterpreter) formContent(stream, source *Stream) error {
 	if p.hidden {
 		return nil
 	}
@@ -1646,6 +1694,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		}
 	}
 	child := *p
+	child.stream = source
 	child.content = nil
 	if target == nil {
 		resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
@@ -1794,6 +1843,7 @@ func (p *pageInterpreter) form(stream *Stream) error {
 		child.forms = p.forms
 	} else {
 		child.reader, child.resources, child.pageResources = target.reader, target.Resources, target.Resources
+		child.page, child.stream = target, nil
 	}
 	walk := func(interpreter *pageInterpreter) error {
 		if target != nil {

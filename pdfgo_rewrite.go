@@ -26,7 +26,7 @@ import (
 	"slices"
 )
 
-// RewriteOptions 批量修改图像、文字、链接、附件和动作，保留原加密配置
+// RewriteOptions 批量修改文档信息、图像、文字、链接、附件和动作，保留原加密配置
 // 图像及页面引用须指向原文件的间接对象；空配置原样写出，不修改源对象
 // 大纲通过原节点引用定位，标题使用UTF-8文字
 // OutlineActions替换整个动作序列，空序列移除动作及目标，不可与同节点的OutlineDestinations同时指定
@@ -37,8 +37,10 @@ import (
 // MovieAnnotations按页面追加视频注解，同一注解指针只能添加一次，可由MovieAction.Target引用
 // ScreenAnnotations按页面追加屏幕注解，可由RenditionAction.Target引用
 // TextReplacements按页面内容流中的文字对象序号写入整段替换文本，不改动字形及定位
-// Optimization在同次写出中处理压缩及制作软件，默认不优化
+// Information按键更新文档信息字典，nil值删除字段，文本使用EncodeTextString编码，不同步XMP
+// Optimization在同次写出中处理压缩及制作软件，Creator非空时覆盖Information中的Creator及Producer
 type RewriteOptions struct {
+	Information         Dictionary
 	Images              map[Reference]image.Image
 	ImageOptions        ImageWriteOptions
 	LinkRegions         map[AnnotationLocation]LinkRegion
@@ -102,6 +104,10 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if err := options.Optimization.Compression.Validate(); err != nil {
 		return OptimizeReport{}, err
 	}
+	information, err := rewriteInformation(ctx, options.Information)
+	if err != nil {
+		return OptimizeReport{}, err
+	}
 	replacements, err := r.imageReplacements(ctx, options.Images, options.ImageOptions)
 	if err != nil {
 		return OptimizeReport{}, err
@@ -154,7 +160,45 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if textChanged {
 		r.Version = max(r.Version, "1.4")
 	}
-	return r.rewriteTo(ctx, writer, options.Optimization, replacements)
+	return r.rewriteTo(ctx, writer, options.Optimization, replacements, information)
+}
+
+// rewriteInformation 校验信息字典修改并隔离调用方的数据
+// 入参: ctx 取消上下文, changes 待修改字段
+// 返回: Dictionary 独立修改集, error 字段或取消错误
+func rewriteInformation(ctx context.Context, changes Dictionary) (Dictionary, error) {
+	result := make(Dictionary, len(changes))
+	for key, value := range changes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if value == nil {
+			result[key] = nil
+			continue
+		}
+		if key == "Trapped" {
+			if value != Name("True") && value != Name("False") && value != Name("Unknown") {
+				return nil, fmt.Errorf("invalid document trapping state")
+			}
+			result[key] = value
+			continue
+		}
+		text, ok := value.(String)
+		if !ok {
+			return nil, fmt.Errorf("document information requires a text string")
+		}
+		decoded, err := DecodeTextString(text)
+		if err != nil {
+			return nil, err
+		}
+		if key == "CreationDate" || key == "ModDate" {
+			if _, err := ParseDate(decoded); err != nil {
+				return nil, err
+			}
+		}
+		result[key] = String(slices.Clone(text))
+	}
+	return result, ctx.Err()
 }
 
 // actionSequences 遍历待写动作序列，不改变各序列内部顺序
