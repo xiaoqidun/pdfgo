@@ -100,7 +100,7 @@ func (r *Reader) ReadPopupAnnotation(object Object) (PopupAnnotation, error) {
 	}
 	popup.Reference, _ = object.(Reference)
 	popup.Subtype = "Popup"
-	popup.Rect, err = r.rectangle(dict["Rect"])
+	popup.Rect, err = r.annotationRectangle(dict, "Popup")
 	if err != nil {
 		return popup, err
 	}
@@ -199,7 +199,7 @@ func (p *Page) AnnotationsContext(ctx context.Context) ([]Annotation, error) {
 		if !ok {
 			return nil, fmt.Errorf("missing annotation subtype")
 		}
-		box, err := p.reader.rectangle(dict["Rect"])
+		box, err := p.reader.annotationRectangle(dict, subtype)
 		if err != nil {
 			return nil, err
 		}
@@ -210,6 +210,21 @@ func (p *Page) AnnotationsContext(ctx context.Context) ([]Annotation, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// annotationRectangle 读取注解矩形，诊断模式保留缺少区域的非可视弹窗
+// 入参: dict 原始注解字典, subtype 已解析的注解类型
+// 返回: Rectangle 注解区域，缺失弹窗区域时为空, error 矩形或引用错误
+func (r *Reader) annotationRectangle(dict Dictionary, subtype Name) (Rectangle, error) {
+	value, err := r.Resolve(dict["Rect"])
+	if err != nil {
+		return Rectangle{}, err
+	}
+	if value == nil && subtype == "Popup" && r.warning != nil {
+		r.warning(Diagnostic{Message: "PDF Popup annotation has no Rect; nonvisual popup data retained without a display region"})
+		return Rectangle{}, nil
+	}
+	return r.rectangle(value)
 }
 
 // ReadAnnotationAppearance 读取已有的正常外观，按AS选择状态，不生成或解码外观

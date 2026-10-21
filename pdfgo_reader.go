@@ -76,6 +76,7 @@ type objectStream struct {
 	reference Reference
 	data      []byte
 	ids       []int64
+	indices   map[int64]int64
 	offsets   []int64
 	bytes     int64
 }
@@ -617,7 +618,9 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 		return nil, nil, err
 	}
 	seen := map[Reference]bool{}
+	generations := map[int64]int64{}
 	damagedStreamIndex, hasObjectStreams := false, false
+	var objectStreams []Reference
 	var catalog Reference
 	var offset int64
 	for offset < r.size {
@@ -749,10 +752,16 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 			return nil, nil, fmt.Errorf("ambiguous or excessive recovery objects")
 		}
 		seen[ref] = true
+		if generation, exists := generations[ref.Number]; exists && generation != ref.Generation {
+			generations[ref.Number] = -1
+		} else if !exists {
+			generations[ref.Number] = ref.Generation
+		}
 		index[ref.Number] = xrefEntry{kind: 1, position: start, generation: ref.Generation}
 		if dict, ok := object.(Dictionary); ok {
 			if dict["Type"] == Name("ObjStm") {
 				hasObjectStreams = true
+				objectStreams = append(objectStreams, ref)
 			}
 			if dict["Type"] == Name("Catalog") {
 				if catalog.Number != 0 && catalog != ref {
@@ -802,9 +811,6 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 		}
 		offset = end
 	}
-	if damagedStreamIndex && hasObjectStreams {
-		return nil, nil, fmt.Errorf("damaged cross-reference stream requires compressed object index")
-	}
 	if trailer["Root"] == nil && catalog.Number > 0 {
 		trailer["Root"] = catalog
 	}
@@ -826,8 +832,67 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 			index[id] = entry
 		}
 	}
+	if damagedStreamIndex && hasObjectStreams {
+		if err := r.rebuildCompressedEntries(index, trailer, objectStreams); err != nil {
+			return nil, nil, err
+		}
+	}
+	if root, ok := trailer["Root"].(Reference); ok && root.Number == catalog.Number && root.Generation != catalog.Generation && generations[root.Number] == catalog.Generation {
+		entry := index[root.Number]
+		if entry.kind == 1 && entry.generation == catalog.Generation {
+			trailer["Root"] = catalog
+			r.warning(Diagnostic{Offset: entry.position, Message: fmt.Sprintf("stale catalog generation %d recovered as %d from unique object %d", root.Generation, catalog.Generation, catalog.Number)})
+		}
+	}
 	r.recoveryIndex = index
 	return index, trailer, nil
+}
+
+// rebuildCompressedEntries 从完整且无冲突的对象流头补回缺失索引，不覆盖显式条目或解码未认证数据
+// 入参: index 已验证的索引, trailer 尾字典, containers 顺序扫描发现的对象流引用
+// 返回: error 歧义、解码、超限或读取错误
+func (r *Reader) rebuildCompressedEntries(index map[int64]xrefEntry, trailer Dictionary, containers []Reference) error {
+	if trailer["Encrypt"] != nil {
+		return fmt.Errorf("encrypted cross-reference recovery requires compressed object index")
+	}
+	local := *r
+	local.xref, local.Trailer = index, trailer
+	local.cache, local.loading = map[Reference]Object{}, map[Reference]bool{}
+	local.recoveryIndex, local.recoveryTried = index, true
+	local.objectStreams = [4]*objectStream{}
+	candidates := map[int64]xrefEntry{}
+	remaining := int64(readerRecoveryLimit)
+	seen := map[Reference]bool{}
+	for _, ref := range containers {
+		entry := index[ref.Number]
+		if entry.kind != 1 || entry.generation != ref.Generation || seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		if remaining <= 0 {
+			return fmt.Errorf("object stream recovery decode limit exceeded")
+		}
+		stream, err := local.readObjectStreamLimit(ref, remaining)
+		if err != nil {
+			return err
+		}
+		remaining -= stream.bytes
+		for i, id := range stream.ids {
+			if _, exists := index[id]; exists {
+				continue
+			}
+			if _, exists := candidates[id]; exists {
+				return fmt.Errorf("ambiguous recovered compressed object %d", id)
+			}
+			candidates[id] = xrefEntry{kind: 2, position: ref.Number, generation: int64(i)}
+		}
+		delete(local.cache, ref)
+	}
+	for id, entry := range candidates {
+		index[id] = entry
+	}
+	r.warning(Diagnostic{Message: fmt.Sprintf("rebuilt %d missing compressed cross-reference entries from unique object stream indices", len(candidates))})
+	return nil
 }
 
 // recoveryLengths 收集唯一且完整的整数对象候选，仅用于验证前向流长度引用
@@ -1569,7 +1634,7 @@ func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, 
 	}
 	direct := *stream
 	direct.reader = nil
-	data, err := direct.Decode()
+	data, err := direct.decodeContext(context.Background(), r.warning)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1660,7 +1725,15 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 	}
 	index := entry.generation
 	if index < 0 || index >= int64(len(stream.ids)) || stream.ids[index] != ref.Number {
-		return nil, fmt.Errorf("object stream index mismatch")
+		if r.warning == nil {
+			return nil, fmt.Errorf("object stream index mismatch")
+		}
+		var found bool
+		index, found = stream.indices[ref.Number]
+		if !found {
+			return nil, fmt.Errorf("object stream index mismatch")
+		}
+		r.warning(Diagnostic{Message: fmt.Sprintf("object stream index %d recovered as %d for object %d in stream %d", entry.generation, index, ref.Number, container.Number)})
 	}
 	p := objectParser{data: stream.data[stream.offsets[index]:stream.offsets[index+1]], final: true}
 	if r.warning != nil {
@@ -1692,6 +1765,13 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 // 入参: ref 对象流引用
 // 返回: *objectStream 对象流数据, error 错误信息
 func (r *Reader) readObjectStream(ref Reference) (*objectStream, error) {
+	return r.readObjectStreamLimit(ref, 0)
+}
+
+// readObjectStreamLimit 在重建时限制解码和索引内存，零上限沿用普通读取
+// 入参: ref 对象流引用, limit 解码及索引总字节上限
+// 返回: *objectStream 对象流数据, error 错误信息
+func (r *Reader) readObjectStreamLimit(ref Reference, limit int64) (*objectStream, error) {
 	object, err := r.Object(ref)
 	if err != nil {
 		return nil, err
@@ -1705,26 +1785,34 @@ func (r *Reader) readObjectStream(ref Reference) (*objectStream, error) {
 	if e1 != nil || e2 != nil || count <= 0 || first < 0 {
 		return nil, fmt.Errorf("invalid object stream header")
 	}
-	data, err := stream.Decode()
+	data, err := stream.decodeContextLimit(context.Background(), r.warning, limit)
 	if err != nil {
 		return nil, err
 	}
 	if first > int64(len(data)) || count > first/4 {
 		return nil, fmt.Errorf("invalid object stream dimensions")
 	}
+	if limit > 0 && (int64(cap(data))+8 > limit || count > (limit-int64(cap(data))-8)/80) {
+		return nil, fmt.Errorf("object stream recovery index limit exceeded")
+	}
 	p := objectParser{data: data[:first]}
 	ids, offsets := make([]int64, count), make([]int64, count+1)
+	indices := make(map[int64]int64, count)
 	for i := int64(0); i < count; i++ {
 		ids[i], e1 = strconv.ParseInt(p.token(), 10, 64)
 		offsets[i], e2 = strconv.ParseInt(p.token(), 10, 64)
 		if e1 != nil || e2 != nil || ids[i] <= 0 || offsets[i] < 0 || offsets[i] > int64(len(data))-first || (i > 0 && offsets[i] <= offsets[i-1]) {
 			return nil, fmt.Errorf("invalid object stream index")
 		}
+		if _, exists := indices[ids[i]]; exists {
+			return nil, fmt.Errorf("duplicate object stream number")
+		}
+		indices[ids[i]] = i
 	}
 	p.skipSpace()
 	if p.pos != len(p.data) {
 		return nil, fmt.Errorf("object stream index mismatch")
 	}
 	offsets[count] = int64(len(data)) - first
-	return &objectStream{reference: ref, data: data[first:], ids: ids, offsets: offsets, bytes: int64(cap(data)) + 8*(count*2+1)}, nil
+	return &objectStream{reference: ref, data: data[first:], ids: ids, indices: indices, offsets: offsets, bytes: int64(cap(data)) + 8*(count*2+1) + 64*count}, nil
 }

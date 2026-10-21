@@ -39,8 +39,9 @@ func WalkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 // 入参: ctx 取消上下文, data 内容流, visit 操作访问函数, resolve 颜色空间解析器, warning 可恢复诊断
 // 返回: error 解析或访问错误
 func walkOperations(ctx context.Context, data []byte, visit func(Operation) error, resolve func(Object) (Object, error), warning func(Diagnostic)) error {
-	p := objectParser{data: data, warning: warning}
+	p := objectParser{data: data, warning: warning, content: true}
 	var operands []Object
+	compatibility := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -83,8 +84,26 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 			continue
 		}
 		op := p.token()
+		if warning != nil && compatibility == 0 && !contentOperator(op) {
+			for i := 1; i < len(op); i++ {
+				b := op[i]
+				if b == '+' || b == '-' || b == '.' || b >= '0' && b <= '9' {
+					if count := graphicsOperandCount(op[:i]); count >= 0 && len(operands) == count {
+						p.pos -= len(op) - i
+						op = op[:i]
+						warning(Diagnostic{Offset: int64(p.pos), Message: "missing separator after content operator " + op})
+					}
+					break
+				}
+			}
+		}
 		if op == "" {
 			return p.fail("invalid content operator")
+		}
+		if op == "BX" {
+			compatibility++
+		} else if op == "EX" && compatibility > 0 {
+			compatibility--
 		}
 		if op == "BI" {
 			if len(operands) != 0 {
@@ -106,6 +125,60 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 		clear(operands)
 		operands = operands[:0]
 	}
+}
+
+// contentNumber 在内容流中恢复粘连的数字边界及无有效位的零，不改变结构对象语法
+// 入参: token 已读取的词法单元
+// 返回: string 当前数字或未经恢复的原词法单元
+func (p *objectParser) contentNumber(token string) string {
+	if token == "" || validNumber(token) || validScientificNumber(token) {
+		return token
+	}
+	switch token {
+	case "-", "+", ".", "-.", "+.":
+		p.warning(Diagnostic{Offset: p.base + int64(p.pos-len(token)), Message: "content number without digits interpreted as zero: " + token})
+		return "0"
+	}
+	i := 0
+	if token[0] == '+' || token[0] == '-' {
+		i++
+	}
+	dot := false
+	for i < len(token) {
+		b := token[i]
+		if b >= '0' && b <= '9' {
+			i++
+		} else if b == '.' && !dot {
+			dot = true
+			i++
+		} else {
+			break
+		}
+	}
+	if i == len(token) || !validNumber(token[:i]) {
+		return token
+	}
+	b := token[i]
+	if b != '+' && b != '-' && b != '.' && !contentOperator(token[i:]) {
+		return token
+	}
+	p.pos -= len(token) - i
+	p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "missing separator after content number " + token[:i]})
+	return token[:i]
+}
+
+// contentOperator 限定可从相邻数字分离的标准内容操作符
+// 入参: token 操作符候选
+// 返回: bool 是否为已知操作符
+func contentOperator(token string) bool {
+	if graphicsOperandCount(token) >= 0 {
+		return true
+	}
+	switch token {
+	case "d", "ri", "i", "gs", "CS", "cs", "SC", "SCN", "sc", "scn", "sh", "Do", "BI", "Tf", "Tj", "TJ", "'", "\"", "MP", "DP", "BMC", "BDC", "EMC":
+		return true
+	}
+	return false
 }
 
 // contentArray 读取内容流数组，诊断并略过其中不能作为数组元素的操作符

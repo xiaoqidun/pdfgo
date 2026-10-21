@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"unicode/utf8"
 )
@@ -52,6 +53,9 @@ func (f *Font) GlyphMapContext(ctx context.Context) (map[rune]uint16, error) {
 			return nil, err
 		}
 		glyph, ok, err := f.encodingGlyph(ctx, code)
+		if errors.Is(err, errRecoveredCmapGlyphUnavailable) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

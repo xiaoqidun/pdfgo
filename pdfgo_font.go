@@ -46,6 +46,7 @@ type Font struct {
 	widths               map[uint32]float64
 	defaultWidth         float64
 	defaultWidthDeclared bool
+	programMetrics       *fontProgramMetrics
 	coreName             string
 	cidWidths            cidMetrics[float64]
 	verticals            cidMetrics[VerticalMetrics]
@@ -58,6 +59,7 @@ type Font struct {
 	glyphCount           uint32
 	simpleCmap           []byte
 	cmapEncoding         Name
+	cmapRecovered        bool
 	symbolic             bool
 	post                 *fontPostMapping
 	cffGlyphs            map[uint32]uint16
@@ -582,6 +584,9 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		}
 		font.differences = builtIn
 	}
+	if (subtype == "Type1" || subtype == "MMType1") && font.ProgramType == "FontFile" && len(font.widths) == 0 && !font.defaultWidthDeclared {
+		font.programMetrics = &fontProgramMetrics{program: font.Program, type1: true}
+	}
 	var cffProgram []byte
 	if font.ProgramType == "Type1C" || font.ProgramType == "CIDFontType0C" {
 		cffProgram = font.Program
@@ -596,7 +601,15 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	}
 	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && cffProgram == nil {
 		font.symbolic = font.symbolic || noEncoding
-		font.simpleCmap, font.cmapEncoding, err = fontCmapContext(ctx, font.Program, font.symbolic)
+		cmapWarning := r.warning
+		if cmapWarning != nil {
+			cmapWarning = func(d Diagnostic) {
+				font.Recovered = true
+				font.cmapRecovered = true
+				r.warning(d)
+			}
+		}
+		font.simpleCmap, font.cmapEncoding, err = fontCmapContext(ctx, font.Program, font.symbolic, cmapWarning)
 		if errors.Is(err, errFontCmapUnavailable) && !font.symbolic {
 			glyphs, readErr := fontPostGlyphsContext(ctx, font.Program)
 			if readErr != nil {
@@ -621,6 +634,9 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		font.cffGlyphs, font.cffNames, err = cffFontMappingWithGlyphMap(cffProgram, font.composite, font.encoding, font.differences, font.composite, font.ProgramType, font.glyphMap)
 		if err != nil {
 			return nil, err
+		}
+		if !font.composite && len(font.widths) == 0 && !font.defaultWidthDeclared {
+			font.programMetrics = &fontProgramMetrics{program: cffProgram}
 		}
 	}
 	if (font.composite && cidSubtype == "CIDFontType2" || font.simpleCmap != nil || font.post != nil) && len(font.Program) != 0 && cffProgram == nil {
@@ -753,6 +769,15 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var type1Metrics *type1FontMetrics
+	var cffMetrics *cffFontMetrics
+	if f.programMetrics != nil && len(data) != 0 {
+		var err error
+		type1Metrics, cffMetrics, err = f.programMetrics.load(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var core *coreFontMetrics
 	if (f.Subtype == "Type1" || f.coreName != "") && len(f.Program) == 0 {
 		fonts, err := coreFonts()
@@ -840,6 +865,11 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 				}
 			}
 		}
+		if type1Metrics != nil {
+			if _, exists := type1Metrics.glyphs[name]; !exists {
+				name = ".notdef"
+			}
+		}
 		if !ok && valid && f.cidMap != nil {
 			text, ok = predefinedCodeUnicode(f.encoding, raw)
 		}
@@ -892,6 +922,20 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		}
 		if !ok {
 			width = f.defaultWidth
+			if type1Metrics != nil {
+				embeddedWidth, err := type1Metrics.glyphWidth(ctx, name)
+				if err != nil {
+					return nil, err
+				}
+				width, ok = embeddedWidth, true
+			}
+			if cffMetrics != nil {
+				embeddedWidth, err := cffMetrics.glyphWidth(ctx, f.cffGlyphs[cid])
+				if err != nil {
+					return nil, err
+				}
+				width, ok = embeddedWidth, true
+			}
 			if len(f.widths) == 0 && core != nil {
 				if standardWidth, found := core.widths[name]; found {
 					width = standardWidth
@@ -903,6 +947,9 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 			width *= f.type3Matrix[0] * 1000
 		}
 		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && (core == nil || name != ".notdef") {
+			if len(f.Program) != 0 {
+				return nil, &UnsupportedError{Feature: "embedded font metrics"}
+			}
 			return nil, &UnsupportedError{Feature: "unembedded standard font metrics"}
 		}
 		glyph := Glyph{Code: code, Text: text, Width: width, WordSpace: step == 1 && code == 32}
@@ -926,6 +973,13 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 			id, err := f.simpleGlyphContext(ctx, code, name)
 			if err != nil {
 				return nil, err
+			}
+			if f.cmapRecovered {
+				undefined := !f.symbolic && (name == "" || name == ".notdef")
+				blank := !f.symbolic && (name == "space" || name == "nonbreakingspace")
+				if id == 0 && !undefined && !blank || f.glyphCount != 0 && uint32(id) >= f.glyphCount {
+					return nil, fmt.Errorf("font %q %w for character code %#x (%q)", f.Name, errRecoveredCmapGlyphUnavailable, code, name)
+				}
 			}
 			if f.glyphCount != 0 && uint32(id) >= f.glyphCount {
 				id = 0

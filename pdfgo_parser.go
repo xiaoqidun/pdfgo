@@ -28,6 +28,7 @@ type objectParser struct {
 	depth     int
 	exhausted bool
 	final     bool
+	content   bool
 	warning   func(Diagnostic)
 }
 
@@ -166,6 +167,9 @@ func (p *objectParser) object() (Object, error) {
 		}
 	}
 	token := p.token()
+	if p.content && p.warning != nil {
+		token = p.contentNumber(token)
+	}
 	if p.warning != nil && len(token) > len("endobj") && token[len(token)-len("endobj"):] == "endobj" && validNumber(token[:len(token)-len("endobj")]) {
 		token = token[:len(token)-len("endobj")]
 		p.pos -= len("endobj")

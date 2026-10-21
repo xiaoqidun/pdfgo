@@ -19,12 +19,16 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"unicode/utf16"
 	"unicode/utf8"
 )
 
 // errFontCmapUnavailable 表示缺少适用字符表，非符号字体可改用名称表
 var errFontCmapUnavailable = errors.New("TrueType cmap unavailable")
+
+// errRecoveredCmapGlyphUnavailable 表示恢复字符表与名称表均未提供实际字形
+var errRecoveredCmapGlyphUnavailable = errors.New("recovered cmap has no valid glyph mapping")
 
 // fontTable 读取SFNT字体的指定表并校验目录与数据范围
 // 入参: data 字体数据, tag 表标签
@@ -74,9 +78,9 @@ func fontTableContext(ctx context.Context, data []byte, tag string) ([]byte, err
 }
 
 // fontCmapContext 选择并校验TrueType字符表，检查目录及分组解析的取消
-// 入参: ctx 取消上下文, data 字体数据, symbolic 是否为符号字体
+// 入参: ctx 取消上下文, data 字体数据, symbolic 是否为符号字体, warning 独立候选恢复诊断
 // 返回: []byte 已校验字符表, Name 映射编码, error 解析或取消错误
-func fontCmapContext(ctx context.Context, data []byte, symbolic bool) ([]byte, Name, error) {
+func fontCmapContext(ctx context.Context, data []byte, symbolic bool, warning func(Diagnostic)) ([]byte, Name, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
@@ -94,8 +98,13 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool) ([]byte, N
 	if entries > (len(cmap)-4)/8 {
 		return nil, "", fmt.Errorf("invalid cmap directory")
 	}
-	selected, score := -1, -1
-	var encodingName Name
+	type candidate struct {
+		index, priority int
+		offset          uint32
+		encoding        Name
+	}
+	var candidates []candidate
+	var offsets []uint32
 	for n := 0; n < entries; n++ {
 		if n&255 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -103,6 +112,12 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool) ([]byte, N
 			}
 		}
 		record := cmap[4+n*8:]
+		offset := binary.BigEndian.Uint32(record[4:])
+		if warning != nil {
+			if uint64(offset) >= uint64(4+entries*8) && uint64(offset)+2 <= uint64(len(cmap)) {
+				offsets = append(offsets, offset)
+			}
+		}
 		platform, encoding := binary.BigEndian.Uint16(record), binary.BigEndian.Uint16(record[2:])
 		priority := -1
 		if symbolic {
@@ -129,23 +144,79 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool) ([]byte, N
 				priority = 2
 			}
 		}
-		if priority > score {
-			selected = n
-			score = priority
-			encodingName = "Unicode"
+		if priority >= 0 {
+			encodingName := Name("Unicode")
 			if platform == 3 && encoding == 0 {
 				encodingName = "Symbol"
 			} else if platform == 1 && encoding == 0 {
 				encodingName = "MacRomanEncoding"
 			}
+			candidates = append(candidates, candidate{n, priority, offset, encodingName})
 		}
 	}
-	if selected < 0 {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if len(candidates) == 0 {
 		return nil, "", errFontCmapUnavailable
 	}
-	offset := uint64(binary.BigEndian.Uint32(cmap[4+selected*8+4:]))
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].priority > candidates[j].priority })
+	if warning == nil {
+		candidates = candidates[:1]
+	} else {
+		sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+	}
+	var firstErr error
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		limit := len(cmap)
+		if warning != nil {
+			next := sort.Search(len(offsets), func(n int) bool { return offsets[n] > candidate.offset })
+			if next < len(offsets) {
+				limit = int(offsets[next])
+			}
+		}
+		var table []byte
+		var err error
+		if warning != nil && uint64(candidate.offset) < uint64(4+entries*8) {
+			err = fmt.Errorf("invalid cmap offset")
+		} else {
+			table, err = fontCmapSubtableContext(ctx, cmap[:limit], uint64(candidate.offset))
+		}
+		if cancelled := ctx.Err(); cancelled != nil {
+			return nil, "", cancelled
+		}
+		if err != nil {
+			if warning == nil {
+				return nil, "", err
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if firstErr != nil {
+			warning(Diagnostic{Message: fmt.Sprintf("PDF font cmap preferred subtable unavailable: %v; independent subtable %d (%s) retained", firstErr, candidate.index, candidate.encoding)})
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
+		}
+		return table, candidate.encoding, nil
+	}
+	return nil, "", firstErr
+}
+
+// fontCmapSubtableContext 校验独立子表声明的完整范围及内部映射，不修补原始字节
+// 入参: ctx 取消上下文, cmap 字符表可用范围, offset 子表起点
+// 返回: []byte 已校验子表, error 解析或取消错误
+func fontCmapSubtableContext(ctx context.Context, cmap []byte, offset uint64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if offset+2 > uint64(len(cmap)) {
-		return nil, "", fmt.Errorf("invalid cmap offset")
+		return nil, fmt.Errorf("invalid cmap offset")
 	}
 	table := cmap[offset:]
 	format := binary.BigEndian.Uint16(table)
@@ -153,25 +224,25 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool) ([]byte, N
 	switch format {
 	case 0, 2, 4, 6:
 		if len(table) < 4 {
-			return nil, "", fmt.Errorf("truncated cmap")
+			return nil, fmt.Errorf("truncated cmap")
 		}
 		length = uint64(binary.BigEndian.Uint16(table[2:]))
 	case 8, 10, 12, 13:
 		if len(table) < 8 {
-			return nil, "", fmt.Errorf("truncated cmap")
+			return nil, fmt.Errorf("truncated cmap")
 		}
 		length = uint64(binary.BigEndian.Uint32(table[4:]))
 	default:
-		return nil, "", &UnsupportedError{Feature: fmt.Sprintf("TrueType cmap format %d", format)}
+		return nil, &UnsupportedError{Feature: fmt.Sprintf("TrueType cmap format %d", format)}
 	}
 	if length < 4 || length > uint64(len(table)) {
-		return nil, "", fmt.Errorf("invalid cmap length")
+		return nil, fmt.Errorf("invalid cmap length")
 	}
 	table = table[:length]
 	if err := validateFontCmap(ctx, table); err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return table, encodingName, nil
+	return table, nil
 }
 
 // validateFontCmap 校验字符表范围、分段顺序及字形数组，不展开字符集合

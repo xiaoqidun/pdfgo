@@ -78,6 +78,13 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 // 入参: ctx 取消上下文, warning 恢复诊断，空值表示严格解码
 // 返回: []byte 独立解码数据, error 解码或取消错误
 func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([]byte, error) {
+	return s.decodeContextLimit(ctx, warning, 0)
+}
+
+// decodeContextLimit 为对象流索引重建限制原始及解码数据，仅允许无预测的Flate过滤器
+// 入参: ctx 取消上下文, warning 恢复诊断, limit 数据上限，零值沿用通用解码
+// 返回: []byte 独立解码数据, error 解码、超限或取消错误
+func (s *Stream) decodeContextLimit(ctx context.Context, warning func(Diagnostic), limit int64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -86,12 +93,21 @@ func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([
 		return nil, err
 	}
 	data := s.Data
+	if limit > 0 && int64(len(data)) > limit {
+		return nil, fmt.Errorf("stream recovery decode limit exceeded")
+	}
 	for i, filter := range filters {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		name := filter.(Name)
 		dict, _ := params[i].(Dictionary)
+		if limit > 0 {
+			predictor, err := integerDefault(dict, "Predictor", 1)
+			if name != "FlateDecode" || err != nil || predictor != 1 {
+				return nil, fmt.Errorf("unsupported bounded object stream filter")
+			}
+		}
 		var err error
 		switch name {
 		case "Crypt":
@@ -103,8 +119,15 @@ func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([
 			var reader io.ReadCloser
 			reader, err = zlib.NewReader(bytes.NewReader(data))
 			if err == nil {
-				data, err = io.ReadAll(&contextInput{ctx: ctx, reader: reader})
+				var input io.Reader = &contextInput{ctx: ctx, reader: reader}
+				if limit > 0 {
+					input = io.LimitReader(input, limit+1)
+				}
+				data, err = io.ReadAll(input)
 				closeErr := reader.Close()
+				if limit > 0 && int64(len(data)) > limit {
+					return nil, fmt.Errorf("stream recovery decode limit exceeded")
+				}
 				if err == nil {
 					err = closeErr
 				}
