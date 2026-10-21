@@ -16,15 +16,109 @@ package pdfgo
 
 import (
 	"bytes"
+	"compress/lzw"
 	"compress/zlib"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 )
+
+// contentImageSamples 缓存独立图像样本流及是否恢复了缺失的结束码
+type contentImageSamples struct {
+	stream    *Stream
+	recovered bool
+}
 
 // inlineByteReader 限制解码器预读，避免读取内联图像后的内容操作符
 type inlineByteReader struct {
 	data []byte
 	pos  int
+}
+
+// recoverLZWImage 复用正常LZW解码，仅在缺失结束码且声明样本完整时恢复图像
+// 入参: image 当前绘制图像，不修改原始流或字典
+// 返回: error 解码、样本不足或取消错误
+func (p *pageInterpreter) recoverLZWImage(image *Image) error {
+	if p.visitor.Warning == nil {
+		return nil
+	}
+	source := image.Stream
+	if p.forms != nil {
+		if cached, ok := p.forms.images[source]; ok {
+			image.Stream = cached.stream
+			if cached.recovered {
+				p.visitor.Warning(Diagnostic{Message: "LZW image end code missing; complete declared image samples retained"})
+			}
+			return p.ctx.Err()
+		}
+	}
+	filters, params, err := image.Stream.filterChain(p.reader)
+	if err != nil {
+		return err
+	}
+	if len(filters) != 1 || filters[0] != Name("LZWDecode") {
+		return nil
+	}
+	parameters, _ := params[0].(Dictionary)
+	early, err := integerDefault(parameters, "EarlyChange", 1)
+	if err != nil || early != 0 {
+		return err
+	}
+	predictor, err := integerDefault(parameters, "Predictor", 1)
+	if err != nil || predictor != 1 {
+		return err
+	}
+	data, decodeErr := source.decodeContext(p.ctx, nil)
+	if err := p.ctx.Err(); err != nil {
+		return err
+	}
+	recovered := false
+	if decodeErr != nil {
+		if !errors.Is(decodeErr, io.ErrUnexpectedEOF) {
+			return decodeErr
+		}
+		decoder := lzw.NewReader(bytes.NewReader(source.Data), lzw.MSB, 8)
+		var err error
+		data, err = io.ReadAll(&contextInput{ctx: p.ctx, reader: decoder})
+		closeErr := decoder.Close()
+		if err := p.ctx.Err(); err != nil {
+			return err
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) || closeErr != nil {
+			return decodeErr
+		}
+		validation := *image
+		validation.Warning = nil
+		if _, err := validation.rawSamples(p.ctx, data); err != nil {
+			if canceled := p.ctx.Err(); canceled != nil {
+				return canceled
+			}
+			return decodeErr
+		}
+		recovered = true
+	}
+	stream := *source
+	stream.Dictionary = maps.Clone(stream.Dictionary)
+	delete(stream.Dictionary, "Filter")
+	delete(stream.Dictionary, "DecodeParms")
+	stream.Dictionary["Length"] = Integer(len(data))
+	stream.Data = data
+	image.Stream = &stream
+	if p.forms == nil {
+		p.forms = &formCache{}
+	}
+	if len(p.forms.images) < 1024 && len(data)+256 <= formCacheLimit-p.forms.bytes {
+		if p.forms.images == nil {
+			p.forms.images = make(map[*Stream]contentImageSamples)
+		}
+		p.forms.images[source] = contentImageSamples{stream: &stream, recovered: recovered}
+		p.forms.bytes += len(data) + 256
+	}
+	if recovered {
+		p.visitor.Warning(Diagnostic{Message: "LZW image end code missing; complete declared image samples retained"})
+	}
+	return p.ctx.Err()
 }
 
 // Read 每次提供一个编码字节，并记录已消费长度

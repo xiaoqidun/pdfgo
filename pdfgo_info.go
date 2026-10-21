@@ -15,8 +15,11 @@
 package pdfgo
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 )
 
@@ -47,6 +50,7 @@ type OutputIntent struct {
 }
 
 // OutputIntents 读取并验证文档输出意图，不将目标配置应用到普通屏显
+// 配置Warning时诊断无效辅助字段并返回可读取的部分，无效配置的Space为空，原始对象保持不变
 // 返回: []OutputIntent 按文档顺序排列的输出条件, error 字典、字段或ICC错误
 func (r *Reader) OutputIntents() ([]OutputIntent, error) {
 	catalog, err := r.catalogDictionary()
@@ -55,17 +59,28 @@ func (r *Reader) OutputIntents() ([]OutputIntent, error) {
 	}
 	value, err := r.Resolve(catalog["OutputIntents"])
 	if err != nil || value == nil {
+		if r.recoverAuxiliary(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	array, ok := value.(Array)
 	if !ok {
-		return nil, fmt.Errorf("invalid OutputIntents array")
+		err := fmt.Errorf("invalid OutputIntents array")
+		if r.recoverAuxiliary(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	result := make([]OutputIntent, len(array))
 	for n, object := range array {
 		result[n], err = r.readOutputIntent(object)
 		if err != nil {
-			return nil, fmt.Errorf("output intent %d: %w", n+1, err)
+			err = fmt.Errorf("output intent %d: %w", n+1, err)
+			if !r.recoverAuxiliary(err) {
+				return nil, err
+			}
+			result[n].Space = nil
 		}
 	}
 	return result, nil
@@ -143,6 +158,7 @@ func (r *Reader) readOutputIntent(object Object) (OutputIntent, error) {
 	if err != nil {
 		return result, fmt.Errorf("DestOutputProfile: %w", err)
 	}
+	result.Profile = append([]byte(nil), data...)
 	result.Space, err = NewICCColorSpace(data)
 	if err != nil {
 		return result, fmt.Errorf("DestOutputProfile: %w", err)
@@ -154,25 +170,35 @@ func (r *Reader) readOutputIntent(object Object) (OutputIntent, error) {
 	if value != nil && value != Integer(result.Space.Components()) {
 		return result, fmt.Errorf("DestOutputProfile component count mismatch")
 	}
-	result.Profile = append([]byte(nil), data...)
 	return result, nil
 }
 
 // Info 读取文档信息字典，解码PDF文本字符串，日期保留原文以免丢失精度
+// 配置Warning时诊断无效辅助字段并读取其他文本，原始对象保持不变
 // 返回: DocumentInfo 文档信息, error 字典或字段类型错误
 func (r *Reader) Info() (DocumentInfo, error) {
 	result := DocumentInfo{Trapped: "Unknown"}
 	value, err := r.Resolve(r.Trailer["Info"])
 	if err != nil || value == nil {
+		if r.recoverAuxiliary(err) {
+			return result, nil
+		}
 		return result, err
 	}
 	dict, ok := value.(Dictionary)
 	if !ok {
-		return result, fmt.Errorf("invalid document information dictionary")
+		err := fmt.Errorf("invalid document information dictionary")
+		if r.recoverAuxiliary(err) {
+			return result, nil
+		}
+		return result, err
 	}
 	for _, key := range slices.Sorted(maps.Keys(dict)) {
 		value, err := r.Resolve(dict[key])
 		if err != nil {
+			if r.recoverAuxiliary(err) {
+				continue
+			}
 			return result, err
 		}
 		if value == nil {
@@ -181,17 +207,28 @@ func (r *Reader) Info() (DocumentInfo, error) {
 		if key == "Trapped" {
 			trapped, ok := value.(Name)
 			if !ok || trapped != "True" && trapped != "False" && trapped != "Unknown" {
-				return result, fmt.Errorf("invalid document trapping status")
+				err := fmt.Errorf("invalid document trapping status")
+				if r.recoverAuxiliary(err) {
+					continue
+				}
+				return result, err
 			}
 			result.Trapped = trapped
 			continue
 		}
 		text, ok := value.(String)
 		if !ok {
-			return result, fmt.Errorf("invalid document information %s", key)
+			err := fmt.Errorf("invalid document information %s", key)
+			if r.recoverAuxiliary(err) {
+				continue
+			}
+			return result, err
 		}
 		decoded, err := DecodeTextString(text)
 		if err != nil {
+			if r.recoverAuxiliary(err) {
+				continue
+			}
 			return result, err
 		}
 		switch key {
@@ -219,6 +256,18 @@ func (r *Reader) Info() (DocumentInfo, error) {
 		}
 	}
 	return result, nil
+}
+
+// recoverAuxiliary 报告辅助信息错误，输入读取、关闭及取消错误继续传递
+// 入参: err 辅助信息错误
+// 返回: bool 是否已记录并允许继续
+func (r *Reader) recoverAuxiliary(err error) bool {
+	var read *ReadError
+	if err == nil || r.warning == nil || errors.As(err, &read) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed) {
+		return false
+	}
+	r.warning(Diagnostic{Message: err.Error()})
+	return true
 }
 
 // Metadata 读取文档目录声明的元数据流，不解码XML或与信息字典合并

@@ -22,6 +22,7 @@ const formCacheLimit = 8 << 20
 // formCache 共享同次访问的解码数据，不保存调用图形状态
 type formCache struct {
 	entries map[*Stream]*formContent
+	images  map[*Stream]contentImageSamples
 	bytes   int
 }
 

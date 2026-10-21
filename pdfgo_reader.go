@@ -52,7 +52,7 @@ type Reader struct {
 }
 
 // ReaderOptions 设置密码编码、结构诊断及生成注释外观时的文字整形
-// Warning非空时允许恢复错误Size声明、异常ToUnicode及完整压缩数据缺失的Flate校验尾部，不重建对象或猜测内容
+// Warning非空时诊断并恢复可判定的对象边界、重复键、树索引、辅助信息及完整数据的缺失压缩尾部
 // ShapeText用于横排纯文本字段、列表选项及注释标题，空值不生成需要整形的外观，已有外观不受影响
 type ReaderOptions struct {
 	Password     []byte
@@ -364,8 +364,11 @@ func (r *Reader) readRange(offset, length int64) ([]byte, error) {
 		return nil, fmt.Errorf("invalid file range")
 	}
 	data := make([]byte, int(length))
-	_, err := io.ReadFull(io.NewSectionReader(r.source, offset, length), data)
-	return data, err
+	n, err := io.ReadFull(io.NewSectionReader(r.source, offset, length), data)
+	if err != nil {
+		return data, &ReadError{Offset: offset + int64(n), Err: err}
+	}
+	return data, nil
 }
 
 // parseAt 按需扩展单个对象的解析窗口，不复制整个源文件
@@ -384,14 +387,24 @@ func (r *Reader) parseAt(offset int64, parse func(*objectParser) error) error {
 		previous := len(data)
 		window := make([]byte, int(length))
 		copy(window, data)
-		if _, err := io.ReadFull(io.NewSectionReader(r.source, offset+int64(previous), length-int64(previous)), window[previous:]); err != nil {
-			return err
+		if n, err := io.ReadFull(io.NewSectionReader(r.source, offset+int64(previous), length-int64(previous)), window[previous:]); err != nil {
+			return &ReadError{Offset: offset + int64(previous+n), Err: err}
 		}
 		data = window
 		p := objectParser{data: data}
+		var warnings []Diagnostic
+		if r.warning != nil {
+			p.warning = func(d Diagnostic) {
+				d.Offset += offset
+				warnings = append(warnings, d)
+			}
+		}
 		err := parse(&p)
 		if (p.exhausted || int64(p.pos) >= length-1) && length < remaining {
 			continue
+		}
+		for _, warning := range warnings {
+			r.warning(warning)
 		}
 		var syntax *SyntaxError
 		if errors.As(err, &syntax) {
@@ -409,6 +422,8 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 	var ref Reference
 	var value Object
 	var keyword string
+	var objectEnd int
+	var boundary bool
 	err := r.parseAt(offset, func(input *objectParser) error {
 		p = *input
 		defer func() { input.pos, input.exhausted = p.pos, p.exhausted }()
@@ -423,7 +438,14 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 		if err != nil {
 			return err
 		}
+		objectEnd = p.pos
 		keyword = p.token()
+		boundary = false
+		if keyword != "endobj" && keyword != "stream" && r.warning != nil {
+			next := objectParser{data: p.data, pos: objectEnd}
+			boundary = next.objectBoundary()
+			p.exhausted = p.exhausted || next.exhausted
+		}
 		if p.pos < len(p.data) && p.data[p.pos] == '\r' {
 			p.pos++
 		}
@@ -459,7 +481,15 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 			if tail.token() != "endstream" {
 				return tail.fail("missing endstream")
 			}
+			end := tail.pos
 			if tail.token() != "endobj" {
+				if tail.warning != nil {
+					tail.pos = end
+					if tail.objectBoundary() {
+						tail.warning(Diagnostic{Offset: int64(end), Message: "missing endobj before the next object boundary"})
+						return nil
+					}
+				}
 				return tail.fail("missing endobj")
 			}
 			return nil
@@ -467,9 +497,28 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 		return ref, value, err
 	}
 	if keyword != "endobj" {
-		return ref, nil, p.fail("missing endobj")
+		if boundary {
+			r.warning(Diagnostic{Offset: offset + int64(objectEnd), Message: "missing endobj before the next object boundary"})
+			return ref, value, nil
+		}
+		return ref, nil, &SyntaxError{Offset: offset + int64(p.pos), Message: "missing endobj"}
 	}
 	return ref, value, nil
+}
+
+// objectBoundary 检查后续对象头或交叉引用边界，不解析后续对象内容
+// 返回: bool 是否位于明确的对象边界
+func (p *objectParser) objectBoundary() bool {
+	token := p.token()
+	if token == "xref" || token == "trailer" || token == "startxref" {
+		return true
+	}
+	number, err := strconv.ParseInt(token, 10, 64)
+	if err != nil || number <= 0 {
+		return false
+	}
+	generation, err := strconv.ParseInt(p.token(), 10, 64)
+	return err == nil && generation >= 0 && generation <= 65535 && p.token() == "obj"
 }
 
 // readXref 读取传统或流式交叉引用区段
@@ -680,6 +729,13 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 		return nil, fmt.Errorf("object stream index mismatch")
 	}
 	p := objectParser{data: stream.data[stream.offsets[index]:stream.offsets[index+1]]}
+	if r.warning != nil {
+		p.warning = func(d Diagnostic) {
+			d.Message = fmt.Sprintf("compressed object %d %d: %s", ref.Number, ref.Generation, d.Message)
+			d.Offset = 0
+			r.warning(d)
+		}
+	}
 	value, err := p.object()
 	if err != nil {
 		return nil, err

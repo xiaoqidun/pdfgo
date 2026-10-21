@@ -253,8 +253,11 @@ func (g *MeshGradient) sourceColorsAt(patch int, u, v float64) ([4]float64, [4][
 		weights = [4]float64{(1 - u) * (1 - v), (1 - u) * v, u * v, u * (1 - v)}
 		colors = g.Patches[patch].Colors
 	} else {
-		if u+v > 1+1e-12 {
+		if u+v > 1+1e-10 {
 			return weights, colors, fmt.Errorf("invalid triangle evaluation")
+		}
+		if sum := u + v; sum > 1 {
+			u, v = u/sum, v/sum
 		}
 		weights = [4]float64{math.Max(0, 1-u-v), u, v, 0}
 		copy(colors[:], g.Triangles[patch-len(g.Patches)].Colors[:])

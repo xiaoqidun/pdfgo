@@ -718,6 +718,7 @@ func (r *Reader) destinationParameters(array Array) (Name, Array, error) {
 		return "", nil, fmt.Errorf("%w: mode or parameter count", ErrInvalidDestination)
 	}
 	parameters := make(Array, count)
+	var coordinates [4]float64
 	for n, v := range array[2:] {
 		parameters[n], err = r.Resolve(v)
 		if err != nil {
@@ -739,7 +740,11 @@ func (r *Reader) destinationParameters(array Array) (Name, Array, error) {
 			if math.IsNaN(value) || math.IsInf(value, 0) || mode == "XYZ" && n == 2 && value < 0 {
 				return "", nil, fmt.Errorf("%w: parameter range", ErrInvalidDestination)
 			}
+			coordinates[n] = value
 		}
+	}
+	if mode == "FitR" && (coordinates[0] == coordinates[2] || coordinates[1] == coordinates[3]) {
+		return "", nil, fmt.Errorf("%w: empty rectangle", ErrInvalidDestination)
 	}
 	return mode, parameters, nil
 }

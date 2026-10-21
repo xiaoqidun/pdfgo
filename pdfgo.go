@@ -31,6 +31,12 @@ type SyntaxError struct {
 	Message string
 }
 
+// ReadError 表示输入源读取失败，Err保留原始错误
+type ReadError struct {
+	Offset int64
+	Err    error
+}
+
 // UnsupportedError 表示尚未支持的PDF能力
 type UnsupportedError struct {
 	Feature string
@@ -40,6 +46,18 @@ type UnsupportedError struct {
 // 返回: string 错误描述
 func (e *SyntaxError) Error() string {
 	return fmt.Sprintf("offset %d: %s", e.Offset, e.Message)
+}
+
+// Error 返回读取位置及原始错误
+// 返回: string 错误描述
+func (e *ReadError) Error() string {
+	return fmt.Sprintf("offset %d: %v", e.Offset, e.Err)
+}
+
+// Unwrap 返回原始读取错误
+// 返回: error 原始错误
+func (e *ReadError) Unwrap() error {
+	return e.Err
 }
 
 // Error 返回错误信息

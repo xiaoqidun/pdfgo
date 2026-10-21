@@ -27,6 +27,7 @@ type objectParser struct {
 	base      int64
 	depth     int
 	exhausted bool
+	warning   func(Diagnostic)
 }
 
 // isSpace 判断PDF空白字节
@@ -311,7 +312,10 @@ func (p *objectParser) dictionary() (Object, error) {
 		}
 		name := key.(Name)
 		if _, exists := value[name]; exists {
-			return nil, p.fail("duplicate dictionary key")
+			if p.warning == nil {
+				return nil, p.fail("duplicate dictionary key")
+			}
+			p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "duplicate dictionary key " + string(name) + "; last value retained"})
 		}
 		entry, err := p.object()
 		if err != nil {

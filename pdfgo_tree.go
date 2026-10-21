@@ -17,9 +17,11 @@ package pdfgo
 import (
 	"context"
 	"fmt"
+	"reflect"
 )
 
 // WalkNameTree 按节点顺序访问名称树，名称保留原始字节，值不预先解析
+// 配置Warning时诊断直接子字典、重复键及重复节点，重复节点仅访问一次
 // 入参: ctx 取消上下文, root 名称树根, visit 名称和值的访问函数
 // 返回: error 结构、重复名称、循环或访问错误
 func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(string, Object) error) error {
@@ -31,6 +33,7 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 		return err
 	}
 	seen := map[Reference]bool{}
+	dictionaries := map[uintptr]Dictionary{}
 	names := map[string]bool{}
 	stack := []Array{{root}}
 	for len(stack) > 0 {
@@ -46,7 +49,11 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 		*top = (*top)[1:]
 		if ref, ok := object.(Reference); ok {
 			if seen[ref] {
-				return fmt.Errorf("repeated name tree node")
+				err := fmt.Errorf("repeated name tree node")
+				if !r.recoverAuxiliary(err) {
+					return err
+				}
+				continue
 			}
 			seen[ref] = true
 		}
@@ -58,6 +65,15 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 		if !ok {
 			return fmt.Errorf("invalid name tree node")
 		}
+		identity := reflect.ValueOf(node).Pointer()
+		if _, seen := dictionaries[identity]; seen {
+			err := fmt.Errorf("repeated name tree node")
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			continue
+		}
+		dictionaries[identity] = node
 		value, err = r.Resolve(node["Names"])
 		if err != nil {
 			return err
@@ -81,7 +97,10 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 				}
 				key := string(name)
 				if names[key] {
-					return fmt.Errorf("duplicate name tree key")
+					err := fmt.Errorf("duplicate name tree key")
+					if !r.recoverAuxiliary(err) {
+						return err
+					}
 				}
 				names[key] = true
 				if err := visit(key, pairs[i+1]); err != nil {
@@ -100,7 +119,10 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 			}
 			for _, kid := range kids {
 				if _, ok := kid.(Reference); !ok {
-					return fmt.Errorf("name tree child is not indirect")
+					err := fmt.Errorf("name tree child is not indirect")
+					if _, direct := kid.(Dictionary); !direct || !r.recoverAuxiliary(err) {
+						return err
+					}
 				}
 			}
 			stack = append(stack, kids)
@@ -109,7 +131,8 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 	return ctx.Err()
 }
 
-// WalkNumberTree 按键递增访问数字树，值不预先解析
+// WalkNumberTree 按节点顺序访问数字树并验证键递增，值不预先解析
+// 配置Warning时诊断直接子字典、键顺序和Limits错误，保留访问顺序及所有键值
 // 入参: ctx 取消上下文, root 数字树根, visit 数字键和值的访问函数
 // 返回: error 结构、重复键、循环或访问错误
 func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int64, Object) error) error {
@@ -121,17 +144,19 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 		return err
 	}
 	type frame struct {
-		object  Object
-		kids    Array
-		next    int
-		entered bool
-		first   int64
-		last    int64
-		hasKeys bool
-		limits  [2]int64
+		object      Object
+		kids        Array
+		next        int
+		entered     bool
+		first       int64
+		last        int64
+		hasKeys     bool
+		limits      [2]int64
+		validLimits bool
 	}
 	stack := []frame{{object: root}}
 	seen := make(map[Reference]bool)
+	dictionaries := make(map[uintptr]Dictionary)
 	var previous int64
 	hasPrevious := false
 	for len(stack) != 0 {
@@ -144,20 +169,28 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 				object := current.kids[current.next]
 				current.next++
 				if _, ok := object.(Reference); !ok {
-					return fmt.Errorf("number tree child is not indirect")
+					err := fmt.Errorf("number tree child is not indirect")
+					if _, direct := object.(Dictionary); !direct || !r.recoverAuxiliary(err) {
+						return err
+					}
 				}
 				stack = append(stack, frame{object: object})
 				continue
 			}
 			if len(stack) > 1 {
-				if !current.hasKeys || current.limits != [2]int64{current.first, current.last} {
-					return fmt.Errorf("number tree limits do not match keys")
+				if !current.hasKeys || current.validLimits && current.limits != [2]int64{current.first, current.last} {
+					err := fmt.Errorf("number tree limits do not match keys")
+					if !r.recoverAuxiliary(err) {
+						return err
+					}
 				}
 				parent := &stack[len(stack)-2]
-				if !parent.hasKeys {
-					parent.first, parent.hasKeys = current.first, true
+				if current.hasKeys {
+					if !parent.hasKeys {
+						parent.first, parent.hasKeys = current.first, true
+					}
+					parent.last = current.last
 				}
-				parent.last = current.last
 			}
 			stack = stack[:len(stack)-1]
 			continue
@@ -165,7 +198,12 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 		object := current.object
 		if ref, ok := object.(Reference); ok {
 			if seen[ref] {
-				return fmt.Errorf("repeated number tree node")
+				err := fmt.Errorf("repeated number tree node")
+				if !r.recoverAuxiliary(err) {
+					return err
+				}
+				stack = stack[:len(stack)-1]
+				continue
 			}
 			seen[ref] = true
 		}
@@ -177,19 +215,37 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 		if !ok {
 			return fmt.Errorf("invalid number tree node")
 		}
+		identity := reflect.ValueOf(node).Pointer()
+		if _, seen := dictionaries[identity]; seen {
+			err := fmt.Errorf("repeated number tree node")
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		dictionaries[identity] = node
 		value, err = r.Resolve(node["Limits"])
 		if err != nil {
 			return err
 		}
 		if len(stack) == 1 {
 			if value != nil {
-				return fmt.Errorf("number tree root contains limits")
+				err := fmt.Errorf("number tree root contains limits")
+				if !r.recoverAuxiliary(err) {
+					return err
+				}
 			}
 		} else {
 			limits, ok := value.(Array)
 			if !ok || len(limits) != 2 {
-				return fmt.Errorf("invalid number tree limits")
+				err := fmt.Errorf("invalid number tree limits")
+				if !r.recoverAuxiliary(err) {
+					return err
+				}
+				limits = nil
 			}
+			current.validLimits = len(limits) == 2
 			for index, object := range limits {
 				value, err := r.Resolve(object)
 				if err != nil {
@@ -197,12 +253,21 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 				}
 				key, ok := value.(Integer)
 				if !ok {
-					return fmt.Errorf("invalid number tree limit key")
+					err := fmt.Errorf("invalid number tree limit key")
+					if !r.recoverAuxiliary(err) {
+						return err
+					}
+					current.validLimits = false
+					continue
 				}
 				current.limits[index] = int64(key)
 			}
-			if current.limits[0] > current.limits[1] {
-				return fmt.Errorf("invalid number tree limits order")
+			if current.validLimits && current.limits[0] > current.limits[1] {
+				err := fmt.Errorf("invalid number tree limits order")
+				if !r.recoverAuxiliary(err) {
+					return err
+				}
+				current.validLimits = false
 			}
 		}
 		pairs, err := r.Resolve(node["Nums"])
@@ -230,8 +295,14 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 					return err
 				}
 				key, ok := value.(Integer)
-				if !ok || hasPrevious && int64(key) <= previous {
-					return fmt.Errorf("invalid number tree key order")
+				if !ok {
+					return fmt.Errorf("invalid number tree key")
+				}
+				if hasPrevious && int64(key) <= previous {
+					err := fmt.Errorf("invalid number tree key order")
+					if !r.recoverAuxiliary(err) {
+						return err
+					}
 				}
 				previous, hasPrevious = int64(key), true
 				if !current.hasKeys {

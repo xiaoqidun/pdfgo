@@ -626,10 +626,33 @@ func (p *pageInterpreter) run(data []byte) error {
 		return err
 	}
 	if len(p.stack) != 0 || p.inText || len(p.marked) != 0 {
-		return fmt.Errorf("unbalanced graphics, text or marked content state")
+		if p.visitor.Warning == nil {
+			return fmt.Errorf("unbalanced graphics, text or marked content state")
+		}
+		p.visitor.Warning(Diagnostic{Offset: int64(len(data)), Message: "unbalanced graphics, text or marked content state at content end; completed painting retained"})
+		if err := p.ctx.Err(); err != nil {
+			return err
+		}
+		if p.inText {
+			if err := p.operation(Operation{Operator: "ET", Offset: int64(len(data))}); err != nil {
+				return err
+			}
+		}
+		for len(p.marked) != 0 {
+			if err := p.markedContent(Operation{Operator: "EMC", Offset: int64(len(data))}); err != nil {
+				return err
+			}
+		}
+		if len(p.stack) != 0 {
+			p.state = p.stack[0]
+			p.stack = nil
+		}
 	}
 	if p.compatibility != 0 {
 		return fmt.Errorf("unbalanced compatibility section")
+	}
+	if err := p.ctx.Err(); err != nil {
+		return err
 	}
 	if p.content != nil {
 		p.content.parsed = true
@@ -935,6 +958,16 @@ func (p *pageInterpreter) operation(op Operation) error {
 		stroke := op.Operator == "S" || op.Operator == "s" || op.Operator == "B" || op.Operator == "B*" || op.Operator == "b" || op.Operator == "b*"
 		p.path.EvenOdd = op.Operator == "f*" || op.Operator == "B*" || op.Operator == "b*"
 		fill, stroke = p.visiblePaint(fill, stroke)
+		if (fill || stroke) && len(p.path.Segments) != 0 && !p.hasPoint {
+			if p.visitor.Warning == nil {
+				return fmt.Errorf("empty painted path")
+			}
+			p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: "empty painted path ignored"})
+			if err := p.ctx.Err(); err != nil {
+				return err
+			}
+			fill, stroke = false, false
+		}
 		if (fill || stroke) && len(p.path.Segments) > 0 {
 			if err := p.validatePaint(fill, stroke); err != nil {
 				return err
@@ -1589,6 +1622,9 @@ func (p *pageInterpreter) image(stream *Stream) error {
 		}
 	}
 	image.Warning = p.visitor.Warning
+	if err := p.recoverLZWImage(image); err != nil {
+		return err
+	}
 	return p.visitor.Image(ImageMark{Sequence: p.sequence, Image: image, Matrix: p.state.matrix, Style: style})
 }
 
