@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"strings"
 )
 
 // contentImageSamples 缓存独立图像样本流及是否恢复了缺失的结束码
@@ -174,11 +175,28 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 		p.pos++
 	}
 	p.pos++
-	aliases := map[Name]Name{"G": "DeviceGray", "RGB": "DeviceRGB", "CMYK": "DeviceCMYK", "I": "Indexed", "AHx": "ASCIIHexDecode", "A85": "ASCII85Decode", "LZW": "LZWDecode", "Fl": "FlateDecode", "RL": "RunLengthDecode", "CCF": "CCITTFaxDecode", "DCT": "DCTDecode"}
+	aliases := map[Name]Name{"G": "DeviceGray", "RGB": "DeviceRGB", "CMYK": "DeviceCMYK", "I": "Indexed"}
 	expand := func(value Object) Object {
 		if name, ok := value.(Name); ok {
 			if full, ok := aliases[name]; ok {
 				return full
+			}
+			if full, ok := streamFilterAliases[name]; ok {
+				return full
+			}
+			if p.warning != nil {
+				for alias, full := range aliases {
+					if strings.EqualFold(string(name), string(alias)) {
+						p.warning(Diagnostic{Offset: int64(p.pos), Message: "inline image abbreviation case normalized: " + string(name)})
+						return full
+					}
+				}
+				for alias, full := range streamFilterAliases {
+					if strings.EqualFold(string(name), string(alias)) {
+						p.warning(Diagnostic{Offset: int64(p.pos), Message: "inline image abbreviation case normalized: " + string(name)})
+						return full
+					}
+				}
 			}
 		}
 		return value
@@ -218,7 +236,7 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 	} else if filters[0] == Name("CCITTFaxDecode") {
 		length, err = inlineCCITTLength(data, dict, params[0])
 	} else {
-		length, err = inlineFilterLength(data, filters[0].(Name), params[0])
+		length, err = inlineFilterLength(data, filters[0].(Name), params[0], p.warning)
 	}
 	if err != nil {
 		return nil, err
@@ -229,7 +247,10 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 	stream.Data = data[:length]
 	p.pos += length
 	if p.pos == len(p.data) || !isSpace(p.data[p.pos]) {
-		return nil, p.fail("missing inline image end separator")
+		if p.warning == nil || !bytes.HasPrefix(p.data[p.pos:], []byte("EI")) || p.pos+2 < len(p.data) && !isDelimiter(p.data[p.pos+2]) {
+			return nil, p.fail("missing inline image end separator")
+		}
+		p.warning(Diagnostic{Offset: int64(p.pos), Message: "inline image end separator missing; encoded data boundary retained"})
 	}
 	p.skipSpace()
 	if p.token() != "EI" {
@@ -334,9 +355,9 @@ func inlineSampleLength(dict Dictionary) (int, error) {
 }
 
 // inlineFilterLength 根据首层过滤器的结束标记定位压缩数据末尾
-// 入参: data 内容流余下数据, filter 过滤器名称, params 解码参数
+// 入参: data 内容流余下数据, filter 过滤器名称, params 解码参数, warning 可恢复诊断
 // 返回: int 压缩字节数, error 无效或未支持的编码
-func inlineFilterLength(data []byte, filter Name, params Object) (int, error) {
+func inlineFilterLength(data []byte, filter Name, params Object, warning func(Diagnostic)) (int, error) {
 	switch filter {
 	case "FlateDecode":
 		r := bytes.NewReader(data)
@@ -346,6 +367,10 @@ func inlineFilterLength(data []byte, filter Name, params Object) (int, error) {
 		}
 		_, err = io.Copy(io.Discard, z)
 		closeErr := z.Close()
+		if errors.Is(err, zlib.ErrChecksum) && warning != nil {
+			warning(Diagnostic{Message: "inline Flate checksum mismatch; complete compressed data retained"})
+			err = nil
+		}
 		if err != nil {
 			return 0, err
 		}

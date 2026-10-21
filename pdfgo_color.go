@@ -303,9 +303,22 @@ func (r *Reader) readCalRGB(object Object) (*calRGBSpace, error) {
 	if white[0] <= 0 || white[1] != 1 || white[2] <= 0 || s.gamma[0] <= 0 || s.gamma[1] <= 0 || s.gamma[2] <= 0 {
 		return nil, fmt.Errorf("invalid CalRGB white point or gamma")
 	}
+	compatibleBlack := false
 	for n, value := range black {
-		if value < 0 || value == white[n] {
+		if value < 0 || value == white[n] && r.warning == nil {
 			return nil, fmt.Errorf("invalid CalRGB black point")
+		}
+		compatibleBlack = compatibleBlack || r.warning != nil && value >= white[n]
+	}
+	if compatibleBlack {
+		if err := s.compatibleBlackPoint(white, black); err != nil {
+			return nil, err
+		}
+		r.warning(Diagnostic{Message: "CalRGB black point recovered using finite normalized luminance compensation"})
+	}
+	for n, value := range black {
+		if compatibleBlack {
+			break
 		}
 		if value != 0 {
 			scale := white[n] / (white[n] - value)
@@ -324,6 +337,60 @@ func (r *Reader) readCalRGB(object Object) (*calRGBSpace, error) {
 		s.adapt[n] = target[n] / source[n]
 	}
 	return s, nil
+}
+
+// compatibleBlackPoint 按浏览器的归一化亮度解释恢复奇异黑点，保留矩阵与仿射偏移
+// 入参: white 源白点, black 有限非负黑点
+// 返回: error 不可逆或非有限补偿错误
+func (s *calRGBSpace) compatibleBlackPoint(white, black [3]float64) error {
+	cone := bradford(white)
+	d65 := [3]float64{.95047, 1, 1.08883}
+	target := bradford(d65)
+	var normalize, restore, scale, offset [3]float64
+	for i, value := range black {
+		if cone[i] <= 0 {
+			return fmt.Errorf("invalid CalRGB white point")
+		}
+		normalize[i] = 1 / white[i]
+		restore[i] = cone[i] * d65[i] / target[i]
+		decoded := value * 27 / 24389
+		if value > 8 {
+			decoded = math.Pow((value+16)/116, 3)
+		}
+		if decoded >= 1 {
+			return fmt.Errorf("invalid CalRGB black point")
+		}
+		scale[i] = 1 / (1 - decoded)
+		offset[i] = 1 - scale[i]
+	}
+	for column := 0; column < 3; column++ {
+		value := calRGBAdapt([3]float64(s.matrix[3*column:3*column+3]), normalize)
+		for i := range value {
+			value[i] *= scale[i]
+		}
+		value = calRGBAdapt(value, restore)
+		copy(s.matrix[3*column:3*column+3], value[:])
+	}
+	s.offset = calRGBAdapt(offset, restore)
+	for _, values := range [][]float64{s.matrix[:], s.offset[:]} {
+		for _, value := range values {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return fmt.Errorf("invalid CalRGB black point compensation")
+			}
+		}
+	}
+	return nil
+}
+
+// calRGBAdapt 在锥体响应空间执行对角变换，返回未截断的XYZ分量
+// 入参: xyz 源色度, scale 锥体响应比例
+// 返回: [3]float64 目标色度
+func calRGBAdapt(xyz, scale [3]float64) [3]float64 {
+	cone := bradford(xyz)
+	for i := range cone {
+		cone[i] *= scale[i]
+	}
+	return [3]float64{.9869929*cone[0] - .1470543*cone[1] + .1599627*cone[2], .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2], -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]}
 }
 
 // bradford 将XYZ变换到用于白点适应的锥体响应空间

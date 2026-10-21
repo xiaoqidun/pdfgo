@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // calculatorStackSize 采用PDF要求至少支持的百项操作数栈容量
@@ -43,6 +44,35 @@ type calculatorInstruction struct {
 	op       string
 	value    calculatorValue
 	branches [][]calculatorInstruction
+}
+
+// calculatorFunction 保存编译代码和单次兼容诊断，不改变严格求值器的类型规则
+type calculatorFunction struct {
+	program []calculatorInstruction
+	warning func(Diagnostic)
+	once    sync.Once
+}
+
+// newCalculatorFunction 编译函数并绑定本次阅读器的兼容策略
+// 入参: data 函数字节, warning 兼容诊断，空值保持严格校验
+// 返回: *calculatorFunction 函数, error 语法错误
+func newCalculatorFunction(data []byte, warning func(Diagnostic)) (*calculatorFunction, error) {
+	program, err := compileCalculator(data)
+	if err != nil {
+		return nil, err
+	}
+	return &calculatorFunction{program: program, warning: warning}, nil
+}
+
+// evaluate 求值计算器，仅对确定的整数值和栈顶输出进行有界兼容
+// 入参: input 输入值, output 输出缓冲区
+// 返回: error 类型、算术或栈错误
+func (f *calculatorFunction) evaluate(input, output []float64) error {
+	return evaluateCalculatorRecovery(f.program, input, output, f.warning != nil, func() {
+		f.once.Do(func() {
+			f.warning(Diagnostic{Message: "calculator integral real operands or excess stack values recovered using declared outputs"})
+		})
+	})
 }
 
 // compileCalculator 按PDF语法编译计算器函数，不将条件代码块作为可操作对象
@@ -130,6 +160,13 @@ func compileCalculator(data []byte) ([]calculatorInstruction, error) {
 // 入参: program 指令序列, input 输入值, output 输出缓冲区
 // 返回: error 类型、算术或栈错误
 func evaluateCalculator(program []calculatorInstruction, input, output []float64) error {
+	return evaluateCalculatorRecovery(program, input, output, false, nil)
+}
+
+// evaluateCalculatorRecovery 执行计算器，兼容时仅接纳范围内整数值及多余的底层栈项
+// 入参: program 指令, input 输入, output 输出, compatible 是否兼容, recovered 恢复诊断
+// 返回: error 类型、算术或栈错误
+func evaluateCalculatorRecovery(program []calculatorInstruction, input, output []float64, compatible bool, recovered func()) error {
 	if len(input) > calculatorStackSize {
 		return fmt.Errorf("calculator stack overflow")
 	}
@@ -218,15 +255,33 @@ func evaluateCalculator(program []calculatorInstruction, input, output []float64
 				slices.Reverse(values[offset:])
 			}
 		default:
-			value, err := calculatorOperation(op, stack[n-required:])
+			operands := stack[n-required:]
+			if compatible && (op == "mod" || op == "idiv") {
+				valid, changed := true, false
+				for _, value := range operands {
+					valid = valid && value.kind != calculatorBooleanKind && value.number >= math.MinInt32 && value.number <= math.MaxInt32 && value.number == math.Trunc(value.number)
+					changed = changed || value.kind != calculatorIntegerKind
+				}
+				if valid && changed {
+					for i := range operands {
+						operands[i] = calculatorInteger(int64(operands[i].number))
+					}
+					recovered()
+				}
+			}
+			value, err := calculatorOperation(op, operands)
 			if err != nil {
 				return err
 			}
 			stack = append(stack[:n-required], value)
 		}
 	}
-	if len(stack) != len(output) {
+	if len(stack) < len(output) || !compatible && len(stack) != len(output) {
 		return fmt.Errorf("invalid calculator result count")
+	}
+	if len(stack) > len(output) {
+		stack = stack[len(stack)-len(output):]
+		recovered()
 	}
 	for i, value := range stack {
 		n, ok := calculatorNumber(value)

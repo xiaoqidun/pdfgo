@@ -16,10 +16,14 @@ package pdfgo
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 )
+
+// errMissingHalftoneThreshold 标识缺失阈值流，不混淆引用、网屏类型或解码错误
+var errMissingHalftoneThreshold = errors.New("missing halftone threshold stream")
 
 // Halftone 保存设备空间半色调定义，连续色调显示不需要网屏化
 // Thresholds保持标准中的数组顺序，类型16使用高位优先的16位阈值
@@ -98,6 +102,45 @@ func (h *Halftone) namedOverride(named map[string]*Halftone) bool {
 		}
 	}
 	return false
+}
+
+// displayHalftone 在连续色调解释中恢复缺失阈值流，不丢弃有效的传递函数
+// 入参: object 网屏定义
+// 返回: *Halftone 网屏或连续色调缺省, error 严格校验、函数或取消错误
+func (p *pageInterpreter) displayHalftone(object Object) (*Halftone, error) {
+	h, cause := p.reader.ReadHalftoneForDevice(object, p.visitor.Halftones)
+	if cause == nil || p.visitor.Warning == nil || !errors.Is(cause, errMissingHalftoneThreshold) {
+		return h, cause
+	}
+	if err := p.ctx.Err(); err != nil {
+		return nil, err
+	}
+	value, err := p.reader.Resolve(object)
+	if err != nil {
+		return nil, err
+	}
+	dict, ok := value.(Dictionary)
+	if !ok {
+		return nil, cause
+	}
+	kind, err := p.reader.Resolve(dict["HalftoneType"])
+	if err != nil {
+		return nil, err
+	}
+	if kind != Integer(6) && kind != Integer(10) && kind != Integer(16) {
+		return nil, cause
+	}
+	transfer, err := p.reader.Resolve(dict["TransferFunction"])
+	if err != nil {
+		return nil, err
+	}
+	h = &Halftone{Type: int(kind.(Integer)), Dictionary: dict, TransferFunction: transfer, reader: p.reader}
+	identity, err := h.IdentityTransfer(p.reader)
+	if err != nil || !identity {
+		return nil, cause
+	}
+	p.visitor.Warning(Diagnostic{Message: "missing halftone threshold stream unused by continuous-tone display; identity transfer retained"})
+	return nil, p.ctx.Err()
 }
 
 // readHalftone 读取单色或分量网屏，禁止嵌套类型5
@@ -220,7 +263,7 @@ func (r *Reader) readHalftone(object Object, component bool, named map[string]*H
 		return nil, &UnsupportedError{Feature: fmt.Sprintf("halftone type %d", kind)}
 	}
 	if !isStream {
-		return nil, fmt.Errorf("missing halftone threshold stream")
+		return nil, errMissingHalftoneThreshold
 	}
 	fields := []struct {
 		key    Name

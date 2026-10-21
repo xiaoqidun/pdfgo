@@ -382,7 +382,10 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 		return nil, err
 	}
 	if width != i.Width || height != i.Height {
-		return nil, fmt.Errorf("JPEG2000 dimensions differ from image dictionary")
+		if i.Warning == nil {
+			return nil, fmt.Errorf("JPEG2000 dimensions differ from image dictionary")
+		}
+		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG2000 dimensions differ from image dictionary; using image data dimensions %dx%d", width, height)})
 	}
 	count := 3
 	if cmyk {
@@ -420,6 +423,15 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 		options.Warning = func(err error) { i.Warning(Diagnostic{Message: err.Error()}) }
 	}
 	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), options)
+	if err != nil && i.Warning != nil && ctx.Err() == nil {
+		end := bytes.LastIndex(stream, []byte{255, 217}) + 2
+		if end > 2 && end < len(stream) {
+			if recovered, recoveredErr := j2kgo.NewDecoder(ctx, bytes.NewReader(stream[:end]), nil); recoveredErr == nil {
+				i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG2000 has %d trailing bytes after a complete EOC; retaining all validated tile-parts", len(stream)-end)})
+				decoder, err = recovered, nil
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

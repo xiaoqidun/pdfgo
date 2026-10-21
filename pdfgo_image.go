@@ -16,12 +16,14 @@ package pdfgo
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"fmt"
 	"hash/maphash"
 	"image"
 	"image/color"
 	"io"
+	"maps"
 	"math"
 
 	"github.com/xiaoqidun/jbig2"
@@ -31,7 +33,7 @@ import (
 var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 
 // Image 保存图像有效属性及原始数据流，颜色空间和遮罩使用PDF对象
-// Warning非空时允许恢复多余样本、完整压缩数据缺失的Flate校验尾部、JPEG2000分段总数及TLM索引不一致，并报告原因
+// Warning非空时允许恢复完整图像的尺寸、Decode、遮罩及编码封装差异，并报告原因
 // Intent为空时继承绘图状态，单独解码使用相对色度
 type Image struct {
 	Width               int
@@ -190,10 +192,20 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	data := make([]byte, 0, len(jbig2FileHeader)+len(globals)+len(encoded))
-	data = append(data, jbig2FileHeader...)
-	data = append(data, globals...)
-	data = append(data, encoded...)
+	data := encoded
+	if bytes.HasPrefix(encoded, jbig2FileHeader[:8]) {
+		if len(globals) != 0 {
+			return nil, nil
+		}
+		if i.Warning != nil {
+			i.Warning(Diagnostic{Message: "JBIG2 image already has a complete file header; preserving original file without a second header"})
+		}
+	} else {
+		data = make([]byte, 0, len(jbig2FileHeader)+len(globals)+len(encoded))
+		data = append(data, jbig2FileHeader...)
+		data = append(data, globals...)
+		data = append(data, encoded...)
+	}
 	config, err := jbig2.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
@@ -270,16 +282,23 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		}
 		return int64(n), nil
 	}
-	w, err := readInteger("Width")
-	if err != nil {
-		return nil, err
-	}
-	h, err := readInteger("Height")
-	if err != nil {
-		return nil, err
-	}
-	if w <= 0 || h <= 0 || uint64(w) > uint64(^uint(0)>>1) || uint64(h) > uint64(^uint(0)>>1) {
-		return nil, fmt.Errorf("invalid image dimensions or platform integer overflow")
+	w, widthErr := readInteger("Width")
+	h, heightErr := readInteger("Height")
+	if widthErr != nil || heightErr != nil || w <= 0 || h <= 0 || uint64(w) > uint64(^uint(0)>>1) || uint64(h) > uint64(^uint(0)>>1) {
+		width, height, encodedErr := 0, 0, fmt.Errorf("image dimensions unavailable")
+		if r.warning != nil {
+			width, height, encodedErr = r.encodedImageDimensions(stream)
+		}
+		if encodedErr == nil && width > 0 && height > 0 {
+			w, h = int64(width), int64(height)
+			r.warning(Diagnostic{Message: fmt.Sprintf("invalid image dictionary dimensions; using encoded image dimensions %dx%d", width, height)})
+		} else if widthErr != nil {
+			return nil, widthErr
+		} else if heightErr != nil {
+			return nil, heightErr
+		} else {
+			return nil, fmt.Errorf("invalid image dimensions or platform integer overflow")
+		}
 	}
 	maskObject, err := r.Resolve(dict["ImageMask"])
 	if err != nil {
@@ -661,10 +680,14 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	if terminal == "" || len(filters) != 0 {
 		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data}).decodeContext(ctx, i.Warning)
 		if err != nil {
+			if terminal == "" {
+				return i.recoverArrayPredictorSamplesContext(ctx, filters, parameters, err)
+			}
 			return nil, err
 		}
 	}
 	var result image.Image
+	dimensionsRecovered := false
 	switch terminal {
 	case "CCITTFaxDecode":
 		result, err = i.ccittSamplesContext(ctx, data, terminalParams)
@@ -706,6 +729,21 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 		if err != nil {
 			return nil, err
 		}
+		bounds := result.Bounds()
+		if i.Warning != nil && (bounds.Dx() != i.Width || bounds.Dy() != i.Height) {
+			info, ok := decoder.GetDocument().GetPageInfo(0)
+			if !ok || uint64(info.Width) != uint64(bounds.Dx()) || uint64(info.Height) != uint64(bounds.Dy()) {
+				return nil, fmt.Errorf("JBIG2 decoded dimensions differ from coded page information")
+			}
+			if bounds.Dx() <= 0 || bounds.Dy() <= 0 || bounds.Dx() > jpegRecoveryPixelLimit/bounds.Dy() {
+				return nil, fmt.Errorf("JBIG2 dimension recovery exceeds sample budget")
+			}
+			if err := jbig2SinglePageContext(ctx, data); err != nil {
+				return nil, err
+			}
+			i.Warning(Diagnostic{Message: fmt.Sprintf("JBIG2 dimensions differ from image dictionary %dx%d; retaining complete coded image dimensions %dx%d", i.Width, i.Height, bounds.Dx(), bounds.Dy())})
+			dimensionsRecovered = true
+		}
 	case "JPXDecode":
 		cmyk := i.ColorSpace == Name("DeviceCMYK")
 		result, err = i.jpxSamplesRowsContext(ctx, data, cmyk, size, rows)
@@ -718,10 +756,157 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	if err != nil {
 		return nil, err
 	}
-	if (terminal != "JPXDecode" || size.X <= 0 || size.Y <= 0) && (result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height) {
+	if !dimensionsRecovered && (terminal != "JPXDecode" || size.X <= 0 || size.Y <= 0) && (result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height) && (i.Warning == nil || terminal != "DCTDecode" && terminal != "JPXDecode") {
 		return nil, fmt.Errorf("decoded image dimensions differ from dictionary")
 	}
 	return result, nil
+}
+
+// recoverArrayPredictorSamplesContext 仅在无效参数数组的PNG预测失败且原始样本完整时恢复单层Flate图像
+// 入参: ctx 取消上下文, filters 生效过滤器, parameters 已解析参数, originalErr 原解码错误
+// 返回: image.Image 精确尺寸的原始样本, error 原错误、校验或取消错误
+func (i *Image) recoverArrayPredictorSamplesContext(ctx context.Context, filters, parameters Array, originalErr error) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if i.Warning == nil || i.reader == nil || len(filters) != 1 || filters[0] != Name("FlateDecode") || len(parameters) != 1 {
+		return nil, originalErr
+	}
+	filter, err := i.reader.Resolve(i.Stream.Dictionary["Filter"])
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := filter.(Name); !ok {
+		return nil, originalErr
+	}
+	value, err := i.reader.Resolve(i.Stream.Dictionary["DecodeParms"])
+	if err != nil {
+		return nil, err
+	}
+	array, ok := value.(Array)
+	if !ok || len(array) != 1 {
+		return nil, originalErr
+	}
+	params, ok := parameters[0].(Dictionary)
+	if !ok {
+		return nil, originalErr
+	}
+	predictor, err := integerDefault(params, "Predictor", 1)
+	if err != nil || predictor < 10 || predictor > 15 {
+		return nil, originalErr
+	}
+	components, err := i.ColorSpaceComponents()
+	if err != nil {
+		return nil, err
+	}
+	for key, expected := range map[Name]int{"Columns": i.Width, "Colors": components, "BitsPerComponent": i.BitsPerComponent} {
+		fallback := int64(1)
+		if key == "BitsPerComponent" {
+			fallback = 8
+		}
+		actual, err := integerDefault(params, key, fallback)
+		if err != nil || actual != int64(expected) {
+			return nil, originalErr
+		}
+	}
+	stride, expected, err := imageSampleSize(i.Width, i.Height, components, i.BitsPerComponent)
+	if err != nil || expected >= imageBufferLimit() {
+		return nil, originalErr
+	}
+	decoder, err := zlib.NewReader(bytes.NewReader(i.Stream.Data))
+	if err != nil {
+		return nil, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: decoder}, int64(expected)+1))
+	closeErr := decoder.Close()
+	if canceled := ctx.Err(); canceled != nil {
+		return nil, canceled
+	}
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if len(raw) != expected {
+		return nil, originalErr
+	}
+	invalidFilter := false
+	for position := 0; position < len(raw); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if raw[position] > 4 {
+			invalidFilter = true
+			break
+		}
+		if len(raw)-position <= stride+1 {
+			break
+		}
+		position += stride + 1
+	}
+	if !invalidFilter {
+		return nil, originalErr
+	}
+	validation := *i
+	validation.Warning = nil
+	samples, err := validation.rawSamples(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	i.Warning(Diagnostic{Message: fmt.Sprintf("image Filter is a Name but DecodeParms is an array; PNG predictor failed, retaining complete unpredicted samples %dx%d with %d components at %d bits", i.Width, i.Height, components, i.BitsPerComponent)})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return samples, nil
+}
+
+// jbig2SinglePageContext 仅解析段头验证完整单页边界，不为后续页面分配像素
+// 入参: ctx 取消上下文, data 顺序组织的文件或嵌入段数据
+// 返回: error 不完整段、多页、未知段长度或取消错误
+func jbig2SinglePageContext(ctx context.Context, data []byte) error {
+	if bytes.HasPrefix(data, jbig2FileHeader[:8]) {
+		if len(data) < 9 || data[8]&1 == 0 {
+			return fmt.Errorf("JBIG2 dimension recovery requires sequential segments")
+		}
+		offset := 9
+		if data[8]&2 == 0 {
+			offset = 13
+		}
+		if len(data) < offset {
+			return io.ErrUnexpectedEOF
+		}
+		data = data[offset:]
+	}
+	pages := 0
+	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		segment := jbig2.NewSegment()
+		parser := jbig2.NewDocument(data, nil, false, false)
+		if parser.ParseSegmentHeader(segment) != jbig2.ResultSuccess || segment.DataLength == ^uint32(0) {
+			return fmt.Errorf("JBIG2 dimension recovery requires complete explicit segment lengths")
+		}
+		end := uint64(segment.DataOffset) + uint64(segment.DataLength)
+		if end == 0 || end > uint64(len(data)) {
+			return io.ErrUnexpectedEOF
+		}
+		if segment.Flags.Type == 48 {
+			pages++
+			if pages > 1 {
+				return fmt.Errorf("JBIG2 dimension recovery requires a complete single page")
+			}
+		}
+		if segment.Flags.Type == 51 && end != uint64(len(data)) {
+			return fmt.Errorf("JBIG2 has data after the end-of-file segment")
+		}
+		data = data[int(end):]
+	}
+	if pages != 1 {
+		return fmt.Errorf("JBIG2 dimension recovery requires one coded page")
+	}
+	return ctx.Err()
 }
 
 // RGBA 返回不透明的设备色预览，原始分量由图像解码流程解释
@@ -959,7 +1144,16 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	}
 	if len(decode) != 0 {
 		if len(decode) != len(ranges) {
-			return nil, fmt.Errorf("invalid image Decode array")
+			if i.Warning == nil {
+				return nil, fmt.Errorf("invalid image Decode array")
+			}
+			if len(decode) < len(ranges) {
+				i.Warning(Diagnostic{Message: "image Decode array too short; using default component ranges"})
+				decode = nil
+			} else {
+				i.Warning(Diagnostic{Message: "image Decode array too long; retaining declared color component ranges"})
+				decode = decode[:len(ranges)]
+			}
 		}
 		for n, value := range decode {
 			v, err := i.reader.number(value)
@@ -1712,6 +1906,23 @@ func (i *Image) decodeMaskRows(ctx context.Context, components int, rows *imageR
 		}
 		return nil, values, false, nil, nil
 	}
+	if i.Warning != nil {
+		if stream, ok := object.(*Stream); ok && stream != nil {
+			copyStream := *stream
+			copyStream.Dictionary = maps.Clone(stream.Dictionary)
+			for key, fallback := range map[Name]int{"Width": i.Width, "Height": i.Height} {
+				value, err := i.reader.Resolve(stream.Dictionary[key])
+				if err != nil {
+					return nil, nil, false, nil, err
+				}
+				if n, ok := value.(Integer); !ok || n <= 0 {
+					copyStream.Dictionary[key] = Integer(fallback)
+					i.Warning(Diagnostic{Message: fmt.Sprintf("invalid image mask %s; using parent dimension %d", key, fallback)})
+				}
+			}
+			object = &copyStream
+		}
+	}
 	mask, err := i.reader.ReadImage(object)
 	if err != nil {
 		return nil, nil, false, nil, err
@@ -1762,6 +1973,18 @@ func (i *Image) maskObject() (Object, bool, error) {
 		return nil, false, nil
 	}
 	object, err = i.reader.Resolve(i.Mask)
+	if err == nil && i.Warning != nil {
+		if stream, ok := object.(*Stream); ok && stream != nil {
+			flag, resolveErr := i.reader.Resolve(stream.Dictionary["ImageMask"])
+			if resolveErr != nil {
+				return nil, false, resolveErr
+			}
+			if flag != Boolean(true) {
+				i.Warning(Diagnostic{Message: "ignoring image Mask stream without ImageMask, as required by display semantics"})
+				return nil, false, nil
+			}
+		}
+	}
 	return object, false, err
 }
 

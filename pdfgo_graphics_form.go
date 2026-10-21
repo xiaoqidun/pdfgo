@@ -94,7 +94,7 @@ func (p *pageInterpreter) walkContent(data []byte) ([]Operation, int, error) {
 			}
 		}
 		return p.operation(operation)
-	}, p.contentColorSpace)
+	}, p.contentColorSpace, p.visitor.Warning)
 	return operations, size, err
 }
 

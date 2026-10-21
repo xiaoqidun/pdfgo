@@ -63,10 +63,12 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 		return fmt.Errorf("invalid catalog")
 	}
 	seen := map[Reference]bool{}
+	active := map[Reference]bool{}
 	index := 0
 	type frame struct {
 		kids  Array
 		attrs pageAttributes
+		ref   Reference
 	}
 	stack := []frame{{kids: Array{catalog["Pages"]}}}
 	for len(stack) != 0 {
@@ -75,26 +77,34 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 		}
 		current := &stack[len(stack)-1]
 		if len(current.kids) == 0 {
+			delete(active, current.ref)
 			stack = stack[:len(stack)-1]
 			continue
 		}
 		object, inherited := current.kids[0], current.attrs
 		current.kids = current.kids[1:]
 		ref, ok := object.(Reference)
-		if !ok {
+		if !ok && r.warning == nil {
 			return fmt.Errorf("page tree node is not indirect")
 		}
-		if seen[ref] {
+		if ok && (active[ref] || (seen[ref] && r.warning == nil)) {
 			return fmt.Errorf("repeated page tree node")
 		}
-		seen[ref] = true
-		resolved, err := r.Resolve(ref)
+		resolved, err := r.Resolve(object)
 		if err != nil {
 			return err
 		}
 		dict, ok := resolved.(Dictionary)
 		if !ok {
 			return fmt.Errorf("invalid page tree node")
+		}
+		if ref.Number == 0 {
+			r.warning(Diagnostic{Message: "direct dictionary in page tree retained"})
+		} else {
+			if seen[ref] {
+				r.warning(Diagnostic{Message: "repeated non-cyclic page tree node retained"})
+			}
+			seen[ref] = true
 		}
 		attrs := inherited
 		for _, attr := range [...]struct {
@@ -113,6 +123,16 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 		if err != nil {
 			return err
 		}
+		if kind == nil && r.warning != nil {
+			if dict["Kids"] != nil {
+				kind = Name("Pages")
+			} else if dict["Contents"] != nil || dict["MediaBox"] != nil {
+				kind = Name("Page")
+			}
+			if kind != nil {
+				r.warning(Diagnostic{Message: "missing page tree Type inferred from node structure"})
+			}
+		}
 		switch kind {
 		case Name("Pages"):
 			kids, err := r.Resolve(dict["Kids"])
@@ -123,7 +143,13 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 			if !ok {
 				return fmt.Errorf("invalid page tree kids")
 			}
-			stack = append(stack, frame{kids: array, attrs: attrs})
+			if len(stack) >= 8192 {
+				return fmt.Errorf("excessive page tree depth")
+			}
+			if ref.Number != 0 {
+				active[ref] = true
+			}
+			stack = append(stack, frame{kids: array, attrs: attrs, ref: ref})
 		case Name("Page"):
 			page, err := r.readPage(ref, dict, attrs)
 			if err != nil {
@@ -177,6 +203,10 @@ func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error
 		if err != nil {
 			return written, err
 		}
+		if resolved == nil && p.reader.warning != nil {
+			p.reader.warning(Diagnostic{Message: "null entry in page Contents array has no content"})
+			continue
+		}
 		stream, ok := resolved.(*Stream)
 		if !ok {
 			return written, fmt.Errorf("page content is not a stream")
@@ -212,12 +242,20 @@ func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error
 // 入参: ref 页面引用, dict 页面字典, attrs 已继承的页面属性
 // 返回: *Page 页面, error 页面属性错误
 func (r *Reader) readPage(ref Reference, dict Dictionary, attrs pageAttributes) (*Page, error) {
+	if attrs.mediaBox == nil && r.warning != nil {
+		attrs.mediaBox = Array{Integer(0), Integer(0), Integer(612), Integer(792)}
+		r.warning(Diagnostic{Message: "missing MediaBox replaced by default page size"})
+	}
 	media, err := r.rectangle(attrs.mediaBox)
 	if err != nil {
 		return nil, err
 	}
 	if media.XMin == media.XMax || media.YMin == media.YMax {
-		return nil, fmt.Errorf("empty media box")
+		if r.warning == nil {
+			return nil, fmt.Errorf("empty media box")
+		}
+		media = Rectangle{0, 0, 612, 792}
+		r.warning(Diagnostic{Message: "empty MediaBox replaced by default page size"})
 	}
 	crop := media
 	if attrs.cropBox != nil {
@@ -227,10 +265,20 @@ func (r *Reader) readPage(ref Reference, dict Dictionary, attrs pageAttributes) 
 		}
 		crop = Rectangle{math.Max(media.XMin, crop.XMin), math.Max(media.YMin, crop.YMin), math.Min(media.XMax, crop.XMax), math.Min(media.YMax, crop.YMax)}
 		if crop.XMin >= crop.XMax || crop.YMin >= crop.YMax {
-			return nil, fmt.Errorf("empty crop box")
+			if r.warning == nil {
+				return nil, fmt.Errorf("empty crop box")
+			}
+			crop = media
+			r.warning(Diagnostic{Message: "empty CropBox intersection replaced by MediaBox"})
 		}
 	}
 	resourceDict, ok := attrs.resources.(Dictionary)
+	if !ok && r.warning != nil {
+		if stream, valid := attrs.resources.(*Stream); valid {
+			resourceDict, ok = stream.Dictionary, true
+			r.warning(Diagnostic{Message: "page Resources stream dictionary retained"})
+		}
+	}
 	if !ok && attrs.resources != nil {
 		return nil, fmt.Errorf("invalid page resources")
 	}

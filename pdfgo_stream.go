@@ -21,11 +21,24 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/adler32"
 	"io"
 	"math/bits"
+	"strings"
 )
+
+// streamFilterAliases 保存内联图像的标准过滤器缩写
+var streamFilterAliases = map[Name]Name{
+	"AHx": "ASCIIHexDecode",
+	"A85": "ASCII85Decode",
+	"LZW": "LZWDecode",
+	"Fl":  "FlateDecode",
+	"RL":  "RunLengthDecode",
+	"CCF": "CCITTFaxDecode",
+	"DCT": "DCTDecode",
+}
 
 // Stream 保存流字典及未经解码的数据
 // 阅读器返回的流解码需与所属Reader串行调用，并保持数据源可读
@@ -95,8 +108,12 @@ func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([
 				if err == nil {
 					err = closeErr
 				}
-				if err == io.ErrUnexpectedEOF && warning != nil && completeFlatePayload(ctx, encoded, data) {
-					warning(Diagnostic{Message: "Flate checksum truncated; complete compressed data retained"})
+				if warning != nil && ctx.Err() == nil && (errors.Is(err, zlib.ErrChecksum) || err == io.ErrUnexpectedEOF && completeFlatePayload(ctx, encoded, data)) {
+					message := "Flate checksum truncated; complete compressed data retained"
+					if errors.Is(err, zlib.ErrChecksum) {
+						message = "Flate checksum mismatch; complete compressed data retained"
+					}
+					warning(Diagnostic{Message: message})
 					err = nil
 				}
 			}
@@ -107,7 +124,7 @@ func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([
 				data, _, err = decodeLZWBytesContext(ctx, data, early)
 			}
 		case "ASCIIHexDecode":
-			data, err = decodeASCIIHexContext(ctx, data)
+			data, err = decodeASCIIHexContext(ctx, data, warning)
 		case "ASCII85Decode":
 			data, err = decodeASCII85Context(ctx, data)
 		case "RunLengthDecode":
@@ -140,9 +157,9 @@ func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([
 	return data, nil
 }
 
-// completeFlatePayload 验证完整压缩块及残留校验前缀，不恢复截断数据或错误校验值
+// completeFlatePayload 验证完整压缩块及截断校验尾部，不恢复截断压缩数据
 // 入参: ctx 取消上下文, encoded 压缩数据, decoded 已解码数据
-// 返回: bool 是否仅缺失末尾校验字节
+// 返回: bool 是否仅存在校验尾部问题
 func completeFlatePayload(ctx context.Context, encoded, decoded []byte) bool {
 	if len(encoded) < 2 || encoded[1]&0x20 != 0 {
 		return false
@@ -152,11 +169,14 @@ func completeFlatePayload(ctx context.Context, encoded, decoded []byte) bool {
 	checksum := adler32.New()
 	count, err := io.Copy(checksum, &contextInput{ctx: ctx, reader: reader})
 	closeErr := reader.Close()
-	if err != nil || closeErr != nil || ctx.Err() != nil || count != int64(len(decoded)) || source.Len() >= 4 {
+	if err != nil || closeErr != nil || ctx.Err() != nil || count != int64(len(decoded)) || source.Len() > 4 {
 		return false
 	}
 	var expected [4]byte
 	binary.BigEndian.PutUint32(expected[:], checksum.Sum32())
+	if source.Len() == 4 {
+		return true
+	}
 	return bytes.Equal(encoded[len(encoded)-source.Len():], expected[:source.Len()])
 }
 
@@ -164,10 +184,10 @@ func completeFlatePayload(ctx context.Context, encoded, decoded []byte) bool {
 func (*Stream) pdfObject() {}
 
 // decodeASCIIHexContext 按校验后的长度解码十六进制流，补齐末尾半字节
-// 入参: ctx 取消上下文, data 编码数据
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: []byte 解码数据, error 编码或取消错误
-func decodeASCIIHexContext(ctx context.Context, data []byte) ([]byte, error) {
-	end, size, err := asciiHexSize(ctx, data)
+func decodeASCIIHexContext(ctx context.Context, data []byte, warning func(Diagnostic)) ([]byte, error) {
+	end, size, err := asciiHexSize(ctx, data, warning)
 	if err != nil {
 		return nil, err
 	}
@@ -204,13 +224,13 @@ func decodeASCIIHexContext(ctx context.Context, data []byte) ([]byte, error) {
 }
 
 // asciiHexSize 校验十六进制字符和结束标记，计算解码长度
-// 入参: ctx 取消上下文, data 编码数据
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: int 结束标记位置, int 解码字节数, error 编码或取消错误
-func asciiHexSize(ctx context.Context, data []byte) (int, int, error) {
+func asciiHexSize(ctx context.Context, data []byte, warning func(Diagnostic)) (int, int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
-	digits := 0
+	digits, invalid := 0, false
 	for n, b := range data {
 		if n&4095 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -224,8 +244,18 @@ func asciiHexSize(ctx context.Context, data []byte) (int, int, error) {
 			return n, digits/2 + digits%2, ctx.Err()
 		case isSpace(b):
 		default:
-			return 0, 0, hex.InvalidByteError(b)
+			if warning == nil {
+				return 0, 0, hex.InvalidByteError(b)
+			}
+			if !invalid {
+				warning(Diagnostic{Offset: int64(n), Message: "non-hexadecimal ASCIIHex bytes ignored"})
+				invalid = true
+			}
 		}
+	}
+	if warning != nil {
+		warning(Diagnostic{Offset: int64(len(data)), Message: "ASCIIHex terminator missing; encoded stream boundary retained"})
+		return len(data), digits/2 + digits%2, ctx.Err()
 	}
 	return 0, 0, fmt.Errorf("missing ASCIIHex terminator")
 }
@@ -271,7 +301,10 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 		params[0] = v
 	case Array:
 		if len(v) != len(filters) {
-			return nil, nil, fmt.Errorf("filter parameter count mismatch")
+			if reader == nil || reader.warning == nil {
+				return nil, nil, fmt.Errorf("filter parameter count mismatch")
+			}
+			reader.warning(Diagnostic{Message: "filter parameter count mismatch; positional parameters and missing defaults retained"})
 		}
 		copy(params, v)
 	default:
@@ -284,6 +317,19 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 		}
 		if _, ok := filters[i].(Name); !ok {
 			return nil, nil, fmt.Errorf("filter is not a name")
+		}
+		if reader != nil && reader.warning != nil {
+			if name, ok := streamFilterAliases[filters[i].(Name)]; ok {
+				reader.warning(Diagnostic{Message: "abbreviated stream filter expanded: " + string(filters[i].(Name))})
+				filters[i] = name
+			}
+			for _, name := range []Name{"FlateDecode", "LZWDecode", "ASCIIHexDecode", "ASCII85Decode", "RunLengthDecode", "CCITTFaxDecode", "DCTDecode", "JPXDecode", "JBIG2Decode", "Crypt"} {
+				if filters[i] != name && strings.EqualFold(string(filters[i].(Name)), string(name)) {
+					reader.warning(Diagnostic{Message: "stream filter name case normalized: " + string(filters[i].(Name))})
+					filters[i] = name
+					break
+				}
+			}
 		}
 		params[i], err = resolve(params[i])
 		if err != nil {

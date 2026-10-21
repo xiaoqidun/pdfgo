@@ -64,10 +64,18 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 			return nil, fmt.Errorf("invalid color space resources")
 		}
 		if count == 0 {
-			if spaces[name] == nil {
-				return nil, fmt.Errorf("missing color space resource %q", name)
+			resolved, err := r.Resolve(spaces[name])
+			if err != nil {
+				return nil, err
 			}
-			return r.remapColorSpace(spaces[name], resources, remap, depth+1)
+			if resolved == nil {
+				if r.warning == nil {
+					return nil, fmt.Errorf("missing color space resource %q", name)
+				}
+				r.warning(Diagnostic{Message: fmt.Sprintf("missing named color space %q; PDF viewer DeviceGray default used", name)})
+				return Name("DeviceGray"), nil
+			}
+			return r.remapColorSpace(resolved, resources, remap, depth+1)
 		}
 		defaultValue, err := r.Resolve(spaces[key])
 		if err != nil {

@@ -31,39 +31,43 @@ import (
 // Vertical为true时使用竖排度量，字形本身仍以横排原点描述
 // BoundingBox保留非Type3字体描述符边界，未提供有效边界时为空
 // FallbackBoundingBox保留未内嵌标准字体的AFM保守边界，不用于排版，边界单位为千分之一文字空间
+// Recovered表示已诊断恢复源字体声明，Dictionary仍保留原始字段供调用方保存
 type Font struct {
-	Name                string
-	Subtype             Name
-	Program             []byte
-	ProgramType         Name
-	Dictionary          Dictionary
-	BoundingBox         *Rectangle
-	FallbackBoundingBox *Rectangle
-	Unicode             UnicodeMap
-	Vertical            bool
-	widths              map[uint32]float64
-	defaultWidth        float64
-	cidWidths           cidMetrics[float64]
-	verticals           cidMetrics[VerticalMetrics]
-	defaultVertical     [2]float64
-	composite           bool
-	encoding            Name
-	cidMap              *cidCMap
-	cidUnicode          UnicodeMap
-	glyphMap            []byte
-	glyphCount          uint32
-	simpleCmap          []byte
-	cmapEncoding        Name
-	symbolic            bool
-	post                *fontPostMapping
-	cffGlyphs           map[uint32]uint16
-	cffNames            map[uint32]string
-	differences         map[uint32]string
-	type3Matrix         Matrix
-	type3Bounds         *Rectangle
-	type3Procs          Dictionary
-	type3Resources      Dictionary
-	reader              *Reader
+	Name                 string
+	Subtype              Name
+	Program              []byte
+	ProgramType          Name
+	Dictionary           Dictionary
+	BoundingBox          *Rectangle
+	FallbackBoundingBox  *Rectangle
+	Unicode              UnicodeMap
+	Vertical             bool
+	Recovered            bool
+	widths               map[uint32]float64
+	defaultWidth         float64
+	defaultWidthDeclared bool
+	coreName             string
+	cidWidths            cidMetrics[float64]
+	verticals            cidMetrics[VerticalMetrics]
+	defaultVertical      [2]float64
+	composite            bool
+	encoding             Name
+	cidMap               *cidCMap
+	cidUnicode           UnicodeMap
+	glyphMap             []byte
+	glyphCount           uint32
+	simpleCmap           []byte
+	cmapEncoding         Name
+	symbolic             bool
+	post                 *fontPostMapping
+	cffGlyphs            map[uint32]uint16
+	cffNames             map[uint32]string
+	differences          map[uint32]string
+	type3Matrix          Matrix
+	type3Bounds          *Rectangle
+	type3Procs           Dictionary
+	type3Resources       Dictionary
+	reader               *Reader
 }
 
 // Glyph 保存原始字符码、Unicode文本、字形名称、编号和千分之一字宽
@@ -130,10 +134,14 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	if err != nil {
 		return nil, err
 	}
+	invalidName := false
 	if value != nil {
 		name, ok := value.(Name)
 		if !ok {
-			return nil, fmt.Errorf("invalid base font name")
+			if r.warning == nil {
+				return nil, fmt.Errorf("invalid base font name")
+			}
+			invalidName = true
 		}
 		font.Name = string(name)
 	}
@@ -168,6 +176,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	}
 	metrics := dict
 	var cidSubtype Name
+	invalidGIDMap := false
 	noEncoding := false
 	if subtype == Name("Type0") {
 		font.composite = true
@@ -181,6 +190,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			return nil, err
 		}
 		font.Vertical = font.cidMap.vertical
+		font.Recovered = font.cidMap.recovered
 		descendants, err := r.Resolve(dict["DescendantFonts"])
 		if err != nil {
 			return nil, err
@@ -282,7 +292,10 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		if err != nil {
 			return nil, err
 		}
-		if gidMap != nil && gidMap != Name("Identity") {
+		_, gidStream := gidMap.(*Stream)
+		if gidMap != nil && gidMap != Name("Identity") && !gidStream && r.warning != nil && cidSubtype == "CIDFontType2" {
+			invalidGIDMap = true
+		} else if gidMap != nil && gidMap != Name("Identity") {
 			stream, ok := gidMap.(*Stream)
 			if !ok || stream == nil {
 				return nil, fmt.Errorf("invalid CIDToGIDMap")
@@ -433,6 +446,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 				return nil, err
 			}
 			font.Unicode = nil
+			font.Recovered = true
 			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q ToUnicode unavailable: %v; glyph mapping retained", font.Name, err)})
 		}
 	}
@@ -489,6 +503,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			return nil, err
 		}
 		if !font.composite && value != nil {
+			font.defaultWidthDeclared = true
 			font.defaultWidth, err = r.number(value)
 			if err != nil {
 				return nil, err
@@ -529,6 +544,33 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		if font.composite {
 			font.ProgramType = "CIDFontType0C"
 		}
+	}
+	if len(font.Program) >= 12 && (string(font.Program[:4]) == "OTTO" || string(font.Program[:4]) == "\x00\x01\x00\x00" || string(font.Program[:4]) == "true") {
+		actual := Name("FontFile2")
+		if string(font.Program[:4]) == "OTTO" {
+			actual = "OpenType"
+		}
+		mismatch := font.ProgramType != actual && !(actual == "FontFile2" && font.ProgramType == "OpenType") || font.composite && cidSubtype == "CIDFontType0" && actual == "FontFile2"
+		if mismatch {
+			if r.warning == nil {
+				return nil, fmt.Errorf("font program container differs from declared subtype")
+			}
+			if _, err := fontTableContext(ctx, font.Program, "maxp"); err != nil {
+				return nil, err
+			}
+			font.ProgramType, font.Recovered = actual, true
+			if font.composite && actual == "FontFile2" {
+				cidSubtype = "CIDFontType2"
+			}
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q program container recovered as %s; original glyph IDs retained", font.Name, actual)})
+		}
+	}
+	if invalidName {
+		if len(font.Program) == 0 || subtype == "Type3" {
+			return nil, fmt.Errorf("invalid base font name without embedded glyph program")
+		}
+		font.Recovered = true
+		r.warning(Diagnostic{Message: "invalid PDF base font name; embedded glyph program retained"})
 	}
 	if (subtype == Name("Type1") || subtype == Name("MMType1")) && font.ProgramType == "FontFile" && font.encoding == "" {
 		builtIn, err := type1BuiltInEncoding(font.Program)
@@ -576,8 +618,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "MacExpertEncoding" && font.encoding != "StandardEncoding" {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
-		identity := font.composite && (cidSubtype == Name("CIDFontType0") || cidSubtype == Name("CIDFontType2") && font.glyphMap == nil)
-		font.cffGlyphs, font.cffNames, err = cffFontMapping(cffProgram, font.composite, font.encoding, font.differences, identity, font.ProgramType)
+		font.cffGlyphs, font.cffNames, err = cffFontMappingWithGlyphMap(cffProgram, font.composite, font.encoding, font.differences, font.composite, font.ProgramType, font.glyphMap)
 		if err != nil {
 			return nil, err
 		}
@@ -599,6 +640,10 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	}
 	if font.composite && len(font.Program) != 0 && cidSubtype == Name("CIDFontType0") && font.cffGlyphs == nil {
 		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without CFF program"}
+	}
+	if invalidGIDMap {
+		font.Recovered = true
+		r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid non-stream CIDToGIDMap; default Identity mapping retained", font.Name)})
 	}
 	if font.composite && metrics["CIDSystemInfo"] != nil {
 		value, err := r.Resolve(metrics["CIDSystemInfo"])
@@ -622,10 +667,15 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		if !regOK || !ordOK {
 			return nil, fmt.Errorf("invalid CID character collection")
 		}
-		if font.cidMap.ordering != "" && font.cidMap.ordering != "Identity" && (font.cidMap.ordering != string(ord) || font.cidMap.registry != string(reg)) {
-			return nil, fmt.Errorf("CMap and font character collections differ")
+		mismatch := font.cidMap.ordering != "" && font.cidMap.ordering != "Identity" && (font.cidMap.ordering != string(ord) || font.cidMap.registry != string(reg))
+		if mismatch {
+			if r.warning == nil || len(font.Program) == 0 || font.cffGlyphs == nil && font.glyphCount == 0 {
+				return nil, fmt.Errorf("CMap and font character collections differ")
+			}
+			font.Recovered = true
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q CMap and font character collections differ; embedded CID glyph mapping retained without collection Unicode inference", font.Name)})
 		}
-		if string(reg) == "Adobe" {
+		if !mismatch && string(reg) == "Adobe" {
 			index, err := cmapResourceIndex()
 			if err != nil {
 				return nil, err
@@ -639,12 +689,22 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			}
 		}
 	}
-	if font.Subtype == "Type1" && len(font.Program) == 0 && !boundsDeclared {
+	if !font.composite && len(font.Program) == 0 && len(font.widths) == 0 && !font.defaultWidthDeclared && r.warning != nil {
+		if name := coreFontAlias(font.Name); name != "" {
+			font.coreName, font.Recovered = name, true
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q missing widths recovered from existing Base14 %s metrics; source font name retained", font.Name, name)})
+		}
+	}
+	if (font.Subtype == "Type1" || font.coreName != "") && len(font.Program) == 0 && !boundsDeclared {
 		fonts, err := coreFonts()
 		if err != nil {
 			return nil, err
 		}
-		if metrics := fonts[font.Name]; metrics != nil && metrics.bounds != nil {
+		name := font.Name
+		if font.coreName != "" {
+			name = font.coreName
+		}
+		if metrics := fonts[name]; metrics != nil && metrics.bounds != nil {
 			bounds := *metrics.bounds
 			font.FallbackBoundingBox = &bounds
 		}
@@ -694,12 +754,16 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		return nil, err
 	}
 	var core *coreFontMetrics
-	if f.Subtype == "Type1" && len(f.Program) == 0 {
+	if (f.Subtype == "Type1" || f.coreName != "") && len(f.Program) == 0 {
 		fonts, err := coreFonts()
 		if err != nil {
 			return nil, err
 		}
-		core = fonts[f.Name]
+		name := f.Name
+		if f.coreName != "" {
+			name = f.coreName
+		}
+		core = fonts[name]
 	}
 	step := 1
 	if f.composite {
@@ -723,6 +787,9 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		code := uint32(codeNumber(raw))
 		cid := code
 		if f.cidMap != nil {
+			if err := f.cidMap.validateCode(raw, valid); err != nil {
+				return nil, err
+			}
 			cid = uint32(f.cidMap.lookup(raw, valid))
 		}
 		if f.composite && len(f.Program) != 0 && !f.hasCIDGlyph(cid) {

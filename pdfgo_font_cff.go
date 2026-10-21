@@ -174,6 +174,14 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 // 入参: identity 是否允许非CID字形身份映射, programType 字体容器类型
 // 返回: map[uint32]uint16 字符码或CID到字形编号的映射, map[uint32]string 字符码到字形名称的映射, error 错误信息
 func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool, programType Name) (map[uint32]uint16, map[uint32]string, error) {
+	return cffFontMappingWithGlyphMap(data, composite, encoding, differences, identity, programType, nil)
+}
+
+// cffFontMappingWithGlyphMap 读取CFF字形选择，非CID程序优先使用明确的CIDToGIDMap
+// 入参: data CFF数据, composite 复合字体, encoding 基础编码, differences 编码差异
+// 入参: identity 非CID程序是否允许编号映射, programType 容器类型, glyphMap 原始CID到GID表
+// 返回: map[uint32]uint16 字形映射, map[uint32]string 字形名称, error 结构错误
+func cffFontMappingWithGlyphMap(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool, programType Name, glyphMap []byte) (map[uint32]uint16, map[uint32]string, error) {
 	dict, stringsIndex, chars, err := cffFontData(data)
 	if err != nil {
 		return nil, nil, err
@@ -190,6 +198,15 @@ func cffFontMapping(data []byte, composite bool, encoding Name, differences map[
 	}
 	if composite && identity && !cidKeyed {
 		glyphs := make(map[uint32]uint16, len(chars))
+		if glyphMap != nil {
+			for cid := 0; cid < len(glyphMap)/2 && cid <= 65535; cid++ {
+				gid := binary.BigEndian.Uint16(glyphMap[cid*2:])
+				if int(gid) < len(chars) {
+					glyphs[uint32(cid)] = gid
+				}
+			}
+			return glyphs, nil, nil
+		}
 		for gid := range chars {
 			glyphs[uint32(gid)] = uint16(gid)
 		}

@@ -50,6 +50,7 @@ type standardSecurity struct {
 	stringFilter    Name
 	embeddedFilter  Name
 	encryptMetadata bool
+	authenticated   bool
 }
 
 // Encryption 返回加密信息副本，未加密文档返回nil
@@ -85,7 +86,12 @@ func (r *Reader) openSecurity(password []byte) error {
 	if !vok || !rok || !(v == 1 && (revision == 2 || revision == 3) || v == 2 && revision == 3 || v == 4 && revision == 4) {
 		return &UnsupportedError{Feature: "PDF encryption revision"}
 	}
-	length, err := integerDefault(dict, "Length", 40)
+	defaultLength := int64(40)
+	if v == 4 && r.warning != nil && dict["Length"] == nil {
+		defaultLength = 128
+		r.warning(Diagnostic{Message: "missing V4 encryption Length; authenticating with the 128-bit default"})
+	}
+	length, err := integerDefault(dict, "Length", defaultLength)
 	if err != nil || length < 40 || length > 128 || length%8 != 0 || v == 1 && length != 40 {
 		return fmt.Errorf("invalid encryption key length")
 	}
@@ -109,7 +115,9 @@ func (r *Reader) openSecurity(password []byte) error {
 			}
 			s.encryptMetadata = bool(b)
 		}
-		if value := dict["CF"]; value != nil {
+		if value, err := r.securityFilters(dict["CF"]); err != nil {
+			return err
+		} else if value != nil {
 			s.filters, ok = value.(Dictionary)
 			if !ok {
 				return fmt.Errorf("invalid crypt filter dictionary")
@@ -175,8 +183,47 @@ func (r *Reader) openSecurity(password []byte) error {
 			return err
 		}
 	}
+	s.authenticated = true
 	r.security = s
 	return nil
+}
+
+// securityFilters 在认证前解析加密过滤器的间接字典，不改变原始加密参数
+// 入参: object CF字典或间接引用
+// 返回: Object 已解析的字典, error 引用或类型错误
+func (r *Reader) securityFilters(object Object) (Object, error) {
+	if r.warning == nil || object == nil {
+		return object, nil
+	}
+	value, err := r.Resolve(object)
+	if err != nil {
+		return nil, err
+	}
+	dict, ok := value.(Dictionary)
+	if !ok {
+		return nil, fmt.Errorf("invalid crypt filter dictionary")
+	}
+	result := make(Dictionary, len(dict))
+	for name, entry := range dict {
+		value, err := r.Resolve(entry)
+		if err != nil {
+			return nil, err
+		}
+		filter, ok := value.(Dictionary)
+		if !ok {
+			return nil, fmt.Errorf("invalid crypt filter %s dictionary", name)
+		}
+		copy := make(Dictionary, len(filter))
+		for key, value := range filter {
+			copy[key] = value
+		}
+		if length, ok := copy["Length"].(Integer); ok && ((copy["CFM"] == Name("AESV2") && length == 128) || (copy["CFM"] == Name("AESV3") && length == 256)) {
+			copy["Length"] = length / 8
+			r.warning(Diagnostic{Message: fmt.Sprintf("crypt filter %s Length is in bits; equivalent byte length retained", name)})
+		}
+		result[name] = copy
+	}
+	return result, nil
 }
 
 // padPassword 截断或填充密码为32字节
@@ -374,6 +421,18 @@ func (s *standardSecurity) decryptObject(value Object, ref Reference) (Object, e
 				if !ok {
 					return nil, fmt.Errorf("invalid Crypt filter name")
 				}
+			}
+		}
+		if len(v.Data) == aes.BlockSize && s.authenticated && v.reader != nil && v.reader.security == s && v.reader.warning != nil {
+			method, err := s.cryptMethod(name)
+			if err != nil {
+				return nil, fmt.Errorf("decrypt stream %d %d: %w", ref.Number, ref.Generation, err)
+			}
+			if method == "AESV2" || method == "AESV3" {
+				v.reader.warning(Diagnostic{Message: fmt.Sprintf("authenticated IV-only AES stream %d %d decoded as empty without changing source bytes", ref.Number, ref.Generation)})
+				v.Data = nil
+				v.decrypted = true
+				return v, nil
 			}
 		}
 		v.Data, err = s.decryptBytes(v.Data, ref, name)

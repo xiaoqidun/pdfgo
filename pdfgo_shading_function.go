@@ -305,13 +305,13 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		if err != nil {
 			return nil, err
 		}
-		program, err := compileCalculator(data)
+		program, err := newCalculatorFunction(data, r.warning)
 		if err != nil {
 			return nil, err
 		}
 		if domain[0] == domain[1] {
 			var values [4]float64
-			if err := evaluateCalculator(program, domain[:1], values[:channels]); err != nil {
+			if err := program.evaluate(domain[:1], values[:channels]); err != nil {
 				return nil, err
 			}
 			return constantGradientFunction(clipGradientValue(values, limits)), nil
@@ -320,7 +320,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		if err != nil {
 			return &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
 				x = math.Max(domain[0], math.Min(domain[1], x))
-				err = evaluateCalculator(program, []float64{x}, values[:channels])
+				err = program.evaluate([]float64{x}, values[:channels])
 				if err != nil {
 					return values, err
 				}
@@ -328,7 +328,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 			}}, nil
 		}
 		var output [4]float64
-		if err := evaluateCalculator(program, domain[:1], output[:channels]); err != nil {
+		if err := program.evaluate(domain[:1], output[:channels]); err != nil {
 			return nil, err
 		}
 		stops := []GradientStop{{Position: 0}, {Position: 1}}
@@ -344,7 +344,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		if len(stops) == 0 {
 			return &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
 				x = math.Max(domain[0], math.Min(domain[1], x))
-				err = evaluateCalculator(program, []float64{x}, values[:channels])
+				err = program.evaluate([]float64{x}, values[:channels])
 				if err != nil {
 					return values, err
 				}

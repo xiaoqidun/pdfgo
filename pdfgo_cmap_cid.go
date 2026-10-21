@@ -43,24 +43,26 @@ type cidNotdefRange struct {
 
 // cidMappedRange 保留连续CID区间及定义顺序，避免展开大量逐字符映射
 type cidMappedRange struct {
-	first uint64
-	last  uint64
-	end   uint64
-	cid   uint16
-	order int
+	first   uint64
+	last    uint64
+	end     uint64
+	cid     uint16
+	order   int
+	invalid bool
 }
 
 // cidCMap 保存编码范围、字形选择和只读继承关系
 type cidCMap struct {
-	ranges   []cidMappedRange
-	spaces   []cidCodeRange
-	notdef   []cidNotdefRange
-	registry string
-	ordering string
-	vertical bool
-	modeSet  bool
-	use      Name
-	base     *cidCMap
+	ranges    []cidMappedRange
+	spaces    []cidCodeRange
+	notdef    []cidNotdefRange
+	registry  string
+	ordering  string
+	vertical  bool
+	modeSet   bool
+	use       Name
+	base      *cidCMap
+	recovered bool
 }
 
 // ParseCIDMap 读取CMap中的字符码到CID的直接映射及连续范围
@@ -117,6 +119,13 @@ func ParseCIDMapContext(ctx context.Context, data []byte) (CIDMap, error) {
 // 入参: ctx 取消上下文, data CMap数据
 // 返回: *cidCMap 本层映射, error 格式或取消错误
 func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
+	return parseCIDCMapRecoveryContext(ctx, data, nil)
+}
+
+// parseCIDCMapRecoveryContext 按诊断策略读取可确定的CID条目，无效目标保留到使用时拒绝
+// 入参: ctx 取消上下文, data CMap数据, warning 恢复诊断，空值严格校验
+// 返回: *cidCMap 本层映射, error 格式或取消错误
+func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(Diagnostic)) (*cidCMap, error) {
 	p := objectParser{data: data}
 	result := &cidCMap{}
 	previous := ""
@@ -172,7 +181,11 @@ func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
 					}
 				case "CMapType":
 					if value != Integer(1) {
-						return nil, p.fail("invalid CID CMap type")
+						if warning == nil || value != Integer(0) {
+							return nil, p.fail("invalid CID CMap type")
+						}
+						result.recovered = true
+						warning(Diagnostic{Offset: int64(p.pos), Message: "CID CMap declares type zero; explicit CID operators retained"})
 					}
 				}
 			}
@@ -201,10 +214,11 @@ func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
 			name = ""
 			continue
 		}
-		if token == "usefont" && previous != "0" || token == "beginbfchar" || token == "beginbfrange" || token == "beginrearrangedfont" || token == "beginusematrix" {
+		binaryCID := token == "beginbfchar" && warning != nil
+		if token == "usefont" && previous != "0" || token == "beginbfchar" && !binaryCID || token == "beginbfrange" || token == "beginrearrangedfont" || token == "beginusematrix" {
 			return nil, &UnsupportedError{Feature: "CID CMap operator " + token}
 		}
-		if token != "begincidchar" && token != "begincidrange" && token != "begincodespacerange" && token != "beginnotdefchar" && token != "beginnotdefrange" {
+		if !binaryCID && token != "begincidchar" && token != "begincidrange" && token != "begincodespacerange" && token != "beginnotdefchar" && token != "beginnotdefrange" {
 			previous = token
 			name = ""
 			continue
@@ -212,6 +226,10 @@ func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
 		count, err := strconv.Atoi(previous)
 		if err != nil || count < 0 {
 			return nil, p.fail("invalid CMap mapping count")
+		}
+		if binaryCID {
+			result.recovered = true
+			warning(Diagnostic{Offset: int64(p.pos), Message: "CID CMap uses bfchar; bounded binary CID destinations retained, not Unicode"})
 		}
 		for index := range count {
 			if index&255 == 0 {
@@ -256,18 +274,34 @@ func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
 				return nil, err
 			}
 			cid, ok := value.(Integer)
-			if !ok || cid < 0 || cid > 65535 {
+			if binaryCID {
+				bytes, valid := value.(String)
+				if !valid || len(bytes) == 0 || len(bytes) > 2 {
+					return nil, p.fail("invalid binary CMap CID")
+				}
+				cid, ok = Integer(codeNumber(bytes)), true
+			}
+			if !ok {
 				return nil, p.fail("invalid CMap CID")
 			}
+			invalid := cid < 0 || cid > 65535
 			if token == "beginnotdefchar" || token == "beginnotdefrange" {
+				if invalid {
+					return nil, p.fail("invalid CMap CID")
+				}
 				result.notdef = append(result.notdef, cidNotdefRange{start, end, len(first), uint16(cid)})
 				continue
 			}
-			if uint64(cid)+end-start > 65535 {
-				return nil, p.fail("invalid CMap CID range")
+			invalid = invalid || uint64(cid)+end-start > 65535
+			if invalid {
+				if warning == nil {
+					return nil, p.fail("invalid CMap CID range")
+				}
+				result.recovered = true
+				warning(Diagnostic{Offset: int64(p.pos), Message: "out-of-range CMap CID destination retained as invalid; use is rejected"})
 			}
 			size := uint64(len(first)) << 32
-			result.ranges = append(result.ranges, cidMappedRange{first: size | start, last: size | end, cid: uint16(cid), order: len(result.ranges)})
+			result.ranges = append(result.ranges, cidMappedRange{first: size | start, last: size | end, cid: uint16(cid), order: len(result.ranges), invalid: invalid})
 		}
 		end := "end" + strings.TrimPrefix(token, "begin")
 		if p.token() != end {
@@ -282,6 +316,7 @@ func (c *cidCMap) inherit() {
 	if c.base == nil {
 		return
 	}
+	c.recovered = c.recovered || c.base.recovered
 	if len(c.spaces) == 0 {
 		c.spaces = c.base.spaces
 	}
@@ -334,17 +369,48 @@ func (c *cidCMap) lookup(raw []byte, valid bool) uint16 {
 // 入参: raw 字符码
 // 返回: uint16 字符标识, bool 是否存在映射
 func (c *cidCMap) mapped(raw []byte) (uint16, bool) {
+	entry := c.mappedRange(raw)
+	if entry == nil {
+		return 0, false
+	}
+	if entry.invalid {
+		return 0, true
+	}
+	return entry.cid + uint16(codeNumber(raw)-uint64(uint32(entry.first))), true
+}
+
+// mappedRange 查找最后声明的匹配范围，不将无效目标回退到父映射
+// 入参: raw 原始字符码
+// 返回: *cidMappedRange 范围项，未匹配时为空
+func (c *cidCMap) mappedRange(raw []byte) *cidMappedRange {
 	code := uint64(len(raw))<<32 | codeNumber(raw)
 	index := sort.Search(len(c.ranges), func(i int) bool { return c.ranges[i].first > code })
 	order := -1
-	var cid uint16
+	var result *cidMappedRange
 	for i := index - 1; i >= 0 && c.ranges[i].end >= code; i-- {
-		entry := c.ranges[i]
+		entry := &c.ranges[i]
 		if code <= entry.last && entry.order > order {
-			cid, order = entry.cid+uint16(code-entry.first), entry.order
+			result, order = entry, entry.order
 		}
 	}
-	return cid, order >= 0
+	return result
+}
+
+// validateCode 拒绝实际使用的无效CID范围，未引用的异常条目不影响已知字形
+// 入参: raw 字符码, valid 是否匹配编码范围
+// 返回: error 无效目标错误
+func (c *cidCMap) validateCode(raw []byte, valid bool) error {
+	if valid {
+		for current := c; current != nil; current = current.base {
+			if entry := current.mappedRange(raw); entry != nil {
+				if entry.invalid {
+					return fmt.Errorf("invalid CMap CID destination for character %x", raw)
+				}
+				return nil
+			}
+		}
+	}
+	return nil
 }
 
 // characterCodes 反查指定CID的有效字符码，不展开无关映射区间
@@ -356,6 +422,9 @@ func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, 
 		for _, entry := range current.ranges {
 			if err := ctx.Err(); err != nil {
 				return nil, err
+			}
+			if entry.invalid {
+				continue
 			}
 			start, _ := slices.BinarySearch(cids, entry.cid)
 			last := uint64(entry.cid) + entry.last - entry.first
@@ -373,7 +442,7 @@ func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, 
 					raw[size-i-1] = byte(code >> (i * 8))
 				}
 				data := raw[:size]
-				if n, valid := c.next(data); valid && n == size && c.lookup(data, true) == cid {
+				if n, valid := c.next(data); valid && n == size && c.validateCode(data, true) == nil && c.lookup(data, true) == cid {
 					codes = append(codes, string(data))
 				}
 			}
@@ -431,7 +500,7 @@ func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, active m
 	if err != nil {
 		return nil, err
 	}
-	mapping, err := parseCIDCMapContext(ctx, data)
+	mapping, err := parseCIDCMapRecoveryContext(ctx, data, r.warning)
 	if err != nil {
 		return nil, err
 	}

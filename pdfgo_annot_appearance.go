@@ -125,6 +125,10 @@ func (r *Reader) readAnnotationBorder(annotation Annotation) (*annotationBorder,
 		}
 		if value != nil {
 			border, ok := value.(Array)
+			if ok && len(border) == 0 && r.warning != nil {
+				r.warning(Diagnostic{Message: "empty annotation Border array has no visible border"})
+				border = Array{Integer(0), Integer(0), Integer(0)}
+			}
 			if !ok || len(border) < 3 || len(border) > 4 {
 				return nil, fmt.Errorf("invalid annotation border")
 			}

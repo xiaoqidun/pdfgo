@@ -27,6 +27,7 @@ type objectParser struct {
 	base      int64
 	depth     int
 	exhausted bool
+	final     bool
 	warning   func(Diagnostic)
 }
 
@@ -85,6 +86,43 @@ func (p *objectParser) token() string {
 	return string(p.data[start:p.pos])
 }
 
+// streamDataStart 校验流头换行，诊断模式允许单独CR或换行前的水平空白
+// 返回: bool 是否找到明确的数据起点
+func (p *objectParser) streamDataStart() bool {
+	start := p.pos
+	if p.warning != nil {
+		for p.pos < len(p.data) && (p.data[p.pos] == ' ' || p.data[p.pos] == '\t' || p.data[p.pos] == 0 || p.data[p.pos] == '\f') {
+			p.pos++
+		}
+	}
+	if p.pos == len(p.data) {
+		p.exhausted = true
+		return false
+	}
+	if p.data[p.pos] == '\r' {
+		p.pos++
+		if p.pos == len(p.data) {
+			p.exhausted = true
+			return false
+		}
+		if p.data[p.pos] != '\n' {
+			if p.warning == nil {
+				return false
+			}
+			p.warning(Diagnostic{Offset: p.base + int64(start), Message: "stream line ending recovered from CR"})
+			return true
+		}
+	}
+	if p.data[p.pos] != '\n' {
+		return false
+	}
+	p.pos++
+	if p.warning != nil && p.pos-start > 1 && p.data[start] != '\r' {
+		p.warning(Diagnostic{Offset: p.base + int64(start), Message: "horizontal whitespace before stream line ending"})
+	}
+	return true
+}
+
 // object 读取单个PDF对象
 // 返回: Object 对象，null对应nil, error 语法错误
 func (p *objectParser) object() (Object, error) {
@@ -112,6 +150,10 @@ func (p *objectParser) object() (Object, error) {
 		values := Array{}
 		for {
 			p.skipSpace()
+			if p.pos == len(p.data) && p.final && p.warning != nil {
+				p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "array closed at source EOF; parsed elements retained"})
+				return values, nil
+			}
 			if p.pos < len(p.data) && p.data[p.pos] == ']' {
 				p.pos++
 				return values, nil
@@ -124,6 +166,11 @@ func (p *objectParser) object() (Object, error) {
 		}
 	}
 	token := p.token()
+	if p.warning != nil && len(token) > len("endobj") && token[len(token)-len("endobj"):] == "endobj" && validNumber(token[:len(token)-len("endobj")]) {
+		token = token[:len(token)-len("endobj")]
+		p.pos -= len("endobj")
+		p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "numeric object adjacent to endobj; numeric value retained"})
+	}
 	switch token {
 	case "true":
 		return Boolean(true), nil
@@ -132,13 +179,19 @@ func (p *objectParser) object() (Object, error) {
 	case "null":
 		return nil, nil
 	}
-	if !validNumber(token) {
+	if !validNumber(token) && !(p.warning != nil && validScientificNumber(token)) {
 		return nil, p.fail("invalid object token")
+	}
+	if p.warning != nil && validScientificNumber(token) {
+		p.warning(Diagnostic{Offset: p.base + int64(p.pos-len(token)), Message: "non-standard scientific numeric notation"})
 	}
 	if value, err := strconv.ParseInt(token, 10, 64); err == nil {
 		saved := p.pos
 		generation, err := strconv.ParseInt(p.token(), 10, 64)
-		if err == nil && generation >= 0 && generation <= 65535 && value > 0 && p.token() == "R" {
+		if err == nil && generation >= 0 && generation <= 65535 && (value > 0 || (value == 0 && p.warning != nil)) && p.token() == "R" {
+			if value == 0 {
+				p.warning(Diagnostic{Offset: p.base + int64(saved), Message: "zero object number in indirect reference treated as null"})
+			}
 			return Reference{Number: value, Generation: generation}, nil
 		}
 		p.pos = saved
@@ -169,6 +222,34 @@ func validNumber(s string) bool {
 		}
 	}
 	return digits > 0 && dots <= 1
+}
+
+// validScientificNumber 识别有限十进制指数语法，不允许NaN、Inf和非十进制形式
+// 入参: s 数字文本
+// 返回: bool 是否为十进制指数语法
+func validScientificNumber(s string) bool {
+	for i, b := range []byte(s) {
+		if b != 'e' && b != 'E' {
+			continue
+		}
+		if !validNumber(s[:i]) {
+			return false
+		}
+		exponent := s[i+1:]
+		if len(exponent) > 0 && (exponent[0] == '+' || exponent[0] == '-') {
+			exponent = exponent[1:]
+		}
+		if exponent == "" {
+			return false
+		}
+		for _, digit := range []byte(exponent) {
+			if digit < '0' || digit > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // name 读取名称并解除十六进制转义
@@ -264,6 +345,10 @@ func (p *objectParser) literalString() (Object, error) {
 		}
 		value = append(value, b)
 	}
+	if p.final && p.warning != nil {
+		p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "literal string terminated at source EOF; decoded bytes retained"})
+		return value, nil
+	}
 	return nil, p.fail("unterminated literal string")
 }
 
@@ -272,6 +357,7 @@ func (p *objectParser) literalString() (Object, error) {
 func (p *objectParser) hexString() (Object, error) {
 	p.pos++
 	var digits []byte
+	invalid := false
 	for p.pos < len(p.data) {
 		b := p.data[p.pos]
 		p.pos++
@@ -286,8 +372,26 @@ func (p *objectParser) hexString() (Object, error) {
 			return value, nil
 		}
 		if !isSpace(b) {
+			if p.warning != nil && !(b >= '0' && b <= '9' || b >= 'a' && b <= 'f' || b >= 'A' && b <= 'F') {
+				if !invalid {
+					p.warning(Diagnostic{Offset: p.base + int64(p.pos-1), Message: "invalid hex string digits ignored; valid nibbles retained"})
+					invalid = true
+				}
+				continue
+			}
 			digits = append(digits, b)
 		}
+	}
+	if p.final && p.warning != nil {
+		if len(digits)%2 != 0 {
+			digits = append(digits, '0')
+		}
+		value := make(String, len(digits)/2)
+		if _, err := hex.Decode(value, digits); err != nil {
+			return nil, p.fail("invalid hex string")
+		}
+		p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "hex string terminated at source EOF; decoded bytes retained"})
+		return value, nil
 	}
 	return nil, p.fail("unterminated hex string")
 }
@@ -299,6 +403,10 @@ func (p *objectParser) dictionary() (Object, error) {
 	value := Dictionary{}
 	for {
 		p.skipSpace()
+		if p.pos == len(p.data) && p.final && p.warning != nil {
+			p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "dictionary closed at source EOF; parsed entries retained"})
+			return value, nil
+		}
 		if p.pos+1 < len(p.data) && p.data[p.pos] == '>' && p.data[p.pos+1] == '>' {
 			p.pos += 2
 			return value, nil
@@ -321,6 +429,39 @@ func (p *objectParser) dictionary() (Object, error) {
 		if err != nil {
 			return nil, err
 		}
+		if font, ok := entry.(Name); ok && p.warning != nil && (name == "BaseFont" || name == "FontName") {
+			for count := 0; count < 8; count++ {
+				saved := p.pos
+				part := p.token()
+				if part == "" {
+					p.pos = saved
+					break
+				}
+				if !fontNamePart(part) || len(font)+len(part) > 2048 {
+					return nil, p.fail("invalid unescaped font name")
+				}
+				font += Name(" " + part)
+				p.warning(Diagnostic{Offset: p.base + int64(saved), Message: "unescaped space in font name; complete name retained"})
+			}
+			entry = font
+		}
 		value[name] = entry
 	}
+}
+
+// fontNamePart 限定可恢复的未转义字体名称片段，不接收PDF结构关键字
+// 入参: part 空白分隔的名称片段
+// 返回: bool 是否为普通字体标识符
+func fontNamePart(part string) bool {
+	switch part {
+	case "obj", "endobj", "stream", "endstream", "xref", "trailer", "startxref", "true", "false", "null", "R":
+		return false
+	}
+	for _, b := range []byte(part) {
+		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '_' || b == '+' || b == ',' || b == '.' {
+			continue
+		}
+		return false
+	}
+	return part != ""
 }

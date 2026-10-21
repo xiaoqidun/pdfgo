@@ -222,7 +222,7 @@ func (r *Reader) ReadAnnotationAppearance(annotation Annotation) (*Stream, error
 	}
 	appearance, ok := value.(Dictionary)
 	if !ok {
-		return nil, fmt.Errorf("invalid annotation appearance dictionary")
+		return nil, fmt.Errorf("%w: dictionary", ErrInvalidAnnotationAppearance)
 	}
 	stream, err := r.annotationAppearanceStream(appearance, annotation.Dictionary["AS"])
 	if err != nil || stream == nil {
@@ -233,7 +233,7 @@ func (r *Reader) ReadAnnotationAppearance(annotation Annotation) (*Stream, error
 		return nil, err
 	}
 	if subtype != Name("Form") {
-		return nil, fmt.Errorf("invalid annotation appearance subtype")
+		return nil, fmt.Errorf("%w: subtype", ErrInvalidAnnotationAppearance)
 	}
 	return stream, nil
 }
@@ -253,7 +253,7 @@ func (r *Reader) annotationAppearanceStream(appearance Dictionary, selected Obje
 		}
 		state, ok := selected.(Name)
 		if !ok {
-			return nil, fmt.Errorf("missing annotation appearance state")
+			return nil, fmt.Errorf("%w: missing state", ErrInvalidAnnotationAppearance)
 		}
 		value, err = r.Resolve(states[state])
 		if err != nil || value == nil {
@@ -428,6 +428,10 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	}
 	appearance, ok := value.(Dictionary)
 	if !ok {
+		if visitor.Warning != nil {
+			visitor.Warning(Diagnostic{Message: "PDF annotation has no usable static appearance"})
+			return ctx.Err()
+		}
 		return &UnsupportedError{Feature: "annotation appearance"}
 	}
 	stream, err := r.annotationAppearanceStream(appearance, annotation.Dictionary["AS"])
@@ -446,6 +450,10 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 			visitor.Warning(Diagnostic{Message: "invalid PDF widget appearance replaced from field properties"})
 		}
 	}
+	if errors.Is(err, ErrInvalidAnnotationAppearance) && visitor.Warning != nil {
+		visitor.Warning(Diagnostic{Message: "PDF annotation has no usable static appearance: " + err.Error()})
+		return ctx.Err()
+	}
 	if err != nil || stream == nil {
 		return err
 	}
@@ -454,10 +462,10 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		return err
 	}
 	if subtype != Name("Form") {
-		if subtype != nil || visitor.Warning == nil {
+		if visitor.Warning == nil {
 			return &UnsupportedError{Feature: "annotation appearance stream"}
 		}
-		visitor.Warning(Diagnostic{Message: "PDF annotation appearance missing Form subtype; form appearance retained"})
+		visitor.Warning(Diagnostic{Message: "PDF annotation appearance has invalid Form subtype; form appearance retained"})
 	}
 	source := stream
 	if visitor.Group != nil {
@@ -503,7 +511,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	}
 	rect := annotation.Rect
 	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
-	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: rect}
+	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: rect}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
 	if parent != nil {

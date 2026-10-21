@@ -16,11 +16,15 @@ package pdfgo
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
 	"slices"
 )
+
+// errICCSourceProfileClass 区分非源配置类别，不将设备链接或抽象变换替换为设备色
+var errICCSourceProfileClass = errors.New("invalid ICC source profile class")
 
 // validateICCSourceHeader 按PDF要求校验源配置类别、模型与分量数
 // 入参: data 配置数据, count PDF声明的分量数
@@ -29,15 +33,15 @@ func validateICCSourceHeader(data []byte, count int) error {
 	if len(data) < 132 || string(data[36:40]) != "acsp" || uint64(binary.BigEndian.Uint32(data)) != uint64(len(data)) {
 		return fmt.Errorf("invalid ICC profile header")
 	}
+	switch string(data[12:16]) {
+	case "scnr", "mntr", "prtr", "spac":
+	default:
+		return errICCSourceProfileClass
+	}
 	model := string(data[16:20])
 	components := map[string]int{"GRAY": 1, "RGB ": 3, "CMYK": 4, "Lab ": 3}[model]
 	if components == 0 || components != count {
 		return fmt.Errorf("invalid ICC source profile components")
-	}
-	switch string(data[12:16]) {
-	case "scnr", "mntr", "prtr", "spac":
-	default:
-		return fmt.Errorf("invalid ICC source profile class")
 	}
 	if string(data[20:24]) != "XYZ " && string(data[20:24]) != "Lab " {
 		return fmt.Errorf("invalid ICC profile connection space")
@@ -51,17 +55,34 @@ func validateICCSourceHeader(data []byte, count int) error {
 func (r *Reader) remapICCAlternate(object Array, resources Dictionary, remap bool, depth int) (Object, error) {
 	stream, count, err := r.iccProfileStream(object)
 	if err != nil {
+		if r.warning != nil && len(object) == 2 && object[0] == Name("ICCBased") {
+			value, resolveErr := r.Resolve(object[1])
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			if profile, ok := value.(*Stream); ok && profile != nil {
+				value, resolveErr = r.Resolve(profile.Dictionary["N"])
+				if resolveErr != nil {
+					return nil, resolveErr
+				}
+				if value == nil {
+					r.warning(Diagnostic{Message: "ICCBased color space without N; PDF viewer DeviceGray default used without inferring profile components"})
+					return Name("DeviceGray"), nil
+				}
+			}
+		}
 		return nil, err
 	}
-	data, err := stream.Decode()
-	if err != nil {
-		return nil, err
+	data, cause := stream.Decode()
+	if cause == nil {
+		var profile *iccColorSpace
+		profile, cause = r.readICCProfileData(data, int(count))
+		if cause == nil && profile != nil {
+			return object, nil
+		}
 	}
-	if len(data) < 9 || data[8] <= 4 {
-		return object, nil
-	}
-	if err := validateICCSourceHeader(data, int(count)); err != nil {
-		return nil, err
+	if cause != nil && (r.warning == nil || errors.Is(cause, errICCSourceProfileClass)) {
+		return nil, cause
 	}
 	alternate, err := r.iccAlternateObject(stream, int(count))
 	if err != nil {
@@ -86,6 +107,21 @@ func (r *Reader) remapICCAlternate(object Array, resources Dictionary, remap boo
 	}
 	copy.Dictionary["Alternate"] = alternate
 	return Array{Name("ICCBased"), &copy}, nil
+}
+
+// recoverICCAlternate 仅在备用空间及分量范围有效时恢复损坏配置，保留原始配置
+// 入参: stream 配置流, count 源分量数, ranges 源范围, effective 是否已重映射, cause 配置错误
+// 返回: *iccColorSpace 备用变换, error 严格校验或备用空间错误
+func (r *Reader) recoverICCAlternate(stream *Stream, count int, ranges *[8]float64, effective bool, cause error) (*iccColorSpace, error) {
+	if r.warning == nil || errors.Is(cause, errICCSourceProfileClass) {
+		return nil, cause
+	}
+	space, err := r.readICCAlternate(stream, count, ranges, effective)
+	if err != nil {
+		return nil, fmt.Errorf("%w; ICC alternate: %v", cause, err)
+	}
+	r.warning(Diagnostic{Message: "invalid ICC profile recovered using valid alternate color space: " + cause.Error()})
+	return space, nil
 }
 
 // iccAlternateObject 读取备用颜色空间，缺省按N选择设备空间

@@ -40,6 +40,7 @@ type TilingPattern struct {
 	blendingSpace *ColorSpace
 	maskGroup     *Stream
 	halftones     map[string]*Halftone
+	empty         bool
 }
 
 // Walk 独立解释图案单元内容，保留图案边界与无色图案的基色
@@ -55,6 +56,9 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	if p.reader.closed {
 		return os.ErrClosed
 	}
+	if p.empty {
+		return nil
+	}
 	if p.depth > 64 {
 		return &UnsupportedError{Feature: "nested pattern depth"}
 	}
@@ -63,7 +67,7 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	}
 	box := p.BBox
 	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
-	child := pageInterpreter{reader: p.reader, page: p.page, stream: p.stream, resources: p.resources, pageResources: p.pageResources, visitor: visitor, ctx: ctx, depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
+	child := pageInterpreter{reader: p.reader, page: p.page, stream: p.stream, resources: p.resources, pageResources: p.pageResources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
 	child.glyphStreams = p.glyphStreams
 	child.blendingSpace, child.maskGroup = p.blendingSpace, p.maskGroup
 	child.state = p.initial
@@ -164,6 +168,15 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err != nil {
 		return nil, err
 	}
+	empty := false
+	if (xstep == 0 || ystep == 0) && (box.XMin == box.XMax || box.YMin == box.YMax) && p.visitor.Warning != nil && !math.IsNaN(xstep) && !math.IsNaN(ystep) && !math.IsInf(xstep, 0) && !math.IsInf(ystep, 0) {
+		empty = true
+		xstep, ystep = 1, 1
+		p.visitor.Warning(Diagnostic{Message: "zero-step tiling pattern with empty bounding box retained as empty paint"})
+		if err := p.ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	if xstep == 0 || ystep == 0 || math.IsNaN(xstep) || math.IsNaN(ystep) || math.IsInf(xstep, 0) || math.IsInf(ystep, 0) {
 		return nil, fmt.Errorf("invalid tiling pattern step")
 	}
@@ -200,7 +213,7 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	pattern := &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones}
+	pattern := &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones, empty: empty}
 	pattern.page, pattern.stream = p.page, stream
 	if p.tilingPatterns == nil {
 		p.tilingPatterns = make(map[Name]*TilingPattern)

@@ -194,25 +194,37 @@ func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpac
 	}
 	data, err := stream.Decode()
 	if err != nil {
-		return nil, err
+		return r.recoverICCAlternate(stream, int(count), ranges, effective, err)
 	}
-	if err := validateICCSourceHeader(data, int(count)); err != nil {
+	space, err := r.readICCProfileData(data, int(count))
+	if err != nil {
+		return r.recoverICCAlternate(stream, int(count), ranges, effective, err)
+	}
+	if space == nil {
+		return r.readICCAlternate(stream, int(count), ranges, effective)
+	}
+	return space.withRanges(ranges), nil
+}
+
+// readICCProfileData 校验并缓存源配置，后续版本返回空值以选择标准备用空间
+// 入参: data 配置数据, count PDF声明的分量数
+// 返回: *iccColorSpace 配置变换，后续版本为空, error 配置错误
+func (r *Reader) readICCProfileData(data []byte, count int) (*iccColorSpace, error) {
+	if err := validateICCSourceHeader(data, count); err != nil {
 		return nil, err
 	}
 	if data[8] > 4 {
-		if _, err := iccProfileDirectory(data, string(data[16:20])); err != nil {
-			return nil, err
-		}
-		return r.readICCAlternate(stream, int(count), ranges, effective)
+		_, err := iccProfileDirectory(data, string(data[16:20]))
+		return nil, err
 	}
 	key := sha256.Sum256(data)
 	if cached := r.colorProfiles[key]; cached != nil {
-		if cached.components() != int(count) {
+		if cached.components() != count {
 			return nil, fmt.Errorf("invalid ICC component count")
 		}
-		return cached.withRanges(ranges), nil
+		return cached, nil
 	}
-	space, err := parseICCColorSpace(data, int(count), key)
+	space, err := parseICCColorSpace(data, count, key)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +232,7 @@ func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpac
 		r.colorProfiles = make(map[[32]byte]*iccColorSpace)
 	}
 	r.colorProfiles[key] = space
-	return space.withRanges(ranges), nil
+	return space, nil
 }
 
 // parseICCColorSpace 解析已确定分量数的配置，所有来源共用矩阵、曲线和查找表实现

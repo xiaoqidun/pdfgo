@@ -172,7 +172,7 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 			}
 		}
 		return nil
-	}, func(value Object) (Object, error) { return r.resourceColorSpace(value, resources) })
+	}, func(value Object) (Object, error) { return r.resourceColorSpace(value, resources) }, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -34,9 +34,21 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 		return fmt.Errorf("invalid AES-256 key length")
 	}
 	values := make(map[Name][]byte, 5)
-	for name, size := range map[Name]int{"O": 48, "U": 48, "OE": 32, "UE": 32, "Perms": 16} {
+	for _, field := range []struct {
+		name Name
+		size int
+	}{{"U", 48}, {"UE", 32}, {"Perms", 16}, {"O", 48}, {"OE", 32}} {
+		name, size := field.name, field.size
 		value, ok := dict[name].(String)
+		if r.warning != nil && ok && (name == "O" || name == "U") && len(value) > size {
+			r.warning(Diagnostic{Message: fmt.Sprintf("AES-256 %s entry has trailing bytes; authenticating the first %d bytes", name, size)})
+			value = value[:size]
+		}
 		if !ok || len(value) != size {
+			if r.warning != nil && (name == "O" || name == "OE") {
+				values[name] = nil
+				continue
+			}
 			return fmt.Errorf("invalid AES-256 %s entry", name)
 		}
 		values[name] = value
@@ -53,7 +65,9 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 		}
 		s.encryptMetadata = bool(flag)
 	}
-	if value := dict["CF"]; value != nil {
+	if value, err := r.securityFilters(dict["CF"]); err != nil {
+		return err
+	} else if value != nil {
 		s.filters, ok = value.(Dictionary)
 		if !ok {
 			return fmt.Errorf("invalid crypt filter dictionary")
@@ -79,20 +93,26 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 	}
 	password = password[:min(len(password), 127)]
 	user, owner := values["U"], values["O"]
-	validation := aes256PasswordHash(password, owner[32:40], user, revision)
-	ownerValid := subtle.ConstantTimeCompare(validation, owner[:32]) == 1
-	clear(validation)
+	ownerValid := false
+	if len(owner) == 48 && len(values["OE"]) == 32 {
+		validation := aes256PasswordHash(password, owner[32:40], user, revision)
+		ownerValid = subtle.ConstantTimeCompare(validation, owner[:32]) == 1
+		clear(validation)
+	}
 	entry, encrypted, extra := owner, values["OE"], user
 	if ownerValid {
 		s.info.Owner = true
 	} else {
-		validation = aes256PasswordHash(password, user[32:40], nil, revision)
+		validation := aes256PasswordHash(password, user[32:40], nil, revision)
 		userValid := subtle.ConstantTimeCompare(validation, user[:32]) == 1
 		clear(validation)
 		if !userValid {
 			return ErrPassword
 		}
 		entry, encrypted, extra = user, values["UE"], nil
+		if len(owner) != 48 || len(values["OE"]) != 32 {
+			r.warning(Diagnostic{Message: "invalid AES-256 owner entries unused after successful user authentication"})
+		}
 	}
 	wrapping := aes256PasswordHash(password, entry[40:48], extra, revision)
 	defer clear(wrapping)
@@ -121,6 +141,7 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 			return err
 		}
 	}
+	s.authenticated = true
 	r.security = s
 	valid = true
 	return nil

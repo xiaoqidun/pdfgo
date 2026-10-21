@@ -53,6 +53,39 @@ type coreFontMetrics struct {
 	bounds *Rectangle
 }
 
+// coreFontAlias 匹配明确的Base14度量兼容名称，不将任意外部字体替换为标准字体
+// 入参: name 原始字体名称
+// 返回: string 对应Base14名称，未匹配时为空
+func coreFontAlias(name string) string {
+	switch name {
+	case "Arial", "ArialMT":
+		return "Helvetica"
+	case "Arial,Bold", "Arial-BoldMT":
+		return "Helvetica-Bold"
+	case "Arial,Italic", "Arial-ItalicMT":
+		return "Helvetica-Oblique"
+	case "Arial,BoldItalic", "Arial-BoldItalicMT":
+		return "Helvetica-BoldOblique"
+	case "TimesNewRoman", "TimesNewRomanPSMT":
+		return "Times-Roman"
+	case "TimesNewRoman,Bold", "TimesNewRomanPS-BoldMT":
+		return "Times-Bold"
+	case "TimesNewRoman,Italic", "TimesNewRomanPS-ItalicMT":
+		return "Times-Italic"
+	case "TimesNewRoman,BoldItalic", "TimesNewRomanPS-BoldItalicMT":
+		return "Times-BoldItalic"
+	case "CourierNew", "CourierNewPSMT":
+		return "Courier"
+	case "CourierNew,Bold", "CourierNewPS-BoldMT":
+		return "Courier-Bold"
+	case "CourierNew,Italic", "CourierNewPS-ItalicMT":
+		return "Courier-Oblique"
+	case "CourierNew,BoldItalic", "CourierNewPS-BoldItalicMT":
+		return "Courier-BoldOblique"
+	}
+	return ""
+}
+
 // parseCoreFontMetrics 读取内置AFM资源中的字符编码、名称、横向字宽及边界
 // 入参: data 原始AFM资源
 // 返回: *coreFontMetrics 标准字体度量, error 无效字符度量

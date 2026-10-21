@@ -38,11 +38,12 @@ type FunctionGradient struct {
 
 // coordinateFunction 保存二维采样或计算器函数及各分量的独立函数
 type coordinateFunction struct {
+	ctx     context.Context
 	domain  [4]float64
 	bounds  []float64
 	outputs int
 	sampled *sampledFunction
-	program []calculatorInstruction
+	program *calculatorFunction
 	parts   []*coordinateFunction
 }
 
@@ -78,6 +79,11 @@ func (g *FunctionGradient) ColorAt(point Point) ([3]float64, error) {
 // 入参: point 二维输入, out 输出分量缓冲区
 // 返回: error 计算器或非有限结果错误
 func (f *coordinateFunction) evaluate(point [2]float64, out []float64) error {
+	if f.ctx != nil {
+		if err := f.ctx.Err(); err != nil {
+			return err
+		}
+	}
 	if f.parts != nil {
 		for i, part := range f.parts {
 			if err := part.evaluate(point, out[i:i+1]); err != nil {
@@ -91,8 +97,13 @@ func (f *coordinateFunction) evaluate(point [2]float64, out []float64) error {
 	}
 	if f.sampled != nil {
 		f.sampled.evaluate(point[:], out)
-	} else if err := evaluateCalculator(f.program, point[:], out); err != nil {
+	} else if err := f.program.evaluate(point[:], out); err != nil {
 		return err
+	}
+	if f.ctx != nil {
+		if err := f.ctx.Err(); err != nil {
+			return err
+		}
 	}
 	for i, value := range out {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
@@ -117,7 +128,7 @@ func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Objec
 	if err != nil {
 		return nil, err
 	}
-	f := &coordinateFunction{outputs: outputs}
+	f := &coordinateFunction{outputs: outputs, ctx: ctx}
 	if array, ok := value.(Array); ok {
 		if len(array) != outputs {
 			return nil, fmt.Errorf("invalid coordinate function count")
@@ -171,7 +182,7 @@ func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Objec
 		var data []byte
 		data, err = stream.DecodeContext(ctx)
 		if err == nil {
-			f.program, err = compileCalculator(data)
+			f.program, err = newCalculatorFunction(data, r.warning)
 		}
 	default:
 		return nil, fmt.Errorf("invalid two-input function type")

@@ -222,6 +222,7 @@ type ReplacementText struct {
 // Form可保留普通表单边界，缺省直接展开；透明表单仍由Group接收
 // Form的子访问器接收已变换并裁剪的图元，不应再次应用表单矩阵
 // Form及Group的子访问器未指定内容标记、可选内容及警告回调时沿用上层回调
+// Warning非空时诊断无效内容指令及可恢复外观，保留有效绘制和已有文字定位
 type Visitor struct {
 	Path            func(PathMark) error
 	Text            func(TextMark) error
@@ -281,6 +282,7 @@ type pageInterpreter struct {
 	textClips              []*TextClip
 	textMatrix, lineMatrix Matrix
 	inText                 bool
+	implicitText           bool
 	textObject             *TextObject
 	path                   Path
 	pathPoints             []Point
@@ -299,6 +301,7 @@ type pageInterpreter struct {
 	type3                  bool
 	uncoloredType3         bool
 	glyphStreams           []*Stream
+	formStreams            []*Stream
 	maskGroup              *Stream
 	blendingSpace          *ColorSpace
 	forms                  *formCache
@@ -496,7 +499,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	if _, err := page.WriteContent(ctx, &data); err != nil {
 		return err
 	}
-	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, bounds: page.CropBox}
+	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: page.CropBox}
 	interpreter.blendingSpace = groupSpace
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
@@ -564,7 +567,12 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	}
 	for _, active := range mark.glyphStreams {
 		if active == stream {
-			return fmt.Errorf("recursive Type3 character procedure %q", mark.Glyphs[index].Name)
+			message := fmt.Sprintf("recursive Type3 character procedure %q", mark.Glyphs[index].Name)
+			if visitor.Warning == nil {
+				return fmt.Errorf("%s", message)
+			}
+			visitor.Warning(Diagnostic{Message: message})
+			return ctx.Err()
 		}
 	}
 	if len(mark.glyphStreams) >= 64 {
@@ -588,7 +596,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if resources == nil {
 		resources = mark.Resources
 	}
-	interpreter := pageInterpreter{reader: r, page: mark.page, stream: stream, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, type3: true, replacement: mark.Replacement, sequence: mark.Sequence}
+	interpreter := pageInterpreter{reader: r, page: mark.page, stream: stream, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), type3: true, replacement: mark.Replacement, sequence: mark.Sequence}
 	interpreter.glyphStreams = append(append([]*Stream(nil), mark.glyphStreams...), stream)
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
@@ -672,7 +680,7 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 	optional := false
 	if op.Operator == "EMC" {
 		if len(op.Operands) != 0 || len(p.marked) == 0 {
-			return fmt.Errorf("unmatched marked content end")
+			return p.operationWarning(op, "unmatched marked content end")
 		}
 		state := p.marked[len(p.marked)-1]
 		mark.Tag, p.hidden = state.tag, state.hidden
@@ -691,15 +699,29 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 		var ok bool
 		mark.Tag, ok = op.Operands[0].(Name)
 		if !ok {
-			return fmt.Errorf("invalid marked content tag")
+			if err := p.operationWarning(op, "invalid marked content tag; enclosed drawing retained"); err != nil {
+				return err
+			}
+			if op.Operator == "BMC" || op.Operator == "BDC" {
+				p.marked = append(p.marked, markedContentState{hidden: p.hidden, previous: p.replacement, sequence: p.sequence})
+			}
+			return p.ctx.Err()
 		}
 		if count == 2 {
 			object := op.Operands[1]
 			if name, ok := object.(Name); ok {
-				var err error
-				object, err = p.resource("Properties", name)
+				value, err := p.reader.Resolve(p.resources["Properties"])
 				if err != nil {
 					return err
+				}
+				properties, ok := value.(Dictionary)
+				if !ok || properties[name] == nil {
+					if err := p.operationWarning(op, "missing Properties resource "+string(name)+"; enclosed drawing retained"); err != nil {
+						return err
+					}
+					object = Dictionary{}
+				} else {
+					object = properties[name]
 				}
 			}
 			value, err := p.reader.Resolve(object)
@@ -744,6 +766,9 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 			}
 		}
 		mark.Hidden = p.hidden
+	}
+	if mark.Tag == "" {
+		return p.ctx.Err()
 	}
 	if p.visitor.MarkedContent != nil {
 		return p.visitor.MarkedContent(mark)
@@ -796,7 +821,7 @@ func (p *pageInterpreter) addPathSegment(name string, points ...Point) {
 	p.path.Segments = append(p.path.Segments, Segment{name, stored})
 }
 
-// operation 执行内容操作，未知可见操作返回明确错误
+// operation 执行内容操作，诊断模式跳过无效状态及未知指令
 // 入参: op 内容操作
 // 返回: error 错误信息
 func (p *pageInterpreter) operation(op Operation) error {
@@ -804,15 +829,21 @@ func (p *pageInterpreter) operation(op Operation) error {
 	if p.uncoloredPattern {
 		switch op.Operator {
 		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN", "sh", "ri":
-			return fmt.Errorf("color operator in uncolored pattern")
+			return p.operationWarning(op, "color operator in uncolored pattern")
 		}
 	}
 	var v []float64
 	if n := graphicsOperandCount(op.Operator); n >= 0 {
+		if len(a) > n && p.visitor.Warning != nil {
+			if err := p.operationWarning(op, "excess numeric operands; trailing operands retained"); err != nil {
+				return err
+			}
+			a = a[len(a)-n:]
+		}
 		var err error
 		v, err = numbers(a, n)
 		if err != nil {
-			return err
+			return p.operationWarning(op, "invalid operands for "+op.Operator+": "+err.Error())
 		}
 	}
 	if p.uncoloredType3 {
@@ -846,7 +877,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.stack = append(p.stack, p.state)
 	case "Q":
 		if len(p.stack) == 0 {
-			return fmt.Errorf("unmatched operator %q", "Q")
+			return p.operationWarning(op, "unmatched operator Q")
 		}
 		p.state = p.stack[len(p.stack)-1]
 		p.stack = p.stack[:len(p.stack)-1]
@@ -854,12 +885,15 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.state.matrix = p.state.matrix.Mul(Matrix(v))
 	case "w":
 		if v[0] < 0 {
-			return fmt.Errorf("negative line width")
+			if err := p.operationWarning(op, "negative line width uses hairline default"); err != nil {
+				return err
+			}
+			v[0] = 0
 		}
 		p.state.style.LineWidth = v[0]
 	case "J", "j":
 		if v[0] < 0 || v[0] > 2 || v[0] != math.Trunc(v[0]) {
-			return fmt.Errorf("invalid line style")
+			return p.operationWarning(op, "invalid line style ignored")
 		}
 		if op.Operator == "J" {
 			p.state.style.Cap = int(v[0])
@@ -868,7 +902,12 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 	case "M":
 		if v[0] < 1 {
-			return fmt.Errorf("invalid miter limit")
+			if err := p.operationWarning(op, "miter limit below PDF minimum"); err != nil {
+				return err
+			}
+			if v[0] <= 0 {
+				return nil
+			}
 		}
 		p.state.style.MiterLimit = v[0]
 	case "d":
@@ -934,7 +973,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.current = end
 	case "h":
 		if !p.hasPoint {
-			return fmt.Errorf("close without current point")
+			return p.operationWarning(op, "close without current point")
 		}
 		add("C")
 		p.current = p.start
@@ -1176,16 +1215,22 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if operator == "G" {
 				paint = p.state.style.Stroke
 			}
+			pattern, err := p.tilingPattern(name)
+			if err != nil {
+				return err
+			}
+			if patternBase != nil && (pattern == nil || pattern.PaintType == 1) {
+				if err := p.operationWarning(op, "colored pattern does not use its declared base color space"); err != nil {
+					return err
+				}
+				patternBase = nil
+			}
 			if patternBase != nil {
 				if err := patternBaseColor(&paint, patternBase, a[:len(a)-1], p.state.style.RenderingIntent); err != nil {
 					return err
 				}
 			} else if len(a) != 1 {
 				return fmt.Errorf("invalid colored pattern operands")
-			}
-			pattern, err := p.tilingPattern(name)
-			if err != nil {
-				return err
 			}
 			if pattern != nil {
 				if pattern.PaintType == 2 && patternBase == nil || pattern.PaintType == 1 && patternBase != nil {
@@ -1215,10 +1260,24 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 			return nil
 		}
+		count := 1
+		if space == "DeviceRGB" {
+			count = 3
+		} else if space == "DeviceCMYK" {
+			count = 4
+		}
+		if _, err := numbers(a, count); err != nil {
+			return p.operationWarning(op, "invalid color operands: "+err.Error())
+		}
 		return p.deviceColor(a, operator == "g")
 	case "BT":
 		if p.inText {
-			return fmt.Errorf("nested text object")
+			if !p.implicitText {
+				return fmt.Errorf("nested text object")
+			}
+			if err := p.operation(Operation{Operator: "ET"}); err != nil {
+				return err
+			}
 		}
 		p.inText = true
 		p.textObject = &TextObject{Knockout: !p.state.nonKnockout}
@@ -1227,9 +1286,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.lineMatrix = Identity()
 	case "ET":
 		if !p.inText {
-			return fmt.Errorf("unmatched operator %q", "ET")
+			return p.operationWarning(op, "unmatched operator ET")
 		}
 		p.inText = false
+		p.implicitText = false
 		p.textObject = nil
 		if len(p.textClips) != 0 {
 			p.state.style.Clips = append(append([]Path(nil), p.state.style.Clips...), Path{Text: p.textClips})
@@ -1328,8 +1388,8 @@ func (p *pageInterpreter) operation(op Operation) error {
 				if err != nil {
 					return err
 				}
-				if !p.inText || p.state.font == nil {
-					return fmt.Errorf("text without active font")
+				if err := p.textState(); err != nil {
+					return err
 				}
 				shift := Matrix{1, 0, 0, 1, 0, 0}
 				if p.state.font.Vertical {
@@ -1378,9 +1438,26 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if p.compatibility != 0 {
 			return nil
 		}
+		if p.visitor.Warning != nil {
+			return p.operationWarning(op, "unsupported content operator "+op.Operator)
+		}
 		return &UnsupportedError{Feature: "content operator " + op.Operator}
 	}
 	return nil
+}
+
+// operationWarning 发送内容诊断，严格模式返回错误
+// 入参: op 原始指令, message 诊断原因
+// 返回: error 严格校验或取消错误
+func (p *pageInterpreter) operationWarning(op Operation, message string) error {
+	if err := p.ctx.Err(); err != nil {
+		return err
+	}
+	if p.visitor.Warning == nil {
+		return fmt.Errorf("%s", message)
+	}
+	p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: message})
+	return p.ctx.Err()
 }
 
 // graphicsOperandCount 获取固定数值操作符的参数数量，其他操作返回负数
@@ -1405,12 +1482,28 @@ func graphicsOperandCount(operator string) int {
 	}
 }
 
+// textState 验证活动字体，诊断模式为缺失文字对象保留已有文字矩阵
+// 返回: error 字体缺失、严格校验或取消错误
+func (p *pageInterpreter) textState() error {
+	if p.state.font == nil {
+		return fmt.Errorf("text without active font")
+	}
+	if !p.inText {
+		if err := p.operationWarning(Operation{Operator: "Tj"}, "text outside text object; existing text matrix retained"); err != nil {
+			return err
+		}
+		p.inText, p.implicitText = true, true
+		p.textObject = &TextObject{Knockout: !p.state.nonKnockout}
+	}
+	return p.ctx.Err()
+}
+
 // showText 保留逐字定位并更新文字矩阵
 // 入参: data 编码后的文字字节
 // 返回: error 错误信息
 func (p *pageInterpreter) showText(data []byte) error {
-	if !p.inText || p.state.font == nil {
-		return fmt.Errorf("text without active font")
+	if err := p.textState(); err != nil {
+		return err
 	}
 	mode := p.state.mode
 	if p.state.font.Subtype == "Type3" {
@@ -1540,17 +1633,22 @@ func (p *pageInterpreter) xobject(a []Object) error {
 	if p.hidden {
 		return nil
 	}
-	object, err := p.resource("XObject", name)
+	resources, err := p.reader.Resolve(p.resources["XObject"])
 	if err != nil {
 		return err
 	}
+	dict, ok := resources.(Dictionary)
+	if !ok || dict[name] == nil {
+		return p.operationWarning(Operation{Operator: "Do"}, "missing XObject resource "+string(name))
+	}
+	object := dict[name]
 	value, err := p.reader.Resolve(object)
 	if err != nil {
 		return err
 	}
 	stream, ok := value.(*Stream)
 	if !ok || stream == nil {
-		return fmt.Errorf("invalid XObject stream")
+		return p.operationWarning(Operation{Operator: "Do"}, "invalid XObject stream "+string(name))
 	}
 	kind, err := p.reader.Resolve(stream.Dictionary["Subtype"])
 	if err != nil {
@@ -1690,7 +1788,12 @@ func (p *pageInterpreter) formContent(stream, source *Stream) error {
 	if subtype == Name("PS") {
 		return p.postscript(stream)
 	}
-	if p.depth >= 32 {
+	for _, ancestor := range p.formStreams {
+		if ancestor == source {
+			return p.operationWarning(Operation{Operator: "Do"}, "form recursion detected")
+		}
+	}
+	if p.depth >= 1024 {
 		return fmt.Errorf("form recursion limit exceeded")
 	}
 	visible, err := p.optionalVisible(stream.Dictionary["OC"])
@@ -1730,6 +1833,7 @@ func (p *pageInterpreter) formContent(stream, source *Stream) error {
 		}
 	}
 	child := *p
+	child.formStreams = append(append([]*Stream(nil), p.formStreams...), source)
 	child.stream = source
 	child.content = nil
 	if target == nil {
@@ -1738,10 +1842,13 @@ func (p *pageInterpreter) formContent(stream, source *Stream) error {
 			return err
 		}
 		if resources != nil {
-			var ok bool
-			child.resources, ok = resources.(Dictionary)
+			dict, ok := resources.(Dictionary)
 			if !ok {
-				return fmt.Errorf("invalid form resources")
+				if err := p.operationWarning(Operation{Operator: "Do"}, "invalid form resources; enclosing resources retained"); err != nil {
+					return err
+				}
+			} else {
+				child.resources = dict
 			}
 		}
 	}
@@ -1837,6 +1944,7 @@ func (p *pageInterpreter) formContent(stream, source *Stream) error {
 	child.hasPoint = false
 	child.pendingClip = false
 	child.inText = false
+	child.implicitText = false
 	child.textObject = nil
 	value, err := p.reader.Resolve(stream.Dictionary["Matrix"])
 	if err != nil {
@@ -2029,7 +2137,9 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 		switch key {
 		case "Type":
 			if value != Name("ExtGState") {
-				return fmt.Errorf("invalid graphics state object type")
+				if err := p.operationWarning(Operation{Operator: "gs"}, "invalid graphics state object type; state entries retained"); err != nil {
+					return err
+				}
 			}
 		case "TK":
 			flag, ok := value.(Boolean)
@@ -2038,7 +2148,7 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 			}
 			p.state.nonKnockout = !bool(flag)
 		case "HT":
-			p.state.style.Halftone, err = p.reader.ReadHalftoneForDevice(dict[key], p.visitor.Halftones)
+			p.state.style.Halftone, err = p.displayHalftone(dict[key])
 			if err != nil {
 				return err
 			}
@@ -2072,7 +2182,12 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				return err
 			}
 		case "TR", "TR2":
-			if key == "TR2" && value == Name("Default") {
+			if value == Name("Default") {
+				if key == "TR" {
+					if err := p.operationWarning(Operation{Operator: "gs"}, "TR Default uses device transfer default"); err != nil {
+						return err
+					}
+				}
 				p.state.style.Transfer = nil
 				continue
 			}
@@ -2109,7 +2224,10 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				return err
 			}
 			if n[0] < 0 || n[0] > 1 {
-				return fmt.Errorf("invalid alpha")
+				if err := p.operationWarning(Operation{Operator: "gs"}, "invalid alpha; current opacity retained"); err != nil {
+					return err
+				}
+				continue
 			}
 			if p.opaqueGroup && n[0] != 1 {
 				return &UnsupportedError{Feature: "transparent group content"}
@@ -2182,7 +2300,11 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 			p.state.style.Antialias = &v
 		case "BG", "BG2", "UCR", "UCR2":
 			var function *ColorFunction
-			if (key != "BG2" && key != "UCR2") || value != Name("Default") {
+			if value == Name("Identity") {
+				if err := p.operationWarning(Operation{Operator: "gs"}, "named identity color function uses device default"); err != nil {
+					return err
+				}
+			} else if (key != "BG2" && key != "UCR2") || value != Name("Default") {
 				function, err = p.reader.ReadColorFunction(value)
 				if err != nil {
 					return err

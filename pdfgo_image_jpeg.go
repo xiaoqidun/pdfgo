@@ -25,6 +25,9 @@ import (
 	"io"
 )
 
+// jpegRecoveryPixelLimit 限制异常JPEG恢复验证的像素预算，不按损坏帧头扩大分配
+const jpegRecoveryPixelLimit = 128 << 20
+
 // jpegFrame 保存采样布局和独立显示元数据状态
 type jpegFrame struct {
 	components      int
@@ -32,6 +35,37 @@ type jpegFrame struct {
 	progressive     bool
 	sampling        [4][2]int
 	displayMetadata bool
+}
+
+// encodedImageDimensions 只读取单层JPEG或JPEG2000图像头，不为无效字典推测尺寸
+// 入参: stream 图像编码流
+// 返回: int 编码宽度, int 编码高度, error 不可确定的尺寸或编码错误
+func (r *Reader) encodedImageDimensions(stream *Stream) (int, int, error) {
+	filters, _, err := stream.filterChain(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(filters) == 1 {
+		switch filters[0] {
+		case Name("DCTDecode"):
+			config, err := jpeg.DecodeConfig(bytes.NewReader(stream.Data))
+			if err == nil && (config.Height <= 0 || config.Width <= 0 || config.Width > jpegRecoveryPixelLimit/config.Height) {
+				return 0, 0, fmt.Errorf("JPEG dimension recovery exceeds sample budget")
+			}
+			return config.Width, config.Height, err
+		case Name("JPXDecode"):
+			data, err := jpxCodestream(stream.Data)
+			if err != nil {
+				return 0, 0, err
+			}
+			width, height, _, err := jpxSize(data)
+			if err == nil && (height <= 0 || width <= 0 || width > jpegRecoveryPixelLimit/height) {
+				return 0, 0, fmt.Errorf("JPEG2000 dimension recovery exceeds sample budget")
+			}
+			return width, height, err
+		}
+	}
+	return 0, 0, fmt.Errorf("image encoding has no independent dimensions")
 }
 
 // jpegEncodingImage 为不透明八位图像复用预乘视图，避免编码器逐像素接口分配
@@ -79,7 +113,7 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	if data == nil {
 		return nil, nil
 	}
-	frame, transform, _, err := i.jpegTransformContext(ctx, data, params)
+	data, frame, transform, _, err := i.jpegReadTransformContext(ctx, data, params)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +122,10 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	if config.Width != i.Width || config.Height != i.Height {
-		return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
+		if i.Warning == nil {
+			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
+		}
+		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using complete image data dimensions %dx%d", config.Width, config.Height)})
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -137,7 +174,7 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	frame, transform, tagged, err := i.jpegTransformContext(ctx, data, params)
+	data, frame, transform, tagged, err := i.jpegReadTransformContext(ctx, data, params)
 	if err != nil {
 		return nil, err
 	}
@@ -157,13 +194,16 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 		return nil, err
 	}
 	if config.Width != i.Width || config.Height != i.Height {
-		return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
+		if i.Warning == nil {
+			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
+		}
+		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using image data dimensions %dx%d", config.Width, config.Height)})
 	}
 	if err := frame.sampleSize(); err != nil {
 		return nil, err
 	}
 	if components == 4 || components == 3 && (config.ColorModel != color.YCbCrModel || !transform) {
-		if _, _, err := imageBufferSize(i.Width, i.Height, 4); err != nil {
+		if _, _, err := imageBufferSize(config.Width, config.Height, 4); err != nil {
 			return nil, err
 		}
 	}
@@ -220,6 +260,13 @@ func jpegColorInfoContext(ctx context.Context, data []byte) (jpegFrame, byte, bo
 // 入参: ctx 取消上下文, data JPEG数据, visit 可选片段处理函数
 // 返回: jpegFrame 采样布局, byte Adobe变换, bool Adobe标记, error 格式、处理或取消错误
 func jpegColorSegmentsContext(ctx context.Context, data []byte, visit func(byte, int, int) error) (jpegFrame, byte, bool, error) {
+	return jpegReadSegmentsContext(ctx, data, visit, nil)
+}
+
+// jpegReadSegmentsContext 检查JPEG标记，恢复扫描时只移除扫描外的多余字节
+// 入参: ctx 取消上下文, data 编码数据, visit 片段访问函数, skip 多余字节处理函数
+// 返回: jpegFrame 采样布局, byte Adobe变换, bool Adobe标记, error 格式或取消错误
+func jpegReadSegmentsContext(ctx context.Context, data []byte, visit func(byte, int, int) error, skip func(int, int) error) (jpegFrame, byte, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return jpegFrame{}, 0, false, err
 	}
@@ -234,7 +281,19 @@ func jpegColorSegmentsContext(ctx context.Context, data []byte, visit func(byte,
 		}
 		if data[pos] != 0xff {
 			if !entropy {
-				return jpegFrame{}, 0, false, fmt.Errorf("invalid JPEG marker")
+				if skip == nil {
+					return jpegFrame{}, 0, false, fmt.Errorf("invalid JPEG marker")
+				}
+				end := pos + min(65536, len(data)-pos)
+				n := bytes.IndexByte(data[pos:end], 0xff)
+				if n >= 0 {
+					end = pos + n
+				}
+				if err := skip(pos, end); err != nil {
+					return jpegFrame{}, 0, false, err
+				}
+				pos = end
+				continue
 			}
 			end := pos + min(65536, len(data)-pos)
 			n := bytes.IndexByte(data[pos:end], 0xff)
@@ -262,6 +321,12 @@ func jpegColorSegmentsContext(ctx context.Context, data []byte, visit func(byte,
 		marker := data[pos]
 		pos++
 		if entropy && (marker == 0 || marker >= 0xd0 && marker <= 0xd7) {
+			continue
+		}
+		if skip != nil && marker == 0 {
+			if err := skip(start, pos); err != nil {
+				return jpegFrame{}, 0, false, err
+			}
 			continue
 		}
 		entropy = false
@@ -312,6 +377,200 @@ func jpegColorSegmentsContext(ctx context.Context, data []byte, visit func(byte,
 		pos += size
 	}
 	return jpegFrame{}, 0, false, fmt.Errorf("missing JPEG end marker")
+}
+
+// jpegReadTransformContext 仅在完整样本可严格解码时恢复结束标记及扫描外冗余数据
+// 入参: ctx 取消上下文, data JPEG数据, params DCT参数
+// 返回: []byte 有效编码, jpegFrame 采样布局, bool 颜色变换, bool Adobe标记, error 解码或取消错误
+func (i *Image) jpegReadTransformContext(ctx context.Context, data []byte, params Dictionary) ([]byte, jpegFrame, bool, bool, error) {
+	frame, transform, tagged, err := i.jpegTransformContext(ctx, data, params)
+	if err == nil && i.Warning != nil && (frame.width != i.Width || frame.height != i.Height) {
+		data, err = i.jpegDimensionFileContext(ctx, data, frame, params)
+		if err == nil {
+			frame, transform, tagged, err = i.jpegTransformContext(ctx, data, params)
+		}
+		return data, frame, transform, tagged, err
+	}
+	if err == nil || i.Warning == nil || ctx.Err() != nil {
+		return data, frame, transform, tagged, err
+	}
+	originalErr := err
+	if len(data) < 2 || data[0] != 255 || data[1] != 216 || len(data) > imageBufferLimit()-2 {
+		return nil, jpegFrame{}, false, false, originalErr
+	}
+	candidate := make([]byte, 0, len(data)+2)
+	for position := 0; position < len(data); {
+		if err := ctx.Err(); err != nil {
+			return nil, jpegFrame{}, false, false, err
+		}
+		end := position + min(65536, len(data)-position)
+		candidate = append(candidate, data[position:end]...)
+		position = end
+	}
+	if data[len(data)-2] != 255 || data[len(data)-1] != 217 {
+		candidate = append(candidate, 255, 217)
+	}
+	candidate, err = jpegRestoreFramePrefix(ctx, candidate)
+	if err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	var normalized []byte
+	position := 0
+	frame, _, _, err = jpegReadSegmentsContext(ctx, candidate, nil, func(start, end int) error {
+		normalized = append(normalized, candidate[position:start]...)
+		position = end
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	if position != 0 {
+		normalized = append(normalized, candidate[position:]...)
+		candidate = normalized
+	}
+	if err := frame.sampleSize(); err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	if frame.height <= 0 || frame.width <= 0 || frame.width > jpegRecoveryPixelLimit/frame.height {
+		return nil, jpegFrame{}, false, false, fmt.Errorf("JPEG framing recovery exceeds sample budget")
+	}
+	validation := *i
+	validation.Width, validation.Height, validation.Warning = frame.width, frame.height, nil
+	if _, err := validation.jpegSamplesContext(ctx, candidate, params); err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	frame, transform, tagged, err = i.jpegTransformContext(ctx, candidate, params)
+	if err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	i.Warning(Diagnostic{Message: fmt.Sprintf("recovered JPEG framing after complete sample validation: %v", originalErr)})
+	return candidate, frame, transform, tagged, ctx.Err()
+}
+
+// jpegRestoreFramePrefix 保留原量化数据，仅恢复被前一片段长度吞入的帧标记前缀
+// 入参: ctx 取消上下文, data 待完整解码验证的JPEG副本
+// 返回: []byte 恢复标记前缀的编码或原编码, error 取消错误
+func jpegRestoreFramePrefix(ctx context.Context, data []byte) ([]byte, error) {
+	for position := 2; position+4 <= len(data); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if data[position] != 255 {
+			if data[position-1] == 255 && (data[position] == 192 || data[position] == 193 || data[position] == 194) {
+				result := make([]byte, len(data)+1)
+				copy(result, data[:position])
+				result[position] = 255
+				copy(result[position+1:], data[position:])
+				return result, ctx.Err()
+			}
+			return data, nil
+		}
+		marker := data[position+1]
+		if marker == 218 || marker == 217 {
+			return data, nil
+		}
+		length := int(binary.BigEndian.Uint16(data[position+2:]))
+		if length < 2 || length > len(data)-position-2 {
+			return data, nil
+		}
+		position += length + 2
+	}
+	return data, ctx.Err()
+}
+
+// jpegDimensionFileContext 用完整扫描验证字典高度候选，禁止截去额外MCU行或按损坏高度分配巨幅图像
+// 入参: ctx 取消上下文, data JPEG数据, frame 原编码布局, params DCT参数
+// 返回: []byte 已验证的编码副本或原编码, error 不完整扫描、预算或取消错误
+func (i *Image) jpegDimensionFileContext(ctx context.Context, data []byte, frame jpegFrame, params Dictionary) ([]byte, error) {
+	validate := func(encoded []byte, width, height int) error {
+		if width <= 0 || height <= 0 || width > jpegRecoveryPixelLimit/height {
+			return fmt.Errorf("JPEG dimension recovery exceeds sample budget")
+		}
+		validation := *i
+		validation.Width, validation.Height, validation.Warning = width, height, nil
+		_, err := validation.jpegSamplesContext(ctx, encoded, params)
+		return err
+	}
+	maxH, maxV := 1, 1
+	for n := 0; n < min(frame.components, len(frame.sampling)); n++ {
+		maxH = max(maxH, frame.sampling[n][0])
+		maxV = max(maxV, frame.sampling[n][1])
+	}
+	if !frame.progressive && frame.width == i.Width && i.Height > 0 && i.Height < frame.height && (frame.width+8*maxH-1)/(8*maxH) > 8 {
+		frameStart, scanStart, scanCount := 0, 0, 0
+		_, _, _, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
+			switch marker {
+			case 0xc0, 0xc1:
+				if frameStart != 0 {
+					return fmt.Errorf("multiple JPEG frames cannot recover dimensions")
+				}
+				for data[start+1] == 255 {
+					start++
+				}
+				frameStart = start + 5
+			case 0xda:
+				scanCount++
+				for data[start+1] == 255 {
+					start++
+				}
+				if start+4 < end && int(data[start+4]) == frame.components {
+					scanStart = end
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if frameStart != 0 && scanStart != 0 && scanCount == 1 {
+			end := scanStart
+			for end+1 < len(data) {
+				if end&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				if data[end] != 255 {
+					end++
+					continue
+				}
+				marker := data[end+1]
+				if marker == 0 || marker >= 0xd0 && marker <= 0xd7 {
+					end += 2
+					continue
+				}
+				if marker == 255 {
+					end++
+					continue
+				}
+				break
+			}
+			if end > scanStart && end+1 < len(data) && data[end+1] == 217 && data[end-1] != 0 {
+				unit := 8 * maxV
+				firstHeight := (i.Height + unit - 1) / unit * unit
+				for _, height := range [2]int{firstHeight, firstHeight + unit} {
+					if height >= frame.height || height > 65535 {
+						continue
+					}
+					candidate := bytes.Clone(data)
+					binary.BigEndian.PutUint16(candidate[frameStart:], uint16(height))
+					if err := validate(candidate, frame.width, height); err == nil {
+						probe := make([]byte, end+1)
+						copy(probe, candidate[:end-1])
+						probe[end-1], probe[end] = 255, 217
+						if err := validate(probe, frame.width, height); err != nil && ctx.Err() == nil {
+							i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG frame height %d disagrees with complete scan; recovered verified height %d", frame.height, height)})
+							return candidate, nil
+						}
+					}
+				}
+			}
+		}
+	}
+	if err := validate(data, frame.width, frame.height); err != nil {
+		return nil, err
+	}
+	return data, ctx.Err()
 }
 
 // jpegDisplayFileContext 无损移除PDF忽略的Exif和ICC片段，保留颜色标记及扫描数据

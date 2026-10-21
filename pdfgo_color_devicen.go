@@ -30,7 +30,7 @@ type deviceNSpace struct {
 	none          bool
 	input, output []float64
 	expressions   []affineValue
-	program       []calculatorInstruction
+	program       *calculatorFunction
 	sampled       *sampledFunction
 	nested        *tintAlternate
 }
@@ -120,7 +120,7 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 		for i, value := range tints {
 			input[i] = math.Max(s.input[2*i], math.Min(s.input[2*i+1], math.Max(0, math.Min(1, value))))
 		}
-		if err := evaluateCalculator(s.program, input, values[:s.outputComponents()]); err != nil {
+		if err := s.program.evaluate(input, values[:s.outputComponents()]); err != nil {
 			return values, err
 		}
 		values = clipGradientValue(values, s.output)
@@ -283,7 +283,7 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 	if err != nil {
 		return nil, err
 	}
-	program, err := compileCalculator(data)
+	program, err := newCalculatorFunction(data, r.warning)
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +300,7 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 	for i := range names {
 		inputs[i] = input[2*i]
 	}
-	if err := evaluateCalculator(program, inputs, outputs[:alternate.components]); err != nil {
+	if err := program.evaluate(inputs, outputs[:alternate.components]); err != nil {
 		return nil, err
 	}
 	return s, nil
