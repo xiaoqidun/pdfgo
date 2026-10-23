@@ -1495,6 +1495,9 @@ func (p *pageInterpreter) textState() error {
 		p.inText, p.implicitText = true, true
 		p.textObject = &TextObject{Knockout: !p.state.nonKnockout}
 	}
+	if p.textObject == nil || p.textObject.Knockout == p.state.nonKnockout {
+		p.textObject = &TextObject{Knockout: !p.state.nonKnockout}
+	}
 	return p.ctx.Err()
 }
 
@@ -2143,8 +2146,13 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 			}
 		case "TK":
 			flag, ok := value.(Boolean)
-			if !ok || p.inText {
+			if !ok || p.inText && p.visitor.Warning == nil {
 				return fmt.Errorf("invalid text knockout state")
+			}
+			if p.inText {
+				if err := p.operationWarning(Operation{Operator: "gs"}, "invalid text knockout state inside text object; subsequent text uses updated state"); err != nil {
+					return err
+				}
 			}
 			p.state.nonKnockout = !bool(flag)
 		case "HT":
