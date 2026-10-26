@@ -1052,7 +1052,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 		name := map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[len(v)]
 		fill := op.Operator == "g" || op.Operator == "rg" || op.Operator == "k"
-		if p.resources["ColorSpace"] == nil {
+		if p.resources["ColorSpace"] == nil && p.reader.deviceProfile == nil {
 			return p.setDeviceColor(v, name, fill)
 		}
 		object, err := p.reader.resourceColorSpace(name, p.resources)

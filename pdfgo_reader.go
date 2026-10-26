@@ -50,6 +50,7 @@ type Reader struct {
 	fonts              map[Reference]*Font
 	halftones          map[Reference]*Halftone
 	colorProfiles      map[[32]byte]*iccColorSpace
+	deviceProfile      *Stream
 	colorProfileDepth  int
 	objectStreams      [4]*objectStream
 	security           *standardSecurity
