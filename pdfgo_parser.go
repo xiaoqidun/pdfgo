@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"math"
 	"strconv"
+	"strings"
 )
 
 // objectParser 维护解析位置、嵌套深度及试探读取的窗口耗尽状态
@@ -189,17 +190,24 @@ func (p *objectParser) object() (Object, error) {
 	if p.warning != nil && validScientificNumber(token) {
 		p.warning(Diagnostic{Offset: p.base + int64(p.pos-len(token)), Message: "non-standard scientific numeric notation"})
 	}
-	if value, err := strconv.ParseInt(token, 10, 64); err == nil {
-		saved := p.pos
-		generation, err := strconv.ParseInt(p.token(), 10, 64)
-		if err == nil && generation >= 0 && generation <= 65535 && (value > 0 || (value == 0 && p.warning != nil)) && p.token() == "R" {
-			if value == 0 {
-				p.warning(Diagnostic{Offset: p.base + int64(saved), Message: "zero object number in indirect reference treated as null"})
+	if !strings.ContainsAny(token, ".eE") {
+		if value, err := strconv.ParseInt(token, 10, 64); err == nil {
+			saved := p.pos
+			generationToken := p.token()
+			generation := int64(-1)
+			var err error
+			if validNumber(generationToken) && !strings.ContainsRune(generationToken, '.') {
+				generation, err = strconv.ParseInt(generationToken, 10, 64)
 			}
-			return Reference{Number: value, Generation: generation}, nil
+			if err == nil && generation >= 0 && generation <= 65535 && (value > 0 || (value == 0 && p.warning != nil)) && p.token() == "R" {
+				if value == 0 {
+					p.warning(Diagnostic{Offset: p.base + int64(saved), Message: "zero object number in indirect reference treated as null"})
+				}
+				return Reference{Number: value, Generation: generation}, nil
+			}
+			p.pos = saved
+			return Integer(value), nil
 		}
-		p.pos = saved
-		return Integer(value), nil
 	}
 	value, err := strconv.ParseFloat(token, 64)
 	if err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
