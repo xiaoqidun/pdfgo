@@ -43,6 +43,56 @@ type DestinationViewport struct {
 	ContentBounds *Rectangle
 }
 
+// Transform 变换已解析的目标坐标，保留空坐标和缩放语义
+// 入参: matrix 到新页面坐标的轴对齐可逆变换
+// 返回: DestinationTarget 新目标, error 目标或变换错误
+func (d DestinationTarget) Transform(matrix Matrix) (DestinationTarget, error) {
+	value := func(number float64, keep bool) Object {
+		if keep {
+			return nil
+		}
+		return Real(number)
+	}
+	source := Destination{Mode: d.Mode}
+	switch d.Mode {
+	case "XYZ":
+		source.Parameters = Array{value(d.Left, d.KeepLeft), value(d.Top, d.KeepTop), value(d.Zoom, d.KeepZoom)}
+	case "FitH", "FitBH":
+		source.Parameters = Array{value(d.Top, d.KeepTop)}
+	case "FitV", "FitBV":
+		source.Parameters = Array{value(d.Left, d.KeepLeft)}
+	case "FitR":
+		source.Parameters = Array{Real(d.Left), Real(d.Top), Real(d.Right), Real(d.Bottom)}
+	}
+	return source.Transform(matrix)
+}
+
+// Constrain 将视图限制在目标页面的可展示范围，不修改原始目标
+// 页面小于视口时居中；这是调用方选择的显示边界策略，不属于PDF目标语义
+// 入参: viewport 与视图采用相同坐标单位的窗口及页面范围
+// 返回: DestinationView 限定后的视图, error 无效范围或缩放
+func (v DestinationView) Constrain(viewport DestinationViewport) (DestinationView, error) {
+	if !destinationRectangle(viewport.PageBounds) || !destinationFinite(viewport.Width) || !destinationFinite(viewport.Height) || viewport.Width <= 0 || viewport.Height <= 0 || !destinationFinite(v.Left) || !destinationFinite(v.Top) || !destinationFinite(v.Zoom) || v.Zoom <= 0 {
+		return DestinationView{}, fmt.Errorf("%w: display bounds", ErrInvalidDestination)
+	}
+	width, height := viewport.Width/v.Zoom, viewport.Height/v.Zoom
+	if !destinationFinite(width) || !destinationFinite(height) {
+		return DestinationView{}, fmt.Errorf("%w: display extent overflow", ErrInvalidDestination)
+	}
+	limit := func(position, minimum, maximum, extent float64) float64 {
+		if maximum-minimum <= extent {
+			return minimum + (maximum-minimum-extent)/2
+		}
+		return math.Max(minimum, math.Min(maximum-extent, position))
+	}
+	v.Left = limit(v.Left, viewport.PageBounds.XMin, viewport.PageBounds.XMax, width)
+	v.Top = limit(v.Top, viewport.PageBounds.YMin, viewport.PageBounds.YMax, height)
+	if !destinationFinite(v.Left) || !destinationFinite(v.Top) {
+		return DestinationView{}, fmt.Errorf("%w: display position overflow", ErrInvalidDestination)
+	}
+	return v, nil
+}
+
 // Transform 将PDF目标转换到左上原点坐标，支持缩放、平移和直角旋转，保留空值
 // 入参: matrix 从PDF默认用户空间到目标页面坐标的轴对齐可逆变换
 // 返回: DestinationTarget 变换后的目标, error 模式、参数或变换错误
