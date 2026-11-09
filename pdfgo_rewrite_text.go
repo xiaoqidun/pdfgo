@@ -182,3 +182,104 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 	result.Write(data[position:])
 	return result.Bytes(), ctx.Err()
 }
+
+// transformPageContent 逐页替换内容流，独立封装共享内容并保留已有页面修改
+// 入参: ctx 取消上下文, transform 内容变换, result 本次替换对象
+// 返回: error 读取、变换或写出错误
+func (r *Reader) transformPageContent(ctx context.Context, transform func(context.Context, *Page, []byte) ([]byte, error), result map[Reference]Object) error {
+	number := int64(0)
+	for id := range r.xref {
+		number = max(number, id)
+	}
+	for ref := range result {
+		number = max(number, ref.Number)
+	}
+	return r.rewriteReader(result).WalkPages(ctx, func(_ int, page *Page) error {
+		var content bytes.Buffer
+		if _, err := page.WriteContent(ctx, &content); err != nil {
+			return err
+		}
+		data, err := transform(ctx, page, content.Bytes())
+		if err != nil {
+			return err
+		}
+		if data == nil {
+			return ctx.Err()
+		}
+		encoded, err := compressPDFBytes(ctx, data)
+		if err != nil {
+			return err
+		}
+		stream := &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded}
+		ref, reusable := page.Dictionary["Contents"].(Reference)
+		_, original := r.xref[ref.Number]
+		if reusable && !original {
+			result[ref] = stream
+		} else {
+			ref, err = appendRewriteObject(result, &number, stream)
+		}
+		if err != nil {
+			return err
+		}
+		dict, err := r.rewriteDictionary(page.Reference, result)
+		if err != nil {
+			return err
+		}
+		dict["Contents"] = ref
+		result[page.Reference] = dict
+		return ctx.Err()
+	})
+}
+
+// CompactText 合并相邻且显式重设文字矩阵的文字对象，不跨越内容标记及图形状态边界
+// 入参: ctx 取消上下文, data 解码页面内容
+// 返回: []byte 精简内容，未变化时为nil, error 解析或取消错误
+func CompactText(ctx context.Context, data []byte) ([]byte, error) {
+	var output bytes.Buffer
+	position, endText, beginText := 0, -1, -1
+	mode, clipped := int64(0), false
+	var stack []int64
+	err := WalkOperations(ctx, data, func(op Operation) error {
+		switch op.Operator {
+		case "q":
+			stack = append(stack, mode)
+		case "Q":
+			if len(stack) > 0 {
+				mode, stack = stack[len(stack)-1], stack[:len(stack)-1]
+			}
+		case "Tr":
+			if len(op.Operands) == 1 {
+				value, ok := op.Operands[0].(Integer)
+				if ok {
+					mode = int64(value)
+				}
+			}
+		}
+		clipped = clipped || mode >= 4
+		if op.Operator == "Tm" && len(op.Operands) == 6 && beginText >= 0 {
+			output.Write(data[position:endText])
+			position = beginText + 2
+		}
+		if op.Operator == "BT" && endText >= 0 && len(op.Operands) == 0 {
+			beginText = int(op.Offset)
+		} else {
+			beginText = -1
+			endText = -1
+			if op.Operator == "ET" && len(op.Operands) == 0 && !clipped {
+				endText = int(op.Offset)
+			}
+		}
+		if op.Operator == "ET" {
+			clipped = false
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if position == 0 {
+		return nil, ctx.Err()
+	}
+	output.Write(data[position:])
+	return output.Bytes(), ctx.Err()
+}

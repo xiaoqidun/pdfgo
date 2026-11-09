@@ -38,6 +38,8 @@ import (
 // ScreenAnnotations按页面追加屏幕注解，可由RenditionAction.Target引用
 // TextReplacements按页面内容流中的文字对象序号写入整段替换文本，不改动字形及定位
 // Information按键更新文档信息字典，nil值删除字段，文本使用EncodeTextString编码，不同步XMP
+// TransformContent在文字替换后逐页变换解码内容，返回nil保留原内容，输入缓冲可原地修改
+// 回调中的Page及其资源为只读借用，不得修改，返回内容须使用该页已有资源
 // Optimization在同次写出中处理压缩及制作软件，Creator非空时覆盖Information中的Creator及Producer
 type RewriteOptions struct {
 	Information         Dictionary
@@ -56,6 +58,7 @@ type RewriteOptions struct {
 	MovieAnnotations    map[Reference][]*MovieAnnotation
 	ScreenAnnotations   map[Reference][]*ScreenAnnotation
 	TextReplacements    map[Reference][]TextReplacement
+	TransformContent    func(context.Context, *Page, []byte) ([]byte, error)
 	Optimization        OptimizeOptions
 }
 
@@ -154,7 +157,12 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if err != nil {
 		return OptimizeReport{}, err
 	}
-	if textChanged || len(replacements) != 0 && options.Optimization.Compression.Mode != CompressionUnchanged {
+	if options.TransformContent != nil {
+		if err := r.transformPageContent(ctx, options.TransformContent, replacements); err != nil {
+			return OptimizeReport{}, err
+		}
+	}
+	if textChanged || options.TransformContent != nil || len(replacements) != 0 && options.Optimization.Compression.Mode != CompressionUnchanged {
 		r = r.rewriteReader(replacements)
 	}
 	if textChanged {
