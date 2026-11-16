@@ -45,11 +45,13 @@ type ThreeDProjection struct {
 }
 
 // ThreeDCamera 保存相机来源，Source为空时使用模型中的视图
-// Matrix仅用于M来源，Path仅用于U3D来源；CenterOfOrbit为空时由阅读器确定
+// Matrix仅用于M来源，Path仅用于U3D来源；PathFromRoot保留数组路径的根匹配语义，单名称为false
+// CenterOfOrbit为空时由阅读器确定
 type ThreeDCamera struct {
 	Source        Name
 	Matrix        [12]float64
 	Path          []string
+	PathFromRoot  bool
 	CenterOfOrbit *float64
 }
 
@@ -257,6 +259,7 @@ func (r *Reader) ReadThreeDCamera(object Object) (ThreeDCamera, error) {
 			return result, err
 		}
 		path, ok := value.(Array)
+		result.PathFromRoot = ok
 		if _, single := value.(String); single {
 			path, ok = Array{value}, true
 		}
