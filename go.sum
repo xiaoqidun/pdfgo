@@ -1,10 +1,8 @@
-github.com/xiaoqidun/j2kgo v1.0.2 h1:OAjjEOfaBaQzBNcj9wx+eM68UI5pewR6SzNZa1R1DIw=
-github.com/xiaoqidun/j2kgo v1.0.2/go.mod h1:DCwAfuDzCDYqUiAlZ7BDwigTjaXw7o9L1FtEma/D1aA=
-github.com/xiaoqidun/jbig2 v1.1.9 h1:l932WIdNJpe4jIoJ+eeUR/+ZcmHtQwuwLgMRZPU7mgo=
-github.com/xiaoqidun/jbig2 v1.1.9/go.mod h1:gPtM5nWFKDMn4jkw/4Jebu5ifDNwg0MGqDguAVabc84=
+github.com/xiaoqidun/j2kgo v1.0.3 h1:824gyl8dQBOOukXFbDrDiLzXNPO+Q78a10xISMlkO7Y=
+github.com/xiaoqidun/j2kgo v1.0.3/go.mod h1:DCwAfuDzCDYqUiAlZ7BDwigTjaXw7o9L1FtEma/D1aA=
+github.com/xiaoqidun/jbig2 v1.1.10 h1:LOxD2TdwZjO03wXpjKDMgyLdpYab6SVly5YZAyTtwFo=
+github.com/xiaoqidun/jbig2 v1.1.10/go.mod h1:gPtM5nWFKDMn4jkw/4Jebu5ifDNwg0MGqDguAVabc84=
 golang.org/x/image v0.48.0 h1:1AvuPcuoOTJpA7s4VZ5umrb90T3So0rkB/bSGmxkxik=
 golang.org/x/image v0.48.0/go.mod h1:mmtg64iqJKGqEgy+r13dfybl85tmxUd2lMnmaiSdWYY=
-golang.org/x/sys v0.50.0 h1:dkKZEFTEKaLr1sjhs0WiKqoi8Jj5nHbS3Njmx1UoMJs=
-golang.org/x/sys v0.50.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
 golang.org/x/text v0.44.0 h1:YItdp/mQNGnsmrgpcdA5yQ3bnRxCfo/Tj/iByGW9GGo=
 golang.org/x/text v0.44.0/go.mod h1:S4FR1waQ9LbjQTls97SyRjDaUUVkaM+cXwwuG/G+MwY=

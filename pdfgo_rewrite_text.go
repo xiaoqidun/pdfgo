@@ -32,11 +32,11 @@ type TextReplacement struct {
 }
 
 // textReplacements 按页写入标准替换文本，复制内容流以隔离共享资源
-// 入参: ctx 取消上下文, changes 页面替换区段, result 已有替换对象
-// 返回: bool 是否修改内容, error 参数、内容或取消错误
-func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]TextReplacement, result map[Reference]Object) (bool, error) {
+// 入参: ctx 取消上下文, changes 页面替换区段, result 已有替换对象, deferCompress 是否延后至内容变换阶段压缩
+// 返回: map[Reference][]byte 待变换的未压缩页面内容, bool 是否修改内容, error 参数、内容或取消错误
+func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]TextReplacement, result map[Reference]Object, deferCompress bool) (map[Reference][]byte, bool, error) {
 	if len(changes) == 0 {
-		return false, nil
+		return nil, false, nil
 	}
 	number := int64(0)
 	for id := range r.xref {
@@ -44,6 +44,10 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 	}
 	for ref := range result {
 		number = max(number, ref.Number)
+	}
+	var pending map[Reference][]byte
+	if deferCompress {
+		pending = make(map[Reference][]byte, len(changes))
 	}
 	visited, changed := 0, false
 	err := r.WalkPages(ctx, func(_ int, source *Page) error {
@@ -63,11 +67,16 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 		if err != nil {
 			return err
 		}
+		if deferCompress {
+			pending[source.Reference] = data
+			changed = true
+			return nil
+		}
 		encoded, err := compressPDFBytes(ctx, data)
 		if err != nil {
 			return err
 		}
-		ref, err := appendRewriteObject(result, &number, &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded})
+		ref, err := appendRewriteObject(result, &number, &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded, compressed: true})
 		if err != nil {
 			return err
 		}
@@ -81,12 +90,12 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 		return nil
 	})
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if visited != len(changes) {
-		return false, fmt.Errorf("PDF text replacement page is not in the page tree")
+		return nil, false, fmt.Errorf("PDF text replacement page is not in the page tree")
 	}
-	return changed, ctx.Err()
+	return pending, changed, ctx.Err()
 }
 
 // replaceContentText 在完整文字区段外写入ActualText，保留原始操作字节
@@ -184,9 +193,9 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 }
 
 // transformPageContent 逐页替换内容流，独立封装共享内容并保留已有页面修改
-// 入参: ctx 取消上下文, transform 内容变换, result 本次替换对象
+// 入参: ctx 取消上下文, transform 内容变换, pending 文字替换后的未压缩页面内容, result 本次替换对象
 // 返回: error 读取、变换或写出错误
-func (r *Reader) transformPageContent(ctx context.Context, transform func(context.Context, *Page, []byte) ([]byte, error), result map[Reference]Object) error {
+func (r *Reader) transformPageContent(ctx context.Context, transform func(context.Context, *Page, []byte) ([]byte, error), pending map[Reference][]byte, result map[Reference]Object) error {
 	number := int64(0)
 	for id := range r.xref {
 		number = max(number, id)
@@ -195,22 +204,32 @@ func (r *Reader) transformPageContent(ctx context.Context, transform func(contex
 		number = max(number, ref.Number)
 	}
 	return r.rewriteReader(result).WalkPages(ctx, func(_ int, page *Page) error {
-		var content bytes.Buffer
-		if _, err := page.WriteContent(ctx, &content); err != nil {
-			return err
+		raw, hasPending := pending[page.Reference]
+		var input []byte
+		if hasPending {
+			input = bytes.Clone(raw)
+		} else {
+			var content bytes.Buffer
+			if _, err := page.WriteContent(ctx, &content); err != nil {
+				return err
+			}
+			input = content.Bytes()
 		}
-		data, err := transform(ctx, page, content.Bytes())
+		data, err := transform(ctx, page, input)
 		if err != nil {
 			return err
 		}
 		if data == nil {
-			return ctx.Err()
+			if !hasPending {
+				return ctx.Err()
+			}
+			data = raw
 		}
 		encoded, err := compressPDFBytes(ctx, data)
 		if err != nil {
 			return err
 		}
-		stream := &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded}
+		stream := &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded, compressed: true}
 		ref, reusable := page.Dictionary["Contents"].(Reference)
 		_, original := r.xref[ref.Number]
 		if reusable && !original {

@@ -111,10 +111,11 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if err != nil {
 		return OptimizeReport{}, err
 	}
-	replacements, err := r.imageReplacements(ctx, options.Images, options.ImageOptions)
+	lazyImages, err := r.prepareImageReplacements(ctx, options.Images, options.ImageOptions)
 	if err != nil {
 		return OptimizeReport{}, err
 	}
+	replacements := make(map[Reference]Object)
 	attachments, err := r.attachmentReplacements(ctx, options, replacements)
 	if err != nil {
 		return OptimizeReport{}, err
@@ -153,12 +154,12 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if err := r.lifecycleReplacements(ctx, options, replacements, resources); err != nil {
 		return OptimizeReport{}, err
 	}
-	textChanged, err := r.textReplacements(ctx, options.TextReplacements, replacements)
+	pendingContent, textChanged, err := r.textReplacements(ctx, options.TextReplacements, replacements, options.TransformContent != nil)
 	if err != nil {
 		return OptimizeReport{}, err
 	}
 	if options.TransformContent != nil {
-		if err := r.transformPageContent(ctx, options.TransformContent, replacements); err != nil {
+		if err := r.transformPageContent(ctx, options.TransformContent, pendingContent, replacements); err != nil {
 			return OptimizeReport{}, err
 		}
 	}
@@ -168,7 +169,7 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if textChanged {
 		r.Version = max(r.Version, "1.4")
 	}
-	return r.rewriteTo(ctx, writer, options.Optimization, replacements, information)
+	return r.rewriteTo(ctx, writer, options.Optimization, replacements, lazyImages, information)
 }
 
 // rewriteInformation 校验信息字典修改并隔离调用方的数据
@@ -243,8 +244,6 @@ func (o RewriteOptions) actionSequences() iter.Seq[[]NavigationAction] {
 // 入参: replacements 替换对象
 // 返回: *Reader 独立对象缓存的读取视图
 func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
-	cache := maps.Clone(r.cache)
-	maps.Copy(cache, replacements)
 	return &Reader{
 		Version:        r.Version,
 		Trailer:        r.Trailer,
@@ -253,7 +252,7 @@ func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
 		originalSource: r.originalSource,
 		originalSize:   r.originalSize,
 		xref:           r.xref,
-		cache:          cache,
+		cache:          r.cache.cloneWithPinned(replacements),
 		loading:        make(map[Reference]bool),
 		security:       r.security,
 		warning:        r.warning,

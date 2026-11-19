@@ -62,13 +62,10 @@ func (r *Reader) encodeLosslessPixels(ctx context.Context, source *Stream, img i
 		result.Data = encoded
 		result.Dictionary["Filter"] = Name("FlateDecode")
 	}
-	if source.decrypted {
-		name, err := r.security.outputStreamFilter(source, r)
-		if err != nil {
-			return nil, err
-		}
-		best.Dictionary["Filter"] = Array{Name("Crypt"), best.Dictionary["Filter"]}
-		best.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, best.Dictionary["DecodeParms"]}
+	if err := r.applyExplicitCryptFilter(source, best); err != nil {
+		return nil, err
+	}
+	if source.decrypted && r.security != nil {
 		best.decrypted = true
 	}
 	return best, nil
@@ -181,13 +178,8 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		parameters := Dictionary{"Predictor": Integer(15), "Colors": Integer(colors), "BitsPerComponent": Integer(bits), "Columns": w}
 		result.Dictionary["Filter"] = Name("FlateDecode")
 		result.Dictionary["DecodeParms"] = parameters
-		if stream.decrypted {
-			name, err := r.security.outputStreamFilter(stream, r)
-			if err != nil {
-				return nil
-			}
-			result.Dictionary["Filter"] = Array{Name("Crypt"), Name("FlateDecode")}
-			result.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, parameters}
+		if err := r.applyExplicitCryptFilter(stream, &result); err != nil {
+			return nil
 		}
 		best = &result
 		return nil

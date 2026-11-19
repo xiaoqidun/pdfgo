@@ -71,13 +71,13 @@ type pdfOutput struct {
 // 入参: ctx 取消上下文, writer 输出流, options 优化配置
 // 返回: OptimizeReport 优化结果, error 读写错误
 func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options OptimizeOptions) (report OptimizeReport, err error) {
-	return r.rewriteTo(ctx, writer, options, nil, nil)
+	return r.rewriteTo(ctx, writer, options, nil, nil, nil)
 }
 
 // rewriteTo 写出资源替换与可选优化，保持原阅读器的对象和安全配置
-// 入参: ctx 取消上下文, writer 输出流, options 优化配置, replacements 替换对象, information 信息字典修改
+// 入参: ctx 取消上下文, writer 输出流, options 优化配置, replacements 替换对象, lazyImages 延迟编码替换图像, information 信息字典修改
 // 返回: OptimizeReport 写出结果, error 读写错误
-func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options OptimizeOptions, replacements map[Reference]Object, information Dictionary) (report OptimizeReport, err error) {
+func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options OptimizeOptions, replacements map[Reference]Object, lazyImages map[Reference]*lazyReplacementImage, information Dictionary) (report OptimizeReport, err error) {
 	if r.closed {
 		return report, os.ErrClosed
 	}
@@ -119,7 +119,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		return progress("write", 1, 1)
 	}
-	if options.Compression.Mode == CompressionUnchanged && len(replacements) == 0 && len(information) == 0 {
+	if options.Compression.Mode == CompressionUnchanged && len(replacements) == 0 && len(lazyImages) == 0 && len(information) == 0 {
 		return report, copySource()
 	}
 	object := func(ref Reference) (Object, error) {
@@ -198,7 +198,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 				}
 			}
 		case Dictionary:
-			if ref, ok := v["SMask"].(Reference); ok && replacements[ref] != nil {
+			if ref, ok := v["SMask"].(Reference); ok && (replacements[ref] != nil || lazyImages[ref] != nil) {
 				if _, original := r.xref[ref.Number]; original {
 					return fmt.Errorf("cannot replace a soft-mask image")
 				}
@@ -237,26 +237,22 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	if err := collect(trailer, 0); err != nil {
 		return report, err
 	}
-	originalCache := make(map[Reference]bool, len(r.cache))
+	originalCache := r.cache.snapshot()
 	originalObjectStreams := r.objectStreams
 	defer func() { r.objectStreams = originalObjectStreams }()
-	for ref := range r.cache {
-		originalCache[ref] = true
-	}
-	defer func() {
-		for ref := range r.cache {
-			if !originalCache[ref] {
-				delete(r.cache, ref)
-			}
-		}
-	}()
+	defer r.cache.prune(originalCache)
 	for i := 0; i < len(refs); i++ {
 		if err := progress("scan", i, len(refs)); err != nil {
 			return report, err
 		}
-		value, err := object(refs[i])
-		if err != nil {
-			return report, err
+		var value Object
+		if lazy := lazyImages[refs[i]]; lazy != nil {
+			value = lazy.baseDict
+		} else {
+			value, err = object(refs[i])
+			if err != nil {
+				return report, err
+			}
 		}
 		if err = collect(value, 0); err != nil {
 			return report, err
@@ -270,16 +266,21 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			metadata[refs[i]] = value
 		}
 		if !originalCache[refs[i]] {
-			delete(r.cache, refs[i])
+			r.cache.delete(refs[i])
 		}
 		if signed {
-			if len(replacements) != 0 || len(information) != 0 {
+			if len(replacements) != 0 || len(lazyImages) != 0 || len(information) != 0 {
 				return report, fmt.Errorf("cannot rewrite objects in a signed PDF")
 			}
 			return report, copySource()
 		}
 	}
 	for ref := range replacements {
+		if !seen[ref] {
+			return report, fmt.Errorf("replacement object %d is not reachable", ref.Number)
+		}
+	}
+	for ref := range lazyImages {
 		if !seen[ref] {
 			return report, fmt.Errorf("replacement object %d is not reachable", ref.Number)
 		}
@@ -294,15 +295,20 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if err := progress("scan", i, len(maskRefs)); err != nil {
 			return report, err
 		}
-		value, err := object(maskRefs[i])
-		if err != nil {
-			return report, err
+		var value Object
+		if lazy := lazyImages[maskRefs[i]]; lazy != nil {
+			value = lazy.baseDict
+		} else {
+			value, err = object(maskRefs[i])
+			if err != nil {
+				return report, err
+			}
 		}
 		if err := collect(value, 0); err != nil {
 			return report, err
 		}
 		if !originalCache[maskRefs[i]] {
-			delete(r.cache, maskRefs[i])
+			r.cache.delete(maskRefs[i])
 		}
 	}
 	protecting = false
@@ -317,7 +323,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			return report, err
 		}
 		ref := dataRefs[i]
-		if replacements[ref] != nil {
+		if replacements[ref] != nil || lazyImages[ref] != nil {
 			if _, original := r.xref[ref.Number]; original {
 				return report, fmt.Errorf("cannot replace a stream shared with original file data")
 			}
@@ -344,7 +350,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if err != nil {
 			return report, err
 		}
-		out.aliases, err = r.optimizationAliases(ctx, refs, originalCache, metadata)
+		out.aliases, err = r.optimizationAliases(ctx, refs, originalCache, metadata, lazyImages)
 		if err != nil {
 			return report, err
 		}
@@ -408,7 +414,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	for _, ref := range refs {
 		maxID = max(maxID, ref.Number)
 	}
-	if maxID > math.MaxInt32-1024 {
+	if maxID > math.MaxInt32-int64(len(lazyImages))-1024 {
 		return report, fmt.Errorf("PDF object number exceeds output limit")
 	}
 	infoRef, _ := trailer["Info"].(Reference)
@@ -494,6 +500,10 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			}
 		}
 	}
+	version, err = replacementImageVersion(ctx, version, lazyImages)
+	if err != nil {
+		return report, err
+	}
 	if _, err := fmt.Fprintf(out, "%%PDF-%s\n%%\xE2\xE3\xCF\xD3\n", version); err != nil {
 		return report, err
 	}
@@ -545,13 +555,37 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		groupSize = 0
 		return err
 	}
+	var pinnedMask Reference
+	defer func() {
+		if pinnedMask.Number > 0 {
+			r.cache.unpin(pinnedMask)
+		}
+	}()
 	for i, ref := range refs {
 		if err := progress("write", i, len(refs)); err != nil {
 			return report, err
 		}
 		var value Object
+		var maskStream *Stream
+		var maskRef Reference
 		if ref == infoRef && newInfo != nil {
 			value = newInfo
+		} else if lazy := lazyImages[ref]; lazy != nil {
+			var stream *Stream
+			stream, maskStream, err = encodeReplacementImage(ctx, lazy)
+			if err != nil {
+				return report, err
+			}
+			if maskStream != nil {
+				maxID++
+				maskRef = Reference{Number: maxID}
+				stream.Dictionary["SMask"] = maskRef
+				if options.Compression.Mode != CompressionUnchanged {
+					r.cache.pin(maskRef, maskStream)
+					pinnedMask = maskRef
+				}
+			}
+			value = stream
 		} else {
 			value, err = object(ref)
 			if err != nil {
@@ -608,8 +642,36 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		} else if err := writeObject(ref, value); err != nil {
 			return report, err
 		}
+		if maskStream != nil {
+			if pinnedMask.Number > 0 {
+				r.cache.unpin(pinnedMask)
+				pinnedMask = Reference{}
+			}
+			maskValue := Object(maskStream)
+			if options.Compression.Mode != CompressionUnchanged {
+				if err := progress("compress", report.Streams, 0); err != nil {
+					return report, err
+				}
+				maskCompression := options.Compression
+				maskCompression.Mode = CompressionLossless
+				maskValue, err = r.optimizeStreamSize(ctx, maskStream, maskCompression, image.Point{})
+				if err != nil {
+					return report, err
+				}
+			}
+			if err := writeObject(maskRef, maskValue); err != nil {
+				return report, err
+			}
+			report.Objects++
+			report.Streams++
+			if options.Compression.Mode != CompressionUnchanged {
+				if err := progress("compress", report.Streams, 0); err != nil {
+					return report, err
+				}
+			}
+		}
 		if !originalCache[ref] {
-			delete(r.cache, ref)
+			r.cache.delete(ref)
 		}
 	}
 	if err := flush(); err != nil {
@@ -947,18 +1009,6 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 	}
 	result := *s
 	result.Dictionary = maps.Clone(s.Dictionary)
-	replace := func(data []byte, filter Name) {
-		result.Data = data
-		result.Dictionary["Filter"] = filter
-		delete(result.Dictionary, "DecodeParms")
-		if s.decrypted {
-			name, e := r.security.outputStreamFilter(s, r)
-			if e == nil {
-				result.Dictionary["Filter"] = Array{Name("Crypt"), filter}
-				result.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, nil}
-			}
-		}
-	}
 	if options.Mode == CompressionLossy && s.Dictionary["Subtype"] == Name("Image") && s.Dictionary["BitsPerComponent"] == Integer(8) && s.Dictionary["Decode"] == nil && s.Dictionary["Mask"] == nil && s.Dictionary["ImageMask"] != Boolean(true) {
 		if s.Dictionary["SMask"] != nil {
 			size = image.Point{}
@@ -1033,10 +1083,13 @@ func (r *Reader) optimizeStreamEncoding(ctx context.Context, s *Stream, options 
 					return nil, e
 				}
 				if len(encoded)+40 < len(s.Data) {
-					replace(encoded, Name("DCTDecode"))
-					result.Dictionary["Width"] = Integer(img.Bounds().Dx())
-					result.Dictionary["Height"] = Integer(img.Bounds().Dy())
-					return &result, nil
+					reencoded, e := r.reencodedStream(s, encoded, Name("DCTDecode"))
+					if e != nil {
+						return nil, e
+					}
+					reencoded.Dictionary["Width"] = Integer(img.Bounds().Dx())
+					reencoded.Dictionary["Height"] = Integer(img.Bounds().Dy())
+					return reencoded, nil
 				}
 			}
 		}
@@ -1087,6 +1140,9 @@ func (r *Reader) optimizeDataStream(ctx context.Context, s *Stream) (*Stream, er
 	result := *s
 	result.Dictionary = maps.Clone(s.Dictionary)
 	if len(filters) > 0 && filters[0] == Name("FlateDecode") {
+		if s.compressed {
+			return &result, nil
+		}
 		encoded, e := recompressPDFBytes(ctx, s.Data)
 		if e != nil {
 			return nil, e
@@ -1137,7 +1193,25 @@ func (r *Reader) optimizeDataStream(ctx context.Context, s *Stream) (*Stream, er
 	return &result, nil
 }
 
-// reencodedStream 替换流编码，保留显式加密过滤器
+// applyExplicitCryptFilter 在V4及以上且原流显式声明Crypt时为目标流前置加密过滤器
+// 入参: source 原始流, dst 目标流
+// 返回: error 加密过滤器解析错误
+func (r *Reader) applyExplicitCryptFilter(source, dst *Stream) error {
+	if !source.decrypted || r.security == nil {
+		return nil
+	}
+	name, explicit, err := r.security.explicitStreamCryptFilter(source, r)
+	if err != nil {
+		return err
+	}
+	if explicit {
+		dst.Dictionary["Filter"] = Array{Name("Crypt"), dst.Dictionary["Filter"]}
+		dst.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, dst.Dictionary["DecodeParms"]}
+	}
+	return nil
+}
+
+// reencodedStream 替换流编码，仅在V4及以上且原流显式声明Crypt时保留加密过滤器
 // 入参: source 原始流, data 输出编码, filter 输出过滤器
 // 返回: *Stream 输出流, error 加密过滤器解析错误
 func (r *Reader) reencodedStream(source *Stream, data []byte, filter Name) (*Stream, error) {
@@ -1146,15 +1220,37 @@ func (r *Reader) reencodedStream(source *Stream, data []byte, filter Name) (*Str
 	result.Data = data
 	result.Dictionary["Filter"] = filter
 	delete(result.Dictionary, "DecodeParms")
-	if source.decrypted {
-		name, err := r.security.outputStreamFilter(source, r)
-		if err != nil {
-			return nil, err
-		}
-		result.Dictionary["Filter"] = Array{Name("Crypt"), filter}
-		result.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, nil}
+	if err := r.applyExplicitCryptFilter(source, &result); err != nil {
+		return nil, err
 	}
 	return &result, nil
+}
+
+// explicitStreamCryptFilter 提取V4及以上原流显式声明的Crypt过滤器名称
+// 入参: stream 原始流, r 阅读器
+// 返回: Name 过滤器名称, bool 是否显式声明, error 解析错误
+func (s *standardSecurity) explicitStreamCryptFilter(stream *Stream, r *Reader) (Name, bool, error) {
+	if s == nil || s.info.Revision < 4 {
+		return "", false, nil
+	}
+	copy := *stream
+	copy.decrypted = false
+	filters, params, err := copy.filterChain(r)
+	if err != nil {
+		return "", false, err
+	}
+	if len(filters) == 0 || filters[0] != Name("Crypt") {
+		return "", false, nil
+	}
+	name := Name("Identity")
+	if dict, ok := params[0].(Dictionary); ok && dict["Name"] != nil {
+		var valid bool
+		name, valid = dict["Name"].(Name)
+		if !valid {
+			return "", false, fmt.Errorf("invalid stream crypt filter")
+		}
+	}
+	return name, true, nil
 }
 
 // outputStreamFilter 获取原流的加密过滤器，保留显式Identity及嵌入文件策略
@@ -1168,21 +1264,10 @@ func (s *standardSecurity) outputStreamFilter(stream *Stream, r *Reader) (Name, 
 	if stream.Dictionary["Type"] == Name("Metadata") && !s.encryptMetadata || stream.Dictionary["F"] != nil {
 		name = "Identity"
 	}
-	copy := *stream
-	copy.decrypted = false
-	filters, params, err := copy.filterChain(r)
-	if err != nil {
+	if explicitName, explicit, err := s.explicitStreamCryptFilter(stream, r); err != nil {
 		return "", err
-	}
-	if len(filters) > 0 && filters[0] == Name("Crypt") {
-		name = "Identity"
-		if dict, ok := params[0].(Dictionary); ok && dict["Name"] != nil {
-			var valid bool
-			name, valid = dict["Name"].(Name)
-			if !valid {
-				return "", fmt.Errorf("invalid stream crypt filter")
-			}
-		}
+	} else if explicit {
+		return explicitName, nil
 	}
 	return name, nil
 }

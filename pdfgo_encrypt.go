@@ -98,11 +98,19 @@ func (r *Reader) openSecurity(password []byte) error {
 	owner, ook := dict["O"].(String)
 	user, uok := dict["U"].(String)
 	permissions, pok := dict["P"].(Integer)
-	ids, _ := r.Trailer["ID"].(Array)
+	idObject, err := r.Resolve(r.Trailer["ID"])
+	if err != nil {
+		return err
+	}
+	ids, _ := idObject.(Array)
 	if !ook || !uok || len(owner) != 32 || len(user) != 32 || !pok || permissions < -1<<31 || permissions > 1<<32-1 || len(ids) != 2 {
 		return fmt.Errorf("invalid standard encryption parameters")
 	}
-	id, ok := ids[0].(String)
+	firstID, err := r.Resolve(ids[0])
+	if err != nil {
+		return err
+	}
+	id, ok := firstID.(String)
 	if !ok {
 		return fmt.Errorf("invalid encryption file identifier")
 	}
@@ -192,8 +200,8 @@ func (r *Reader) openSecurity(password []byte) error {
 // 入参: object CF字典或间接引用
 // 返回: Object 已解析的字典, error 引用或类型错误
 func (r *Reader) securityFilters(object Object) (Object, error) {
-	if r.warning == nil || object == nil {
-		return object, nil
+	if object == nil {
+		return nil, nil
 	}
 	value, err := r.Resolve(object)
 	if err != nil {
@@ -217,9 +225,11 @@ func (r *Reader) securityFilters(object Object) (Object, error) {
 		for key, value := range filter {
 			copy[key] = value
 		}
-		if length, ok := copy["Length"].(Integer); ok && ((copy["CFM"] == Name("AESV2") && length == 128) || (copy["CFM"] == Name("AESV3") && length == 256)) {
-			copy["Length"] = length / 8
-			r.warning(Diagnostic{Message: fmt.Sprintf("crypt filter %s Length is in bits; equivalent byte length retained", name)})
+		if r.warning != nil {
+			if length, ok := copy["Length"].(Integer); ok && ((copy["CFM"] == Name("AESV2") && length == 128) || (copy["CFM"] == Name("AESV3") && length == 256)) {
+				copy["Length"] = length / 8
+				r.warning(Diagnostic{Message: fmt.Sprintf("crypt filter %s Length is in bits; equivalent byte length retained", name)})
+			}
 		}
 		result[name] = copy
 	}
@@ -338,6 +348,9 @@ func (s *standardSecurity) decryptBytes(data []byte, ref Reference, name Name) (
 		out := make([]byte, len(data))
 		c.XORKeyStream(out, data)
 		return out, nil
+	}
+	if len(data) == 0 {
+		return nil, nil
 	}
 	if len(data) < 2*aes.BlockSize || len(data)%aes.BlockSize != 0 {
 		return nil, fmt.Errorf("invalid AES encrypted data length")

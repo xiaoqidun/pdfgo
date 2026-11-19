@@ -18,12 +18,14 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
 	"io"
 	"maps"
 	"math"
+	"slices"
 )
 
 // optimizeJPXImage 按已知显示尺寸缩小普通JPEG2000图片，不改遮罩及专色语义
@@ -162,11 +164,11 @@ func (r *Reader) optimizationValue(value Object) (Object, error) {
 			seen = make(map[Reference]bool)
 		}
 		seen[ref] = true
-		_, cached := r.cache[ref]
+		cached := r.cache.has(ref)
 		var err error
 		value, err = r.Object(ref)
 		if !cached {
-			delete(r.cache, ref)
+			r.cache.delete(ref)
 		}
 		if err != nil {
 			return nil, err
@@ -210,19 +212,35 @@ func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters,
 	inner.Dictionary = maps.Clone(stream.Dictionary)
 	inner.Data = data
 	inner.Dictionary["Filter"] = Name("DCTDecode")
-	inner.Dictionary["DecodeParms"] = params[len(params)-1]
-	if stream.decrypted {
-		name, err := r.security.outputStreamFilter(stream, r)
-		if err != nil {
-			return nil, nil
-		}
-		inner.Dictionary["Filter"] = Array{Name("Crypt"), Name("DCTDecode")}
-		inner.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, params[len(params)-1]}
+	lastParam := params[len(params)-1]
+	if lastParam != nil {
+		inner.Dictionary["DecodeParms"] = lastParam
+	} else {
+		delete(inner.Dictionary, "DecodeParms")
+	}
+	if err := r.applyExplicitCryptFilter(stream, &inner); err != nil {
+		return nil, nil
 	}
 	return &inner, ctx.Err()
 }
 
-// imageOutputSizes 汇总页面及表单中图片的最大显示尺寸，不完整时放弃降采样
+// imagePlacementKey 保存图片在局部坐标系中的线性变换分量
+type imagePlacementKey struct {
+	ref Reference
+	a   float64
+	b   float64
+	c   float64
+	d   float64
+}
+
+// cachedFormImages 缓存具有独立资源字典的表单内部图片变换及异常状态
+type cachedFormImages struct {
+	placements  []imagePlacementKey
+	unsafe      []Reference
+	opaqueError bool
+}
+
+// imageOutputSizes 汇总页面及表单中图片的最大显示尺寸，单页异常仅保护该页可达图片并缓存共享表单结果
 // 入参: ctx 取消上下文, dpi 分辨率上限
 // 返回: map[Reference]image.Point 图片像素上限, error 取消错误
 func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]image.Point, error) {
@@ -230,21 +248,136 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		return nil, nil
 	}
 	sizes := make(map[Reference]image.Point)
-	cached := make(map[Reference]bool, len(r.cache))
-	for ref := range r.cache {
-		cached[ref] = true
-	}
+	unsafe := make(map[Reference]bool)
+	cached := r.cache.snapshot()
 	cleanup := func() {
-		for ref := range r.cache {
+		r.cache.prune(cached)
+	}
+	defer cleanup()
+	formCache := make(map[Reference]*cachedFormImages)
+	formActive := make(map[Reference]bool)
+	resolveXObject := func(value Object) (Object, Reference, error) {
+		var ref Reference
+		for n := 0; ; n++ {
+			next, ok := value.(Reference)
+			if !ok {
+				return value, ref, nil
+			}
+			if n > 32 {
+				return nil, Reference{}, fmt.Errorf("cyclic image reference")
+			}
+			ref = next
+			var err error
+			value, err = r.Object(ref)
 			if !cached[ref] {
-				delete(r.cache, ref)
+				r.cache.delete(ref)
+			}
+			if err != nil {
+				return nil, Reference{}, err
 			}
 		}
 	}
-	defer cleanup()
-	budget := 100000
-	var walk func([]byte, Dictionary, Matrix, int) error
-	walk = func(data []byte, resources Dictionary, matrix Matrix, depth int) error {
+	var markResourcesUnsafe func(Dictionary, map[Reference]bool, map[Reference]bool, int) bool
+	markResourcesUnsafe = func(res Dictionary, target map[Reference]bool, visited map[Reference]bool, depth int) bool {
+		if depth > 32 {
+			return false
+		}
+		if res == nil || res["XObject"] == nil {
+			return true
+		}
+		val, err := r.Resolve(res["XObject"])
+		if err != nil {
+			return false
+		}
+		if val == nil {
+			return true
+		}
+		objects, ok := val.(Dictionary)
+		if !ok {
+			return false
+		}
+		for _, entry := range objects {
+			obj, ref, err := resolveXObject(entry)
+			if err != nil {
+				return false
+			}
+			stream, ok := obj.(*Stream)
+			if !ok {
+				continue
+			}
+			subtype, err := r.Resolve(stream.Dictionary["Subtype"])
+			if err != nil {
+				return false
+			}
+			switch subtype {
+			case Name("Image"):
+				if ref.Number > 0 {
+					target[ref] = true
+				}
+			case Name("Form"):
+				if ref.Number > 0 && visited[ref] {
+					continue
+				}
+				if ref.Number > 0 {
+					visited[ref] = true
+				}
+				if stream.Dictionary["Resources"] != nil {
+					childVal, err := r.Resolve(stream.Dictionary["Resources"])
+					if err != nil {
+						return false
+					}
+					if childVal != nil {
+						childDict, ok := childVal.(Dictionary)
+						if !ok {
+							return false
+						}
+						if !markResourcesUnsafe(childDict, target, visited, depth+1) {
+							return false
+						}
+					}
+				}
+			}
+		}
+		return true
+	}
+	recordPlacement := func(ref Reference, matrix Matrix, collector map[imagePlacementKey]struct{}, localUnsafe map[Reference]bool) {
+		if ref.Number <= 0 {
+			return
+		}
+		for _, value := range matrix[:4] {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				localUnsafe[ref] = true
+				return
+			}
+		}
+		if collector != nil {
+			collector[imagePlacementKey{ref: ref, a: matrix[0], b: matrix[1], c: matrix[2], d: matrix[3]}] = struct{}{}
+			return
+		}
+		w := math.Ceil(math.Nextafter(math.Hypot(matrix[0], matrix[1])*float64(dpi)/72, math.Inf(-1)))
+		h := math.Ceil(math.Nextafter(math.Hypot(matrix[2], matrix[3])*float64(dpi)/72, math.Inf(-1)))
+		if math.IsNaN(w) || math.IsNaN(h) || math.IsInf(w, 0) || math.IsInf(h, 0) || w > 1<<30 || h > 1<<30 {
+			localUnsafe[ref] = true
+			return
+		}
+		old := sizes[ref]
+		sizes[ref] = image.Pt(max(old.X, max(1, int(w))), max(old.Y, max(1, int(h))))
+	}
+	applyCachedForm := func(entry *cachedFormImages, parentMatrix Matrix, collector map[imagePlacementKey]struct{}, localUnsafe map[Reference]bool) bool {
+		if entry.opaqueError {
+			return false
+		}
+		for _, ref := range entry.unsafe {
+			localUnsafe[ref] = true
+		}
+		for _, item := range entry.placements {
+			combined := parentMatrix.Mul(Matrix{item.a, item.b, item.c, item.d, 0, 0})
+			recordPlacement(item.ref, combined, collector, localUnsafe)
+		}
+		return true
+	}
+	var walk func([]byte, Dictionary, Matrix, int, *int, map[imagePlacementKey]struct{}, map[Reference]bool) error
+	walk = func(data []byte, resources Dictionary, matrix Matrix, depth int, budget *int, collector map[imagePlacementKey]struct{}, localUnsafe map[Reference]bool) error {
 		if depth > 32 {
 			return fmt.Errorf("image placement recursion limit exceeded")
 		}
@@ -274,8 +407,8 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 					}
 				}
 			case "Do":
-				budget--
-				if budget < 0 {
+				*budget--
+				if *budget < 0 {
 					return fmt.Errorf("image placement operation limit exceeded")
 				}
 				if len(op.Operands) != 1 {
@@ -293,26 +426,11 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				if !ok {
 					return fmt.Errorf("missing image resources")
 				}
-				value = objects[name]
-				var ref Reference
-				for n := 0; ; n++ {
-					next, ok := value.(Reference)
-					if !ok {
-						break
-					}
-					if n > 32 {
-						return fmt.Errorf("cyclic image reference")
-					}
-					ref = next
-					value, err = r.Object(ref)
-					if err != nil {
-						return err
-					}
-					if !cached[ref] {
-						delete(r.cache, ref)
-					}
+				obj, ref, err := resolveXObject(objects[name])
+				if err != nil {
+					return err
 				}
-				stream, ok := value.(*Stream)
+				stream, ok := obj.(*Stream)
 				if !ok {
 					return fmt.Errorf("invalid image resource")
 				}
@@ -322,18 +440,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				}
 				switch subtype {
 				case Name("Image"):
-					w := math.Ceil(math.Nextafter(math.Hypot(matrix[0], matrix[1])*float64(dpi)/72, math.Inf(-1)))
-					h := math.Ceil(math.Nextafter(math.Hypot(matrix[2], matrix[3])*float64(dpi)/72, math.Inf(-1)))
-					if math.IsNaN(w) || math.IsNaN(h) || math.IsInf(w, 0) || math.IsInf(h, 0) || w > 1<<30 || h > 1<<30 {
-						return fmt.Errorf("invalid image dimensions")
-					}
-					if ref.Number > 0 {
-						old := sizes[ref]
-						sizes[ref] = image.Pt(max(old.X, max(1, int(w))), max(old.Y, max(1, int(h))))
-					}
+					recordPlacement(ref, matrix, collector, localUnsafe)
 				case Name("Form"):
-					child := matrix
-					childResources := resources
+					formMatrix := Matrix{1, 0, 0, 1, 0, 0}
 					value, err := r.Resolve(stream.Dictionary["Matrix"])
 					if err != nil {
 						return err
@@ -347,40 +456,113 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 						if err != nil {
 							return err
 						}
-						child = child.Mul(Matrix(values))
+						formMatrix = Matrix(values)
 					}
-					value, err = r.Resolve(stream.Dictionary["Resources"])
+					resValue, err := r.Resolve(stream.Dictionary["Resources"])
 					if err != nil {
+						if ref.Number > 0 {
+							formCache[ref] = &cachedFormImages{opaqueError: true}
+						}
 						return err
 					}
-					if value != nil {
-						var ok bool
-						childResources, ok = value.(Dictionary)
+					if resValue != nil && ref.Number > 0 {
+						if entry, ok := formCache[ref]; ok {
+							if !applyCachedForm(entry, matrix, collector, localUnsafe) {
+								return fmt.Errorf("cached form analysis failed")
+							}
+							return nil
+						}
+						if formActive[ref] {
+							return fmt.Errorf("cyclic image form reference")
+						}
+						childResources, ok := resValue.(Dictionary)
+						if !ok {
+							formCache[ref] = &cachedFormImages{opaqueError: true}
+							return fmt.Errorf("invalid image form resources")
+						}
+						formActive[ref] = true
+						formBudget := 100000
+						subCollector := make(map[imagePlacementKey]struct{})
+						subUnsafe := make(map[Reference]bool)
+						content, decodeErr := stream.DecodeContext(ctx)
+						walkErr := decodeErr
+						if walkErr == nil {
+							walkErr = walk(content, childResources, formMatrix, depth+1, &formBudget, subCollector, subUnsafe)
+						}
+						delete(formActive, ref)
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						var entry *cachedFormImages
+						if walkErr != nil || len(subCollector) > 10000 {
+							entry = &cachedFormImages{}
+							if !markResourcesUnsafe(childResources, subUnsafe, map[Reference]bool{ref: true}, 0) {
+								entry.opaqueError = true
+							} else {
+								entry.unsafe = slices.Collect(maps.Keys(subUnsafe))
+							}
+						} else {
+							entry = &cachedFormImages{
+								placements: slices.Collect(maps.Keys(subCollector)),
+								unsafe:     slices.Collect(maps.Keys(subUnsafe)),
+							}
+						}
+						formCache[ref] = entry
+						if !applyCachedForm(entry, matrix, collector, localUnsafe) {
+							return fmt.Errorf("form resource analysis failed")
+						}
+						return nil
+					}
+					childResources := resources
+					if resValue != nil {
+						dict, ok := resValue.(Dictionary)
 						if !ok {
 							return fmt.Errorf("invalid image form resources")
 						}
+						childResources = dict
 					}
+					child := matrix.Mul(formMatrix)
 					content, err := stream.DecodeContext(ctx)
 					if err != nil {
 						return err
 					}
-					return walk(content, childResources, child, depth+1)
+					return walk(content, childResources, child, depth+1, budget, collector, localUnsafe)
 				}
 			}
 			return nil
 		})
 	}
+	errUnsafe := errors.New("global unsafe")
 	err := r.WalkPages(ctx, func(_ int, page *Page) error {
 		defer cleanup()
 		content, err := page.Content()
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !markResourcesUnsafe(page.Resources, unsafe, map[Reference]bool{}, 0) {
+				return errUnsafe
+			}
+			return nil
 		}
+		pageBudget := 100000
 		unit := page.UserUnit
-		return walk(content, page.Resources, Matrix{unit, 0, 0, unit, 0, 0}, 0)
+		if err := walk(content, page.Resources, Matrix{unit, 0, 0, unit, 0, 0}, 0, &pageBudget, nil, unsafe); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !markResourcesUnsafe(page.Resources, unsafe, map[Reference]bool{}, 0) {
+				return errUnsafe
+			}
+			return nil
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, ctx.Err()
+	}
+	for ref := range unsafe {
+		delete(sizes, ref)
 	}
 	return sizes, ctx.Err()
 }

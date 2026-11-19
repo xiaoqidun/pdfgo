@@ -47,6 +47,7 @@ type Stream struct {
 	Data       []byte
 	reader     *Reader
 	decrypted  bool
+	compressed bool
 }
 
 // contextInput 在分块读取之间检查取消

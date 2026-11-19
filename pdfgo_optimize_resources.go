@@ -21,9 +21,9 @@ import (
 )
 
 // optimizationAliases 合并字典及编码完全相同的图片和字体程序，保留颜色、蒙版及身份语义
-// 入参: ctx 取消上下文, refs 可达对象, cached 原有缓存, metadata 已读取的对象属性
+// 入参: ctx 取消上下文, refs 可达对象, cached 原有缓存, metadata 已读取的对象属性, skip 懒编码替换图像集合
 // 返回: map[Reference]Reference 重复引用, error 读取或取消错误
-func (r *Reader) optimizationAliases(ctx context.Context, refs []Reference, cached map[Reference]bool, metadata map[Reference]Object) (map[Reference]Reference, error) {
+func (r *Reader) optimizationAliases(ctx context.Context, refs []Reference, cached map[Reference]bool, metadata map[Reference]Object, skip map[Reference]*lazyReplacementImage) (map[Reference]Reference, error) {
 	aliases := make(map[Reference]Reference)
 	seen := make(map[[32]byte]Reference)
 	fonts := make(map[Reference]bool)
@@ -60,6 +60,9 @@ func (r *Reader) optimizationAliases(ctx context.Context, refs []Reference, cach
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if skip[ref] != nil {
+			continue
+		}
 		if !fonts[ref] {
 			dict, ok := metadata[ref].(Dictionary)
 			if !ok || dict["Subtype"] != Name("Image") {
@@ -71,7 +74,7 @@ func (r *Reader) optimizationAliases(ctx context.Context, refs []Reference, cach
 			return nil, err
 		}
 		if !cached[ref] {
-			delete(r.cache, ref)
+			r.cache.delete(ref)
 		}
 		s, ok := value.(*Stream)
 		if !ok || s.Dictionary["Subtype"] != Name("Image") && !fonts[ref] || s.Dictionary["StructParent"] != nil || s.Dictionary["ID"] != nil || s.Dictionary["OPI"] != nil || s.Dictionary["F"] != nil {

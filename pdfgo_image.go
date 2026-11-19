@@ -206,7 +206,7 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 		data = append(data, globals...)
 		data = append(data, encoded...)
 	}
-	config, err := jbig2.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
+	config, err := jbig2.DecodeConfigWithOptions(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, i.jbig2DecodeOptions(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -718,7 +718,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 				return nil, err
 			}
 		}
-		decoder, err := jbig2.NewDecoderWithGlobals(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, globals)
+		decoder, err := jbig2.NewDecoderWithGlobalsAndOptions(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, globals, i.jbig2DecodeOptions(ctx))
 		if err != nil {
 			return nil, err
 		}
@@ -732,7 +732,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 		bounds := result.Bounds()
 		if i.Warning != nil && (bounds.Dx() != i.Width || bounds.Dy() != i.Height) {
 			info, ok := decoder.GetDocument().GetPageInfo(0)
-			if !ok || uint64(info.Width) != uint64(bounds.Dx()) || uint64(info.Height) != uint64(bounds.Dy()) {
+			if !ok || uint64(info.Width) != uint64(bounds.Dx()) || (info.Height != 0xFFFFFFFF && uint64(info.Height) != uint64(bounds.Dy())) {
 				return nil, fmt.Errorf("JBIG2 decoded dimensions differ from coded page information")
 			}
 			if bounds.Dx() <= 0 || bounds.Dy() <= 0 || bounds.Dx() > jpegRecoveryPixelLimit/bounds.Dy() {
@@ -859,6 +859,33 @@ func (i *Image) recoverArrayPredictorSamplesContext(ctx context.Context, filters
 		return nil, err
 	}
 	return samples, nil
+}
+
+// jbig2DecodeOptions 构造带上下文取消与像素内存上限的JBIG2解码选项
+// 入参: ctx 取消上下文
+// 返回: *jbig2.DecodeOptions 解码选项
+func (i *Image) jbig2DecodeOptions(ctx context.Context) *jbig2.DecodeOptions {
+	platformLimit := uint64(imageBufferLimit())
+	maxPixels := uint64(jpegRecoveryPixelLimit)
+	if i.Width > 0 && i.Height > 0 && uint64(i.Width) <= platformLimit/uint64(i.Height) {
+		declared := uint64(i.Width) * uint64(i.Height)
+		if declared > maxPixels {
+			maxPixels = declared
+		}
+	}
+	maxPixels = min(maxPixels, min(platformLimit, uint64(1<<30)))
+	maxMemory := min(platformLimit, max(maxPixels*2, uint64(256<<20)))
+	maxMemory = min(maxMemory, uint64(512<<20))
+	return &jbig2.DecodeOptions{
+		Context: ctx,
+		Limits: jbig2.Limits{
+			MaxInputBytes:        min(platformLimit, uint64(256<<20)),
+			MaxDecompressedBytes: min(platformLimit, uint64(256<<20)),
+			MaxSegmentBytes:      min(platformLimit, uint64(256<<20)),
+			MaxPixels:            maxPixels,
+			MaxMemoryBytes:       maxMemory,
+		},
+	}
 }
 
 // jbig2SinglePageContext 仅解析段头验证完整单页边界，不为后续页面分配像素

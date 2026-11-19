@@ -22,10 +22,14 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync"
 )
 
 // objectStreamCacheLimit 限制多个对象流的解码缓存，单个超限流仅保留最近一次
 const objectStreamCacheLimit = 16 << 20
+
+// streamCacheBudget 限制Reader缓存的流对象总字节上限
+const streamCacheBudget = 32 << 20
 
 // readerRecoveryLimit 限制损坏文档的顺序重建范围和单个解析窗口
 const readerRecoveryLimit = 64 << 20
@@ -43,7 +47,7 @@ type Reader struct {
 	originalSize       int64
 	closer             io.Closer
 	xref               map[int64]xrefEntry
-	cache              map[Reference]Object
+	cache              *objectCache
 	loading            map[Reference]bool
 	destinations       map[string]Object
 	legacyDestinations Dictionary
@@ -92,6 +96,295 @@ type xrefEntry struct {
 // objectSecurityError 标记对象解密失败，防止上层边界恢复替换安全错误
 type objectSecurityError struct {
 	err error
+}
+
+// objectCacheEntry 保存受字节预算控制的流缓存链表节点
+type objectCacheEntry struct {
+	ref   Reference
+	value *Stream
+	size  int64
+	prev  *objectCacheEntry
+	next  *objectCacheEntry
+}
+
+// objectCache 管理PDF对象缓存，对流对象按字节预算执行LRU淘汰并保持并发安全
+type objectCache struct {
+	mu      sync.Mutex
+	objects map[Reference]Object
+	pinned  map[Reference]Object
+	streams map[Reference]*objectCacheEntry
+	head    *objectCacheEntry
+	tail    *objectCacheEntry
+	used    int64
+	budget  int64
+}
+
+// newObjectCache 创建带流字节预算的对象缓存
+// 入参: budget 流缓存字节上限
+// 返回: *objectCache 对象缓存
+func newObjectCache(budget int64) *objectCache {
+	if budget <= 0 {
+		budget = streamCacheBudget
+	}
+	return &objectCache{objects: make(map[Reference]Object), streams: make(map[Reference]*objectCacheEntry), budget: budget}
+}
+
+// get 查询缓存对象，命中流缓存时更新最近使用顺序
+// 入参: ref 对象引用
+// 返回: Object 缓存对象, bool 是否命中
+func (c *objectCache) get(ref Reference) (Object, bool) {
+	if c == nil {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pinned != nil {
+		if value, ok := c.pinned[ref]; ok {
+			return value, true
+		}
+	}
+	if value, ok := c.objects[ref]; ok {
+		return value, true
+	}
+	if entry, ok := c.streams[ref]; ok {
+		c.unlinkLocked(entry)
+		c.pushFrontLocked(entry)
+		return entry.value, true
+	}
+	return nil, false
+}
+
+// set 写入对象缓存，流对象按字节预算淘汰最久未使用条目
+// 入参: ref 对象引用, value 对象值
+func (c *objectCache) set(ref Reference, value Object) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pinned != nil {
+		if _, ok := c.pinned[ref]; ok {
+			c.pinned[ref] = value
+			return
+		}
+	}
+	stream, isStream := value.(*Stream)
+	if !isStream {
+		if entry, ok := c.streams[ref]; ok {
+			c.unlinkLocked(entry)
+			delete(c.streams, ref)
+			c.used -= entry.size
+		}
+		c.objects[ref] = value
+		return
+	}
+	delete(c.objects, ref)
+	size := int64(len(stream.Data)) + 256
+	if entry, ok := c.streams[ref]; ok {
+		c.unlinkLocked(entry)
+		delete(c.streams, ref)
+		c.used -= entry.size
+	}
+	if size > c.budget {
+		return
+	}
+	entry := &objectCacheEntry{ref: ref, value: stream, size: size}
+	c.streams[ref] = entry
+	c.pushFrontLocked(entry)
+	c.used += size
+	c.evictLocked()
+}
+
+// has 检查引用是否已在缓存中，不改变淘汰顺序
+// 入参: ref 对象引用
+// 返回: bool 是否已缓存
+func (c *objectCache) has(ref Reference) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pinned != nil {
+		if _, ok := c.pinned[ref]; ok {
+			return true
+		}
+	}
+	if _, ok := c.objects[ref]; ok {
+		return true
+	}
+	_, ok := c.streams[ref]
+	return ok
+}
+
+// delete 移除非固定缓存条目
+// 入参: ref 对象引用
+func (c *objectCache) delete(ref Reference) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.objects, ref)
+	if entry, ok := c.streams[ref]; ok {
+		c.unlinkLocked(entry)
+		delete(c.streams, ref)
+		c.used -= entry.size
+	}
+}
+
+// pin 将临时对象固定在缓存中，不受流字节预算淘汰影响
+// 入参: ref 对象引用, value 对象值
+func (c *objectCache) pin(ref Reference, value Object) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pinned == nil {
+		c.pinned = make(map[Reference]Object)
+	}
+	c.pinned[ref] = value
+}
+
+// unpin 解除临时对象的缓存固定
+// 入参: ref 对象引用
+func (c *objectCache) unpin(ref Reference) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.pinned, ref)
+}
+
+// snapshot 复制当前全部缓存引用集合
+// 返回: map[Reference]bool 已缓存引用集合
+func (c *objectCache) snapshot() map[Reference]bool {
+	if c == nil {
+		return map[Reference]bool{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make(map[Reference]bool, len(c.objects)+len(c.streams)+len(c.pinned))
+	for ref := range c.pinned {
+		result[ref] = true
+	}
+	for ref := range c.objects {
+		result[ref] = true
+	}
+	for ref := range c.streams {
+		result[ref] = true
+	}
+	return result
+}
+
+// prune 删除不在保留集合中的非固定缓存条目
+// 入参: keep 需要保留的引用集合
+func (c *objectCache) prune(keep map[Reference]bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for ref := range c.objects {
+		if !keep[ref] {
+			delete(c.objects, ref)
+		}
+	}
+	for ref, entry := range c.streams {
+		if !keep[ref] {
+			c.unlinkLocked(entry)
+			delete(c.streams, ref)
+			c.used -= entry.size
+		}
+	}
+}
+
+// cloneWithPinned 复制缓存并附加不参与淘汰的固定替换对象
+// 入参: pinned 固定替换对象映射
+// 返回: *objectCache 独立缓存副本
+func (c *objectCache) cloneWithPinned(pinned map[Reference]Object) *objectCache {
+	budget := int64(streamCacheBudget)
+	if c != nil && c.budget > 0 {
+		budget = c.budget
+	}
+	clone := newObjectCache(budget)
+	if len(pinned) > 0 {
+		clone.pinned = make(map[Reference]Object, len(pinned))
+		for ref, value := range pinned {
+			clone.pinned[ref] = value
+		}
+	}
+	if c == nil {
+		return clone
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pinned) > 0 {
+		if clone.pinned == nil {
+			clone.pinned = make(map[Reference]Object, len(c.pinned))
+		}
+		for ref, value := range c.pinned {
+			if _, overridden := clone.pinned[ref]; !overridden {
+				clone.pinned[ref] = value
+			}
+		}
+	}
+	for ref, value := range c.objects {
+		if _, overridden := clone.pinned[ref]; !overridden {
+			clone.objects[ref] = value
+		}
+	}
+	for entry := c.tail; entry != nil; entry = entry.prev {
+		if _, overridden := clone.pinned[entry.ref]; overridden {
+			continue
+		}
+		item := &objectCacheEntry{ref: entry.ref, value: entry.value, size: entry.size}
+		clone.streams[item.ref] = item
+		clone.pushFrontLocked(item)
+		clone.used += item.size
+	}
+	return clone
+}
+
+// unlinkLocked 将节点从流缓存双向链表摘除，调用方须已持有锁
+// 入参: entry 待摘除节点
+func (c *objectCache) unlinkLocked(entry *objectCacheEntry) {
+	if entry.prev != nil {
+		entry.prev.next = entry.next
+	} else if c.head == entry {
+		c.head = entry.next
+	}
+	if entry.next != nil {
+		entry.next.prev = entry.prev
+	} else if c.tail == entry {
+		c.tail = entry.prev
+	}
+	entry.prev = nil
+	entry.next = nil
+}
+
+// pushFrontLocked 将节点插入流缓存双向链表头部，调用方须已持有锁
+// 入参: entry 待插入节点
+func (c *objectCache) pushFrontLocked(entry *objectCacheEntry) {
+	entry.prev = nil
+	entry.next = c.head
+	if c.head != nil {
+		c.head.prev = entry
+	} else {
+		c.tail = entry
+	}
+	c.head = entry
+}
+
+// evictLocked 淘汰最久未使用的流缓存直至总字节不超过预算，调用方须已持有锁
+func (c *objectCache) evictLocked() {
+	for c.used > c.budget && c.tail != nil {
+		victim := c.tail
+		c.unlinkLocked(victim)
+		delete(c.streams, victim.ref)
+		c.used -= victim.size
+	}
 }
 
 // Open 打开PDF文件并读取交叉引用
@@ -181,7 +474,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		options.Warning(Diagnostic{Message: "invalid PDF version " + version + "; using 1.7"})
 		version = "1.7"
 	}
-	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: map[Reference]Object{}, loading: map[Reference]bool{}}
+	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: newObjectCache(streamCacheBudget), loading: map[Reference]bool{}}
 	r.originalSource, r.originalSize = source, size
 	r.warning = options.Warning
 	r.textShaper = options.ShapeText
@@ -285,7 +578,7 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 	if r.closed {
 		return nil, os.ErrClosed
 	}
-	if value, ok := r.cache[ref]; ok {
+	if value, ok := r.cache.get(ref); ok {
 		return value, nil
 	}
 	entry, ok := r.xref[ref.Number]
@@ -363,7 +656,7 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.cache[ref] = value
+	r.cache.set(ref, value)
 	return value, nil
 }
 
@@ -858,7 +1151,7 @@ func (r *Reader) rebuildCompressedEntries(index map[int64]xrefEntry, trailer Dic
 	}
 	local := *r
 	local.xref, local.Trailer = index, trailer
-	local.cache, local.loading = map[Reference]Object{}, map[Reference]bool{}
+	local.cache, local.loading = newObjectCache(streamCacheBudget), map[Reference]bool{}
 	local.recoveryIndex, local.recoveryTried = index, true
 	local.objectStreams = [4]*objectStream{}
 	candidates := map[int64]xrefEntry{}
@@ -887,7 +1180,7 @@ func (r *Reader) rebuildCompressedEntries(index map[int64]xrefEntry, trailer Dic
 			}
 			candidates[id] = xrefEntry{kind: 2, position: ref.Number, generation: int64(i)}
 		}
-		delete(local.cache, ref)
+		local.cache.delete(ref)
 	}
 	for id, entry := range candidates {
 		index[id] = entry

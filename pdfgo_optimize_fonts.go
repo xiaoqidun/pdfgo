@@ -48,7 +48,7 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 		}
 		value, err := r.Object(ref)
 		if !cached[ref] {
-			delete(r.cache, ref)
+			r.cache.delete(ref)
 		}
 		if err != nil {
 			return nil, nil, err
@@ -162,7 +162,7 @@ func (r *Reader) resolveOptimizationObject(value Object, metadata map[Reference]
 		var err error
 		value, err = r.Object(ref)
 		if !cached[ref] {
-			delete(r.cache, ref)
+			r.cache.delete(ref)
 		}
 		if err != nil {
 			return nil, Reference{}, err
@@ -417,11 +417,7 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 // 返回: error 仅返回取消错误，内容流异常时保守将目标字体标为不安全
 func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Reference]Object, cached map[Reference]bool, targets map[Reference]bool, used map[Reference]map[uint16]bool, unsafe map[Reference]bool) error {
 	cleanup := func() {
-		for ref := range r.cache {
-			if !cached[ref] {
-				delete(r.cache, ref)
-			}
-		}
+		r.cache.prune(cached)
 	}
 	defer cleanup()
 	resolveMeta := func(value Object) (Object, error) {
@@ -778,7 +774,7 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 				if (isForm && !visitedForms[ref]) || isPattern {
 					obj, err := r.Object(ref)
 					if !cached[ref] {
-						delete(r.cache, ref)
+						r.cache.delete(ref)
 					}
 					if err != nil {
 						return err
@@ -838,7 +834,7 @@ func compactTrueType(ctx context.Context, data []byte, glyphs []uint16) ([]byte,
 			return data, nil
 		}
 		switch tag {
-		case "cmap", "head", "hhea", "hmtx", "maxp", "OS/2", "post", "name", "glyf", "loca", "cvt ", "fpgm", "prep", "gasp", "kern", "vhea", "vmtx", "hdmx", "LTSH", "VDMX", "GDEF", "GPOS", "GSUB", "BASE", "MATH", "meta", "PCLT", "FFTM", "STAT", "EBDT", "EBLC", "EBSC", "JSTF", "MERG":
+		case "cmap", "head", "hhea", "hmtx", "maxp", "OS/2", "post", "name", "glyf", "loca", "cvt ", "fpgm", "prep", "gasp", "kern", "vhea", "vmtx", "DSIG", "hdmx", "LTSH", "VDMX", "GDEF", "GPOS", "GSUB", "BASE", "MATH", "meta", "PCLT", "FFTM", "STAT", "EBDT", "EBLC", "EBSC", "JSTF", "MERG":
 		default:
 			return data, nil
 		}
@@ -960,7 +956,7 @@ func compactTrueType(ctx context.Context, data []byte, glyphs []uint16) ([]byte,
 	tables["head"] = bytes.Clone(head)
 	binary.BigEndian.PutUint16(tables["head"][50:], newFormat)
 	clear(tables["head"][8:12])
-	for _, tag := range []string{"EBDT", "EBLC", "EBSC", "hdmx", "LTSH", "VDMX", "JSTF", "MERG"} {
+	for _, tag := range []string{"DSIG", "EBDT", "EBLC", "EBSC", "hdmx", "LTSH", "VDMX", "JSTF", "MERG"} {
 		delete(tables, tag)
 	}
 	tableCount := len(tables)
@@ -1158,16 +1154,12 @@ func (r *Reader) optimizeFontStream(ctx context.Context, stream *Stream, glyphs 
 	result := *stream
 	result.Dictionary = maps.Clone(stream.Dictionary)
 	result.Data = encoded
+	result.compressed = true
 	result.Dictionary["Length1"] = Integer(len(compact))
 	result.Dictionary["Filter"] = Name("FlateDecode")
 	delete(result.Dictionary, "DecodeParms")
-	if stream.decrypted {
-		name, err := r.security.outputStreamFilter(stream, r)
-		if err != nil {
-			return stream, nil
-		}
-		result.Dictionary["Filter"] = Array{Name("Crypt"), Name("FlateDecode")}
-		result.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, nil}
+	if err := r.applyExplicitCryptFilter(stream, &result); err != nil {
+		return stream, nil
 	}
 	return &result, nil
 }
