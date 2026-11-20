@@ -173,16 +173,49 @@ func EncodeImageResource(ctx context.Context, source image.Image, options Compre
 	return encodeImage(ctx, source, options, true)
 }
 
-// encodeImage 生成PNG基准候选，安全复用非预乘像素并比较压缩结果
+// encodeImage 生成图像候选，资源有损照片优先直接编码JPEG并避免先编码大图PNG超限
 // 入参: ctx 取消上下文, source 已解码图像, options 压缩配置, resource 是否允许更换格式
 // 返回: []byte 图片编码, error 参数、编码或取消错误
 func encodeImage(ctx context.Context, source image.Image, options CompressionOptions, resource bool) ([]byte, error) {
 	if err := options.Validate(); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if source == nil {
+		return nil, fmt.Errorf("missing PNG image")
+	}
+	bounds := source.Bounds()
+	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
+		return nil, fmt.Errorf("invalid PNG dimensions")
+	}
+	var jpegBest []byte
+	pngResource := resource
+	if resource && options.Mode == CompressionLossy {
+		pngResource = false
+		photo, err := photographicImage(ctx, source)
+		if err != nil {
+			return nil, err
+		}
+		if photo {
+			encoded, err := encodePhotoJPEG(ctx, source, options.ImageQuality(), optimizationBufferLimit)
+			if err != nil {
+				return nil, err
+			}
+			jpegBest = encoded
+		}
+	}
 	var output bytes.Buffer
-	limit := &optimizationBuffer{buffer: &output, limit: optimizationBufferLimit}
+	bufLimit := optimizationBufferLimit
+	if len(jpegBest) != 0 {
+		bufLimit = min(bufLimit, len(jpegBest))
+	}
+	limit := &optimizationBuffer{buffer: &output, limit: bufLimit}
 	if err := EncodePNG(ctx, limit, source); err != nil {
+		if limit.exceeded && len(jpegBest) != 0 {
+			return jpegBest, ctx.Err()
+		}
 		return nil, err
 	}
 	if options.Mode == CompressionUnchanged {
@@ -196,14 +229,69 @@ func encodeImage(ctx context.Context, source image.Image, options CompressionOpt
 	case *image.NRGBA, *image.NRGBA64, *image.Gray, *image.Gray16:
 		pixels = source
 	}
-	data, err := optimizePNGSource(ctx, output.Bytes(), options, image.Point{}, resource, pixels)
+	data, err := optimizePNGSource(ctx, output.Bytes(), options, image.Point{}, pngResource, pixels)
 	if err != nil {
 		return nil, err
+	}
+	if len(jpegBest) != 0 && len(jpegBest) < len(data) {
+		return jpegBest, ctx.Err()
 	}
 	return data, nil
 }
 
-// photographicImage 保守识别连续色调图片，扫描透明度及颜色期间检查取消
+// encodePhotoJPEG 将不透明照片直接编码为优化后的JPEG，灰度图使用单通道编码
+// 入参: ctx 取消上下文, img 图像, quality 有损质量, maxBytes 编码缓冲上限
+// 返回: []byte JPEG编码，超限时为空, error 编码或取消错误
+func encodePhotoJPEG(ctx context.Context, img image.Image, quality, maxBytes int) ([]byte, error) {
+	gray, err := imageAllGray(ctx, img)
+	if err != nil {
+		return nil, err
+	}
+	if gray {
+		img, err = imageToGray8(ctx, img)
+	} else {
+		img, err = jpegEncodingImage(ctx, img)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	limit := &optimizationBuffer{buffer: &out, limit: maxBytes}
+	if err := jpeg.Encode(&pdfOutput{ctx: ctx, writer: limit}, img, &jpeg.Options{Quality: quality}); err != nil {
+		if limit.exceeded {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	return OptimizeJPEG(ctx, out.Bytes())
+}
+
+// imageToGray8 将图像转换为8位单通道灰度图像，已有8位灰度直接复用
+// 入参: ctx 取消上下文, src 源图像
+// 返回: *image.Gray 8位灰度图像, error 取消错误
+func imageToGray8(ctx context.Context, src image.Image) (*image.Gray, error) {
+	if gray, ok := src.(*image.Gray); ok {
+		return gray, ctx.Err()
+	}
+	b := src.Bounds()
+	dst := image.NewGray(image.Rect(0, 0, b.Dx(), b.Dy()))
+	for y := 0; y < b.Dy(); y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for x := 0; x < b.Dx(); x++ {
+			if x&4095 == 4095 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			dst.Pix[y*dst.Stride+x] = imageNRGBAAt(src, b.Min.X+x, b.Min.Y+y).R
+		}
+	}
+	return dst, ctx.Err()
+}
+
+// photographicImage 保守识别连续色调图片，支持彩色与灰度照片并检查取消
 // 入参: ctx 取消上下文, img 图片
 // 返回: bool 是否适合JPEG, error 取消错误
 func photographicImage(ctx context.Context, img image.Image) (bool, error) {
@@ -216,6 +304,7 @@ func photographicImage(ctx context.Context, img image.Image) (bool, error) {
 	}
 	b := img.Bounds()
 	colors := make(map[color.NRGBA]bool)
+	gray := true
 	count, edges := 0, 0
 	for y := b.Min.Y; y < b.Max.Y; y += max(1, b.Dy()/128) {
 		if err := ctx.Err(); err != nil {
@@ -223,6 +312,9 @@ func photographicImage(ctx context.Context, img image.Image) (bool, error) {
 		}
 		for x := b.Min.X; x < b.Max.X; x += max(1, b.Dx()/128) {
 			c := imageNRGBAAt(img, x, y)
+			if gray && (c.R != c.G || c.G != c.B) {
+				gray = false
+			}
 			if len(colors) <= 256 {
 				colors[c] = true
 			}
@@ -235,7 +327,16 @@ func photographicImage(ctx context.Context, img image.Image) (bool, error) {
 			}
 		}
 	}
-	return len(colors) > 256 && edges*20 < count, ctx.Err()
+	if edges*20 >= count {
+		return false, ctx.Err()
+	}
+	if len(colors) > 256 {
+		return true, ctx.Err()
+	}
+	if gray && len(colors) > 32 {
+		return imageAllGray(ctx, img)
+	}
+	return false, ctx.Err()
 }
 
 // compactPNG 共用一次解码和降采样，优先比较JPEG、索引色和灰度候选
@@ -249,6 +350,13 @@ func compactPNG(ctx context.Context, data, best []byte, options CompressionOptio
 // 入参: ctx 取消上下文, data PNG数据, best 已有候选, options 压缩配置, size 像素需求, resource 是否允许更换格式, source 与编码一致的像素或空值
 // 返回: []byte 更小的图片编码, error 编码错误
 func compactPNGSource(ctx context.Context, data, best []byte, options CompressionOptions, size image.Point, resource bool, source image.Image) ([]byte, error) {
+	return compactPNGSourceMode(ctx, data, best, options, size, resource, source, true, true)
+}
+
+// compactPNGSourceMode 按允许的颜色类型比较压缩候选，有损模式支持16位降8位量化与调色板优化
+// 入参: ctx 取消上下文, data PNG数据, best 已有候选, options 压缩配置, size 像素需求, resource 是否允许更换格式, source 已解码像素或空值, allowGray 允许输出灰度, allowColor 允许输出彩色或调色板
+// 返回: []byte 更小的图片编码, error 编码错误
+func compactPNGSourceMode(ctx context.Context, data, best []byte, options CompressionOptions, size image.Point, resource bool, source image.Image, allowGray, allowColor bool) ([]byte, error) {
 	var buffers pngOptimizationBuffers
 	config, err := png.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
@@ -288,7 +396,7 @@ func compactPNGSource(ctx context.Context, data, best []byte, options Compressio
 			return nil, err
 		}
 	}
-	if depth16 {
+	if depth16 && options.Mode != CompressionLossy {
 		var byteExact bool
 		img, byteExact, err = compactPNGPrecision(ctx, img)
 		if err != nil {
@@ -340,7 +448,7 @@ func compactPNGSource(ctx context.Context, data, best []byte, options Compressio
 			return nil, err
 		}
 		for x := b.Min.X; x < b.Max.X; x++ {
-			if (x-b.Min.X)&4095 == 0 {
+			if (x-b.Min.X)&4095 == 4095 {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
@@ -365,20 +473,20 @@ func compactPNGSource(ctx context.Context, data, best []byte, options Compressio
 			break
 		}
 	}
-	if len(palette) <= 256 {
+	if allowColor && len(palette) <= 256 {
 		p := &pngCompactPaletteImage{Image: pixels, palette: palette, indices: indices}
 		best, err = compactPNGImage(ctx, p, best, &buffers)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if gray && !opaque {
+	if allowGray && gray && !opaque {
 		best, err = compactPNGGray(ctx, pixels, 8, true, best)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if gray && opaque {
+	if allowGray && gray && opaque {
 		depth := 1
 		for _, entry := range palette {
 			value := entry.(color.NRGBA).R
@@ -407,12 +515,14 @@ func compactPNGSource(ctx context.Context, data, best []byte, options Compressio
 			return nil, err
 		}
 	}
-	if writable == nil {
-		pixels.(*pngCompactImage).opaque = opaque
-	}
-	best, err = compactPNGImage(ctx, pixels, best, &buffers)
-	if err != nil {
-		return nil, err
+	if allowColor {
+		if writable == nil {
+			pixels.(*pngCompactImage).opaque = opaque
+		}
+		best, err = compactPNGImage(ctx, pixels, best, &buffers)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return best, ctx.Err()
 }
@@ -524,23 +634,11 @@ func compactPNGImage(ctx context.Context, img image.Image, best []byte, buffers 
 // 入参: ctx 取消上下文, img 图像, best 已有候选, quality 有损质量
 // 返回: []byte 更小的编码, error 编码或取消错误
 func compactJPEG(ctx context.Context, img image.Image, best []byte, quality int) ([]byte, error) {
-	img, err := jpegEncodingImage(ctx, img)
+	encoded, err := encodePhotoJPEG(ctx, img, quality, optimizationBufferLimit)
 	if err != nil {
 		return nil, err
 	}
-	var out bytes.Buffer
-	limit := &optimizationBuffer{buffer: &out, limit: optimizationBufferLimit}
-	if err := jpeg.Encode(&pdfOutput{ctx: ctx, writer: limit}, img, &jpeg.Options{Quality: quality}); err != nil {
-		if limit.exceeded {
-			return best, ctx.Err()
-		}
-		return nil, err
-	}
-	encoded, err := OptimizeJPEG(ctx, out.Bytes())
-	if err != nil {
-		return nil, err
-	}
-	if len(encoded) < len(best) {
+	if len(encoded) != 0 && len(encoded) < len(best) {
 		best = encoded
 	}
 	return best, ctx.Err()

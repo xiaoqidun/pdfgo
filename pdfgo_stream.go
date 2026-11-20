@@ -393,6 +393,13 @@ func decodeLZWBytes(data []byte, early int64) ([]byte, int, error) {
 // 入参: ctx 取消上下文, data 编码数据, early 提前增长标志
 // 返回: []byte 解码数据, int 消费字节数, error 编码或取消错误
 func decodeLZWBytesContext(ctx context.Context, data []byte, early int64) ([]byte, int, error) {
+	return decodeLZWBytesLimitContext(ctx, data, early, 0)
+}
+
+// decodeLZWBytesLimitContext 有界解码LZW并返回消费长度，超出上限立即中止
+// 入参: ctx 取消上下文, data 编码数据, early 提前增长标志, limit 解码字节上限，非正数表示不限
+// 返回: []byte 解码数据, int 消费字节数, error 编码、超限或取消错误
+func decodeLZWBytesLimitContext(ctx context.Context, data []byte, early int64, limit int) ([]byte, int, error) {
 	if early != 0 && early != 1 {
 		return nil, 0, fmt.Errorf("invalid LZW EarlyChange")
 	}
@@ -439,6 +446,13 @@ func decodeLZWBytesContext(ctx context.Context, data []byte, early int64) ([]byt
 		}
 		start--
 		stack[start] = byte(current)
+		extra := len(stack) - start
+		if code == next {
+			extra++
+		}
+		if limit > 0 && len(out)+extra > limit {
+			return nil, 0, io.ErrShortBuffer
+		}
 		out = append(out, stack[start:]...)
 		if code == next {
 			out = append(out, byte(current))

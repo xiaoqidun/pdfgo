@@ -20,24 +20,39 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"math"
 	"math/big"
 )
 
-// compactPNGPhysical 优化带像素密度的PNG，保持格式并同步缩放后的密度
-// 入参: ctx 取消上下文, data 原PNG, best 已有候选, density 已校验的pHYs块, options 压缩配置, size 像素需求
+// compactPNGPhysical 优化带像素密度的PNG，有损资源模式允许转JPEG并同步物理密度
+// 入参: ctx 取消上下文, data 原PNG, best 已有候选, density 已校验的pHYs块, options 压缩配置, size 像素需求, resource 是否允许更换格式
 // 返回: []byte 更小的图片编码, error 编码或取消错误
-func compactPNGPhysical(ctx context.Context, data, best, density []byte, options CompressionOptions, size image.Point) ([]byte, error) {
-	candidate, err := compactPNG(ctx, data, best, options, size, false)
-	if err != nil || len(candidate)+len(density) >= len(best) || len(candidate)+len(density) > optimizationBufferLimit {
-		return best, err
+func compactPNGPhysical(ctx context.Context, data, best, density []byte, options CompressionOptions, size image.Point, resource bool) ([]byte, error) {
+	candidate, err := compactPNG(ctx, data, best, options, size, resource)
+	if err != nil {
+		return nil, err
+	}
+	before := image.Pt(int(binary.BigEndian.Uint32(data[16:])), int(binary.BigEndian.Uint32(data[20:])))
+	if bytes.HasPrefix(candidate, []byte{255, 216}) {
+		config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(candidate)})
+		if err != nil {
+			return nil, err
+		}
+		jfif, ok := jfifSegmentFromPNGPhysical(density, before, image.Pt(config.Width, config.Height))
+		if !ok || len(candidate)+len(jfif) >= len(best) || len(candidate)+len(jfif) > optimizationBufferLimit {
+			return best, ctx.Err()
+		}
+		return insertJPEGSegments(candidate, jfif), ctx.Err()
+	}
+	if len(candidate)+len(density) >= len(best) || len(candidate)+len(density) > optimizationBufferLimit {
+		return best, ctx.Err()
 	}
 	config, err := png.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(candidate)})
 	if err != nil {
 		return nil, err
 	}
-	before := image.Pt(int(binary.BigEndian.Uint32(data[16:])), int(binary.BigEndian.Uint32(data[20:])))
 	chunk, ok := resizePNGPhysical(density, before, image.Pt(config.Width, config.Height))
 	if !ok {
 		return best, ctx.Err()
@@ -47,6 +62,42 @@ func compactPNGPhysical(ctx context.Context, data, best, density []byte, options
 	copy(result[33:], chunk)
 	copy(result[33+len(chunk):], candidate[33:])
 	return result, ctx.Err()
+}
+
+// jfifSegmentFromPNGPhysical 将PNG物理密度块按缩放后尺寸转换为JFIF应用段
+// 入参: chunk 已校验的pHYs块, before 原尺寸, after 新尺寸
+// 返回: []byte JFIF应用段, bool 密度是否可安全表示
+func jfifSegmentFromPNGPhysical(chunk []byte, before, after image.Point) ([]byte, bool) {
+	scaled, ok := resizePNGPhysical(chunk, before, after)
+	if !ok {
+		return nil, false
+	}
+	x, y := uint64(binary.BigEndian.Uint32(scaled[8:])), uint64(binary.BigEndian.Uint32(scaled[12:]))
+	if x == 0 && y == 0 {
+		return nil, true
+	}
+	if x == 0 || y == 0 {
+		return nil, false
+	}
+	unit := byte(0)
+	var dx, dy uint64
+	if scaled[16] == 0 {
+		ratio := new(big.Rat).SetFrac64(int64(x), int64(y))
+		dx, dy = ratio.Num().Uint64(), ratio.Denom().Uint64()
+	} else if x%100 == 0 && y%100 == 0 && x/100 <= 65535 && y/100 <= 65535 {
+		unit, dx, dy = 2, x/100, y/100
+	} else {
+		unit = 1
+		dx = max(1, (x*254+5000)/10000)
+		dy = max(1, (y*254+5000)/10000)
+	}
+	if dx == 0 || dy == 0 || dx > 65535 || dy > 65535 {
+		return nil, false
+	}
+	segment := []byte{0xff, 0xe0, 0, 16, 'J', 'F', 'I', 'F', 0, 1, 1, unit, 0, 0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint16(segment[12:], uint16(dx))
+	binary.BigEndian.PutUint16(segment[14:], uint16(dy))
+	return segment, true
 }
 
 // resizePNGPhysical 按缩放后的像素数更新密度，相对单位保留精确比例
@@ -81,34 +132,40 @@ func resizePNGPhysical(chunk []byte, before, after image.Point) ([]byte, bool) {
 	return result, true
 }
 
-// resizeJPEGPhysical 同步JPEG降采样后的JFIF密度，其他元数据及缩略图保持原样
-// 入参: ctx 取消上下文, data 原始JPEG, metadata 独占的元数据缓冲, before 原尺寸, after 新尺寸
-// 返回: bool 密度是否可表示, error JPEG解析或取消错误
-func resizeJPEGPhysical(ctx context.Context, data, metadata []byte, before, after image.Point) (bool, error) {
+// resizeJPEGPhysical 同步JPEG降采样后的JFIF密度，直接扫描保留元数据避免剥离偏移错位
+// 入参: ctx 取消上下文, metadata 独占的元数据缓冲, before 原尺寸, after 新尺寸
+// 返回: bool 密度是否可表示, error 取消错误
+func resizeJPEGPhysical(ctx context.Context, metadata []byte, before, after image.Point) (bool, error) {
 	if before == after {
 		return true, ctx.Err()
 	}
-	offset := 0
 	valid, found := true, false
-	_, _, _, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
-		if marker < 0xe0 || marker > 0xef && marker != 0xfe {
-			return nil
+	for start := 0; start < len(metadata); {
+		if err := ctx.Err(); err != nil {
+			return false, err
 		}
-		position := start + 1
-		for data[position] == 255 {
-			position++
+		marker := start
+		for marker < len(metadata) && metadata[marker] == 255 {
+			marker++
 		}
-		payload := data[position+3 : end]
-		if marker == 0xe0 && bytes.HasPrefix(payload, []byte("JFIF\x00")) {
-			if found || !resizeJFIFDensity(metadata[offset+position+3-start:offset+end-start], before, after) {
+		if marker == start || marker+3 > len(metadata) {
+			return false, nil
+		}
+		size := int(binary.BigEndian.Uint16(metadata[marker+1:]))
+		end := marker + 1 + size
+		if size < 2 || end > len(metadata) {
+			return false, nil
+		}
+		payload := metadata[marker+3 : end]
+		if metadata[marker] == 0xe0 && bytes.HasPrefix(payload, []byte("JFIF\x00")) {
+			if found || !resizeJFIFDensity(payload, before, after) {
 				valid = false
 			}
 			found = true
 		}
-		offset += end - start
-		return ctx.Err()
-	})
-	return valid, err
+		start = end
+	}
+	return valid, ctx.Err()
 }
 
 // resizeJFIFDensity 更新JFIF有效载荷中的密度，绝对单位四舍五入，相对单位保留精确比例

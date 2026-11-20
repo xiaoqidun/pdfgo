@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/binary"
 	"image"
+	"math"
 	"math/big"
 )
 
@@ -94,7 +95,6 @@ func resizeExifGeometry(ctx context.Context, data []byte, before, after image.Po
 	output := bytes.Clone(data)
 	offset := uint64(order.Uint32(data[4:]))
 	var primaryStart, primaryEnd uint64
-	var resolution [2]*big.Rat
 	for directory := 0; directory < 2 && offset != 0; directory++ {
 		if offset < 8 || offset%2 != 0 || offset+2 > uint64(len(data)) {
 			return nil, false
@@ -107,7 +107,25 @@ func resizeExifGeometry(ctx context.Context, data []byte, before, after image.Po
 		if directory == 0 {
 			primaryStart, primaryEnd = offset, end
 		}
-		next, previous := uint64(0), -1
+		next := uint64(0)
+		seen := make(map[int]bool)
+		unitValid := true
+		if directory == 0 {
+			for i := uint64(0); i < count; i++ {
+				if ctx.Err() != nil {
+					return nil, false
+				}
+				at := offset + 2 + i*12
+				entry := data[at : at+12]
+				tag, kind, number := int(order.Uint16(entry)), order.Uint16(entry[2:]), order.Uint32(entry[4:])
+				if tag == 0x128 {
+					unit := order.Uint16(entry[8:])
+					if kind != 3 || number != 1 || unit < 1 || unit > 3 {
+						unitValid = false
+					}
+				}
+			}
+		}
 		for i := uint64(0); i < count; i++ {
 			if ctx.Err() != nil {
 				return nil, false
@@ -115,20 +133,11 @@ func resizeExifGeometry(ctx context.Context, data []byte, before, after image.Po
 			at := offset + 2 + i*12
 			entry := data[at : at+12]
 			tag, kind, number := int(order.Uint16(entry)), order.Uint16(entry[2:]), order.Uint32(entry[4:])
-			if tag <= previous {
-				return nil, false
-			}
-			previous = tag
-			if directory == 0 && tag == 0x128 {
-				unit := order.Uint16(entry[8:])
-				if kind != 3 || number != 1 || unit < 2 || unit > 3 {
-					return nil, false
-				}
-			}
 			if directory == 0 && tag == 0x8769 {
-				if kind != 4 || number != 1 {
+				if kind != 4 || number != 1 || seen[tag] {
 					return nil, false
 				}
+				seen[tag] = true
 				next = uint64(order.Uint32(entry[8:]))
 				continue
 			}
@@ -147,6 +156,10 @@ func resizeExifGeometry(ctx context.Context, data []byte, before, after image.Po
 				case 0xa20e, 0xa20f:
 					axis, rational = tag-0xa20e, true
 				case 0x9214, 0xa214:
+					if seen[tag] {
+						return nil, false
+					}
+					seen[tag] = true
 					if kind != 3 || number < 2 || number > 4 || tag == 0xa214 && number != 2 {
 						return nil, false
 					}
@@ -174,33 +187,40 @@ func resizeExifGeometry(ctx context.Context, data []byte, before, after image.Po
 			if axis < 0 {
 				continue
 			}
+			if seen[tag] {
+				return nil, false
+			}
+			seen[tag] = true
 			oldSize, newSize := before.X, after.X
 			if axis == 1 {
 				oldSize, newSize = before.Y, after.Y
 			}
 			if number != 1 {
+				if rational {
+					continue
+				}
 				return nil, false
 			}
 			if rational {
+				if directory == 0 && !unitValid {
+					continue
+				}
 				position := uint64(order.Uint32(entry[8:]))
 				if kind != 5 || position < 8 || position%2 != 0 || position+8 > uint64(len(data)) || order.Uint32(data[position+4:]) == 0 {
-					return nil, false
+					continue
 				}
 				n, d := order.Uint32(data[position:]), order.Uint32(data[position+4:])
 				if n == 0 {
-					return nil, false
+					continue
 				}
-				ratio := new(big.Rat).SetFrac64(int64(n)*int64(newSize), int64(d)*int64(oldSize))
-				if ratio.Num().BitLen() > 32 || ratio.Denom().BitLen() > 32 {
-					return nil, false
+				num, den, ok := scaleExifRational(n, d, newSize, oldSize)
+				if !ok {
+					continue
 				}
 				value := make([]byte, 8)
-				order.PutUint32(value, uint32(ratio.Num().Uint64()))
-				order.PutUint32(value[4:], uint32(ratio.Denom().Uint64()))
+				order.PutUint32(value, num)
+				order.PutUint32(value[4:], den)
 				output = appendExifValue(order, output, at, value)
-				if directory == 0 {
-					resolution[axis] = ratio
-				}
 			} else {
 				value := uint64(order.Uint32(entry[8:]))
 				if kind == 3 {
@@ -209,9 +229,10 @@ func resizeExifGeometry(ctx context.Context, data []byte, before, after image.Po
 					return nil, false
 				}
 				if value == 0 || value > uint64(oldSize) {
-					return nil, false
+					value = uint64(newSize)
+				} else {
+					value = (value*uint64(newSize) + uint64(oldSize) - 1) / uint64(oldSize)
 				}
-				value = (value*uint64(newSize) + uint64(oldSize) - 1) / uint64(oldSize)
 				if kind == 3 {
 					order.PutUint16(output[at+8:], uint16(value))
 				} else {
@@ -219,14 +240,32 @@ func resizeExifGeometry(ctx context.Context, data []byte, before, after image.Po
 				}
 			}
 		}
-		if directory == 0 && (resolution[0] != nil || resolution[1] != nil) {
-			if resolution[0] == nil || resolution[1] == nil || resolution[0].Cmp(resolution[1]) != 0 {
-				return nil, false
-			}
-		}
 		offset = next
 	}
 	return output, primaryEnd != 0 && ctx.Err() == nil
+}
+
+// scaleExifRational 缩放无符号有理数并约束在32位分子分母范围内
+// 入参: n 原分子, d 原分母, newSize 新尺寸, oldSize 原尺寸
+// 返回: uint32 新分子, uint32 新分母, bool 是否可安全表示
+func scaleExifRational(n, d uint32, newSize, oldSize int) (uint32, uint32, bool) {
+	ratio := new(big.Rat).SetFrac64(int64(n)*int64(newSize), int64(d)*int64(oldSize))
+	if ratio.Num().BitLen() <= 32 && ratio.Denom().BitLen() <= 32 {
+		return uint32(ratio.Num().Uint64()), uint32(ratio.Denom().Uint64()), true
+	}
+	f, _ := ratio.Float64()
+	if f <= 0 || math.IsNaN(f) || math.IsInf(f, 0) || f > math.MaxUint32 {
+		return 0, 0, false
+	}
+	den := uint32(10000)
+	if f*float64(den) > math.MaxUint32 {
+		den = 1
+	}
+	num := uint32(math.Round(f * float64(den)))
+	if num == 0 {
+		return 0, 0, false
+	}
+	return num, den, true
 }
 
 // appendExifValue 追加按双字节对齐的字段值并更新目录偏移

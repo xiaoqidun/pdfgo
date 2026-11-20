@@ -1053,6 +1053,19 @@ func (r *Reader) optimizationContentData(ctx context.Context, stream *Stream, li
 			if err != nil {
 				return nil, err
 			}
+		case "LZWDecode":
+			early, err := integerDefault(dict, "EarlyChange", 1)
+			if err != nil {
+				return nil, err
+			}
+			data, _, err = decodeLZWBytesLimitContext(ctx, data, early, limit)
+			if err != nil {
+				return nil, err
+			}
+			data, err = restorePredictorContext(ctx, data, dict)
+			if err != nil {
+				return nil, err
+			}
 		case "ASCIIHexDecode":
 			data, err = decodeASCIIHexContext(ctx, data, nil)
 			if err != nil {

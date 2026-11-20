@@ -666,13 +666,13 @@ func jpegDisplayFileContext(ctx context.Context, data []byte) ([]byte, error) {
 
 // jpegMetadataProfileContext 扫描JPEG元数据并按需剥离色彩标记与重组ICC分段
 // 入参: ctx 取消上下文, data JPEG数据, stripColor 是否剥离APP14与ICC_PROFILE段
-// 返回: []byte 保留的元数据段, []byte 重组后的ICC数据, bool 是否包含Adobe标记, bool ICC分段是否有效, error 解析或取消错误
-func jpegMetadataProfileContext(ctx context.Context, data []byte, stripColor bool) ([]byte, []byte, bool, bool, error) {
+// 返回: []byte 保留的元数据段, []byte 重组后的ICC数据, jpegFrame 帧头信息, byte Adobe变换值, bool 是否含Adobe标记, bool ICC分段是否有效, error 解析或取消错误
+func jpegMetadataProfileContext(ctx context.Context, data []byte, stripColor bool) ([]byte, []byte, jpegFrame, byte, bool, bool, error) {
 	var metadata []byte
 	var parts [255][]byte
 	count, found, total := 0, 0, 0
 	iccValid := true
-	_, _, adobe, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
+	frame, adobe, tagged, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
 		if marker < 0xe0 || marker > 0xef && marker != 0xfe {
 			return nil
 		}
@@ -712,19 +712,19 @@ func jpegMetadataProfileContext(ctx context.Context, data []byte, stripColor boo
 		return ctx.Err()
 	})
 	if err != nil {
-		return nil, nil, false, false, err
+		return nil, nil, jpegFrame{}, 0, false, false, err
 	}
 	if !stripColor || found == 0 {
-		return metadata, nil, adobe, iccValid, ctx.Err()
+		return metadata, nil, frame, adobe, tagged, iccValid, ctx.Err()
 	}
 	if !iccValid || found != count {
-		return metadata, nil, adobe, false, ctx.Err()
+		return metadata, nil, frame, adobe, tagged, false, ctx.Err()
 	}
 	profile := make([]byte, 0, total)
 	for _, part := range parts[:count] {
 		profile = append(profile, part...)
 	}
-	return metadata, profile, adobe, true, ctx.Err()
+	return metadata, profile, frame, adobe, tagged, true, ctx.Err()
 }
 
 // sampleSize 校验JPEG解码器的采样平面及渐进系数缓冲

@@ -89,6 +89,13 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		return stream, nil
 	}
 	space := d["ColorSpace"]
+	if arr, ok := space.(Array); ok && len(arr) == 1 {
+		resolved, err := r.optimizationValue(arr[0])
+		if err != nil {
+			return stream, ctx.Err()
+		}
+		space = resolved
+	}
 	channels := 0
 	switch space {
 	case Name("DeviceRGB"):
@@ -171,9 +178,12 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 			return nil
 		}
 		result := *stream
-		result.Dictionary = maps.Clone(d)
+		result.Dictionary = maps.Clone(stream.Dictionary)
 		result.Data = buffer.Bytes()
-		result.Dictionary["ColorSpace"] = cs
+		if cs != nil {
+			result.Dictionary["ColorSpace"] = cs
+			delete(result.Dictionary, "Decode")
+		}
 		result.Dictionary["BitsPerComponent"] = Integer(bits)
 		parameters := Dictionary{"Predictor": Integer(15), "Colors": Integer(colors), "BitsPerComponent": Integer(bits), "Columns": w}
 		result.Dictionary["Filter"] = Name("FlateDecode")
@@ -184,7 +194,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		best = &result
 		return nil
 	}
-	if err := encode(pixels, int(w)*channels, channels, 8, channels, d["ColorSpace"]); err != nil {
+	if err := encode(pixels, int(w)*channels, channels, 8, channels, nil); err != nil {
 		return nil, err
 	}
 	if channels == 1 && d["Mask"] == nil {
@@ -193,12 +203,12 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 			return nil, err
 		}
 		if packed != nil {
-			if err := encode(packed, (int(w)*bits+7)/8, 1, bits, 1, space); err != nil {
+			if err := encode(packed, (int(w)*bits+7)/8, 1, bits, 1, nil); err != nil {
 				return nil, err
 			}
 		}
 	}
-	if channels == 3 && d["Decode"] == nil && d["Mask"] == nil && d["SMask"] == nil {
+	if channels == 3 && r.isIdentityDecode(d["Decode"], 3) && d["Mask"] == nil && d["SMask"] == nil {
 		palette := make(map[uint32]byte)
 		var table []byte
 		for i := 0; i < len(pixels); i += 3 {

@@ -107,11 +107,11 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 		return nil, err
 	}
 	cmykSource := config.ColorModel == color.CMYKModel
-	metadata, profileData, adobe, iccValid, err := jpegMetadataProfileContext(ctx, data, cmykSource)
+	metadata, profileData, frame, adobe, tagged, iccValid, err := jpegMetadataProfileContext(ctx, data, cmykSource)
 	if err != nil {
 		return nil, err
 	}
-	if !cmykSource && adobe || cmykSource && !iccValid || len(metadata) >= optimizationBufferLimit {
+	if !cmykSource && frame.components == 3 && tagged && adobe == 0 || cmykSource && !iccValid || len(metadata) >= optimizationBufferLimit {
 		return best, nil
 	}
 	if !cmykSource && (size.X <= 0 || size.Y <= 0 || size.X >= config.Width || size.Y >= config.Height) {
@@ -145,7 +145,7 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 		return nil, err
 	}
 	if len(metadata) != 0 {
-		valid, err := resizeJPEGPhysical(ctx, data, metadata, image.Pt(config.Width, config.Height), img.Bounds().Size())
+		valid, err := resizeJPEGPhysical(ctx, metadata, image.Pt(config.Width, config.Height), img.Bounds().Size())
 		if err != nil {
 			return nil, err
 		}
@@ -177,17 +177,23 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 		return nil, err
 	}
 	if len(candidate)+len(metadata) < len(best) {
-		if len(metadata) == 0 {
-			best = candidate
-		} else {
-			joined := make([]byte, len(candidate)+len(metadata))
-			copy(joined, candidate[:2])
-			copy(joined[2:], metadata)
-			copy(joined[2+len(metadata):], candidate[2:])
-			best = joined
-		}
+		best = insertJPEGSegments(candidate, metadata)
 	}
 	return best, ctx.Err()
+}
+
+// insertJPEGSegments 在JPEG起始标记后插入元数据段，无附加段时直接返回原数据
+// 入参: data JPEG数据, segment 待插入应用段
+// 返回: []byte 拼接后的JPEG数据
+func insertJPEGSegments(data, segment []byte) []byte {
+	if len(segment) == 0 {
+		return data
+	}
+	joined := make([]byte, len(data)+len(segment))
+	copy(joined, data[:2])
+	copy(joined[2:], segment)
+	copy(joined[2+len(segment):], data[2:])
+	return joined
 }
 
 // convertCMYKJPEGToRGBA 按内嵌CMYK配置或内置印刷配置将四色JPEG像素转为不透明RGBA
@@ -205,40 +211,50 @@ func convertCMYKJPEGToRGBA(ctx context.Context, src *image.CMYK, profileData []b
 	}
 	bounds := src.Bounds()
 	dst := image.NewRGBA(bounds)
-	var prev color.CMYK
-	var prevRGB color.RGBA
-	hasPrev := false
+	type cmykCacheEntry struct {
+		key   uint32
+		rgb   color.RGBA
+		valid bool
+	}
+	var cache [4096]cmykCacheEntry
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		if y&15 == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, false, err
 			}
 		}
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			ink := src.CMYKAt(x, y)
-			if hasPrev && ink == prev {
-				dst.SetRGBA(x, y, prevRGB)
-				continue
-			}
-			var rgb [3]float64
-			if space != nil {
-				values := [4]float64{float64(ink.C) / 255, float64(ink.M) / 255, float64(ink.Y) / 255, float64(ink.K) / 255}
-				var err error
-				rgb, err = space.SRGB(values[:], intent)
-				if err != nil {
-					return nil, false, ctx.Err()
-				}
+		srcRow := src.Pix[src.PixOffset(bounds.Min.X, y):]
+		dstRow := dst.Pix[dst.PixOffset(bounds.Min.X, y):]
+		for x := 0; x < bounds.Dx(); x++ {
+			off := x * 4
+			c, m, yv, k := srcRow[off], srcRow[off+1], srcRow[off+2], srcRow[off+3]
+			key := uint32(c) | uint32(m)<<8 | uint32(yv)<<16 | uint32(k)<<24
+			slot := (key * 2654435761) >> 20
+			entry := &cache[slot]
+			var out color.RGBA
+			if entry.valid && entry.key == key {
+				out = entry.rgb
 			} else {
-				rgb = DeviceCMYKToSRGB(float64(ink.C)/255, float64(ink.M)/255, float64(ink.Y)/255, float64(ink.K)/255)
+				var rgb [3]float64
+				if space != nil {
+					values := [4]float64{float64(c) / 255, float64(m) / 255, float64(yv) / 255, float64(k) / 255}
+					var err error
+					rgb, err = space.SRGB(values[:], intent)
+					if err != nil {
+						return nil, false, ctx.Err()
+					}
+				} else {
+					rgb = DeviceCMYKToSRGB(float64(c)/255, float64(m)/255, float64(yv)/255, float64(k)/255)
+				}
+				out = color.RGBA{
+					R: uint8(math.Round(math.Max(0, math.Min(1, rgb[0])) * 255)),
+					G: uint8(math.Round(math.Max(0, math.Min(1, rgb[1])) * 255)),
+					B: uint8(math.Round(math.Max(0, math.Min(1, rgb[2])) * 255)),
+					A: 255,
+				}
+				entry.key, entry.rgb, entry.valid = key, out, true
 			}
-			prev, hasPrev = ink, true
-			prevRGB = color.RGBA{
-				R: uint8(math.Round(math.Max(0, math.Min(1, rgb[0])) * 255)),
-				G: uint8(math.Round(math.Max(0, math.Min(1, rgb[1])) * 255)),
-				B: uint8(math.Round(math.Max(0, math.Min(1, rgb[2])) * 255)),
-				A: 255,
-			}
-			dst.SetRGBA(x, y, prevRGB)
+			dstRow[off], dstRow[off+1], dstRow[off+2], dstRow[off+3] = out.R, out.G, out.B, 255
 		}
 	}
 	return dst, true, ctx.Err()
@@ -256,11 +272,11 @@ func optimizePNG(ctx context.Context, data []byte, options CompressionOptions, s
 // 返回: []byte 优化数据, error 编码错误
 func optimizePNGSource(ctx context.Context, data []byte, options CompressionOptions, size image.Point, resource bool, pixels image.Image) ([]byte, error) {
 	var chunks []pngOptimizationChunk
-	eligible := false
 	plain := true
 	unsafeMetadata := false
 	ended := false
-	var density []byte
+	var density, iccpChunk, gamaChunk, chrmChunk []byte
+	srgbChunk, hdrColor, hasExif := false, false, false
 	imageData := false
 	imageDataEnded := false
 	palette := false
@@ -315,11 +331,24 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 		if kind != "IHDR" && kind != "IDAT" && kind != "IEND" && kind != "PLTE" && kind != "tRNS" && kind != "pHYs" {
 			plain = false
 		}
-		if kind == "pHYs" {
+		switch kind {
+		case "pHYs":
 			if n != 9 || density != nil || imageData || raw[16] > 1 || binary.BigEndian.Uint32(raw[8:]) > math.MaxInt32 || binary.BigEndian.Uint32(raw[12:]) > math.MaxInt32 {
 				return nil, fmt.Errorf("invalid PNG physical dimensions")
 			}
 			density = raw
+		case "iCCP":
+			iccpChunk = raw[8 : len(raw)-4]
+		case "sRGB":
+			srgbChunk = true
+		case "gAMA":
+			gamaChunk = raw[8 : len(raw)-4]
+		case "cHRM":
+			chrmChunk = raw[8 : len(raw)-4]
+		case "cICP", "mDCV", "cLLI":
+			hdrColor = true
+		case "eXIf":
+			hasExif = true
 		}
 		imageDataEnded = imageDataEnded || imageData && kind != "IDAT"
 		imageData = imageData || kind == "IDAT"
@@ -329,9 +358,6 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 			unsafeMetadata = true
 		default:
 			unsafeMetadata = unsafeMetadata || raw[7]&32 == 0
-		}
-		if kind == "IHDR" {
-			eligible = n == 13 && raw[16] == 8 && (raw[17] == 2 || raw[17] == 6)
 		}
 		pos += len(raw)
 		if kind == "IEND" {
@@ -355,7 +381,7 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 		if density == nil {
 			candidate, err = compactPNGSource(ctx, data, best, options, size, resource, pixels)
 		} else {
-			candidate, err = compactPNGPhysical(ctx, data, best, density, options, size)
+			candidate, err = compactPNGPhysical(ctx, data, best, density, options, size, resource)
 		}
 		if err != nil {
 			return nil, err
@@ -410,125 +436,445 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 			reused = [][]byte{packed.Bytes()}
 		}
 	}
-	assemble := func(idat [][]byte, header []byte, lossy bool) []byte {
+	if reused != nil {
 		var out bytes.Buffer
 		length := uint64(8 + 12)
-		for _, part := range idat {
+		for _, part := range reused {
 			length += uint64(len(part))
 		}
 		for _, c := range chunks {
-			if c.kind != "IDAT" && !(lossy && (c.kind == "PLTE" || c.kind == "tRNS" || c.kind == "hIST" || c.kind == "sBIT")) {
+			if c.kind != "IDAT" {
 				length += uint64(len(c.data))
 			}
 		}
-		if length >= uint64(len(best)) || length > optimizationBufferLimit {
-			return best
-		}
-		out.Grow(int(length))
-		out.Write(data[:8])
-		written := false
-		for _, c := range chunks {
-			switch c.kind {
-			case "IHDR":
-				if header != nil {
-					out.Write(header)
+		if length < uint64(len(best)) && length <= optimizationBufferLimit {
+			out.Grow(int(length))
+			out.Write(data[:8])
+			written := false
+			for _, c := range chunks {
+				if c.kind == "IDAT" {
+					if !written {
+						writePNGChunk(&out, "IDAT", reused...)
+						written = true
+					}
 				} else {
 					out.Write(c.data)
 				}
-			case "IDAT":
-				if !written {
-					writePNGChunk(&out, "IDAT", idat...)
-					written = true
-				}
-			case "PLTE", "tRNS", "hIST", "sBIT":
-				if !lossy {
-					out.Write(c.data)
-				}
-			case "pHYs":
-				chunk := c.data
-				if header != nil {
-					before := image.Pt(int(binary.BigEndian.Uint32(data[16:])), int(binary.BigEndian.Uint32(data[20:])))
-					after := image.Pt(int(binary.BigEndian.Uint32(header[8:])), int(binary.BigEndian.Uint32(header[12:])))
-					var ok bool
-					chunk, ok = resizePNGPhysical(chunk, before, after)
-					if !ok {
-						return best
-					}
-				}
-				out.Write(chunk)
-			default:
-				out.Write(c.data)
 			}
-		}
-		return out.Bytes()
-	}
-	if reused != nil {
-		if candidate := assemble(reused, nil, false); len(candidate) < len(best) {
-			best = candidate
+			best = out.Bytes()
 		}
 	}
-	if !plain && options.Mode == CompressionLossy && eligible && (options.ImageQuality() < 100 || size.X > 0 && size.Y > 0) {
+	if !plain && options.Mode == CompressionLossy && (resource || options.ImageQuality() < 100 || size.X > 0 && size.Y > 0 || data[24] == 16) {
 		config, err := png.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 		if err != nil {
 			return nil, err
 		}
-		if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 {
-			return best, nil
+		pixelSize := int64(4)
+		if data[24] == 16 {
+			pixelSize = 8
+		}
+		if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/pixelSize {
+			return best, ctx.Err()
 		}
 		img, err := png.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 		if err != nil {
 			return nil, err
 		}
-		img, err = ResizeImage(ctx, img, size)
-		if err != nil {
-			return nil, err
-		}
-		bounds := img.Bounds()
-		pixels, _, err := compactPNGStorage(ctx, img)
-		if err != nil {
-			return nil, err
-		}
-		bits := uint(4 + options.ImageQuality()*4/100)
-		levels := (1 << bits) - 1
-		quant := func(v uint8) uint8 { return uint8(((int(v)*levels + 127) / 255) * 255 / levels) }
-		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			if err := ctx.Err(); err != nil {
+		before := image.Pt(config.Width, config.Height)
+		if resource && !hdrColor && !hasExif {
+			photo, err := photographicImage(ctx, img)
+			if err != nil {
 				return nil, err
 			}
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				if (x-bounds.Min.X)&4095 == 0 {
-					if err := ctx.Err(); err != nil {
+			if photo {
+				srgbImg, ok, err := pngImageToSRGB(ctx, img, iccpChunk, srgbChunk, gamaChunk, chrmChunk)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					resized, err := ResizeImage(ctx, srgbImg, size)
+					if err != nil {
 						return nil, err
 					}
+					encoded, err := encodePhotoJPEG(ctx, resized, options.ImageQuality(), min(len(best), optimizationBufferLimit))
+					if err != nil {
+						return nil, err
+					}
+					if len(encoded) != 0 {
+						var jfif []byte
+						densityOK := true
+						if density != nil {
+							jfif, densityOK = jfifSegmentFromPNGPhysical(density, before, resized.Bounds().Size())
+						}
+						if densityOK && len(encoded)+len(jfif) < len(best) && len(encoded)+len(jfif) <= optimizationBufferLimit {
+							best = insertJPEGSegments(encoded, jfif)
+						}
+					}
 				}
-				c := imageNRGBAAt(img, x, y)
-				c.R, c.G, c.B = quant(c.R), quant(c.G), quant(c.B)
-				pixels.SetNRGBA(x, y, c)
 			}
 		}
-		var b bytes.Buffer
-		encoder := png.Encoder{CompressionLevel: png.BestCompression}
-		limit := &optimizationBuffer{buffer: &b, limit: min(len(best), optimizationBufferLimit)}
-		if err := encoder.Encode(&pdfOutput{ctx: ctx, writer: limit}, pixels); err != nil {
-			if limit.exceeded {
-				return best, ctx.Err()
+		allowGray, allowColor := true, true
+		if len(iccpChunk) != 0 {
+			if data[25] == 0 || data[25] == 4 {
+				allowColor = false
+			} else {
+				allowGray = false
 			}
+		}
+		candidate, err := compactPNGSourceMode(ctx, data, best, options, size, false, img, allowGray, allowColor)
+		if err != nil {
 			return nil, err
 		}
-		candidate := b.Bytes()
-		var idat [][]byte
-		for pos := 33; pos < len(candidate); {
-			n := int(binary.BigEndian.Uint32(candidate[pos:]))
-			if string(candidate[pos+4:pos+8]) == "IDAT" {
-				idat = append(idat, candidate[pos+8:pos+8+n])
+		if &candidate[0] != &best[0] {
+			assembled, err := assembleLossyPNGChunks(ctx, data, chunks, candidate, len(best))
+			if err != nil {
+				return nil, err
 			}
-			pos += n + 12
-		}
-		if result := assemble(idat, candidate[8:33], true); len(result) < len(best) {
-			best = result
+			if len(assembled) != 0 && len(assembled) < len(best) {
+				best = assembled
+			}
 		}
 	}
 	return best, ctx.Err()
+}
+
+// pngImageToSRGB 按PNG色彩块将图像转换到sRGB，保留纯灰度特征以支持单通道JPEG编码
+// 入参: ctx 取消上下文, img 解码图像, iccp iCCP块载荷, hasSRGB 是否存在sRGB块, gama gAMA块载荷, chrm cHRM块载荷
+// 返回: image.Image sRGB图像, bool 色彩配置是否可安全转换, error 取消错误
+func pngImageToSRGB(ctx context.Context, img image.Image, iccp []byte, hasSRGB bool, gama, chrm []byte) (image.Image, bool, error) {
+	if len(iccp) == 0 && (hasSRGB || len(gama) == 0 && len(chrm) == 0) {
+		return img, true, ctx.Err()
+	}
+	var space *ColorSpace
+	var intent Name
+	var gammaOnly float64
+	if len(iccp) != 0 {
+		parsed, ok, err := pngICCColorSpace(ctx, iccp)
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		space, intent = parsed, parsed.DefaultIntent()
+	} else if len(chrm) != 0 {
+		parsed, ok := pngCalRGBColorSpace(gama, chrm)
+		if !ok {
+			return nil, false, ctx.Err()
+		}
+		space, intent = parsed, "RelativeColorimetric"
+	} else if len(gama) == 4 {
+		raw := binary.BigEndian.Uint32(gama)
+		if raw == 0 {
+			return nil, false, ctx.Err()
+		}
+		if raw >= 44955 && raw <= 45955 {
+			return img, true, ctx.Err()
+		}
+		gammaOnly = 100000.0 / float64(raw)
+	} else {
+		return nil, false, ctx.Err()
+	}
+	bounds := img.Bounds()
+	if space != nil && space.Model == "DeviceGray" {
+		dst := image.NewGray(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+		var cache [256]uint8
+		var cached [256]bool
+		for y := 0; y < bounds.Dy(); y++ {
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+			for x := 0; x < bounds.Dx(); x++ {
+				if x&4095 == 4095 {
+					if err := ctx.Err(); err != nil {
+						return nil, false, err
+					}
+				}
+				c := imageNRGBA64At(img, bounds.Min.X+x, bounds.Min.Y+y)
+				if c.R%257 == 0 && cached[c.R>>8] {
+					dst.Pix[y*dst.Stride+x] = cache[c.R>>8]
+					continue
+				}
+				rgb, err := space.SRGB([]float64{float64(c.R) / 65535}, intent)
+				if err != nil {
+					return nil, false, ctx.Err()
+				}
+				v := uint8(math.Round(math.Max(0, math.Min(1, rgb[0])) * 255))
+				if c.R%257 == 0 {
+					cache[c.R>>8], cached[c.R>>8] = v, true
+				}
+				dst.Pix[y*dst.Stride+x] = v
+			}
+		}
+		return dst, true, ctx.Err()
+	}
+	if space != nil && space.Model != "DeviceRGB" {
+		return nil, false, ctx.Err()
+	}
+	var gammaLUT [256]uint8
+	if gammaOnly > 0 {
+		for i := range gammaLUT {
+			gammaLUT[i] = uint8(srgbComponent(math.Pow(float64(i)/255, gammaOnly)) >> 8)
+		}
+	}
+	_, isGray := img.(*image.Gray)
+	_, isGray16 := img.(*image.Gray16)
+	if (isGray || isGray16) && gammaOnly > 0 {
+		dst := image.NewGray(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+		for y := 0; y < bounds.Dy(); y++ {
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+			for x := 0; x < bounds.Dx(); x++ {
+				if x&4095 == 4095 {
+					if err := ctx.Err(); err != nil {
+						return nil, false, err
+					}
+				}
+				c := imageNRGBA64At(img, bounds.Min.X+x, bounds.Min.Y+y)
+				if isGray {
+					dst.Pix[y*dst.Stride+x] = gammaLUT[c.R>>8]
+				} else {
+					dst.Pix[y*dst.Stride+x] = uint8(srgbComponent(math.Pow(float64(c.R)/65535, gammaOnly)) >> 8)
+				}
+			}
+		}
+		return dst, true, ctx.Err()
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	var prev color.NRGBA64
+	var prevRGB color.RGBA
+	hasPrev := false
+	for y := 0; y < bounds.Dy(); y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		for x := 0; x < bounds.Dx(); x++ {
+			if x&4095 == 4095 {
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
+			}
+			c := imageNRGBA64At(img, bounds.Min.X+x, bounds.Min.Y+y)
+			if hasPrev && c == prev {
+				dst.SetRGBA(x, y, prevRGB)
+				continue
+			}
+			var out color.RGBA
+			if gammaOnly > 0 {
+				if c.R>>8 == c.R&0xff && c.G>>8 == c.G&0xff && c.B>>8 == c.B&0xff {
+					out = color.RGBA{
+						R: gammaLUT[c.R>>8],
+						G: gammaLUT[c.G>>8],
+						B: gammaLUT[c.B>>8],
+						A: 255,
+					}
+				} else {
+					out = color.RGBA{
+						R: uint8(srgbComponent(math.Pow(float64(c.R)/65535, gammaOnly)) >> 8),
+						G: uint8(srgbComponent(math.Pow(float64(c.G)/65535, gammaOnly)) >> 8),
+						B: uint8(srgbComponent(math.Pow(float64(c.B)/65535, gammaOnly)) >> 8),
+						A: 255,
+					}
+				}
+			} else {
+				rgb, err := space.SRGB([]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}, intent)
+				if err != nil {
+					return nil, false, ctx.Err()
+				}
+				out = color.RGBA{
+					R: uint8(math.Round(math.Max(0, math.Min(1, rgb[0])) * 255)),
+					G: uint8(math.Round(math.Max(0, math.Min(1, rgb[1])) * 255)),
+					B: uint8(math.Round(math.Max(0, math.Min(1, rgb[2])) * 255)),
+					A: 255,
+				}
+			}
+			prev, prevRGB, hasPrev = c, out, true
+			dst.SetRGBA(x, y, out)
+		}
+	}
+	return dst, true, ctx.Err()
+}
+
+// pngICCColorSpace 解压并解析PNG的iCCP色彩配置文件
+// 入参: ctx 取消上下文, payload iCCP块载荷
+// 返回: *ColorSpace 色彩空间, bool 是否解析有效, error 取消错误
+func pngICCColorSpace(ctx context.Context, payload []byte) (*ColorSpace, bool, error) {
+	sep := bytes.IndexByte(payload, 0)
+	if sep < 1 || sep > 79 || sep+2 >= len(payload) || payload[sep+1] != 0 {
+		return nil, false, ctx.Err()
+	}
+	reader, err := zlib.NewReader(bytes.NewReader(payload[sep+2:]))
+	if err != nil {
+		return nil, false, ctx.Err()
+	}
+	profile, err := io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: reader}, 16<<20+1))
+	closeErr := reader.Close()
+	if ctx.Err() != nil {
+		return nil, false, ctx.Err()
+	}
+	if err != nil || closeErr != nil || len(profile) > 16<<20 {
+		return nil, false, nil
+	}
+	space, err := NewICCColorSpace(profile)
+	if err != nil {
+		return nil, false, nil
+	}
+	return space, true, nil
+}
+
+// pngCalRGBColorSpace 由PNG的cHRM与gAMA块构造CalRGB色彩空间
+// 入参: gama 可选gAMA块载荷, chrm cHRM块载荷
+// 返回: *ColorSpace 校准RGB空间, bool 参数是否有效
+func pngCalRGBColorSpace(gama, chrm []byte) (*ColorSpace, bool) {
+	if len(chrm) != 32 {
+		return nil, false
+	}
+	decodeGamma := 2.2
+	if len(gama) == 4 {
+		raw := binary.BigEndian.Uint32(gama)
+		if raw == 0 {
+			return nil, false
+		}
+		decodeGamma = 100000.0 / float64(raw)
+	}
+	var vals [8]float64
+	for i := range vals {
+		vals[i] = float64(binary.BigEndian.Uint32(chrm[i*4:])) / 100000.0
+	}
+	wx, wy, rx, ry, gx, gy, bx, by := vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]
+	if wy <= 0 || ry <= 0 || gy <= 0 || by <= 0 {
+		return nil, false
+	}
+	xw, zw := wx/wy, (1-wx-wy)/wy
+	xr, zr := rx/ry, (1-rx-ry)/ry
+	xg, zg := gx/gy, (1-gx-gy)/gy
+	xb, zb := bx/by, (1-bx-by)/by
+	det := xr*(zb-zg) + xg*(zr-zb) + xb*(zg-zr)
+	if det == 0 || math.IsNaN(det) || math.IsInf(det, 0) {
+		return nil, false
+	}
+	sr := (xw*(zb-zg) + xg*(zw-zb) + xb*(zg-zw)) / det
+	sg := (xr*(zb-zw) + xw*(zr-zb) + xb*(zw-zr)) / det
+	sb := (xr*(zw-zg) + xg*(zr-zw) + xw*(zg-zr)) / det
+	if sr <= 0 || sg <= 0 || sb <= 0 {
+		return nil, false
+	}
+	space, err := NewCalRGBColorSpace(
+		[3]float64{xw, 1, zw},
+		[3]float64{0, 0, 0},
+		[3]float64{decodeGamma, decodeGamma, decodeGamma},
+		[9]float64{sr * xr, sr, sr * zr, sg * xg, sg, sg * zg, sb * xb, sb, sb * zb},
+	)
+	if err != nil {
+		return nil, false
+	}
+	return space, true
+}
+
+// assembleLossyPNGChunks 按PNG标准块顺序合并新图像数据与原安全辅助块，同步缩放pHYs和eXIf
+// 入参: ctx 取消上下文, data 原PNG, chunks 原PNG块, candidate 新编码PNG, limit 目标体积上限
+// 返回: []byte 合并后的PNG或空值, error 取消错误
+func assembleLossyPNGChunks(ctx context.Context, data []byte, chunks []pngOptimizationChunk, candidate []byte, limit int) ([]byte, error) {
+	if len(candidate) < 33 {
+		return nil, ctx.Err()
+	}
+	header := candidate[8:33]
+	before := image.Pt(int(binary.BigEndian.Uint32(data[16:])), int(binary.BigEndian.Uint32(data[20:])))
+	after := image.Pt(int(binary.BigEndian.Uint32(header[8:])), int(binary.BigEndian.Uint32(header[12:])))
+	var newPLTE, newTRNS []byte
+	var newIDAT [][]byte
+	for pos := 33; pos < len(candidate); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if len(candidate)-pos < 12 {
+			return nil, nil
+		}
+		n := int(binary.BigEndian.Uint32(candidate[pos:]))
+		if n < 0 || pos+12+n > len(candidate) {
+			return nil, nil
+		}
+		raw := candidate[pos : pos+12+n]
+		switch string(raw[4:8]) {
+		case "PLTE":
+			newPLTE = raw
+		case "tRNS":
+			newTRNS = raw
+		case "IDAT":
+			newIDAT = append(newIDAT, raw[8:8+n])
+		}
+		pos += 12 + n
+	}
+	if len(newIDAT) == 0 {
+		return nil, ctx.Err()
+	}
+	sameFormat := header[16] == data[24] && header[17] == data[25] && newPLTE == nil
+	var beforePLTE, afterPLTE, afterIDAT [][]byte
+	for _, c := range chunks {
+		switch c.kind {
+		case "cHRM", "gAMA", "iCCP", "sRGB", "cICP", "mDCV", "cLLI":
+			beforePLTE = append(beforePLTE, c.data)
+		case "pHYs":
+			chunk, ok := resizePNGPhysical(c.data, before, after)
+			if !ok {
+				return nil, ctx.Err()
+			}
+			beforePLTE = append(beforePLTE, chunk)
+		case "bKGD":
+			if sameFormat {
+				afterPLTE = append(afterPLTE, c.data)
+			}
+		case "eXIf":
+			if before == after {
+				afterIDAT = append(afterIDAT, c.data)
+			} else {
+				updated, ok := resizeExifGeometry(ctx, c.data[8:len(c.data)-4], before, after)
+				if !ok {
+					return nil, ctx.Err()
+				}
+				var buf bytes.Buffer
+				_ = writePNGChunk(&buf, "eXIf", updated)
+				afterIDAT = append(afterIDAT, buf.Bytes())
+			}
+		case "tEXt", "zTXt", "iTXt", "tIME":
+			afterIDAT = append(afterIDAT, c.data)
+		}
+	}
+	var out bytes.Buffer
+	buf := &optimizationBuffer{buffer: &out, limit: min(limit-1, optimizationBufferLimit)}
+	writeRaw := func(raw []byte) bool {
+		_, err := buf.Write(raw)
+		return err == nil
+	}
+	if !writeRaw(data[:8]) || !writeRaw(header) {
+		return nil, ctx.Err()
+	}
+	for _, raw := range beforePLTE {
+		if !writeRaw(raw) {
+			return nil, ctx.Err()
+		}
+	}
+	if newPLTE != nil && !writeRaw(newPLTE) {
+		return nil, ctx.Err()
+	}
+	if newTRNS != nil && !writeRaw(newTRNS) {
+		return nil, ctx.Err()
+	}
+	for _, raw := range afterPLTE {
+		if !writeRaw(raw) {
+			return nil, ctx.Err()
+		}
+	}
+	if err := writePNGChunk(buf, "IDAT", newIDAT...); err != nil {
+		return nil, ctx.Err()
+	}
+	for _, raw := range afterIDAT {
+		if !writeRaw(raw) {
+			return nil, ctx.Err()
+		}
+	}
+	if err := writePNGChunk(buf, "IEND", nil); err != nil {
+		return nil, ctx.Err()
+	}
+	return out.Bytes(), ctx.Err()
 }
 
 // reusePNGImageData 逐块核对过滤后的扫描行，复用完全相同的已压缩图像流
