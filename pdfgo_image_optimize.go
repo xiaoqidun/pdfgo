@@ -102,18 +102,19 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 	if options.Mode != CompressionLossy {
 		return best, nil
 	}
-	metadata, adobe, err := jpegMetadataContext(ctx, data)
-	if err != nil {
-		return nil, err
-	}
-	if adobe || len(metadata) >= optimizationBufferLimit {
-		return best, nil
-	}
 	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
 	if err != nil {
 		return nil, err
 	}
-	if size.X <= 0 || size.Y <= 0 || size.X >= config.Width || size.Y >= config.Height {
+	cmykSource := config.ColorModel == color.CMYKModel
+	metadata, profileData, adobe, iccValid, err := jpegMetadataProfileContext(ctx, data, cmykSource)
+	if err != nil {
+		return nil, err
+	}
+	if !cmykSource && adobe || cmykSource && !iccValid || len(metadata) >= optimizationBufferLimit {
+		return best, nil
+	}
+	if !cmykSource && (size.X <= 0 || size.Y <= 0 || size.X >= config.Width || size.Y >= config.Height) {
 		sufficient, err := jpegQualitySufficient(ctx, data, options.ImageQuality())
 		if err != nil {
 			return nil, err
@@ -129,8 +130,15 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 	if err != nil {
 		return nil, err
 	}
-	if img.ColorModel() == color.CMYKModel {
-		return best, nil
+	if cmykImg, ok := img.(*image.CMYK); ok {
+		converted, ok, err := convertCMYKJPEGToRGBA(ctx, cmykImg, profileData)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return best, nil
+		}
+		img = converted
 	}
 	img, err = ResizeImage(ctx, img, size)
 	if err != nil {
@@ -180,6 +188,60 @@ func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOpti
 		}
 	}
 	return best, ctx.Err()
+}
+
+// convertCMYKJPEGToRGBA 按内嵌CMYK配置或内置印刷配置将四色JPEG像素转为不透明RGBA
+// 入参: ctx 取消上下文, src 四色像素, profileData 可选内嵌ICC配置
+// 返回: *image.RGBA 转换结果, bool 配置是否可用, error 取消错误
+func convertCMYKJPEGToRGBA(ctx context.Context, src *image.CMYK, profileData []byte) (*image.RGBA, bool, error) {
+	var space *ColorSpace
+	var intent Name
+	if len(profileData) != 0 {
+		parsed, err := NewICCColorSpace(profileData)
+		if err != nil || parsed.Model != "DeviceCMYK" {
+			return nil, false, ctx.Err()
+		}
+		space, intent = parsed, parsed.DefaultIntent()
+	}
+	bounds := src.Bounds()
+	dst := image.NewRGBA(bounds)
+	var prev color.CMYK
+	var prevRGB color.RGBA
+	hasPrev := false
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if y&15 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+		}
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			ink := src.CMYKAt(x, y)
+			if hasPrev && ink == prev {
+				dst.SetRGBA(x, y, prevRGB)
+				continue
+			}
+			var rgb [3]float64
+			if space != nil {
+				values := [4]float64{float64(ink.C) / 255, float64(ink.M) / 255, float64(ink.Y) / 255, float64(ink.K) / 255}
+				var err error
+				rgb, err = space.SRGB(values[:], intent)
+				if err != nil {
+					return nil, false, ctx.Err()
+				}
+			} else {
+				rgb = DeviceCMYKToSRGB(float64(ink.C)/255, float64(ink.M)/255, float64(ink.Y)/255, float64(ink.K)/255)
+			}
+			prev, hasPrev = ink, true
+			prevRGB = color.RGBA{
+				R: uint8(math.Round(math.Max(0, math.Min(1, rgb[0])) * 255)),
+				G: uint8(math.Round(math.Max(0, math.Min(1, rgb[1])) * 255)),
+				B: uint8(math.Round(math.Max(0, math.Min(1, rgb[2])) * 255)),
+				A: 255,
+			}
+			dst.SetRGBA(x, y, prevRGB)
+		}
+	}
+	return dst, true, ctx.Err()
 }
 
 // optimizePNG 比较图像表示并限制IDAT重压缩体积，按块复制规则保留附加信息

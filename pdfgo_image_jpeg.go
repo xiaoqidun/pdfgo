@@ -93,13 +93,15 @@ func (i *Image) JPEGFile() ([]byte, error) {
 }
 
 // JPEGFileContext 返回可直接复用的JPEG，移除显示元数据期间检查取消
+// 支持灰度、RGB及符合Adobe反相约定的四通道CMYK图像直通，不重编码像素
 // 入参: ctx 取消上下文
 // 返回: []byte 未重编码的JPEG或空值, error 参数、编码或取消错误
 func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if i.ImageMask || len(i.Decode) != 0 || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB") {
+	invertedCMYK := i.ColorSpace == Name("DeviceCMYK") && i.isInvertedCMYKDecode()
+	if i.ImageMask || !invertedCMYK && (len(i.Decode) != 0 || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB")) {
 		return nil, nil
 	}
 	masked, err := i.HasMask()
@@ -113,11 +115,18 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	if data == nil {
 		return nil, nil
 	}
-	data, frame, transform, _, err := i.jpegReadTransformContext(ctx, data, params)
+	data, frame, transform, tagged, err := i.jpegReadTransformContext(ctx, data, params)
 	if err != nil {
 		return nil, err
 	}
-	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})
+	reader := func() io.Reader { return bytes.NewReader(data) }
+	if invertedCMYK && frame.components == 4 && !tagged {
+		marker := jpegAdobeMarker(transform)
+		reader = func() io.Reader {
+			return io.MultiReader(bytes.NewReader(data[:2]), bytes.NewReader(marker), bytes.NewReader(data[2:]))
+		}
+	}
+	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: reader()})
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +145,48 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 		}
 		return data, nil
 	}
+	if invertedCMYK && frame.components == 4 && config.ColorModel == color.CMYKModel {
+		if frame.displayMetadata {
+			data, err = jpegDisplayFileContext(ctx, data)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !tagged {
+			marker := jpegAdobeMarker(transform)
+			out := make([]byte, len(data)+len(marker))
+			copy(out, data[:2])
+			copy(out[2:], marker)
+			copy(out[2+len(marker):], data[2:])
+			return out, nil
+		}
+		return data, nil
+	}
 	return nil, nil
+}
+
+// isInvertedCMYKDecode 判断解码数组是否为标准四通道反相映射
+// 返回: bool 是否为反相四通道解码
+func (i *Image) isInvertedCMYKDecode() bool {
+	if len(i.Decode) != 8 {
+		return false
+	}
+	values, err := i.reader.numberArray(i.Decode, 8)
+	if err != nil {
+		return false
+	}
+	return values[0] == 1 && values[1] == 0 && values[2] == 1 && values[3] == 0 && values[4] == 1 && values[5] == 0 && values[6] == 1 && values[7] == 0
+}
+
+// jpegAdobeMarker 构建四通道CMYK或YCCK的Adobe APP14标记
+// 入参: transform 是否采用YCCK颜色变换
+// 返回: []byte 16字节APP14标记段
+func jpegAdobeMarker(transform bool) []byte {
+	marker := []byte{0xff, 0xee, 0, 14, 'A', 'd', 'o', 'b', 'e', 0, 100, 0, 0, 0, 0, 0}
+	if transform {
+		marker[15] = 2
+	}
+	return marker
 }
 
 // jpegTransformContext 解析DCT颜色规则并检查标记扫描取消
@@ -181,10 +231,7 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 	components := frame.components
 	reader := func() io.Reader { return bytes.NewReader(data) }
 	if components == 4 && !tagged {
-		marker := []byte{0xff, 0xee, 0, 14, 'A', 'd', 'o', 'b', 'e', 0, 100, 0, 0, 0, 0, 0}
-		if transform {
-			marker[15] = 2
-		}
+		marker := jpegAdobeMarker(transform)
 		reader = func() io.Reader {
 			return io.MultiReader(bytes.NewReader(data[:2]), bytes.NewReader(marker), bytes.NewReader(data[2:]))
 		}
@@ -617,13 +664,41 @@ func jpegDisplayFileContext(ctx context.Context, data []byte) ([]byte, error) {
 	return output, nil
 }
 
-// jpegMetadataContext 扫描完整编码并按原顺序保留元数据，分段检查取消
-// 入参: ctx 取消上下文, data JPEG数据
-// 返回: []byte 元数据段, bool 是否包含Adobe标记, error 解析或取消错误
-func jpegMetadataContext(ctx context.Context, data []byte) ([]byte, bool, error) {
+// jpegMetadataProfileContext 扫描JPEG元数据并按需剥离色彩标记与重组ICC分段
+// 入参: ctx 取消上下文, data JPEG数据, stripColor 是否剥离APP14与ICC_PROFILE段
+// 返回: []byte 保留的元数据段, []byte 重组后的ICC数据, bool 是否包含Adobe标记, bool ICC分段是否有效, error 解析或取消错误
+func jpegMetadataProfileContext(ctx context.Context, data []byte, stripColor bool) ([]byte, []byte, bool, bool, error) {
 	var metadata []byte
+	var parts [255][]byte
+	count, found, total := 0, 0, 0
+	iccValid := true
 	_, _, adobe, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
 		if marker < 0xe0 || marker > 0xef && marker != 0xfe {
+			return nil
+		}
+		segment := start + 1
+		for data[segment] == 255 {
+			segment++
+		}
+		payload := data[segment+3 : end]
+		isICC := marker == 0xe2 && bytes.HasPrefix(payload, []byte("ICC_PROFILE\x00"))
+		isAdobe := marker == 0xee && len(payload) >= 12 && bytes.HasPrefix(payload, []byte("Adobe"))
+		if isICC && stripColor {
+			if len(payload) <= 14 {
+				iccValid = false
+			} else {
+				index, n := int(payload[12]), int(payload[13])
+				if index == 0 || index > n || count != 0 && count != n || parts[index-1] != nil {
+					iccValid = false
+				} else {
+					count, found = n, found+1
+					parts[index-1] = payload[14:]
+					total += len(payload) - 14
+				}
+			}
+			return nil
+		}
+		if isAdobe && stripColor {
 			return nil
 		}
 		for start < end {
@@ -637,9 +712,19 @@ func jpegMetadataContext(ctx context.Context, data []byte) ([]byte, bool, error)
 		return ctx.Err()
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, false, err
 	}
-	return metadata, adobe, ctx.Err()
+	if !stripColor || found == 0 {
+		return metadata, nil, adobe, iccValid, ctx.Err()
+	}
+	if !iccValid || found != count {
+		return metadata, nil, adobe, false, ctx.Err()
+	}
+	profile := make([]byte, 0, total)
+	for _, part := range parts[:count] {
+		profile = append(profile, part...)
+	}
+	return metadata, profile, adobe, true, ctx.Err()
 }
 
 // sampleSize 校验JPEG解码器的采样平面及渐进系数缓冲
