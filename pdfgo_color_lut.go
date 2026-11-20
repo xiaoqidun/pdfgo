@@ -18,16 +18,40 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sync"
 )
+
+// iccD50ToLinearSRGB 保存D50白点经Bradford适应到D65并转线性sRGB的合并矩阵
+var iccD50ToLinearSRGB = [9]float64{
+	3.133782735081906, -1.616878091008565, -0.490623328209115,
+	-0.978761812801972, 1.916136685826815, 0.033441008074734,
+	0.071966941276779, -0.229027051584764, 1.405790510443146,
+}
+
+// iccSRGBEncodeTable 延迟初始化线性sRGB到sRGB编码查找表，避免逐像素幂运算
+var iccSRGBEncodeTable = sync.OnceValue(func() *[8193]float32 {
+	table := new([8193]float32)
+	for i := range table {
+		v := float64(i) / 8192
+		if v <= 0.0031308 {
+			table[i] = float32(12.92 * v)
+		} else {
+			table[i] = float32(1.055*math.Pow(v, 1/2.4) - 0.055)
+		}
+	}
+	return table
+})
 
 // iccLUT 保存ICC输入曲线、多维查找表及输出曲线
 type iccLUT struct {
-	input, output [][]float64
-	grid          int
-	values        []float64
-	matrix        [9]float64
-	precision     int
-	pipeline      *iccPipeline
+	input, output  [][]float64
+	inputIdentity  bool
+	outputIdentity bool
+	grid           int
+	values         []float64
+	matrix         [9]float64
+	precision      int
+	pipeline       *iccPipeline
 }
 
 // iccLUTSpace 保存按渲染意图划分的设备与连接空间变换
@@ -148,22 +172,43 @@ func parseICCLUT(data []byte) (*iccLUT, error) {
 		return values
 	}
 	s.input = make([][]float64, in)
+	s.inputIdentity = true
 	for i := range s.input {
 		s.input[i] = read(input)
+		if !iccIdentityCurve(s.input[i]) {
+			s.inputIdentity = false
+		}
 	}
 	s.values = read(count)
 	s.output = make([][]float64, out)
+	s.outputIdentity = true
 	for i := range s.output {
 		s.output[i] = read(output)
+		if !iccIdentityCurve(s.output[i]) {
+			s.outputIdentity = false
+		}
 	}
 	return s, nil
+}
+
+// iccIdentityCurve 判断查找表曲线是否为恒等映射
+// 入参: curve 查找表曲线
+// 返回: bool 是否恒等
+func iccIdentityCurve(curve []float64) bool {
+	return len(curve) == 2 && curve[0] == 0 && curve[1] == 1
 }
 
 // iccLookupCurve 线性插值输入或输出表，允许非单调曲线
 // 入参: curve 查找表, x 单位输入
 // 返回: float64 插值结果
 func iccLookupCurve(curve []float64, x float64) float64 {
-	x = math.Max(0, math.Min(1, x)) * float64(len(curve)-1)
+	if x <= 0 {
+		return curve[0]
+	}
+	if x >= 1 {
+		return curve[len(curve)-1]
+	}
+	x *= float64(len(curve) - 1)
 	i := min(int(x), len(curve)-2)
 	return curve[i] + (x-float64(i))*(curve[i+1]-curve[i])
 }
@@ -185,31 +230,106 @@ func (s *iccLUT) evaluate(values []float64) [4]float64 {
 	}
 	var index [4]int
 	var fraction [4]float64
-	for i, curve := range s.input {
-		x := iccLookupCurve(curve, input[i]) * float64(s.grid-1)
-		index[i] = min(int(x), s.grid-2)
-		fraction[i] = x - float64(index[i])
+	scale := float64(s.grid - 1)
+	limit := s.grid - 2
+	if s.inputIdentity {
+		for i := range s.input {
+			x := math.Max(0, math.Min(1, input[i])) * scale
+			index[i] = min(int(x), limit)
+			fraction[i] = x - float64(index[i])
+		}
+	} else {
+		for i, curve := range s.input {
+			x := iccLookupCurve(curve, input[i]) * scale
+			index[i] = min(int(x), limit)
+			fraction[i] = x - float64(index[i])
+		}
 	}
 	var result [4]float64
-	for corner := 0; corner < 1<<len(s.input); corner++ {
-		weight, offset := 1.0, 0
-		for i := range s.input {
-			bit := corner >> i & 1
-			offset = offset*s.grid + index[i] + bit
-			if bit == 0 {
-				weight *= 1 - fraction[i]
-			} else {
-				weight *= fraction[i]
+	if len(s.input) == 4 && len(s.output) == 3 {
+		result = s.interpolate4x3(index, fraction)
+	} else if len(s.input) == 3 && len(s.output) == 3 {
+		result = s.interpolate3x3(index, fraction)
+	} else {
+		for corner := 0; corner < 1<<len(s.input); corner++ {
+			weight, offset := 1.0, 0
+			for i := range s.input {
+				bit := corner >> i & 1
+				offset = offset*s.grid + index[i] + bit
+				if bit == 0 {
+					weight *= 1 - fraction[i]
+				} else {
+					weight *= fraction[i]
+				}
+			}
+			for i := range s.output {
+				result[i] += weight * s.values[offset*len(s.output)+i]
 			}
 		}
-		for i := range s.output {
-			result[i] += weight * s.values[offset*len(s.output)+i]
+	}
+	if !s.outputIdentity {
+		for i, curve := range s.output {
+			result[i] = iccLookupCurve(curve, result[i])
 		}
 	}
-	for i, curve := range s.output {
-		result[i] = iccLookupCurve(curve, result[i])
-	}
 	return result
+}
+
+// interpolate4x3 展开四进三出查找表的层级线性插值
+// 入参: index 各轴网格索引, fraction 各轴插值权重
+// 返回: [4]float64 插值输出
+func (s *iccLUT) interpolate4x3(index [4]int, fraction [4]float64) [4]float64 {
+	v := s.values
+	n := s.grid
+	sY := n * 3
+	sM := n * sY
+	sC := n * sM
+	dc, dm, dy, dk := fraction[0], fraction[1], fraction[2], fraction[3]
+	p := index[0]*sC + index[1]*sM + index[2]*sY + index[3]*3
+	p1 := p + sY
+	p2 := p + sM
+	p3 := p2 + sY
+	pC := p + sC
+	pC1 := pC + sY
+	pC2 := pC + sM
+	pC3 := pC2 + sY
+	l000, a000, b000 := v[p]+dk*(v[p+3]-v[p]), v[p+1]+dk*(v[p+4]-v[p+1]), v[p+2]+dk*(v[p+5]-v[p+2])
+	l001, a001, b001 := v[p1]+dk*(v[p1+3]-v[p1]), v[p1+1]+dk*(v[p1+4]-v[p1+1]), v[p1+2]+dk*(v[p1+5]-v[p1+2])
+	l010, a010, b010 := v[p2]+dk*(v[p2+3]-v[p2]), v[p2+1]+dk*(v[p2+4]-v[p2+1]), v[p2+2]+dk*(v[p2+5]-v[p2+2])
+	l011, a011, b011 := v[p3]+dk*(v[p3+3]-v[p3]), v[p3+1]+dk*(v[p3+4]-v[p3+1]), v[p3+2]+dk*(v[p3+5]-v[p3+2])
+	l100, a100, b100 := v[pC]+dk*(v[pC+3]-v[pC]), v[pC+1]+dk*(v[pC+4]-v[pC+1]), v[pC+2]+dk*(v[pC+5]-v[pC+2])
+	l101, a101, b101 := v[pC1]+dk*(v[pC1+3]-v[pC1]), v[pC1+1]+dk*(v[pC1+4]-v[pC1+1]), v[pC1+2]+dk*(v[pC1+5]-v[pC1+2])
+	l110, a110, b110 := v[pC2]+dk*(v[pC2+3]-v[pC2]), v[pC2+1]+dk*(v[pC2+4]-v[pC2+1]), v[pC2+2]+dk*(v[pC2+5]-v[pC2+2])
+	l111, a111, b111 := v[pC3]+dk*(v[pC3+3]-v[pC3]), v[pC3+1]+dk*(v[pC3+4]-v[pC3+1]), v[pC3+2]+dk*(v[pC3+5]-v[pC3+2])
+	l00, a00, b00 := l000+dy*(l001-l000), a000+dy*(a001-a000), b000+dy*(b001-b000)
+	l01, a01, b01 := l010+dy*(l011-l010), a010+dy*(a011-a010), b010+dy*(b011-b010)
+	l10, a10, b10 := l100+dy*(l101-l100), a100+dy*(a101-a100), b100+dy*(b101-b100)
+	l11, a11, b11 := l110+dy*(l111-l110), a110+dy*(a111-a110), b110+dy*(b111-b110)
+	l0, a0, b0 := l00+dm*(l01-l00), a00+dm*(a01-a00), b00+dm*(b01-b00)
+	l1, a1, b1 := l10+dm*(l11-l10), a10+dm*(a11-a10), b10+dm*(b11-b10)
+	return [4]float64{l0 + dc*(l1-l0), a0 + dc*(a1-a0), b0 + dc*(b1-b0)}
+}
+
+// interpolate3x3 展开三进三出查找表的层级线性插值
+// 入参: index 各轴网格索引, fraction 各轴插值权重
+// 返回: [4]float64 插值输出
+func (s *iccLUT) interpolate3x3(index [4]int, fraction [4]float64) [4]float64 {
+	v := s.values
+	n := s.grid
+	sY := n * 3
+	sX := n * sY
+	dx, dy, dz := fraction[0], fraction[1], fraction[2]
+	p := index[0]*sX + index[1]*sY + index[2]*3
+	p1 := p + sY
+	p2 := p + sX
+	p3 := p2 + sY
+	l00, a00, b00 := v[p]+dz*(v[p+3]-v[p]), v[p+1]+dz*(v[p+4]-v[p+1]), v[p+2]+dz*(v[p+5]-v[p+2])
+	l01, a01, b01 := v[p1]+dz*(v[p1+3]-v[p1]), v[p1+1]+dz*(v[p1+4]-v[p1+1]), v[p1+2]+dz*(v[p1+5]-v[p1+2])
+	l10, a10, b10 := v[p2]+dz*(v[p2+3]-v[p2]), v[p2+1]+dz*(v[p2+4]-v[p2+1]), v[p2+2]+dz*(v[p2+5]-v[p2+2])
+	l11, a11, b11 := v[p3]+dz*(v[p3+3]-v[p3]), v[p3+1]+dz*(v[p3+4]-v[p3+1]), v[p3+2]+dz*(v[p3+5]-v[p3+2])
+	l0, a0, b0 := l00+dy*(l01-l00), a00+dy*(a01-a00), b00+dy*(b01-b00)
+	l1, a1, b1 := l10+dy*(l11-l10), a10+dy*(a11-a10), b10+dy*(b11-b10)
+	return [4]float64{l0 + dx*(l1-l0), a0 + dx*(a1-a0), b0 + dx*(b1-b0)}
 }
 
 // iccIntentIndex 选择ICC查找表的渲染意图
@@ -301,11 +421,30 @@ func (s *iccLUTSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
 // 入参: xyz D50色度
 // 返回: [3]float64 单位sRGB分量
 func iccXYZRGB(xyz [3]float64) [3]float64 {
-	source, target := bradford([3]float64{0.9642, 1, 0.8249}), bradford([3]float64{0.95047, 1, 1.08883})
-	s := calRGBSpace{gamma: [3]float64{1, 1, 1}, matrix: [9]float64{1, 0, 0, 0, 1, 0, 0, 0, 1}}
-	for i := range s.adapt {
-		s.adapt[i] = target[i] / source[i]
+	m := iccD50ToLinearSRGB
+	table := iccSRGBEncodeTable()
+	return [3]float64{
+		iccSRGBEncode(table, m[0]*xyz[0]+m[1]*xyz[1]+m[2]*xyz[2]),
+		iccSRGBEncode(table, m[3]*xyz[0]+m[4]*xyz[1]+m[5]*xyz[2]),
+		iccSRGBEncode(table, m[6]*xyz[0]+m[7]*xyz[1]+m[8]*xyz[2]),
 	}
-	c := s.color(xyz[0], xyz[1], xyz[2])
-	return [3]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
+}
+
+// iccSRGBEncode 通过预计算表线性插值将线性分量编码为sRGB
+// 入参: table 编码查找表, v 线性分量
+// 返回: float64 单位sRGB分量
+func iccSRGBEncode(table *[8193]float32, v float64) float64 {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 1 {
+		return 1
+	}
+	if v <= 0.0031308 {
+		return 12.92 * v
+	}
+	x := v * 8192
+	i := int(x)
+	a := float64(table[i])
+	return a + (x-float64(i))*(float64(table[i+1])-a)
 }

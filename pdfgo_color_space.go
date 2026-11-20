@@ -273,11 +273,11 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 	return 0, &UnsupportedError{Feature: "luminosity color space " + string(s.Model)}
 }
 
-// deviceCMYKRGB 按PDF设备颜色转换规则叠加黑色分量后取补色
+// deviceCMYKRGB 按内置印刷配置文件将未标定CMYK分量转换为sRGB
 // 入参: values CMYK单位分量
 // 返回: [3]float64 RGB单位分量
 func deviceCMYKRGB(values []float64) [3]float64 {
-	return [3]float64{1 - math.Min(1, values[0]+values[3]), 1 - math.Min(1, values[1]+values[3]), 1 - math.Min(1, values[2]+values[3])}
+	return DeviceCMYKToSRGB(values[0], values[1], values[2], values[3])
 }
 
 // validate 检查颜色分量数与单位范围

@@ -987,6 +987,57 @@ func (s *packedCMYKImage) sample(x, y int) cmykSample {
 	return sample
 }
 
+// imageMaskOpaque 判断图像遮罩是否全部不透明，避免全白高分辨率遮罩放大原图采样
+// 入参: ctx 取消上下文, source 遮罩图像, inverted 是否反相遮罩
+// 返回: bool 是否全不透明, error 取消错误
+func imageMaskOpaque(ctx context.Context, source image.Image, inverted bool) (bool, error) {
+	bounds := source.Bounds()
+	var pix []byte
+	var stride, rowBytes int
+	switch src := source.(type) {
+	case *image.Gray:
+		pix, stride, rowBytes = src.Pix[src.PixOffset(bounds.Min.X, bounds.Min.Y):], src.Stride, bounds.Dx()
+	case *image.Gray16:
+		pix, stride, rowBytes = src.Pix[src.PixOffset(bounds.Min.X, bounds.Min.Y):], src.Stride, bounds.Dx()*2
+	}
+	if pix != nil {
+		want := uint8(255)
+		if inverted {
+			want = 0
+		}
+		for y := 0; y < bounds.Dy(); y++ {
+			if y&63 == 0 {
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+			}
+			for _, v := range pix[y*stride : y*stride+rowBytes] {
+				if v != want {
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}
+	want := uint16(65535)
+	if inverted {
+		want = 0
+	}
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if y&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+		}
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if imageRGBA64At(source, x, y).R != want {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
 // ColorModel 返回十六位灰度模型
 // 返回: color.Model 颜色模型
 func (s *packedGrayImage) ColorModel() color.Model { return color.Gray16Model }
@@ -1226,6 +1277,15 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			}
 		}
 	}
+	if mask != nil {
+		opaque, err := imageMaskOpaque(ctx, mask.source, inverted)
+		if err != nil {
+			return nil, err
+		}
+		if opaque {
+			mask, matte = nil, nil
+		}
+	}
 	bounds := samples.Bounds()
 	if mask != nil {
 		bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
@@ -1377,7 +1437,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		inputs = make([]float64, components)
 	}
 	var colors *imageColorCache
-	if target == nil && palette == nil && deviceN == nil && separation == nil && (profile != nil || calibrated != nil || lab != nil) && int64(bounds.Dx())*int64(bounds.Dy()) >= 4096 {
+	if target == nil && palette == nil && deviceN == nil && separation == nil && (profile != nil || calibrated != nil || lab != nil || i.ColorSpace == Name("DeviceCMYK")) && int64(bounds.Dx())*int64(bounds.Dy()) >= 4096 {
 		colors = &imageColorCache{seed: maphash.MakeSeed()}
 	}
 	for y := 0; y < bounds.Dy(); y++ {
