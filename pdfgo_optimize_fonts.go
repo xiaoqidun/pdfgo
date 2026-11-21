@@ -82,10 +82,11 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 		}
 		close(jobs)
 		count := min(workers, len(fontRefs))
+		sharedWarning := syncWarning(r.warning)
 		var wg sync.WaitGroup
 		wg.Add(count)
 		for range count {
-			wr := r.workerReader()
+			wr := r.workerReader(sharedWarning)
 			go func() {
 				defer wg.Done()
 				for idx := range jobs {

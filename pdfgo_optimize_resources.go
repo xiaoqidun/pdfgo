@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"image"
+	"image/color"
 	"maps"
 )
 
@@ -285,6 +286,19 @@ func hashLazyReplacementImage(ctx context.Context, item *lazyReplacementImage, a
 	}
 	hash.Write(flags[:])
 	img := unwrapImage(item.image)
+	bits, channels, space, alwaysOpaque := imageEncodingSpec(img)
+	var spec [6]byte
+	spec[0] = byte(bits)
+	spec[1] = byte(channels)
+	if alwaysOpaque {
+		spec[2] = 1
+	}
+	if img.ColorModel() == color.RGBAModel {
+		spec[3] = 1
+	}
+	binary.BigEndian.PutUint16(spec[4:6], uint16(len(space)))
+	hash.Write(spec[:])
+	hash.Write([]byte(space))
 	b := img.Bounds()
 	var dims [12]byte
 	binary.BigEndian.PutUint32(dims[0:4], uint32(b.Dx()))
@@ -343,6 +357,9 @@ func hashLazyReplacementImage(ctx context.Context, item *lazyReplacementImage, a
 	case *image.Paletted:
 		binary.BigEndian.PutUint32(dims[8:12], 6)
 		hash.Write(dims[:])
+		var palLen [4]byte
+		binary.BigEndian.PutUint32(palLen[:], uint32(len(src.Palette)))
+		hash.Write(palLen[:])
 		var entry [8]byte
 		for _, colorEntry := range src.Palette {
 			c := imageNRGBASample(colorEntry)

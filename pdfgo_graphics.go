@@ -434,21 +434,32 @@ func matrixProductSum(a, b, c, d float64) (float64, int) {
 // 入参: source 可选数据源，nil沿用原数据源, warning 可选警告回调, shapeText 可选文字整形回调
 // 返回: *Reader 独立工作视图
 func (r *Reader) Fork(source io.ReaderAt, warning func(Diagnostic), shapeText TextShaper) *Reader {
+	originalSource := r.originalSource
 	if source == nil {
 		source = r.source
+	} else {
+		originalSource = source
+		header := r.originalSize - r.size
+		source = io.NewSectionReader(source, header, r.size)
+	}
+	var security *standardSecurity
+	if r.security != nil {
+		copied := *r.security
+		copied.key = bytes.Clone(r.security.key)
+		security = &copied
 	}
 	return &Reader{
 		Version:        r.Version,
 		Trailer:        r.Trailer,
 		source:         source,
 		size:           r.size,
-		originalSource: r.originalSource,
+		originalSource: originalSource,
 		originalSize:   r.originalSize,
 		xref:           maps.Clone(r.xref),
 		cache:          r.cache,
 		loading:        make(map[Reference]bool),
 		deviceProfile:  r.deviceProfile,
-		security:       r.security,
+		security:       security,
 		warning:        warning,
 		textShaper:     shapeText,
 		decodeWorkers:  1,

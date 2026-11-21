@@ -257,6 +257,24 @@ func (c *objectCache) snapshot() map[Reference]bool {
 	return result
 }
 
+// pruneObjectsIfOver 当非流对象缓存超过上限时清理不在保留集合中的条目
+// 入参: keep 需要保留的引用集合, limit 非流对象条目上限
+func (c *objectCache) pruneObjectsIfOver(keep map[Reference]bool, limit int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.objects) <= limit {
+		return
+	}
+	for ref := range c.objects {
+		if !keep[ref] {
+			delete(c.objects, ref)
+		}
+	}
+}
+
 // prune 删除不在保留集合中的非固定缓存条目
 // 入参: keep 需要保留的引用集合
 func (c *objectCache) prune(keep map[Reference]bool) {

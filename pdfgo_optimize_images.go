@@ -354,6 +354,48 @@ func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img imag
 	return result, ctx.Err()
 }
 
+// stripInlineStreams 将对象树中直嵌的流替换为12字节占位引用，避免体积估算重复计费
+// 入参: value PDF对象, depth 嵌套深度
+// 返回: Object 替换后的对象, bool 是否发生变更
+func stripInlineStreams(value Object, depth int) (Object, bool) {
+	if depth > 64 {
+		return value, false
+	}
+	switch v := value.(type) {
+	case *Stream:
+		return Reference{Number: 10000000}, true
+	case Dictionary:
+		var out Dictionary
+		for k, item := range v {
+			replaced, changed := stripInlineStreams(item, depth+1)
+			if changed {
+				if out == nil {
+					out = maps.Clone(v)
+				}
+				out[k] = replaced
+			}
+		}
+		if out != nil {
+			return out, true
+		}
+	case Array:
+		var out Array
+		for i, item := range v {
+			replaced, changed := stripInlineStreams(item, depth+1)
+			if changed {
+				if out == nil {
+					out = slices.Clone(v)
+				}
+				out[i] = replaced
+			}
+		}
+		if out != nil {
+			return out, true
+		}
+	}
+	return value, false
+}
+
 // pdfStreamByteSize 估算PDF流写出后的总字节数，用于比较候选流与原流体积
 // 入参: ctx 取消上下文, s 流对象
 // 返回: int64 字节总数
@@ -363,6 +405,9 @@ func pdfStreamByteSize(ctx context.Context, s *Stream) int64 {
 	}
 	dict := maps.Clone(s.Dictionary)
 	dict["Length"] = Integer(len(s.Data))
+	if stripped, changed := stripInlineStreams(dict, 0); changed {
+		dict = stripped.(Dictionary)
+	}
 	out := pdfOutput{ctx: ctx, writer: io.Discard}
 	if err := out.object(dict, Reference{}, 0, false); err != nil {
 		return int64(len(s.Data))

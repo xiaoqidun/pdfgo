@@ -102,6 +102,13 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 			return p.fail("invalid content operator")
 		}
 		op := internContentOperator(raw)
+		if compatibility == 0 && op == "R" && len(operands) >= 2 {
+			if num, ok1 := operands[len(operands)-2].(Integer); ok1 && num >= 0 {
+				if gen, ok2 := operands[len(operands)-1].(Integer); ok2 && gen >= 0 && gen <= 65535 {
+					return p.fail("indirect reference in content stream")
+				}
+			}
+		}
 		if warning != nil && compatibility == 0 && !contentOperator(op) {
 			for i := 1; i < len(op); i++ {
 				ch := op[i]

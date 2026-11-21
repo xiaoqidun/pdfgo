@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"math"
@@ -122,6 +123,9 @@ func imagePalettedAlpha(ctx context.Context, source *image.Paletted) (bool, erro
 			}
 			if opaque[index] {
 				continue
+			}
+			if int(index) >= len(source.Palette) {
+				return false, fmt.Errorf("palette index out of range")
 			}
 			_, _, _, alpha := source.Palette[index].RGBA()
 			if alpha != 65535 {
@@ -240,7 +244,12 @@ func imageUnpremultiply(c color.RGBA64) color.NRGBA64 {
 		return color.NRGBA64{R: c.R, G: c.G, B: c.B, A: c.A}
 	}
 	a := uint32(c.A)
-	return color.NRGBA64{R: uint16(uint32(c.R) * 65535 / a), G: uint16(uint32(c.G) * 65535 / a), B: uint16(uint32(c.B) * 65535 / a), A: c.A}
+	return color.NRGBA64{
+		R: uint16(min(uint32(c.R)*65535/a, 65535)),
+		G: uint16(min(uint32(c.G)*65535/a, 65535)),
+		B: uint16(min(uint32(c.B)*65535/a, 65535)),
+		A: c.A,
+	}
 }
 
 // NRGBA64At 直接重采样显示颜色，原始四色和专色仍按原始分量插值

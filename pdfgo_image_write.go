@@ -406,9 +406,9 @@ func encodePDFPackedGray(ctx context.Context, width, height, bits int, fillRow f
 }
 
 // encodePDFPaletted 保留索引调色板及最小位深并启用PNG Up预测器编码PDF图像与可选软遮罩
-// 入参: ctx 取消上下文, img 调色板图像
+// 入参: ctx 取消上下文, img 调色板图像, options 编码参数
 // 返回: *Stream 索引色图像流, *Stream 可选软遮罩流, error 编码或取消错误
-func encodePDFPaletted(ctx context.Context, img *image.Paletted) (*Stream, *Stream, error) {
+func encodePDFPaletted(ctx context.Context, img *image.Paletted, options ImageWriteOptions) (*Stream, *Stream, error) {
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
 	count := len(img.Palette)
@@ -462,6 +462,7 @@ func encodePDFPaletted(ctx context.Context, img *image.Paletted) (*Stream, *Stre
 		}
 		return nil
 	}
+	hasZeroAlpha, hasPartialAlpha := false, false
 	for y := 0; y < height; y++ {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
@@ -473,22 +474,35 @@ func encodePDFPaletted(ctx context.Context, img *image.Paletted) (*Stream, *Stre
 		} else {
 			clear(row)
 			for x, idx := range src {
+				if int(idx) >= count {
+					return nil, nil, fmt.Errorf("palette index out of range")
+				}
 				row[x*bits/8] |= idx << uint(8-bits-x*bits%8)
 			}
 		}
-		if err := writePNGUpRow(colorWriter, row, prev, filtered); err != nil {
-			return nil, nil, err
-		}
 		for x, idx := range src {
+			if int(idx) >= count {
+				return nil, nil, fmt.Errorf("palette index out of range")
+			}
 			a := alphas[idx]
-			if a != 255 && alphaWriter == nil {
-				if err := startAlpha(y, x); err != nil {
-					return nil, nil, err
+			if a != 255 {
+				if a == 0 {
+					hasZeroAlpha = true
+				} else {
+					hasPartialAlpha = true
+				}
+				if alphaWriter == nil {
+					if err := startAlpha(y, x); err != nil {
+						return nil, nil, err
+					}
 				}
 			}
 			if alphaWriter != nil {
 				maskRow[x] = a
 			}
+		}
+		if err := writePNGUpRow(colorWriter, row, prev, filtered); err != nil {
+			return nil, nil, err
 		}
 		if alphaWriter != nil {
 			if err := writePNGUpRow(alphaWriter, maskRow, prevMask, filteredMask); err != nil {
@@ -506,6 +520,14 @@ func encodePDFPaletted(ctx context.Context, img *image.Paletted) (*Stream, *Stre
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
+	}
+	preblend := options.PreblendBinary && hasZeroAlpha && !hasPartialAlpha
+	if preblend {
+		for i, a := range alphas {
+			if a == 0 {
+				table[i*3], table[i*3+1], table[i*3+2] = 255, 255, 255
+			}
+		}
 	}
 	stream := &Stream{
 		Dictionary: Dictionary{
@@ -534,6 +556,9 @@ func encodePDFPaletted(ctx context.Context, img *image.Paletted) (*Stream, *Stre
 				"DecodeParms":      Dictionary{"Predictor": Integer(15), "Colors": Integer(1), "BitsPerComponent": Integer(8), "Columns": Integer(width)},
 			},
 			Data: alpha.Bytes(),
+		}
+		if preblend {
+			mask.Dictionary["Matte"] = Array{Integer(1), Integer(1), Integer(1)}
 		}
 	}
 	return stream, mask, nil
@@ -578,7 +603,7 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 		}
 	case *image.Paletted:
 		if palettedByteExact(source.Palette) {
-			return encodePDFPaletted(ctx, source)
+			return encodePDFPaletted(ctx, source, options)
 		}
 	}
 	bits, channels, space, alwaysOpaque := imageEncodingSpec(img)
@@ -851,9 +876,9 @@ func encodePDFImagePass(ctx context.Context, img image.Image, bounds image.Recta
 					}
 				} else {
 					a32 := uint32(a8)
-					r16 := uint16(uint32(src[si]) * 65535 / a32)
-					g16 := uint16(uint32(src[si+1]) * 65535 / a32)
-					b16 := uint16(uint32(src[si+2]) * 65535 / a32)
+					r16 := uint16(min(uint32(src[si])*65535/a32, 65535))
+					g16 := uint16(min(uint32(src[si+1])*65535/a32, 65535))
+					b16 := uint16(min(uint32(src[si+2])*65535/a32, 65535))
 					binary.BigEndian.PutUint16(row[di:], r16)
 					binary.BigEndian.PutUint16(row[di+2:], g16)
 					binary.BigEndian.PutUint16(row[di+4:], b16)
@@ -899,9 +924,9 @@ func encodePDFImagePass(ctx context.Context, img image.Image, bounds image.Recta
 					}
 				} else {
 					a32 := uint32(a16)
-					r16 := uint16(uint32(binary.BigEndian.Uint16(src[si:])) * 65535 / a32)
-					g16 := uint16(uint32(binary.BigEndian.Uint16(src[si+2:])) * 65535 / a32)
-					b16 := uint16(uint32(binary.BigEndian.Uint16(src[si+4:])) * 65535 / a32)
+					r16 := uint16(min(uint32(binary.BigEndian.Uint16(src[si:]))*65535/a32, 65535))
+					g16 := uint16(min(uint32(binary.BigEndian.Uint16(src[si+2:]))*65535/a32, 65535))
+					b16 := uint16(min(uint32(binary.BigEndian.Uint16(src[si+4:]))*65535/a32, 65535))
 					binary.BigEndian.PutUint16(row[di:], r16)
 					binary.BigEndian.PutUint16(row[di+2:], g16)
 					binary.BigEndian.PutUint16(row[di+4:], b16)
@@ -940,6 +965,9 @@ func encodePDFImagePass(ctx context.Context, img image.Image, bounds image.Recta
 					var c color.NRGBA64
 					if indexes != nil {
 						index := indexes[x]
+						if int(index) >= len(indexed.Palette) {
+							return nil, nil, false, false, fmt.Errorf("palette index out of range")
+						}
 						if !paletteReady[index] {
 							palette[index] = imageNRGBASample(indexed.Palette[index])
 							paletteReady[index] = true

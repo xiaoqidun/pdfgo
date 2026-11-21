@@ -98,6 +98,13 @@ func (p *pngCompactImage) Opaque() bool {
 	return p.opaque
 }
 
+// At 读取八位非预乘颜色，保证标准库PNG编码复用一致的反预乘与钳位语义
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 八位非预乘颜色
+func (p *pngCompactImage) At(x, y int) color.Color {
+	return imageNRGBAAt(p.Image, x, y)
+}
+
 // NRGBAAt 直接读取原始像素，避免通过颜色接口分配临时值
 // 入参: x 横向坐标, y 纵向坐标
 // 返回: color.NRGBA 八位非预乘颜色
@@ -330,9 +337,9 @@ func encodeOptimalPNGFromPixels(ctx context.Context, source image.Image, best []
 					opaque = false
 					a32 := uint32(a)
 					c = color.NRGBA{
-						R: uint8(uint16(uint32(row[off])*65535/a32) >> 8),
-						G: uint8(uint16(uint32(row[off+1])*65535/a32) >> 8),
-						B: uint8(uint16(uint32(row[off+2])*65535/a32) >> 8),
+						R: uint8(min(uint32(row[off])*65535/a32, 65535) >> 8),
+						G: uint8(min(uint32(row[off+1])*65535/a32, 65535) >> 8),
+						B: uint8(min(uint32(row[off+2])*65535/a32, 65535) >> 8),
 						A: a,
 					}
 				}
@@ -475,8 +482,15 @@ func encodeOptimalPNGFromPixels(ctx context.Context, source image.Image, best []
 			return best, ctx.Err()
 		}
 	}
-	if view, ok := pixels.(*pngCompactImage); ok {
+	switch view := pixels.(type) {
+	case *pngCompactImage:
 		view.opaque = opaque
+	case *image.RGBA:
+		pixels = &pngCompactImage{Image: view, opaque: opaque}
+	case *image.NRGBA:
+		if opaque {
+			pixels = &pngCompactImage{Image: view, opaque: true}
+		}
 	}
 	return compactPNGImage(ctx, pixels, best, &buffers)
 }

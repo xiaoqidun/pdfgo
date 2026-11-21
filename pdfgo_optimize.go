@@ -814,12 +814,15 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	prefetchCursor := 0
 	windowLimit := workers * 2
 	if useParallel {
+		origWarning := r.warning
+		sharedWarning := syncWarning(origWarning)
+		r.warning = sharedWarning
 		workCtx, workCancel = context.WithCancel(ctx)
 		taskCh = make(chan *streamOptJob, windowLimit)
 		pendingJobs = make(map[int]*streamOptJob, windowLimit)
 		wg.Add(workers)
 		for range workers {
-			wr := r.workerReader()
+			wr := r.workerReader(sharedWarning)
 			go func() {
 				defer wg.Done()
 				for job := range taskCh {
@@ -835,6 +838,8 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			workCancel()
 			close(taskCh)
 			wg.Wait()
+			r.warning = origWarning
+			r.cache.pruneObjectsIfOver(originalCache, 0)
 		}()
 	}
 	fillPrefetch := func(current int) error {
@@ -893,6 +898,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 					report.Objects--
 				} else {
 					ownedMaskRef = job.ownedMaskRef
+				}
+				if !originalCache[job.ownedMaskRef] {
+					r.cache.delete(job.ownedMaskRef)
 				}
 			}
 			if maskStream != nil {
@@ -1045,8 +1053,11 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 				}
 			}
 		}
-		if !useParallel && !originalCache[ref] {
+		if !originalCache[ref] && (!useParallel || !isStream[ref]) {
 			r.cache.delete(ref)
+		}
+		if useParallel {
+			r.cache.pruneObjectsIfOver(originalCache, 1024)
 		}
 	}
 	if err := flush(); err != nil {
@@ -1296,10 +1307,26 @@ func optimizeWorkers(parallelism int) int {
 	return max(1, runtime.GOMAXPROCS(0))
 }
 
+// syncWarning 包装可恢复诊断回调以支持多协程并发上报
+// 入参: warning 原始警告回调
+// 返回: func(Diagnostic) 并发安全的警告回调
+func syncWarning(warning func(Diagnostic)) func(Diagnostic) {
+	if warning == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	return func(d Diagnostic) {
+		mu.Lock()
+		defer mu.Unlock()
+		warning(d)
+	}
+}
+
 // workerReader 创建共享只读数据与并发安全缓存的轻量阅读器副本，供并行工作协程独占使用
-// 副本将内部图像解码并发度固定为1，避免外层并行池满载时引发嵌套过度订阅
+// 副本隔离交叉引用表并将内部图像解码并发度固定为1，避免外层并行池满载时引发竞态或过度订阅
+// 入参: warning 并发安全的警告回调
 // 返回: *Reader 独立工作阅读器
-func (r *Reader) workerReader() *Reader {
+func (r *Reader) workerReader(warning func(Diagnostic)) *Reader {
 	return &Reader{
 		Version:        r.Version,
 		Trailer:        r.Trailer,
@@ -1307,11 +1334,12 @@ func (r *Reader) workerReader() *Reader {
 		size:           r.size,
 		originalSource: r.originalSource,
 		originalSize:   r.originalSize,
-		xref:           r.xref,
+		xref:           maps.Clone(r.xref),
 		cache:          r.cache,
 		loading:        make(map[Reference]bool),
+		deviceProfile:  r.deviceProfile,
 		security:       r.security,
-		warning:        r.warning,
+		warning:        warning,
 		decodeWorkers:  1,
 		jbig2Globals:   r.jbig2Globals,
 	}
