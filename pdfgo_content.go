@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"slices"
@@ -32,19 +33,31 @@ type Operation struct {
 // 入参: ctx 取消上下文, data 内容流, visit 操作访问函数
 // 返回: error 错误信息
 func WalkOperations(ctx context.Context, data []byte, visit func(Operation) error) error {
-	return walkOperations(ctx, data, visit, nil, nil)
+	return walkOperations(ctx, data, visit, nil, nil, false)
+}
+
+// walkOperationsBorrowed 零拷贝顺序解析内容操作，调用方不得持久化保留Operation.Operands切片
+// 入参: ctx 取消上下文, data 内容流, visit 操作访问函数
+// 返回: error 解析或访问错误
+func walkOperationsBorrowed(ctx context.Context, data []byte, visit func(Operation) error) error {
+	return walkOperations(ctx, data, visit, nil, nil, true)
 }
 
 // walkOperations 解析内容流，并在内联图像引用命名颜色空间时使用当前资源作用域
-// 入参: ctx 取消上下文, data 内容流, visit 操作访问函数, resolve 颜色空间解析器, warning 可恢复诊断
+// 入参: ctx 取消上下文, data 内容流, visit 操作访问函数, resolve 颜色空间解析器, warning 可恢复诊断, borrowed 是否允许复用操作数切片
 // 返回: error 解析或访问错误
-func walkOperations(ctx context.Context, data []byte, visit func(Operation) error, resolve func(Object) (Object, error), warning func(Diagnostic)) error {
+func walkOperations(ctx context.Context, data []byte, visit func(Operation) error, resolve func(Object) (Object, error), warning func(Diagnostic), borrowed bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p := objectParser{data: data, warning: warning, content: true}
 	var operands []Object
 	compatibility := 0
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
+	for steps := 0; ; steps++ {
+		if steps&255 == 255 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 		}
 		p.skipSpace()
 		if p.pos == len(data) {
@@ -58,15 +71,7 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 		}
 		start := p.pos
 		b := data[start]
-		isObject := b == '/' || b == '(' || b == '<' || b == '[' || b == '+' || b == '-' || b == '.' || (b >= '0' && b <= '9')
-		if !isObject {
-			token := p.token()
-			if token == "true" || token == "false" || token == "null" {
-				isObject = true
-			}
-			p.pos = start
-		}
-		if isObject {
+		if b == '/' || b == '(' || b == '<' || b == '[' || b == '+' || b == '-' || b == '.' || (b >= '0' && b <= '9') {
 			var object Object
 			var err error
 			if b == '[' && warning != nil {
@@ -77,17 +82,30 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 			if err != nil {
 				return err
 			}
-			if _, ok := object.(Reference); ok {
-				return p.fail("indirect reference in content stream")
-			}
 			operands = append(operands, object)
 			continue
 		}
-		op := p.token()
+		raw := p.tokenBytes()
+		if len(raw) == 4 && bytes.Equal(raw, []byte("true")) {
+			operands = append(operands, Boolean(true))
+			continue
+		}
+		if len(raw) == 5 && bytes.Equal(raw, []byte("false")) {
+			operands = append(operands, Boolean(false))
+			continue
+		}
+		if len(raw) == 4 && bytes.Equal(raw, []byte("null")) {
+			operands = append(operands, nil)
+			continue
+		}
+		if len(raw) == 0 {
+			return p.fail("invalid content operator")
+		}
+		op := internContentOperator(raw)
 		if warning != nil && compatibility == 0 && !contentOperator(op) {
 			for i := 1; i < len(op); i++ {
-				b := op[i]
-				if b == '+' || b == '-' || b == '.' || b >= '0' && b <= '9' {
+				ch := op[i]
+				if ch == '+' || ch == '-' || ch == '.' || ch >= '0' && ch <= '9' {
 					if count := graphicsOperandCount(op[:i]); count >= 0 && len(operands) == count {
 						p.pos -= len(op) - i
 						op = op[:i]
@@ -96,9 +114,6 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 					break
 				}
 			}
-		}
-		if op == "" {
-			return p.fail("invalid content operator")
 		}
 		if op == "BX" {
 			compatibility++
@@ -117,7 +132,11 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 		}
 		var values []Object
 		if len(operands) != 0 {
-			values = slices.Clone(operands)
+			if borrowed {
+				values = operands[:len(operands):len(operands)]
+			} else {
+				values = slices.Clone(operands)
+			}
 		}
 		if err := visit(Operation{Operator: op, Operands: values, Offset: int64(start)}); err != nil {
 			return fmt.Errorf("content offset %d: %w", start, err)
@@ -125,6 +144,162 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 		clear(operands)
 		operands = operands[:0]
 	}
+}
+
+// internContentOperator 将常见标准PDF内容流操作符映射为静态字符串，消除高频堆分配
+// 入参: raw 原始操作符字节
+// 返回: string 操作符名称
+func internContentOperator(raw []byte) string {
+	switch len(raw) {
+	case 1:
+		switch raw[0] {
+		case 'q':
+			return "q"
+		case 'Q':
+			return "Q"
+		case 'm':
+			return "m"
+		case 'l':
+			return "l"
+		case 'c':
+			return "c"
+		case 'v':
+			return "v"
+		case 'y':
+			return "y"
+		case 'h':
+			return "h"
+		case 'S':
+			return "S"
+		case 's':
+			return "s"
+		case 'f':
+			return "f"
+		case 'F':
+			return "F"
+		case 'B':
+			return "B"
+		case 'b':
+			return "b"
+		case 'n':
+			return "n"
+		case 'W':
+			return "W"
+		case 'w':
+			return "w"
+		case 'J':
+			return "J"
+		case 'j':
+			return "j"
+		case 'M':
+			return "M"
+		case 'd':
+			return "d"
+		case 'i':
+			return "i"
+		case 'g':
+			return "g"
+		case 'G':
+			return "G"
+		case 'k':
+			return "k"
+		case 'K':
+			return "K"
+		case '\'':
+			return "'"
+		case '"':
+			return "\""
+		}
+	case 2:
+		switch uint16(raw[0])<<8 | uint16(raw[1]) {
+		case uint16('c')<<8 | 'm':
+			return "cm"
+		case uint16('r')<<8 | 'e':
+			return "re"
+		case uint16('f')<<8 | '*':
+			return "f*"
+		case uint16('B')<<8 | '*':
+			return "B*"
+		case uint16('b')<<8 | '*':
+			return "b*"
+		case uint16('W')<<8 | '*':
+			return "W*"
+		case uint16('B')<<8 | 'T':
+			return "BT"
+		case uint16('E')<<8 | 'T':
+			return "ET"
+		case uint16('T')<<8 | 'f':
+			return "Tf"
+		case uint16('T')<<8 | 'd':
+			return "Td"
+		case uint16('T')<<8 | 'D':
+			return "TD"
+		case uint16('T')<<8 | 'm':
+			return "Tm"
+		case uint16('T')<<8 | 'j':
+			return "Tj"
+		case uint16('T')<<8 | 'J':
+			return "TJ"
+		case uint16('T')<<8 | 'c':
+			return "Tc"
+		case uint16('T')<<8 | 'w':
+			return "Tw"
+		case uint16('T')<<8 | 'z':
+			return "Tz"
+		case uint16('T')<<8 | 'L':
+			return "TL"
+		case uint16('T')<<8 | 'r':
+			return "Tr"
+		case uint16('T')<<8 | 's':
+			return "Ts"
+		case uint16('T')<<8 | '*':
+			return "T*"
+		case uint16('D')<<8 | 'o':
+			return "Do"
+		case uint16('g')<<8 | 's':
+			return "gs"
+		case uint16('r')<<8 | 'g':
+			return "rg"
+		case uint16('R')<<8 | 'G':
+			return "RG"
+		case uint16('c')<<8 | 's':
+			return "cs"
+		case uint16('C')<<8 | 'S':
+			return "CS"
+		case uint16('s')<<8 | 'c':
+			return "sc"
+		case uint16('S')<<8 | 'C':
+			return "SC"
+		case uint16('r')<<8 | 'i':
+			return "ri"
+		case uint16('s')<<8 | 'h':
+			return "sh"
+		case uint16('B')<<8 | 'I':
+			return "BI"
+		case uint16('B')<<8 | 'X':
+			return "BX"
+		case uint16('E')<<8 | 'X':
+			return "EX"
+		case uint16('M')<<8 | 'P':
+			return "MP"
+		case uint16('D')<<8 | 'P':
+			return "DP"
+		}
+	case 3:
+		switch string(raw) {
+		case "scn":
+			return "scn"
+		case "SCN":
+			return "SCN"
+		case "BDC":
+			return "BDC"
+		case "BMC":
+			return "BMC"
+		case "EMC":
+			return "EMC"
+		}
+	}
+	return string(raw)
 }
 
 // contentNumber 在内容流中恢复粘连的数字边界及无有效位的零，不改变结构对象语法
@@ -192,9 +367,11 @@ func (p *objectParser) contentArray(ctx context.Context) (Array, error) {
 	defer func() { p.depth-- }()
 	p.pos++
 	values := Array{}
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	for steps := 0; ; steps++ {
+		if steps&255 == 255 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 		p.skipSpace()
 		if p.pos == len(p.data) {
@@ -207,15 +384,24 @@ func (p *objectParser) contentArray(ctx context.Context) (Array, error) {
 		}
 		if b != '/' && b != '(' && b != '<' && b != '[' && b != '+' && b != '-' && b != '.' && (b < '0' || b > '9') {
 			start := p.pos
-			token := p.token()
-			if token != "true" && token != "false" && token != "null" {
-				if token == "" {
-					return nil, p.fail("invalid content array element")
-				}
-				p.warning(Diagnostic{Offset: int64(start), Message: "operator in content array ignored: " + token})
+			raw := p.tokenBytes()
+			if len(raw) == 4 && bytes.Equal(raw, []byte("true")) {
+				values = append(values, Boolean(true))
 				continue
 			}
-			p.pos = start
+			if len(raw) == 5 && bytes.Equal(raw, []byte("false")) {
+				values = append(values, Boolean(false))
+				continue
+			}
+			if len(raw) == 4 && bytes.Equal(raw, []byte("null")) {
+				values = append(values, nil)
+				continue
+			}
+			if len(raw) == 0 {
+				return nil, p.fail("invalid content array element")
+			}
+			p.warning(Diagnostic{Offset: int64(start), Message: "operator in content array ignored: " + string(raw)})
+			continue
 		}
 		var object Object
 		var err error

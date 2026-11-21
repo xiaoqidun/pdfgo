@@ -25,6 +25,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"sync"
 
 	"github.com/xiaoqidun/jbig2"
 )
@@ -48,8 +49,16 @@ type Image struct {
 	SoftMask            Object
 	Stream              *Stream
 	Warning             func(Diagnostic)
+	Workers             int
 	reader              *Reader
 	effectiveColorSpace bool
+}
+
+// jbig2GlobalsCache 缓存按对象引用共享的JBIG2全局字典原文及已解析状态
+type jbig2GlobalsCache struct {
+	mu     sync.Mutex
+	raw    map[Reference][]byte
+	parsed map[Reference]*jbig2.Globals
 }
 
 // deviceSampleImage 按需组合设备色或索引色样本与遮罩，不重复展开像素缓冲
@@ -176,15 +185,7 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 	}
 	var globals []byte
 	if params["JBIG2Globals"] != nil {
-		value, err := i.reader.Resolve(params["JBIG2Globals"])
-		if err != nil {
-			return nil, err
-		}
-		stream, ok := value.(*Stream)
-		if !ok || stream == nil {
-			return nil, fmt.Errorf("invalid JBIG2 globals")
-		}
-		globals, err = stream.DecodeContext(ctx)
+		globals, err = i.jbig2GlobalsRaw(ctx, params["JBIG2Globals"])
 		if err != nil {
 			return nil, err
 		}
@@ -703,22 +704,15 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 		if _, _, err := imageBufferSize(i.Width, i.Height, 1); err != nil {
 			return nil, err
 		}
-		var globals []byte
+		opts := i.jbig2DecodeOptions(ctx)
+		var parsedGlobals *jbig2.Globals
 		if terminalParams["JBIG2Globals"] != nil {
-			object, err := i.reader.Resolve(terminalParams["JBIG2Globals"])
-			if err != nil {
-				return nil, err
-			}
-			stream, ok := object.(*Stream)
-			if !ok {
-				return nil, fmt.Errorf("invalid JBIG2 globals")
-			}
-			globals, err = stream.DecodeContext(ctx)
+			parsedGlobals, err = i.jbig2GlobalsParsed(ctx, terminalParams["JBIG2Globals"], opts)
 			if err != nil {
 				return nil, err
 			}
 		}
-		decoder, err := jbig2.NewDecoderWithGlobalsAndOptions(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, globals, i.jbig2DecodeOptions(ctx))
+		decoder, err := jbig2.NewDecoderWithParsedGlobalsAndOptions(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, parsedGlobals, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -859,6 +853,79 @@ func (i *Image) recoverArrayPredictorSamplesContext(ctx context.Context, filters
 		return nil, err
 	}
 	return samples, nil
+}
+
+// newJBIG2GlobalsCache 创建JBIG2全局字典共享缓存
+// 返回: *jbig2GlobalsCache 缓存实例
+func newJBIG2GlobalsCache() *jbig2GlobalsCache {
+	return &jbig2GlobalsCache{raw: make(map[Reference][]byte), parsed: make(map[Reference]*jbig2.Globals)}
+}
+
+// jbig2GlobalsRaw 读取并按对象引用缓存JBIG2全局字典流字节
+// 入参: ctx 取消上下文, obj JBIG2Globals对象
+// 返回: []byte 全局字典字节, error 解析或解码错误
+func (i *Image) jbig2GlobalsRaw(ctx context.Context, obj Object) ([]byte, error) {
+	ref, isRef := obj.(Reference)
+	cache := i.reader.jbig2Globals
+	if isRef && cache != nil {
+		cache.mu.Lock()
+		cached, ok := cache.raw[ref]
+		cache.mu.Unlock()
+		if ok {
+			return cached, nil
+		}
+	}
+	value, err := i.reader.Resolve(obj)
+	if err != nil {
+		return nil, err
+	}
+	stream, ok := value.(*Stream)
+	if !ok || stream == nil {
+		return nil, fmt.Errorf("invalid JBIG2 globals")
+	}
+	data, err := stream.DecodeContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if isRef && cache != nil {
+		cache.mu.Lock()
+		cache.raw[ref] = data
+		cache.mu.Unlock()
+	}
+	return data, nil
+}
+
+// jbig2GlobalsParsed 解析并按对象引用缓存可复用的JBIG2全局符号字典
+// 入参: ctx 取消上下文, obj JBIG2Globals对象, opts 解码选项
+// 返回: *jbig2.Globals 已解析全局字典, error 解析错误
+func (i *Image) jbig2GlobalsParsed(ctx context.Context, obj Object, opts *jbig2.DecodeOptions) (*jbig2.Globals, error) {
+	ref, isRef := obj.(Reference)
+	cache := i.reader.jbig2Globals
+	if isRef && cache != nil {
+		cache.mu.Lock()
+		cached, ok := cache.parsed[ref]
+		cache.mu.Unlock()
+		if ok {
+			return cached, nil
+		}
+	}
+	raw, err := i.jbig2GlobalsRaw(ctx, obj)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	parsed, err := jbig2.ParseGlobalsWithOptions(raw, opts)
+	if err != nil {
+		return nil, err
+	}
+	if isRef && cache != nil {
+		cache.mu.Lock()
+		cache.parsed[ref] = parsed
+		cache.mu.Unlock()
+	}
+	return parsed, nil
 }
 
 // jbig2DecodeOptions 构造带上下文取消与像素内存上限的JBIG2解码选项

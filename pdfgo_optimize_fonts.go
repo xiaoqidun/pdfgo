@@ -16,7 +16,6 @@ package pdfgo
 
 import (
 	"bytes"
-	"compress/zlib"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -25,16 +24,19 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 )
 
-// optimizationFontUpdates 准备更小的字体程序及稳定子集标识，限制累计输出缓存
-// 入参: ctx 取消上下文, glyphs 字体用字, cached 原有缓存
+// optimizationFontUpdates 准备更小的字体程序及稳定子集标识，支持有界并行并限制累计输出缓存
+// 入参: ctx 取消上下文, glyphs 字体用字, cached 原有缓存, workers 并行度
 // 返回: map[Reference]*Stream 字体输出, map[Reference]string 子集标识, error 读取错误
-func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Reference][]uint16, cached map[Reference]bool) (map[Reference]*Stream, map[Reference]string, error) {
+func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Reference][]uint16, cached map[Reference]bool, workers int) (map[Reference]*Stream, map[Reference]string, error) {
 	updates := make(map[Reference]*Stream)
 	tags := make(map[Reference]string)
-	total := 0
-	for _, ref := range slices.SortedFunc(maps.Keys(glyphs), func(a, b Reference) int {
+	if len(glyphs) == 0 {
+		return updates, tags, ctx.Err()
+	}
+	fontRefs := slices.SortedFunc(maps.Keys(glyphs), func(a, b Reference) int {
 		if a.Number < b.Number {
 			return -1
 		}
@@ -42,31 +44,92 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 			return 1
 		}
 		return 0
-	}) {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+	})
+	type fontResult struct {
+		orig *Stream
+		out  *Stream
+		err  error
+	}
+	results := make([]fontResult, len(fontRefs))
+	if workers <= 1 || len(fontRefs) == 1 {
+		for idx, ref := range fontRefs {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			value, err := r.Object(ref)
+			if !cached[ref] {
+				r.cache.delete(ref)
+			}
+			if err != nil {
+				return nil, nil, err
+			}
+			stream, ok := value.(*Stream)
+			if !ok {
+				continue
+			}
+			out, err := r.optimizeFontStream(ctx, stream, glyphs[ref])
+			if err != nil {
+				return nil, nil, err
+			}
+			results[idx] = fontResult{orig: stream, out: out}
 		}
-		value, err := r.Object(ref)
-		if !cached[ref] {
-			r.cache.delete(ref)
+	} else {
+		workCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		jobs := make(chan int, len(fontRefs))
+		for idx := range fontRefs {
+			jobs <- idx
 		}
-		if err != nil {
-			return nil, nil, err
+		close(jobs)
+		count := min(workers, len(fontRefs))
+		var wg sync.WaitGroup
+		wg.Add(count)
+		for range count {
+			wr := r.workerReader()
+			go func() {
+				defer wg.Done()
+				for idx := range jobs {
+					if err := workCtx.Err(); err != nil {
+						results[idx].err = err
+						continue
+					}
+					ref := fontRefs[idx]
+					value, err := wr.Object(ref)
+					if err != nil {
+						results[idx].err = err
+						cancel()
+						continue
+					}
+					stream, ok := value.(*Stream)
+					if !ok {
+						continue
+					}
+					out, err := wr.optimizeFontStream(workCtx, stream, glyphs[ref])
+					if err != nil {
+						results[idx].err = err
+						cancel()
+						continue
+					}
+					results[idx] = fontResult{orig: stream, out: out}
+				}
+			}()
 		}
-		stream, ok := value.(*Stream)
-		if !ok {
+		wg.Wait()
+		for _, res := range results {
+			if res.err != nil {
+				return nil, nil, res.err
+			}
+		}
+	}
+	total := 0
+	for idx, ref := range fontRefs {
+		res := results[idx]
+		if res.out == nil || res.out == res.orig || len(res.out.Data) > optimizationBufferLimit-total {
 			continue
 		}
-		out, err := r.optimizeFontStream(ctx, stream, glyphs[ref])
-		if err != nil {
-			return nil, nil, err
-		}
-		if out == stream || len(out.Data) > optimizationBufferLimit-total {
-			continue
-		}
-		total += len(out.Data)
-		updates[ref] = out
-		hash := sha256.Sum256(out.Data)
+		total += len(res.out.Data)
+		updates[ref] = res.out
+		hash := sha256.Sum256(res.out.Data)
 		var tag [6]byte
 		for i := range tag {
 			tag[i] = 'A' + hash[i]%26
@@ -76,65 +139,106 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 	return updates, tags, ctx.Err()
 }
 
-// optimizedFontNames 同步字体和描述符中的子集名称，不改资源键、字符映射及文本内容
+// optimizedFontNames 按写时复制同步字体和描述符中的子集名称，不改资源键、字符映射及文本内容
 // 入参: value 输出对象, tags 子集标识, aliases 合并引用, depth 嵌套深度
 // 返回: Object 输出对象
 func (r *Reader) optimizedFontNames(value Object, tags map[Reference]string, aliases map[Reference]Reference, depth int) Object {
 	if len(tags) == 0 || depth > 256 {
 		return value
 	}
+	result, _ := r.optimizedFontNamesCOW(value, tags, aliases, depth)
+	return result
+}
+
+// optimizedFontNamesCOW 递归改写子集字体名称，仅当当前节点或子树实际变更时才克隆容器
+// 入参: value 输出对象, tags 子集标识, aliases 合并引用, depth 嵌套深度
+// 返回: Object 输出对象, bool 是否发生变更
+func (r *Reader) optimizedFontNamesCOW(value Object, tags map[Reference]string, aliases map[Reference]Reference, depth int) (Object, bool) {
+	if depth > 256 {
+		return value, false
+	}
 	switch v := value.(type) {
 	case Array:
-		out := slices.Clone(v)
+		var out Array
 		for i, item := range v {
-			out[i] = r.optimizedFontNames(item, tags, aliases, depth+1)
+			updated, changed := r.optimizedFontNamesCOW(item, tags, aliases, depth+1)
+			if changed {
+				if out == nil {
+					out = slices.Clone(v)
+				}
+				out[i] = updated
+			}
 		}
-		return out
+		if out != nil {
+			return out, true
+		}
+		return value, false
 	case *Stream:
+		updated, changed := r.optimizedFontNamesCOW(v.Dictionary, tags, aliases, depth+1)
+		if !changed {
+			return value, false
+		}
 		out := *v
-		out.Dictionary = r.optimizedFontNames(v.Dictionary, tags, aliases, depth+1).(Dictionary)
-		return &out
+		out.Dictionary = updated.(Dictionary)
+		return &out, true
 	case Dictionary:
-		out := maps.Clone(v)
+		var out Dictionary
 		for key, item := range v {
-			out[key] = r.optimizedFontNames(item, tags, aliases, depth+1)
-		}
-		font := v
-		if v["Subtype"] == Name("Type0") {
-			resolved, err := r.Resolve(v["DescendantFonts"])
-			if a, ok := resolved.(Array); err == nil && ok && len(a) == 1 {
-				resolved, err = r.Resolve(a[0])
-				if d, ok := resolved.(Dictionary); err == nil && ok {
-					font = d
+			updated, changed := r.optimizedFontNamesCOW(item, tags, aliases, depth+1)
+			if changed {
+				if out == nil {
+					out = maps.Clone(v)
 				}
+				out[key] = updated
 			}
 		}
-		descriptor := font
-		if font["FontDescriptor"] != nil {
-			if resolved, err := r.Resolve(font["FontDescriptor"]); err == nil {
-				if d, ok := resolved.(Dictionary); ok {
-					descriptor = d
-				}
-			}
-		}
-		ref, _ := descriptor["FontFile2"].(Reference)
-		if canonical, ok := aliases[ref]; ok {
-			ref = canonical
-		}
-		if tag := tags[ref]; tag != "" {
-			for _, key := range []Name{"BaseFont", "FontName"} {
-				if name, ok := v[key].(Name); ok {
-					text := string(name)
-					if len(text) > 7 && text[6] == '+' && strings.Trim(text[:6], "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" {
-						text = text[7:]
+		if v["BaseFont"] != nil || v["FontName"] != nil {
+			font := v
+			if v["Subtype"] == Name("Type0") {
+				resolved, err := r.Resolve(v["DescendantFonts"])
+				if a, ok := resolved.(Array); err == nil && ok && len(a) == 1 {
+					resolved, err = r.Resolve(a[0])
+					if d, ok := resolved.(Dictionary); err == nil && ok {
+						font = d
 					}
-					out[key] = Name(tag + text)
+				}
+			}
+			descriptor := font
+			if font["FontDescriptor"] != nil {
+				if resolved, err := r.Resolve(font["FontDescriptor"]); err == nil {
+					if d, ok := resolved.(Dictionary); ok {
+						descriptor = d
+					}
+				}
+			}
+			ref, _ := descriptor["FontFile2"].(Reference)
+			if canonical, ok := aliases[ref]; ok {
+				ref = canonical
+			}
+			if tag := tags[ref]; tag != "" {
+				for _, key := range []Name{"BaseFont", "FontName"} {
+					if name, ok := v[key].(Name); ok {
+						text := string(name)
+						if len(text) > 7 && text[6] == '+' && strings.Trim(text[:6], "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" {
+							text = text[7:]
+						}
+						renamed := Name(tag + text)
+						if renamed != name {
+							if out == nil {
+								out = maps.Clone(v)
+							}
+							out[key] = renamed
+						}
+					}
 				}
 			}
 		}
-		return out
+		if out != nil {
+			return out, true
+		}
+		return value, false
 	}
-	return value
+	return value, false
 }
 
 // resolveOptimizationObject 解析间接引用链并检测循环引用，按需复用元数据且不污染原有对象缓存
@@ -520,7 +624,7 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 			}
 			return nil
 		}
-		return WalkOperations(ctx, data, func(op Operation) error {
+		return walkOperationsBorrowed(ctx, data, func(op Operation) error {
 			switch op.Operator {
 			case "q":
 				if len(stack) >= 100000 {
@@ -1034,12 +1138,13 @@ func (r *Reader) optimizationContentData(ctx context.Context, stream *Stream, li
 				return nil, &UnsupportedError{Feature: "stream crypt filter"}
 			}
 		case "FlateDecode":
-			input, err := zlib.NewReader(bytes.NewReader(data))
+			input, err := acquireZlibReader(bytes.NewReader(data))
 			if err != nil {
 				return nil, err
 			}
-			data, err = io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1))
+			data, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1), estimateFlateCapacity(stream.Dictionary, len(data), int64(limit)))
 			closeErr := input.Close()
+			releaseZlibReader(input)
 			if len(data) > limit {
 				return nil, io.ErrShortBuffer
 			}
@@ -1118,12 +1223,13 @@ func (r *Reader) optimizationFontData(ctx context.Context, stream *Stream, limit
 	}
 	data := stream.Data
 	if len(filters) == 1 {
-		input, err := zlib.NewReader(bytes.NewReader(data))
+		input, err := acquireZlibReader(bytes.NewReader(data))
 		if err != nil {
 			return nil, err
 		}
-		data, err = io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1))
+		data, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1), estimateFlateCapacity(stream.Dictionary, len(data), int64(limit)))
 		input.Close()
+		releaseZlibReader(input)
 		if err != nil {
 			return nil, err
 		}

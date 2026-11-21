@@ -706,7 +706,7 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 	var stateContent strings.Builder
 	matrices := 0
 	hasFont := false
-	err = WalkOperations(ctx, appearance, func(op Operation) error {
+	err = walkOperationsBorrowed(ctx, appearance, func(op Operation) error {
 		auto := false
 		switch op.Operator {
 		case "Tf":
@@ -828,7 +828,7 @@ func (r *Reader) annotationDefaultColor(ctx context.Context, object Object) (Arr
 		return nil, fmt.Errorf("missing free text default appearance")
 	}
 	color := Array{Integer(0)}
-	err = WalkOperations(ctx, data, func(op Operation) error {
+	err = walkOperationsBorrowed(ctx, data, func(op Operation) error {
 		switch op.Operator {
 		case "g", "rg", "k":
 			count := map[string]int{"g": 1, "rg": 3, "k": 4}[op.Operator]

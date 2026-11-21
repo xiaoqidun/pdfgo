@@ -23,6 +23,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rc4"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -31,17 +32,21 @@ import (
 	"maps"
 	"math"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
+	"sync"
 	"unicode/utf16"
 )
 
 // OptimizeOptions 配置原生PDF重写，不经过页面渲染
 // 原始模式或包含签名时保留源文件；加密文档保留原安全处理器、密码和权限
 // Creator非空时设置重写结果的制作软件；OnProgress回报scan、compress、write阶段，支持取消
+// Parallelism限制并行优化的工作协程数，零值自动按处理器核数选择，WASM环境恒为单线程
 type OptimizeOptions struct {
 	Compression CompressionOptions
 	Creator     string
+	Parallelism int
 	OnProgress  func(stage string, completed, total int) error
 }
 
@@ -62,6 +67,34 @@ type pdfOutput struct {
 	encrypt  Reference
 	aliases  map[Reference]Reference
 	count    int64
+}
+
+// smaskOptInfo 缓存共享软遮罩的不透明与预混合检测结果
+type smaskOptInfo struct {
+	opaque   bool
+	hasMatte bool
+}
+
+// streamOptJob 保存有界并发流优化任务的输入与输出状态
+type streamOptJob struct {
+	ref            Reference
+	lazy           *lazyReplacementImage
+	stream         *Stream
+	ownedMaskRef   Reference
+	ownedMaskObj   Object
+	compression    CompressionOptions
+	mode           CompressionMode
+	exactData      bool
+	size           image.Point
+	colorResources Dictionary
+	hasSMaskInfo   bool
+	smaskInfo      smaskOptInfo
+	done           chan struct{}
+	outValue       Object
+	outLazyMask    *Stream
+	outOwnedMask   Object
+	droppedOwned   bool
+	err            error
 }
 
 // OptimizeTo 重写PDF对象及资源，保留未知字典、表单、附件、导航和加密配置
@@ -156,6 +189,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	seen := make(map[Reference]bool)
 	isStream := make(map[Reference]bool)
 	metadata := make(map[Reference]Object)
+	streamHashes := make(map[Reference][32]byte)
 	var refs []Reference
 	var maskRoots []Object
 	var maskRefs []Reference
@@ -267,6 +301,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if stream, ok := value.(*Stream); ok {
 			isStream[refs[i]] = true
 			metadata[refs[i]] = stream.Dictionary
+			streamHashes[refs[i]] = sha256.Sum256(stream.Data)
 			if stream.Dictionary["Type"] == Name("EmbeddedFile") {
 				dataRoots = append(dataRoots, refs[i])
 			}
@@ -366,6 +401,13 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	var fontGlyphs map[Reference][]uint16
 	var imageColorResources map[Reference]Dictionary
 	var colorConflicts map[Reference]bool
+	workers := optimizeWorkers(options.Parallelism)
+	protectedAliases := make(map[Reference]bool)
+	for _, key := range []Name{"Root", "Encrypt", "Info"} {
+		if ref, ok := trailer[key].(Reference); ok {
+			protectedAliases[ref] = true
+		}
+	}
 	if options.Compression.Mode != CompressionUnchanged {
 		if err := progress("compress", 0, 0); err != nil {
 			return report, err
@@ -378,7 +420,12 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if err != nil {
 			return report, err
 		}
-		out.aliases, err = r.optimizationAliases(ctx, refs, originalCache, metadata, lazyImages)
+		out.aliases, err = r.optimizationAliases(ctx, refs, isStream, metadata, streamHashes, lazyImages, protectedAliases, false)
+		if err != nil {
+			return report, err
+		}
+	} else {
+		out.aliases, err = r.optimizationAliases(ctx, refs, isStream, metadata, streamHashes, lazyImages, protectedAliases, true)
 		if err != nil {
 			return report, err
 		}
@@ -417,11 +464,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	refs = slices.DeleteFunc(refs, func(ref Reference) bool { return out.aliases[ref].Number != 0 })
 	ownedSMask := make(map[Reference]Reference)
 	deferredSMask := make(map[Reference]bool)
-	type smaskInfo struct {
-		opaque   bool
-		hasMatte bool
-	}
-	smaskCache := make(map[Reference]smaskInfo)
+	smaskCache := make(map[Reference]smaskOptInfo)
 	if options.Compression.Mode == CompressionLossy {
 		imageColorResources, colorConflicts, err = r.imageDefaultColorResources(ctx, refs, metadata, out.aliases)
 		if err != nil {
@@ -482,7 +525,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	var fontUpdates map[Reference]*Stream
 	var fontTags map[Reference]string
 	if options.Compression.Mode != CompressionUnchanged {
-		fontUpdates, fontTags, err = r.optimizationFontUpdates(ctx, fontGlyphs, originalCache)
+		fontUpdates, fontTags, err = r.optimizationFontUpdates(ctx, fontGlyphs, originalCache, workers)
 		if err != nil {
 			return report, err
 		}
@@ -507,14 +550,24 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			return report, fmt.Errorf("conflicting PDF object generations")
 		}
 	}
-	report.Objects = len(refs)
 	maxID := int64(0)
 	for _, ref := range refs {
 		maxID = max(maxID, ref.Number)
 	}
-	if maxID > math.MaxInt32-int64(len(lazyImages))-1024 {
+	if maxID > math.MaxInt32-int64(len(lazyImages))-int64(len(refs)/32)-1024 {
 		return report, fmt.Errorf("PDF object number exceeds output limit")
 	}
+	var pageTreeOverrides map[Reference]Object
+	if balanced, treeErr := buildBalancedPageTree(ctx, trailer, refs, isStream, metadata, &maxID); treeErr != nil {
+		return report, treeErr
+	} else if balanced != nil {
+		pageTreeOverrides = balanced.overrides
+		if len(balanced.removed) != 0 {
+			refs = slices.DeleteFunc(refs, func(ref Reference) bool { return balanced.removed[ref] })
+		}
+		refs = append(refs, balanced.added...)
+	}
+	report.Objects = len(refs)
 	infoRef, _ := trailer["Info"].(Reference)
 	var newInfo Dictionary
 	if options.Creator != "" || len(information) != 0 {
@@ -605,6 +658,10 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	if _, err := fmt.Fprintf(out, "%%PDF-%s\n%%\xE2\xE3\xCF\xD3\n", version); err != nil {
 		return report, err
 	}
+	streamCompressLevel := zlib.BestCompression
+	if options.Compression.Mode == CompressionUnchanged {
+		streamCompressLevel = zlib.DefaultCompression
+	}
 	type entry struct {
 		kind       byte
 		position   int64
@@ -638,7 +695,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		first := header.Len()
 		header.Write(body.Bytes())
-		data, err := compressPDFBytes(ctx, header.Bytes())
+		data, err := compressPDFBytesLevel(ctx, header.Bytes(), streamCompressLevel)
 		if err != nil {
 			return err
 		}
@@ -653,12 +710,157 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		groupSize = 0
 		return err
 	}
-	var pinnedMask Reference
-	defer func() {
-		if pinnedMask.Number > 0 {
-			r.cache.unpin(pinnedMask)
+	lookupSMaskInfo := func(smaskVal Object) (smaskOptInfo, error) {
+		var info smaskOptInfo
+		if sRef, isRef := smaskVal.(Reference); isRef {
+			if canonical, aliased := out.aliases[sRef]; aliased {
+				sRef = canonical
+			}
+			if cachedInfo, ok := smaskCache[sRef]; ok {
+				return cachedInfo, nil
+			}
+			if sObj, sErr := object(sRef); sErr == nil {
+				if sStream, ok := sObj.(*Stream); ok {
+					var sCheckErr error
+					info.opaque, sCheckErr = r.isSMaskOpaque(ctx, sStream)
+					if sCheckErr != nil {
+						if !originalCache[sRef] {
+							r.cache.delete(sRef)
+						}
+						return info, sCheckErr
+					}
+					if !info.opaque {
+						if matteVal, _ := r.optimizationValue(sStream.Dictionary["Matte"]); matteVal != nil {
+							info.hasMatte = true
+						}
+					}
+					smaskCache[sRef] = info
+				}
+			}
+			if !originalCache[sRef] {
+				r.cache.delete(sRef)
+			}
+			return info, nil
 		}
-	}()
+		if sObj, sErr := r.optimizationValue(smaskVal); sErr == nil {
+			if sStream, ok := sObj.(*Stream); ok {
+				var sCheckErr error
+				info.opaque, sCheckErr = r.isSMaskOpaque(ctx, sStream)
+				if sCheckErr != nil {
+					return info, sCheckErr
+				}
+				if !info.opaque {
+					if matteVal, _ := r.optimizationValue(sStream.Dictionary["Matte"]); matteVal != nil {
+						info.hasMatte = true
+					}
+				}
+			}
+		}
+		return info, nil
+	}
+	buildStreamJob := func(ref Reference) (*streamOptJob, error) {
+		if deferredSMask[ref] {
+			return nil, nil
+		}
+		lazy := lazyImages[ref]
+		if lazy == nil && (!isStream[ref] || options.Compression.Mode == CompressionUnchanged || fontUpdates[ref] != nil) {
+			return nil, nil
+		}
+		compression := options.Compression
+		if lossless[ref] || colorConflicts[ref] {
+			compression.Mode = CompressionLossless
+		}
+		job := &streamOptJob{
+			ref:            ref,
+			lazy:           lazy,
+			compression:    compression,
+			mode:           options.Compression.Mode,
+			exactData:      exactData[ref],
+			size:           imageSizes[ref],
+			colorResources: imageColorResources[ref],
+		}
+		if lazy == nil {
+			if rep, ok := replacements[ref]; ok {
+				if s, ok := rep.(*Stream); ok {
+					job.stream = s
+				} else {
+					return nil, nil
+				}
+			}
+			if smaskRef, hasOwned := ownedSMask[ref]; hasOwned && compression.Mode == CompressionLossy {
+				job.ownedMaskRef = smaskRef
+				if rep, ok := replacements[smaskRef]; ok {
+					job.ownedMaskObj = rep
+				}
+			} else if compression.Mode == CompressionLossy && !exactData[ref] {
+				if dict, ok := metadata[ref].(Dictionary); ok && dict["SMask"] != nil && dict["Subtype"] == Name("Image") {
+					info, infoErr := lookupSMaskInfo(dict["SMask"])
+					if infoErr != nil {
+						return nil, infoErr
+					}
+					job.hasSMaskInfo = true
+					job.smaskInfo = info
+				}
+			}
+		}
+		return job, nil
+	}
+	useParallel := workers > 1 && (options.Compression.Mode != CompressionUnchanged || len(lazyImages) > 1)
+	var workCtx context.Context
+	var workCancel context.CancelFunc
+	var taskCh chan *streamOptJob
+	var wg sync.WaitGroup
+	var pendingJobs map[int]*streamOptJob
+	prefetchCursor := 0
+	windowLimit := workers * 2
+	if useParallel {
+		workCtx, workCancel = context.WithCancel(ctx)
+		taskCh = make(chan *streamOptJob, windowLimit)
+		pendingJobs = make(map[int]*streamOptJob, windowLimit)
+		wg.Add(workers)
+		for range workers {
+			wr := r.workerReader()
+			go func() {
+				defer wg.Done()
+				for job := range taskCh {
+					wr.executeStreamJob(workCtx, job)
+					if job.err != nil {
+						workCancel()
+					}
+					close(job.done)
+				}
+			}()
+		}
+		defer func() {
+			workCancel()
+			close(taskCh)
+			wg.Wait()
+		}()
+	}
+	fillPrefetch := func(current int) error {
+		if !useParallel {
+			return nil
+		}
+		if prefetchCursor < current {
+			prefetchCursor = current
+		}
+		scanLimit := min(len(refs), current+windowLimit*8)
+		for len(pendingJobs) < windowLimit && prefetchCursor < scanLimit {
+			idx := prefetchCursor
+			prefetchCursor++
+			job, jobErr := buildStreamJob(refs[idx])
+			if jobErr != nil {
+				return jobErr
+			}
+			if job == nil {
+				continue
+			}
+			job.done = make(chan struct{})
+			pendingJobs[idx] = job
+			taskCh <- job
+		}
+		return nil
+	}
 	for i, ref := range refs {
 		if err := progress("write", i, len(refs)); err != nil {
 			return report, err
@@ -666,163 +868,134 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if deferredSMask[ref] {
 			continue
 		}
+		if err := fillPrefetch(i); err != nil {
+			return report, err
+		}
 		var value Object
 		var maskStream *Stream
 		var maskRef Reference
-		var maskOptimized bool
 		var ownedMaskOut Object
 		var ownedMaskRef Reference
-		if ref == infoRef && newInfo != nil {
-			value = newInfo
-		} else if lazy := lazyImages[ref]; lazy != nil {
-			var stream *Stream
-			stream, maskStream, err = encodeReplacementImage(ctx, lazy)
-			if err != nil {
+		if job, ok := pendingJobs[i]; ok {
+			delete(pendingJobs, i)
+			if err := fillPrefetch(i + 1); err != nil {
 				return report, err
+			}
+			<-job.done
+			if job.err != nil {
+				return report, job.err
+			}
+			value = job.outValue
+			maskStream = job.outLazyMask
+			ownedMaskOut = job.outOwnedMask
+			if job.ownedMaskRef.Number > 0 {
+				if job.droppedOwned {
+					report.Objects--
+				} else {
+					ownedMaskRef = job.ownedMaskRef
+				}
 			}
 			if maskStream != nil {
 				maxID++
 				maskRef = Reference{Number: maxID}
-				stream.Dictionary["SMask"] = maskRef
+				if mainStream, ok := value.(*Stream); ok {
+					updated := *mainStream
+					updated.Dictionary = maps.Clone(mainStream.Dictionary)
+					updated.Dictionary["SMask"] = maskRef
+					value = &updated
+				}
+			}
+			if _, isStreamVal := value.(*Stream); isStreamVal {
+				report.Streams++
 				if options.Compression.Mode != CompressionUnchanged {
-					r.cache.pin(maskRef, maskStream)
-					pinnedMask = maskRef
+					if err := progress("compress", report.Streams, 0); err != nil {
+						return report, err
+					}
 				}
 			}
-			value = stream
-		} else {
-			value, err = object(ref)
-			if err != nil {
-				return report, err
+		} else if ref == infoRef && newInfo != nil {
+			value = newInfo
+		} else if override, ok := pageTreeOverrides[ref]; ok {
+			value = override
+		} else if !useParallel {
+			job, jobErr := buildStreamJob(ref)
+			if jobErr != nil {
+				return report, jobErr
 			}
-		}
-		if stream, ok := value.(*Stream); ok {
-			if optimized := fontUpdates[ref]; optimized != nil {
-				stream = optimized
-			}
-			compression := options.Compression
-			if lossless[ref] || colorConflicts[ref] {
-				compression.Mode = CompressionLossless
-			}
-			value = stream
-			if options.Compression.Mode != CompressionUnchanged {
-				if err := progress("compress", report.Streams, 0); err != nil {
-					return report, err
+			if job != nil {
+				if options.Compression.Mode != CompressionUnchanged {
+					if err := progress("compress", report.Streams, 0); err != nil {
+						return report, err
+					}
 				}
-				if exactData[ref] {
-					value, err = r.optimizeDataStream(ctx, stream)
-				} else if maskStream != nil && compression.Mode == CompressionLossy {
-					optMain, optSMask, dropped, optErr := r.optimizeStreamWithOwnedSMask(ctx, stream, maskStream, compression, imageSizes[ref], imageColorResources[ref])
-					if optErr != nil {
-						return report, optErr
-					}
-					value = optMain
-					if dropped {
-						if pinnedMask.Number > 0 {
-							r.cache.unpin(pinnedMask)
-							pinnedMask = Reference{}
-						}
-						maskStream = nil
+				r.executeStreamJob(ctx, job)
+				if job.err != nil {
+					return report, job.err
+				}
+				value = job.outValue
+				maskStream = job.outLazyMask
+				ownedMaskOut = job.outOwnedMask
+				if job.ownedMaskRef.Number > 0 {
+					if job.droppedOwned {
+						report.Objects--
 					} else {
-						maskStream = optSMask
-						maskOptimized = true
+						ownedMaskRef = job.ownedMaskRef
 					}
-				} else if smaskRef, hasOwned := ownedSMask[ref]; hasOwned && compression.Mode == CompressionLossy {
-					smaskObj, smaskErr := object(smaskRef)
-					if smaskErr != nil {
-						return report, smaskErr
+					if !originalCache[job.ownedMaskRef] {
+						r.cache.delete(job.ownedMaskRef)
 					}
-					if smaskStream, ok := smaskObj.(*Stream); ok {
-						optMain, optSMask, dropped, optErr := r.optimizeStreamWithOwnedSMask(ctx, stream, smaskStream, compression, imageSizes[ref], imageColorResources[ref])
-						if optErr != nil {
-							return report, optErr
-						}
-						value = optMain
-						if dropped {
-							report.Objects--
-						} else {
-							ownedMaskOut, ownedMaskRef = optSMask, smaskRef
-						}
-					} else {
-						ownedMaskOut, ownedMaskRef = smaskObj, smaskRef
+				}
+				if maskStream != nil {
+					maxID++
+					maskRef = Reference{Number: maxID}
+					if mainStream, ok := value.(*Stream); ok {
+						updated := *mainStream
+						updated.Dictionary = maps.Clone(mainStream.Dictionary)
+						updated.Dictionary["SMask"] = maskRef
+						value = &updated
 					}
-					if !originalCache[smaskRef] {
-						r.cache.delete(smaskRef)
-					}
-				} else if compression.Mode == CompressionLossy && stream.Dictionary["SMask"] != nil && stream.Dictionary["Subtype"] == Name("Image") {
-					var info smaskInfo
-					if sRef, isRef := stream.Dictionary["SMask"].(Reference); isRef {
-						if canonical, aliased := out.aliases[sRef]; aliased {
-							sRef = canonical
-						}
-						if cachedInfo, ok := smaskCache[sRef]; ok {
-							info = cachedInfo
-						} else {
-							if sObj, sErr := object(sRef); sErr == nil {
-								if sStream, ok := sObj.(*Stream); ok {
-									info.opaque, err = r.isSMaskOpaque(ctx, sStream)
-									if err != nil {
-										if !originalCache[sRef] {
-											r.cache.delete(sRef)
-										}
-										return report, err
-									}
-									if !info.opaque {
-										if matteVal, _ := r.optimizationValue(sStream.Dictionary["Matte"]); matteVal != nil {
-											info.hasMatte = true
-										}
-									}
-									smaskCache[sRef] = info
-								}
-							}
-							if !originalCache[sRef] {
-								r.cache.delete(sRef)
-							}
-						}
-					} else if sObj, sErr := r.optimizationValue(stream.Dictionary["SMask"]); sErr == nil {
-						if sStream, ok := sObj.(*Stream); ok {
-							info.opaque, err = r.isSMaskOpaque(ctx, sStream)
-							if err != nil {
-								return report, err
-							}
-							if !info.opaque {
-								if matteVal, _ := r.optimizationValue(sStream.Dictionary["Matte"]); matteVal != nil {
-									info.hasMatte = true
-								}
-							}
+				}
+				if _, isStreamVal := value.(*Stream); isStreamVal {
+					report.Streams++
+					if options.Compression.Mode != CompressionUnchanged {
+						if err := progress("compress", report.Streams, 0); err != nil {
+							return report, err
 						}
 					}
-					if info.opaque {
-						stripped := *stream
-						stripped.Dictionary = maps.Clone(stream.Dictionary)
-						delete(stripped.Dictionary, "SMask")
-						cand, optErr := r.optimizeStreamSizeWithContext(ctx, &stripped, compression, imageSizes[ref], imageColorResources[ref], false)
-						if optErr != nil {
-							return report, optErr
-						}
-						if pdfStreamByteSize(ctx, cand) < pdfStreamByteSize(ctx, stream) {
-							value = cand
-						} else {
-							value, err = r.optimizeStreamSizeWithContext(ctx, stream, compression, image.Point{}, imageColorResources[ref], false)
-						}
-					} else if info.hasMatte {
-						losslessComp := compression
-						losslessComp.Mode = CompressionLossless
-						value, err = r.optimizeStreamSizeWithContext(ctx, stream, losslessComp, image.Point{}, imageColorResources[ref], false)
-					} else {
-						value, err = r.optimizeStreamSizeWithContext(ctx, stream, compression, image.Point{}, imageColorResources[ref], true)
-					}
+				}
+			} else {
+				if optimized := fontUpdates[ref]; optimized != nil {
+					value = optimized
 				} else {
-					value, err = r.optimizeStreamSizeWithContext(ctx, stream, compression, imageSizes[ref], imageColorResources[ref], false)
+					value, err = object(ref)
+					if err != nil {
+						return report, err
+					}
 				}
+				if _, isStreamVal := value.(*Stream); isStreamVal {
+					report.Streams++
+					if options.Compression.Mode != CompressionUnchanged {
+						if err := progress("compress", report.Streams, 0); err != nil {
+							return report, err
+						}
+					}
+				}
+			}
+		} else {
+			if optimized := fontUpdates[ref]; optimized != nil {
+				value = optimized
+			} else {
+				value, err = object(ref)
 				if err != nil {
 					return report, err
 				}
 			}
-			report.Streams++
-			if options.Compression.Mode != CompressionUnchanged {
-				if err := progress("compress", report.Streams, 0); err != nil {
-					return report, err
+			if _, isStreamVal := value.(*Stream); isStreamVal {
+				report.Streams++
+				if options.Compression.Mode != CompressionUnchanged {
+					if err := progress("compress", report.Streams, 0); err != nil {
+						return report, err
+					}
 				}
 			}
 		}
@@ -861,23 +1034,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			}
 		}
 		if maskStream != nil {
-			if pinnedMask.Number > 0 {
-				r.cache.unpin(pinnedMask)
-				pinnedMask = Reference{}
-			}
-			maskValue := Object(maskStream)
-			if options.Compression.Mode != CompressionUnchanged && !maskOptimized {
-				if err := progress("compress", report.Streams, 0); err != nil {
-					return report, err
-				}
-				maskCompression := options.Compression
-				maskCompression.Mode = CompressionLossless
-				maskValue, err = r.optimizeStreamSize(ctx, maskStream, maskCompression, image.Point{})
-				if err != nil {
-					return report, err
-				}
-			}
-			if err := writeObject(maskRef, maskValue); err != nil {
+			if err := writeObject(maskRef, maskStream); err != nil {
 				return report, err
 			}
 			report.Objects++
@@ -888,7 +1045,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 				}
 			}
 		}
-		if !originalCache[ref] {
+		if !useParallel && !originalCache[ref] {
 			r.cache.delete(ref)
 		}
 	}
@@ -900,8 +1057,26 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		maxID++
 		entries[maxID] = entry{1, offset, 0}
 		ids := slices.Sorted(maps.Keys(entries))
+		maxPos, maxGen := uint64(0), uint64(0)
+		for _, id := range ids {
+			item := entries[id]
+			if uint64(item.position) > maxPos {
+				maxPos = uint64(item.position)
+			}
+			if uint64(item.generation) > maxGen {
+				maxGen = uint64(item.generation)
+			}
+		}
+		offsetBytes := max(1, minUintBytes(maxPos))
+		genBytes := max(1, minUintBytes(maxGen))
+		stride := 1 + offsetBytes + genBytes
 		index := Array{}
 		var data bytes.Buffer
+		data.Grow(len(ids) * (stride + 1))
+		curr := make([]byte, stride)
+		prev := make([]byte, stride)
+		row := make([]byte, stride+1)
+		row[0] = 2
 		for i := 0; i < len(ids); {
 			j := i + 1
 			for j < len(ids) && ids[j] == ids[j-1]+1 {
@@ -909,21 +1084,25 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			}
 			index = append(index, Integer(ids[i]), Integer(j-i))
 			for _, id := range ids[i:j] {
-				entry := entries[id]
-				var item [11]byte
-				item[0] = entry.kind
-				binary.BigEndian.PutUint64(item[1:9], uint64(entry.position))
-				binary.BigEndian.PutUint16(item[9:], uint16(entry.generation))
-				data.Write(item[:])
+				item := entries[id]
+				curr[0] = item.kind
+				putBigEndianBytes(curr[1:1+offsetBytes], uint64(item.position))
+				putBigEndianBytes(curr[1+offsetBytes:stride], uint64(item.generation))
+				for k := range stride {
+					row[k+1] = curr[k] - prev[k]
+				}
+				copy(prev, curr)
+				data.Write(row)
 			}
 			i = j
 		}
-		trailer["Type"], trailer["W"], trailer["Index"], trailer["Size"] = Name("XRef"), Array{Integer(1), Integer(8), Integer(2)}, index, Integer(maxID+1)
-		encoded, err := compressPDFBytes(ctx, data.Bytes())
+		trailer["Type"], trailer["W"], trailer["Index"], trailer["Size"] = Name("XRef"), Array{Integer(1), Integer(offsetBytes), Integer(genBytes)}, index, Integer(maxID+1)
+		encoded, err := compressPDFBytesLevel(ctx, data.Bytes(), streamCompressLevel)
 		if err != nil {
 			return report, err
 		}
 		trailer["Filter"] = Name("FlateDecode")
+		trailer["DecodeParms"] = Dictionary{"Predictor": Integer(12), "Columns": Integer(stride)}
 		if err := writeObject(Reference{Number: maxID}, &Stream{Dictionary: trailer, Data: encoded}); err != nil {
 			return report, err
 		}
@@ -1104,16 +1283,232 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 	return err
 }
 
+// optimizeWorkers 按配置与运行平台计算并行工作协程数，WASM环境恒返回1
+// 入参: parallelism 用户指定的并发数，非正数时按处理器核数自动选择
+// 返回: int 有效工作协程数
+func optimizeWorkers(parallelism int) int {
+	if runtime.GOOS == "js" || runtime.GOARCH == "wasm" {
+		return 1
+	}
+	if parallelism > 0 {
+		return parallelism
+	}
+	return max(1, runtime.GOMAXPROCS(0))
+}
+
+// workerReader 创建共享只读数据与并发安全缓存的轻量阅读器副本，供并行工作协程独占使用
+// 副本将内部图像解码并发度固定为1，避免外层并行池满载时引发嵌套过度订阅
+// 返回: *Reader 独立工作阅读器
+func (r *Reader) workerReader() *Reader {
+	return &Reader{
+		Version:        r.Version,
+		Trailer:        r.Trailer,
+		source:         r.source,
+		size:           r.size,
+		originalSource: r.originalSource,
+		originalSize:   r.originalSize,
+		xref:           r.xref,
+		cache:          r.cache,
+		loading:        make(map[Reference]bool),
+		security:       r.security,
+		warning:        r.warning,
+		decodeWorkers:  1,
+		jbig2Globals:   r.jbig2Globals,
+	}
+}
+
+// executeStreamJob 在独占阅读器上下文中执行单个流或延迟图像的编码与压缩优化
+// 入参: ctx 取消上下文, job 待执行任务
+func (r *Reader) executeStreamJob(ctx context.Context, job *streamOptJob) {
+	if err := ctx.Err(); err != nil {
+		job.err = err
+		return
+	}
+	var stream *Stream
+	var maskStream *Stream
+	if job.lazy != nil {
+		var err error
+		stream, maskStream, err = encodeReplacementImage(ctx, job.lazy)
+		if err != nil {
+			job.err = err
+			return
+		}
+		if maskStream != nil {
+			stream.Dictionary["SMask"] = maskStream
+		}
+	} else if job.stream != nil {
+		stream = job.stream
+	} else {
+		val, err := r.Object(job.ref)
+		if err != nil {
+			job.err = err
+			return
+		}
+		var ok bool
+		stream, ok = val.(*Stream)
+		if !ok {
+			job.outValue = val
+			return
+		}
+	}
+	if job.mode == CompressionUnchanged {
+		job.outValue = stream
+		job.outLazyMask = maskStream
+		return
+	}
+	var value Object = stream
+	var err error
+	if job.exactData {
+		value, err = r.optimizeDataStream(ctx, stream)
+	} else if maskStream != nil && job.compression.Mode == CompressionLossy {
+		optMain, optSMask, dropped, optErr := r.optimizeStreamWithOwnedSMask(ctx, stream, maskStream, job.compression, job.size, job.colorResources)
+		if optErr != nil {
+			job.err = optErr
+			return
+		}
+		value = optMain
+		if dropped {
+			maskStream = nil
+		} else {
+			maskStream = optSMask
+		}
+		job.outValue = value
+		job.outLazyMask = maskStream
+		return
+	} else if job.ownedMaskRef.Number > 0 && job.compression.Mode == CompressionLossy {
+		smaskObj := job.ownedMaskObj
+		if smaskObj == nil {
+			smaskObj, err = r.Object(job.ownedMaskRef)
+			if err != nil {
+				job.err = err
+				return
+			}
+		}
+		if smaskStream, ok := smaskObj.(*Stream); ok {
+			optMain, optSMask, dropped, optErr := r.optimizeStreamWithOwnedSMask(ctx, stream, smaskStream, job.compression, job.size, job.colorResources)
+			if optErr != nil {
+				job.err = optErr
+				return
+			}
+			job.outValue = optMain
+			job.droppedOwned = dropped
+			if !dropped {
+				job.outOwnedMask = optSMask
+			}
+			return
+		}
+		job.outValue = stream
+		job.outOwnedMask = smaskObj
+		return
+	} else if job.hasSMaskInfo {
+		if job.smaskInfo.opaque {
+			stripped := *stream
+			stripped.Dictionary = maps.Clone(stream.Dictionary)
+			delete(stripped.Dictionary, "SMask")
+			cand, optErr := r.optimizeStreamSizeWithContext(ctx, &stripped, job.compression, job.size, job.colorResources, false)
+			if optErr != nil {
+				job.err = optErr
+				return
+			}
+			if pdfStreamByteSize(ctx, cand) < pdfStreamByteSize(ctx, stream) {
+				value = cand
+			} else {
+				value, err = r.optimizeStreamSizeWithContext(ctx, stream, job.compression, image.Point{}, job.colorResources, false)
+			}
+		} else if job.smaskInfo.hasMatte {
+			losslessComp := job.compression
+			losslessComp.Mode = CompressionLossless
+			value, err = r.optimizeStreamSizeWithContext(ctx, stream, losslessComp, image.Point{}, job.colorResources, false)
+		} else {
+			value, err = r.optimizeStreamSizeWithContext(ctx, stream, job.compression, image.Point{}, job.colorResources, true)
+		}
+	} else {
+		value, err = r.optimizeStreamSizeWithContext(ctx, stream, job.compression, job.size, job.colorResources, false)
+	}
+	if err != nil {
+		job.err = err
+		return
+	}
+	if maskStream != nil {
+		maskCompression := job.compression
+		maskCompression.Mode = CompressionLossless
+		optMask, maskErr := r.optimizeStreamSize(ctx, maskStream, maskCompression, image.Point{})
+		if maskErr != nil {
+			job.err = maskErr
+			return
+		}
+		maskStream = optMask
+	}
+	job.outValue = value
+	job.outLazyMask = maskStream
+}
+
+// minUintBytes 计算无符号整数大端表示所需的最小字节数
+// 入参: v 非负整数
+// 返回: int 所需字节数
+func minUintBytes(v uint64) int {
+	switch {
+	case v == 0:
+		return 0
+	case v <= 0xff:
+		return 1
+	case v <= 0xffff:
+		return 2
+	case v <= 0xffffff:
+		return 3
+	case v <= 0xffffffff:
+		return 4
+	case v <= 0xffffffffff:
+		return 5
+	case v <= 0xffffffffffff:
+		return 6
+	case v <= 0xffffffffffffff:
+		return 7
+	default:
+		return 8
+	}
+}
+
+// putBigEndianBytes 将无符号整数按大端序写入定长目标切片
+// 入参: dst 目标切片, v 无符号整数
+func putBigEndianBytes(dst []byte, v uint64) {
+	for i := len(dst) - 1; i >= 0; i-- {
+		dst[i] = byte(v)
+		v >>= 8
+	}
+}
+
+// streamHasFilter 判断流字典终端过滤器是否为指定名称
+// 入参: dict 流字典, target 目标过滤器名称
+// 返回: bool 是否匹配
+func streamHasFilter(dict Dictionary, target Name) bool {
+	switch f := dict["Filter"].(type) {
+	case Name:
+		return f == target
+	case Array:
+		return len(f) > 0 && f[len(f)-1] == target
+	default:
+		return false
+	}
+}
+
 // compressPDFBytes 以最高无损等级编码单个流
 // 入参: ctx 取消上下文, data 原始数据
 // 返回: []byte 压缩数据, error 压缩错误
 func compressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
+	return compressPDFBytesLevel(ctx, data, zlib.BestCompression)
+}
+
+// compressPDFBytesLevel 按指定zlib级别编码单个流
+// 入参: ctx 取消上下文, data 原始数据, level zlib压缩级别
+// 返回: []byte 压缩数据, error 压缩错误
+func compressPDFBytesLevel(ctx context.Context, data []byte, level int) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	var result bytes.Buffer
-	writer := optimizationCompressor(&result)
-	defer releaseOptimizationCompressor(writer)
+	writer := optimizationCompressorLevel(&result, level)
+	defer releaseOptimizationCompressorLevel(writer, level)
 	for len(data) > 0 {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1140,11 +1535,14 @@ func recompressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	input, err := zlib.NewReader(bytes.NewReader(data))
+	input, err := acquireZlibReader(bytes.NewReader(data))
 	if err != nil {
 		return data, ctx.Err()
 	}
-	defer input.Close()
+	defer func() {
+		input.Close()
+		releaseZlibReader(input)
+	}()
 	var result bytes.Buffer
 	output := &optimizationBuffer{buffer: &result, limit: min(len(data), optimizationBufferLimit)}
 	encoder := optimizationCompressor(output)
@@ -1164,13 +1562,29 @@ func (r *Reader) optimizeStreamSize(ctx context.Context, s *Stream, options Comp
 	return r.optimizeStreamSizeWithContext(ctx, s, options, size, nil, false)
 }
 
-// optimizeStreamSizeWithContext 结合默认颜色空间与软遮罩策略优化流编码并比较无损像素优化
+// optimizeStreamSizeWithContext 结合默认颜色空间与软遮罩策略优化流编码并剪枝冗余的无损像素重压
 // 入参: ctx 取消上下文, s 原始流, options 压缩配置, size 像素上限, colorResources 可选默认颜色空间资源, ignoreSMask 是否忽略外部软遮罩
 // 返回: *Stream 输出流, error 优化错误
 func (r *Reader) optimizeStreamSizeWithContext(ctx context.Context, s *Stream, options CompressionOptions, size image.Point, colorResources Dictionary, ignoreSMask bool) (*Stream, error) {
 	encoded, err := r.optimizeStreamEncoding(ctx, s, options, size, colorResources, ignoreSMask)
 	if err != nil {
 		return nil, err
+	}
+	if streamHasFilter(encoded.Dictionary, Name("DCTDecode")) {
+		return encoded, nil
+	}
+	if ew, ok1 := encoded.Dictionary["Width"].(Integer); ok1 {
+		if sw, ok2 := s.Dictionary["Width"].(Integer); ok2 && ew < sw {
+			return encoded, nil
+		}
+	}
+	if eh, ok1 := encoded.Dictionary["Height"].(Integer); ok1 {
+		if sh, ok2 := s.Dictionary["Height"].(Integer); ok2 && eh < sh {
+			return encoded, nil
+		}
+	}
+	if options.Mode == CompressionLossy && encoded != s && len(encoded.Data)*4 <= len(s.Data)*3 {
+		return encoded, nil
 	}
 	compacted, err := r.optimizeImagePixels(ctx, s)
 	if err != nil {

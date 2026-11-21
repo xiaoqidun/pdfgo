@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"compress/zlib"
 	"context"
 	"fmt"
 	"image"
@@ -154,12 +155,16 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if err := r.lifecycleReplacements(ctx, options, replacements, resources); err != nil {
 		return OptimizeReport{}, err
 	}
-	pendingContent, textChanged, err := r.textReplacements(ctx, options.TextReplacements, replacements, options.TransformContent != nil)
+	compressLevel := zlib.BestCompression
+	if options.Optimization.Compression.Mode == CompressionUnchanged {
+		compressLevel = zlib.DefaultCompression
+	}
+	pendingContent, textChanged, err := r.textReplacements(ctx, options.TextReplacements, replacements, options.TransformContent != nil, compressLevel)
 	if err != nil {
 		return OptimizeReport{}, err
 	}
 	if options.TransformContent != nil {
-		if err := r.transformPageContent(ctx, options.TransformContent, pendingContent, replacements); err != nil {
+		if err := r.transformPageContent(ctx, options.TransformContent, pendingContent, replacements, compressLevel); err != nil {
 			return OptimizeReport{}, err
 		}
 	}
@@ -256,6 +261,7 @@ func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
 		loading:        make(map[Reference]bool),
 		security:       r.security,
 		warning:        r.warning,
+		decodeWorkers:  r.decodeWorkers,
 	}
 }
 

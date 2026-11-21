@@ -14,7 +14,10 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // formCacheLimit 限制单次内容访问保留的表单数据及操作估算字节数
 const formCacheLimit = 8 << 20
@@ -89,12 +92,16 @@ func (p *pageInterpreter) walkContent(data []byte) ([]Operation, int, error) {
 				operations = nil
 				size = 0
 			} else {
-				operations = append(operations, operation)
+				saved := operation
+				if len(operation.Operands) != 0 {
+					saved.Operands = slices.Clone(operation.Operands)
+				}
+				operations = append(operations, saved)
 				size += cost
 			}
 		}
 		return p.operation(operation)
-	}, p.contentColorSpace, p.visitor.Warning)
+	}, p.contentColorSpace, p.visitor.Warning, true)
 	return operations, size, err
 }
 

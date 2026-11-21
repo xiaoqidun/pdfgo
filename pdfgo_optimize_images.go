@@ -768,7 +768,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 					markResourcesUnsafe(res, target, map[Reference]bool{ref: true}, 0)
 					break
 				}
-				_ = WalkOperations(ctx, data, func(op Operation) error {
+				_ = walkOperationsBorrowed(ctx, data, func(op Operation) error {
 					if op.Operator == "Do" && len(op.Operands) == 1 {
 						if name, ok := op.Operands[0].(Name); ok && xobjects != nil {
 							xobj, xref, err := resolveObjectRef(xobjects[name])
@@ -928,7 +928,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		}
 		initialMatrix := matrix
 		var stack []Matrix
-		err := WalkOperations(ctx, data, func(op Operation) error {
+		err := walkOperationsBorrowed(ctx, data, func(op Operation) error {
 			switch op.Operator {
 			case "q":
 				if len(stack) >= 100000 {

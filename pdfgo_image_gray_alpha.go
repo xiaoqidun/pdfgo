@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"image"
 	"image/color"
+	"io"
 )
 
 // pngGrayAlphaImage 标记已经验证的等值灰度通道，保留原始非预乘透明样本
@@ -39,7 +40,11 @@ func (p *pngGrayAlphaImage) NRGBA64At(x, y int) color.NRGBA64 {
 // 返回: []byte 更小的编码, error 编码或取消错误
 func compactPNGGray(ctx context.Context, img image.Image, depth int, alpha bool, best []byte) ([]byte, error) {
 	var out bytes.Buffer
-	limit := &optimizationBuffer{buffer: &out, limit: min(len(best), optimizationBufferLimit)}
+	maxLen := optimizationBufferLimit
+	if len(best) > 0 {
+		maxLen = min(len(best), optimizationBufferLimit)
+	}
+	limit := &optimizationBuffer{buffer: &out, limit: maxLen}
 	channels, kind := 1, 0
 	if alpha {
 		channels, kind = 2, 4
@@ -47,6 +52,9 @@ func compactPNGGray(ctx context.Context, img image.Image, depth int, alpha bool,
 	encoder, err := newPNGImageEncoderWithCompression(ctx, limit, img.Bounds(), depth, channels, kind, true)
 	if err != nil {
 		if limit.exceeded {
+			if len(best) == 0 {
+				return nil, io.ErrShortBuffer
+			}
 			return best, ctx.Err()
 		}
 		return nil, err
@@ -82,6 +90,9 @@ func compactPNGGray(ctx context.Context, img image.Image, depth int, alpha bool,
 		}
 		if err := encoder.writeRow(); err != nil {
 			if limit.exceeded {
+				if len(best) == 0 {
+					return nil, io.ErrShortBuffer
+				}
 				return best, ctx.Err()
 			}
 			return nil, err
@@ -89,11 +100,14 @@ func compactPNGGray(ctx context.Context, img image.Image, depth int, alpha bool,
 	}
 	if err := encoder.finish(); err != nil {
 		if limit.exceeded {
+			if len(best) == 0 {
+				return nil, io.ErrShortBuffer
+			}
 			return best, ctx.Err()
 		}
 		return nil, err
 	}
-	if out.Len() < len(best) {
+	if len(best) == 0 || out.Len() < len(best) {
 		best = out.Bytes()
 	}
 	return best, ctx.Err()

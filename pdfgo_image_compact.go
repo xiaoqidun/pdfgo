@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
@@ -147,7 +148,15 @@ func OptimizeImageResource(ctx context.Context, data []byte, options Compression
 	return OptimizeImageSize(ctx, data, options, size)
 }
 
-// EncodePNGWithOptions 编码并优化固定PNG格式，共用已解码像素，不修改输入
+// OptimizeImageFromPixels 从内存像素单次编码最优PNG，跳过冗余的PNG编码与解码回路
+// 不修改输入，不降采样，不附加密度或色彩配置；编码候选超过64MiB时返回io.ErrShortBuffer
+// 入参: ctx 取消上下文, source 已解码图像, options 压缩配置
+// 返回: []byte 最优PNG数据, error 参数、编码或取消错误
+func OptimizeImageFromPixels(ctx context.Context, source image.Image, options CompressionOptions) ([]byte, error) {
+	return encodeImage(ctx, source, options, false)
+}
+
+// EncodePNGWithOptions 编码并优化固定PNG格式，直接基于内存像素单次输出，不修改输入
 // 不降采样，不附加密度或色彩配置；失败时输出可能不完整
 // 编码候选超过64MiB时返回io.ErrShortBuffer
 // 入参: ctx 取消上下文, writer 输出流, source 已解码图像, options 压缩配置
@@ -173,7 +182,7 @@ func EncodeImageResource(ctx context.Context, source image.Image, options Compre
 	return encodeImage(ctx, source, options, true)
 }
 
-// encodeImage 生成图像候选，资源有损照片优先直接编码JPEG并避免先编码大图PNG超限
+// encodeImage 直接基于内存像素生成最优图像编码，避免先编再解的冗余PNG回路
 // 入参: ctx 取消上下文, source 已解码图像, options 压缩配置, resource 是否允许更换格式
 // 返回: []byte 图片编码, error 参数、编码或取消错误
 func encodeImage(ctx context.Context, source image.Image, options CompressionOptions, resource bool) ([]byte, error) {
@@ -190,10 +199,19 @@ func encodeImage(ctx context.Context, source image.Image, options CompressionOpt
 	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
 		return nil, fmt.Errorf("invalid PNG dimensions")
 	}
+	if options.Mode == CompressionUnchanged {
+		var output bytes.Buffer
+		limit := &optimizationBuffer{buffer: &output, limit: optimizationBufferLimit}
+		if err := EncodePNG(ctx, limit, source); err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return output.Bytes(), nil
+	}
 	var jpegBest []byte
-	pngResource := resource
 	if resource && options.Mode == CompressionLossy {
-		pngResource = false
 		photo, err := photographicImage(ctx, source)
 		if err != nil {
 			return nil, err
@@ -206,37 +224,372 @@ func encodeImage(ctx context.Context, source image.Image, options CompressionOpt
 			jpegBest = encoded
 		}
 	}
-	var output bytes.Buffer
-	bufLimit := optimizationBufferLimit
-	if len(jpegBest) != 0 {
-		bufLimit = min(bufLimit, len(jpegBest))
-	}
-	limit := &optimizationBuffer{buffer: &output, limit: bufLimit}
-	if err := EncodePNG(ctx, limit, source); err != nil {
-		if limit.exceeded && len(jpegBest) != 0 {
-			return jpegBest, ctx.Err()
-		}
-		return nil, err
-	}
-	if options.Mode == CompressionUnchanged {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return output.Bytes(), nil
-	}
-	var pixels image.Image
-	switch source.(type) {
-	case *image.NRGBA, *image.NRGBA64, *image.Gray, *image.Gray16:
-		pixels = source
-	}
-	data, err := optimizePNGSource(ctx, output.Bytes(), options, image.Point{}, pngResource, pixels)
+	data, err := encodeOptimalPNGFromPixels(ctx, source, jpegBest, options)
 	if err != nil {
 		return nil, err
 	}
-	if len(jpegBest) != 0 && len(jpegBest) < len(data) {
-		return jpegBest, ctx.Err()
+	return data, ctx.Err()
+}
+
+// encodeOptimalPNGFromPixels 单遍分析内存像素特征并直通最优PNG编码，跳过中间PNG往返
+// 入参: ctx 取消上下文, source 源像素图像, best 可选已有更优候选, options 压缩配置
+// 返回: []byte 最优图像编码, error 编码或取消错误
+func encodeOptimalPNGFromPixels(ctx context.Context, source image.Image, best []byte, options CompressionOptions) ([]byte, error) {
+	var buffers pngOptimizationBuffers
+	bounds := source.Bounds()
+	img := source
+	depth16 := sourceNeeds16BitPNG(ctx, img)
+	if depth16 && options.Mode != CompressionLossy {
+		var byteExact bool
+		var err error
+		img, byteExact, err = compactPNGPrecision(ctx, img)
+		if err != nil {
+			return nil, err
+		}
+		if !byteExact {
+			if _, gray := img.(*pngGrayAlphaImage); gray {
+				return compactPNGGray(ctx, img, 16, true, best)
+			}
+			if _, gray := img.(*image.Gray16); gray {
+				return compactPNGImage(ctx, img, best, &buffers)
+			}
+			return encodeBestPNG16(ctx, img, best)
+		}
 	}
-	return data, nil
+	quantize := options.Mode == CompressionLossy && options.ImageQuality() < 100
+	pixelCount := int64(bounds.Dx()) * int64(bounds.Dy())
+	if pixelCount > optimizationBufferLimit/4 {
+		var out bytes.Buffer
+		maxLen := optimizationBufferLimit
+		if len(best) > 0 {
+			maxLen = min(len(best), optimizationBufferLimit)
+		}
+		limit := &optimizationBuffer{buffer: &out, limit: maxLen}
+		if err := EncodePNG(ctx, limit, img); err != nil {
+			if limit.exceeded && len(best) > 0 {
+				return best, ctx.Err()
+			}
+			return nil, err
+		}
+		if len(best) == 0 || out.Len() < len(best) {
+			best = out.Bytes()
+		}
+		return best, ctx.Err()
+	}
+	var pixels image.Image
+	var writable *image.NRGBA
+	reused := false
+	if !quantize {
+		switch src := img.(type) {
+		case *image.NRGBA:
+			pixels, reused = src, true
+		case *image.RGBA:
+			pixels, reused = src, true
+		case *image.Gray, *image.Paletted:
+			pixels, reused = compactPNGView(src, false), true
+		}
+	}
+	if pixels == nil {
+		writable = image.NewNRGBA(bounds)
+		pixels = writable
+	}
+	palette := make(color.Palette, 0, 16)
+	indices := make(map[color.NRGBA]uint8, 16)
+	gray, opaque := true, true
+	levels := (1 << uint(4+options.ImageQuality()*4/100)) - 1
+	quant := func(v uint8) uint8 { return uint8(((int(v)*levels + 127) / 255) * 255 / levels) }
+	w := bounds.Dx()
+	rgbaSrc, isRGBA := img.(*image.RGBA)
+	nrgbaSrc, isNRGBA := img.(*image.NRGBA)
+	graySrc, isGray := img.(*image.Gray)
+	scanSource := img
+	if writable == nil && !isRGBA && !isNRGBA && !isGray {
+		scanSource = pixels
+	}
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		switch {
+		case isRGBA && !quantize:
+			row := rgbaSrc.Pix[rgbaSrc.PixOffset(bounds.Min.X, y):]
+			for x := 0; x < w; x++ {
+				if x&4095 == 4095 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				off := x * 4
+				a := row[off+3]
+				var c color.NRGBA
+				if a == 255 {
+					c = color.NRGBA{R: row[off], G: row[off+1], B: row[off+2], A: 255}
+				} else if a == 0 {
+					opaque = false
+				} else {
+					opaque = false
+					a32 := uint32(a)
+					c = color.NRGBA{
+						R: uint8(uint16(uint32(row[off])*65535/a32) >> 8),
+						G: uint8(uint16(uint32(row[off+1])*65535/a32) >> 8),
+						B: uint8(uint16(uint32(row[off+2])*65535/a32) >> 8),
+						A: a,
+					}
+				}
+				if gray && (c.R != c.G || c.G != c.B) {
+					gray = false
+				}
+				if len(palette) <= 256 {
+					if _, ok := indices[c]; !ok {
+						indices[c] = uint8(len(palette))
+						palette = append(palette, c)
+					}
+				}
+			}
+		case isNRGBA && !quantize:
+			row := nrgbaSrc.Pix[nrgbaSrc.PixOffset(bounds.Min.X, y):]
+			for x := 0; x < w; x++ {
+				if x&4095 == 4095 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				off := x * 4
+				c := color.NRGBA{R: row[off], G: row[off+1], B: row[off+2], A: row[off+3]}
+				if c.A != 255 {
+					opaque = false
+				}
+				if gray && (c.R != c.G || c.G != c.B) {
+					gray = false
+				}
+				if len(palette) <= 256 {
+					if _, ok := indices[c]; !ok {
+						indices[c] = uint8(len(palette))
+						palette = append(palette, c)
+					}
+				}
+			}
+		case isGray && !quantize:
+			row := graySrc.Pix[graySrc.PixOffset(bounds.Min.X, y):]
+			for x := 0; x < w; x++ {
+				if x&4095 == 4095 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				v := row[x]
+				c := color.NRGBA{R: v, G: v, B: v, A: 255}
+				if len(palette) <= 256 {
+					if _, ok := indices[c]; !ok {
+						indices[c] = uint8(len(palette))
+						palette = append(palette, c)
+					}
+				}
+			}
+		default:
+			var dstRow []byte
+			if writable != nil {
+				dstRow = writable.Pix[writable.PixOffset(bounds.Min.X, y):]
+			}
+			for x := 0; x < w; x++ {
+				if x&4095 == 4095 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				c := imageNRGBAAt(scanSource, bounds.Min.X+x, y)
+				if quantize {
+					c.R, c.G, c.B = quant(c.R), quant(c.G), quant(c.B)
+				}
+				if writable != nil {
+					off := x * 4
+					dstRow[off], dstRow[off+1], dstRow[off+2], dstRow[off+3] = c.R, c.G, c.B, c.A
+				}
+				if gray && (c.R != c.G || c.G != c.B) {
+					gray = false
+				}
+				if opaque && c.A != 255 {
+					opaque = false
+				}
+				if len(palette) <= 256 {
+					if _, ok := indices[c]; !ok {
+						indices[c] = uint8(len(palette))
+						palette = append(palette, c)
+					}
+				}
+			}
+		}
+		if reused && !gray && !opaque && len(palette) > 256 {
+			break
+		}
+	}
+	var err error
+	if gray && opaque {
+		depth := 1
+		if len(palette) > 16 {
+			depth = 8
+		} else {
+			for _, entry := range palette {
+				value := entry.(color.NRGBA).R
+				if value%17 != 0 {
+					depth = 8
+					break
+				}
+				if value%85 != 0 {
+					depth = 4
+				} else if value%255 != 0 {
+					depth = max(depth, 2)
+				}
+			}
+		}
+		if depth < 8 {
+			return compactPNGGray(ctx, pixels, depth, false, best)
+		}
+		var g image.Image = &pngCompactGrayImage{Image: pixels}
+		if isGray && !quantize {
+			g = graySrc
+		}
+		return compactPNGImage(ctx, g, best, &buffers)
+	}
+	if gray && !opaque {
+		best, err = compactPNGGray(ctx, pixels, 8, true, best)
+		if err != nil {
+			return nil, err
+		}
+		if len(palette) <= 256 {
+			p := &pngCompactPaletteImage{Image: pixels, palette: palette, indices: indices}
+			best, err = compactPNGImage(ctx, p, best, &buffers)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return best, ctx.Err()
+	}
+	if len(palette) <= 256 {
+		p := &pngCompactPaletteImage{Image: pixels, palette: palette, indices: indices}
+		best, err = compactPNGImage(ctx, p, best, &buffers)
+		if err != nil {
+			return nil, err
+		}
+		if len(palette) <= 64 {
+			return best, ctx.Err()
+		}
+	}
+	if view, ok := pixels.(*pngCompactImage); ok {
+		view.opaque = opaque
+	}
+	return compactPNGImage(ctx, pixels, best, &buffers)
+}
+
+// sourceNeeds16BitPNG 判断源图像是否包含超出8位精度的高位深像素
+// 入参: ctx 取消上下文, img 源图像
+// 返回: bool 是否可能需要16位PNG编码
+func sourceNeeds16BitPNG(ctx context.Context, img image.Image) bool {
+	switch img.(type) {
+	case *image.RGBA, *image.NRGBA, *image.Gray, *image.YCbCr, *image.CMYK, *image.Alpha, *packedGrayImage:
+		return false
+	case *image.Paletted:
+		return !palettedByteExact(img.(*image.Paletted).Palette)
+	case *image.RGBA64, *image.NRGBA64, *image.Gray16, *image.Alpha16:
+		return true
+	}
+	if palette, ok := img.ColorModel().(color.Palette); ok {
+		for _, entry := range palette {
+			if ctx.Err() != nil {
+				return false
+			}
+			if entry == nil {
+				return true
+			}
+			c := imageNRGBASample(entry)
+			if c.R%257 != 0 || c.G%257 != 0 || c.B%257 != 0 || c.A%257 != 0 {
+				return true
+			}
+		}
+		return false
+	}
+	depth, _, _, err := pngSampleFormat(ctx, img)
+	return err == nil && depth == 16
+}
+
+// encodeBestPNG16 以最高无损压缩等级单次编码16位彩色PNG，保留非预乘透明度
+// 入参: ctx 取消上下文, img 16位图像, best 可选已有候选
+// 返回: []byte 更小编码, error 编码或取消错误
+func encodeBestPNG16(ctx context.Context, img image.Image, best []byte) ([]byte, error) {
+	var out bytes.Buffer
+	maxLen := optimizationBufferLimit
+	if len(best) > 0 {
+		maxLen = min(len(best), optimizationBufferLimit)
+	}
+	limit := &optimizationBuffer{buffer: &out, limit: maxLen}
+	depth, channels, kind, err := pngSampleFormat(ctx, img)
+	if err != nil {
+		return nil, err
+	}
+	sampler, err := newPNGRowSampler(img)
+	if err != nil {
+		return nil, err
+	}
+	bounds := img.Bounds()
+	encoder, err := newPNGImageEncoderWithCompression(ctx, limit, bounds, depth, channels, kind, true)
+	if err != nil {
+		if limit.exceeded {
+			if len(best) == 0 {
+				return nil, io.ErrShortBuffer
+			}
+			return best, ctx.Err()
+		}
+		return nil, err
+	}
+	defer encoder.release()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := sampler.prepare(ctx, y); err != nil {
+			return nil, err
+		}
+		row := encoder.row
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if (x-bounds.Min.X)&4095 == 4095 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			pixel := sampler.sample(x, y)
+			values := [4]uint16{pixel.R, pixel.G, pixel.B, pixel.A}
+			for c := 0; c < channels; c++ {
+				offset := (x-bounds.Min.X)*encoder.pixelBytes + c*depth/8
+				if depth == 8 {
+					row[offset] = byte(values[c] >> 8)
+				} else {
+					binary.BigEndian.PutUint16(row[offset:], values[c])
+				}
+			}
+		}
+		if err := encoder.writeRow(); err != nil {
+			if limit.exceeded {
+				if len(best) == 0 {
+					return nil, io.ErrShortBuffer
+				}
+				return best, ctx.Err()
+			}
+			return nil, err
+		}
+	}
+	if err := encoder.finish(); err != nil {
+		if limit.exceeded {
+			if len(best) == 0 {
+				return nil, io.ErrShortBuffer
+			}
+			return best, ctx.Err()
+		}
+		return nil, err
+	}
+	if len(best) == 0 || out.Len() < len(best) {
+		best = out.Bytes()
+	}
+	return best, ctx.Err()
 }
 
 // encodePhotoJPEG 将不透明照片直接编码为优化后的JPEG，灰度图使用单通道编码
@@ -616,15 +969,22 @@ func compactPNGPrecision(ctx context.Context, img image.Image) (image.Image, boo
 // 返回: []byte 更小的编码, error 编码或取消错误
 func compactPNGImage(ctx context.Context, img image.Image, best []byte, buffers *pngOptimizationBuffers) ([]byte, error) {
 	var out bytes.Buffer
+	maxLen := optimizationBufferLimit
+	if len(best) > 0 {
+		maxLen = min(len(best), optimizationBufferLimit)
+	}
 	encoder := png.Encoder{CompressionLevel: png.BestCompression, BufferPool: buffers}
-	limit := &optimizationBuffer{buffer: &out, limit: min(len(best), optimizationBufferLimit)}
+	limit := &optimizationBuffer{buffer: &out, limit: maxLen}
 	if err := encoder.Encode(&pdfOutput{ctx: ctx, writer: limit}, img); err != nil {
 		if limit.exceeded {
+			if len(best) == 0 {
+				return nil, io.ErrShortBuffer
+			}
 			return best, ctx.Err()
 		}
 		return nil, err
 	}
-	if out.Len() < len(best) {
+	if len(best) == 0 || out.Len() < len(best) {
 		best = out.Bytes()
 	}
 	return best, ctx.Err()

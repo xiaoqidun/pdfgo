@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -32,9 +33,9 @@ type TextReplacement struct {
 }
 
 // textReplacements 按页写入标准替换文本，复制内容流以隔离共享资源
-// 入参: ctx 取消上下文, changes 页面替换区段, result 已有替换对象, deferCompress 是否延后至内容变换阶段压缩
+// 入参: ctx 取消上下文, changes 页面替换区段, result 已有替换对象, deferCompress 是否延后至内容变换阶段压缩, compressLevel 流压缩级别
 // 返回: map[Reference][]byte 待变换的未压缩页面内容, bool 是否修改内容, error 参数、内容或取消错误
-func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]TextReplacement, result map[Reference]Object, deferCompress bool) (map[Reference][]byte, bool, error) {
+func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]TextReplacement, result map[Reference]Object, deferCompress bool, compressLevel int) (map[Reference][]byte, bool, error) {
 	if len(changes) == 0 {
 		return nil, false, nil
 	}
@@ -72,11 +73,11 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 			changed = true
 			return nil
 		}
-		encoded, err := compressPDFBytes(ctx, data)
+		encoded, err := compressPDFBytesLevel(ctx, data, compressLevel)
 		if err != nil {
 			return err
 		}
-		ref, err := appendRewriteObject(result, &number, &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded, compressed: true})
+		ref, err := appendRewriteObject(result, &number, &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded, compressed: compressLevel == zlib.BestCompression})
 		if err != nil {
 			return err
 		}
@@ -181,7 +182,7 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 			}
 		}
 		return nil
-	}, func(value Object) (Object, error) { return r.resourceColorSpace(value, resources) }, nil)
+	}, func(value Object) (Object, error) { return r.resourceColorSpace(value, resources) }, nil, true)
 	if err != nil {
 		return nil, err
 	}
@@ -193,9 +194,9 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 }
 
 // transformPageContent 逐页替换内容流，独立封装共享内容并保留已有页面修改
-// 入参: ctx 取消上下文, transform 内容变换, pending 文字替换后的未压缩页面内容, result 本次替换对象
+// 入参: ctx 取消上下文, transform 内容变换, pending 文字替换后的未压缩页面内容, result 本次替换对象, compressLevel 流压缩级别
 // 返回: error 读取、变换或写出错误
-func (r *Reader) transformPageContent(ctx context.Context, transform func(context.Context, *Page, []byte) ([]byte, error), pending map[Reference][]byte, result map[Reference]Object) error {
+func (r *Reader) transformPageContent(ctx context.Context, transform func(context.Context, *Page, []byte) ([]byte, error), pending map[Reference][]byte, result map[Reference]Object, compressLevel int) error {
 	number := int64(0)
 	for id := range r.xref {
 		number = max(number, id)
@@ -225,11 +226,11 @@ func (r *Reader) transformPageContent(ctx context.Context, transform func(contex
 			}
 			data = raw
 		}
-		encoded, err := compressPDFBytes(ctx, data)
+		encoded, err := compressPDFBytesLevel(ctx, data, compressLevel)
 		if err != nil {
 			return err
 		}
-		stream := &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded, compressed: true}
+		stream := &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded, compressed: compressLevel == zlib.BestCompression}
 		ref, reusable := page.Dictionary["Contents"].(Reference)
 		_, original := r.xref[ref.Number]
 		if reusable && !original {
@@ -258,7 +259,7 @@ func CompactText(ctx context.Context, data []byte) ([]byte, error) {
 	position, endText, beginText := 0, -1, -1
 	mode, clipped := int64(0), false
 	var stack []int64
-	err := WalkOperations(ctx, data, func(op Operation) error {
+	err := walkOperationsBorrowed(ctx, data, func(op Operation) error {
 		switch op.Operator {
 		case "q":
 			stack = append(stack, mode)

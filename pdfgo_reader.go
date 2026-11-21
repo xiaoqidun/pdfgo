@@ -60,20 +60,24 @@ type Reader struct {
 	security           *standardSecurity
 	warning            func(Diagnostic)
 	textShaper         TextShaper
+	decodeWorkers      int
+	jbig2Globals       *jbig2GlobalsCache
 	closed             bool
 	recoveryIndex      map[int64]xrefEntry
 	recoveryTried      bool
 }
 
-// ReaderOptions 设置密码编码、结构诊断及生成注释外观时的文字整形
+// ReaderOptions 设置密码编码、结构诊断、解码并发及生成注释外观时的文字整形
 // Warning非空时诊断并恢复可确定的结构、字体及解码声明，不修改输入数据
 // 源读取、取消及认证错误仍返回，绘制诊断由Visitor.Warning控制
 // ShapeText用于横排纯文本字段、列表选项及注释标题，空值不生成需要整形的外观，已有外观不受影响
+// Workers限制图像解码内部并发数，零值自动选择，外层并发调度时可设为1避免过度订阅
 type ReaderOptions struct {
 	Password     []byte
 	PasswordUTF8 bool
 	Warning      func(Diagnostic)
 	ShapeText    TextShaper
+	Workers      int
 }
 
 // objectStream 保存对象流索引、解码数据及实际缓存字节数
@@ -230,31 +234,6 @@ func (c *objectCache) delete(ref Reference) {
 		delete(c.streams, ref)
 		c.used -= entry.size
 	}
-}
-
-// pin 将临时对象固定在缓存中，不受流字节预算淘汰影响
-// 入参: ref 对象引用, value 对象值
-func (c *objectCache) pin(ref Reference, value Object) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.pinned == nil {
-		c.pinned = make(map[Reference]Object)
-	}
-	c.pinned[ref] = value
-}
-
-// unpin 解除临时对象的缓存固定
-// 入参: ref 对象引用
-func (c *objectCache) unpin(ref Reference) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.pinned, ref)
 }
 
 // snapshot 复制当前全部缓存引用集合
@@ -474,10 +453,13 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		options.Warning(Diagnostic{Message: "invalid PDF version " + version + "; using 1.7"})
 		version = "1.7"
 	}
-	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: newObjectCache(streamCacheBudget), loading: map[Reference]bool{}}
+	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: newObjectCache(streamCacheBudget), loading: map[Reference]bool{}, jbig2Globals: newJBIG2GlobalsCache()}
 	r.originalSource, r.originalSize = source, size
 	r.warning = options.Warning
 	r.textShaper = options.ShapeText
+	if options.Workers > 0 {
+		r.decodeWorkers = options.Workers
+	}
 	err := r.loadCrossReferences()
 	if err != nil {
 		if options.Warning == nil || !readerStructuralError(err) {

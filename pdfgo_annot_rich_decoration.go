@@ -102,7 +102,7 @@ func (d *annotationRichDecorations) add(glyph annotationRichGlyph, state graphic
 func annotationRichDecorationDefaults(ctx context.Context, defaults string) (string, error) {
 	var content strings.Builder
 	content.WriteString("0 g\n")
-	err := WalkOperations(ctx, []byte(defaults), func(op Operation) error {
+	err := walkOperationsBorrowed(ctx, []byte(defaults), func(op Operation) error {
 		switch op.Operator {
 		case "g", "rg", "k", "cs", "sc", "scn", "ri", "gs", "i":
 			for _, operand := range op.Operands {

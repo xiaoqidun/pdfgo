@@ -27,6 +27,7 @@ import (
 	"io"
 	"math/bits"
 	"strings"
+	"sync"
 )
 
 // streamFilterAliases 保存内联图像的标准过滤器缩写
@@ -39,6 +40,12 @@ var streamFilterAliases = map[Name]Name{
 	"CCF": "CCITTFaxDecode",
 	"DCT": "DCTDecode",
 }
+
+// flateReaderPool 复用zlib解码器，降低高频Flate流解压的堆分配
+var flateReaderPool sync.Pool
+
+// emptyZlibStream 保存空数据的合法zlib流，用于在归还解码器时解除原输入引用
+var emptyZlibStream = []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}
 
 // Stream 保存流字典及未经解码的数据
 // 阅读器返回的流解码需与所属Reader串行调用，并保持数据源可读
@@ -118,14 +125,15 @@ func (s *Stream) decodeContextLimit(ctx context.Context, warning func(Diagnostic
 		case "FlateDecode":
 			encoded := data
 			var reader io.ReadCloser
-			reader, err = zlib.NewReader(bytes.NewReader(data))
+			reader, err = acquireZlibReader(bytes.NewReader(data))
 			if err == nil {
 				var input io.Reader = &contextInput{ctx: ctx, reader: reader}
 				if limit > 0 {
 					input = io.LimitReader(input, limit+1)
 				}
-				data, err = io.ReadAll(input)
+				data, err = readAllEstimated(input, estimateFlateCapacity(s.Dictionary, len(encoded), limit))
 				closeErr := reader.Close()
+				releaseZlibReader(reader)
 				if limit > 0 && int64(len(data)) > limit {
 					return nil, fmt.Errorf("stream recovery decode limit exceeded")
 				}
@@ -871,4 +879,62 @@ func paeth(a, b, c byte) byte {
 		result = left
 	}
 	return byte(result)
+}
+
+// acquireZlibReader 从池中获取并重置zlib解码器，池为空时新建实例
+// 入参: input 压缩数据输入流
+// 返回: io.ReadCloser 可用解码器, error 头部解析错误
+func acquireZlibReader(input io.Reader) (io.ReadCloser, error) {
+	if cached, ok := flateReaderPool.Get().(io.ReadCloser); ok {
+		if resetter, ok := cached.(zlib.Resetter); ok {
+			if err := resetter.Reset(input, nil); err != nil {
+				return nil, err
+			}
+			return cached, nil
+		}
+	}
+	return zlib.NewReader(input)
+}
+
+// releaseZlibReader 清除输入引用后归还zlib解码器到缓冲池
+// 入参: reader 待归还的解码器
+func releaseZlibReader(reader io.ReadCloser) {
+	if resetter, ok := reader.(zlib.Resetter); ok {
+		if resetter.Reset(bytes.NewReader(emptyZlibStream), nil) == nil {
+			flateReaderPool.Put(reader)
+		}
+	}
+}
+
+// estimateFlateCapacity 根据流字典Length及压缩长度预估解压输出缓冲容量
+// 入参: dict 流字典, encodedLen 压缩数据长度, limit 解码字节上限
+// 返回: int 建议初始容量
+func estimateFlateCapacity(dict Dictionary, encodedLen int, limit int64) int {
+	base := encodedLen
+	if length, ok := dict["Length"].(Integer); ok && int(length) > base {
+		base = int(length)
+	}
+	hint := base * 3
+	if hint < 512 {
+		hint = 512
+	}
+	if hint > 1<<20 {
+		hint = 1 << 20
+	}
+	if limit > 0 && int64(hint) > limit {
+		hint = int(limit)
+	}
+	return hint
+}
+
+// readAllEstimated 按预估容量一次性读取全部数据，减少切片倍增扩容
+// 入参: input 数据源, hint 预估字节数
+// 返回: []byte 完整数据, error 读取错误
+func readAllEstimated(input io.Reader, hint int) ([]byte, error) {
+	var buf bytes.Buffer
+	if hint > 0 {
+		buf.Grow(hint)
+	}
+	_, err := buf.ReadFrom(input)
+	return buf.Bytes(), err
 }

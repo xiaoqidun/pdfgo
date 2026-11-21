@@ -418,15 +418,12 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	if err != nil {
 		return nil, err
 	}
-	options := &j2kgo.DecodeOptions{}
-	if i.Warning != nil {
-		options.Warning = func(err error) { i.Warning(Diagnostic{Message: err.Error()}) }
-	}
+	options := i.jpxDecodeOptions(true)
 	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), options)
 	if err != nil && i.Warning != nil && ctx.Err() == nil {
 		end := bytes.LastIndex(stream, []byte{255, 217}) + 2
 		if end > 2 && end < len(stream) {
-			if recovered, recoveredErr := j2kgo.NewDecoder(ctx, bytes.NewReader(stream[:end]), nil); recoveredErr == nil {
+			if recovered, recoveredErr := j2kgo.NewDecoder(ctx, bytes.NewReader(stream[:end]), i.jpxDecodeOptions(false)); recoveredErr == nil {
 				i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG2000 has %d trailing bytes after a complete EOC; retaining all validated tile-parts", len(stream)-end)})
 				decoder, err = recovered, nil
 			}
@@ -541,6 +538,21 @@ func jpxTargetSize(ctx context.Context, data []byte, size image.Point) (image.Po
 	return size, err
 }
 
+// jpxDecodeOptions 构造JPEG2000解码选项并透传并发上限
+// 入参: withWarning 是否附带诊断回调
+// 返回: *j2kgo.DecodeOptions 解码选项
+func (i *Image) jpxDecodeOptions(withWarning bool) *j2kgo.DecodeOptions {
+	workers := i.Workers
+	if workers <= 0 && i.reader != nil {
+		workers = i.reader.decodeWorkers
+	}
+	options := &j2kgo.DecodeOptions{Workers: workers}
+	if withWarning && i.Warning != nil {
+		options.Warning = func(err error) { i.Warning(Diagnostic{Message: err.Error()}) }
+	}
+	return options
+}
+
 // jpxReduction 查询码流在目标尺寸下可用的分辨率缩减级数
 // 入参: ctx 取消上下文, data 容器数据, stream 码流数据, size 像素需求
 // 返回: int 缩减级数, error 容器、码流或取消错误
@@ -549,7 +561,7 @@ func jpxReduction(ctx context.Context, data, stream []byte, size image.Point) (i
 	if err != nil || size == (image.Point{}) {
 		return 0, err
 	}
-	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), nil)
+	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), &j2kgo.DecodeOptions{Workers: 1})
 	if err != nil {
 		return 0, err
 	}

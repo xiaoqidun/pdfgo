@@ -16,7 +16,6 @@ package pdfgo
 
 import (
 	"bytes"
-	"compress/zlib"
 	"context"
 	"image"
 	"image/color"
@@ -118,12 +117,13 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 	}
 	pixels := stream.Data
 	if len(filters) == 1 {
-		input, err := zlib.NewReader(bytes.NewReader(pixels))
+		input, err := acquireZlibReader(bytes.NewReader(pixels))
 		if err != nil {
 			return stream, nil
 		}
-		pixels, err = io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1))
+		pixels, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1), estimateFlateCapacity(stream.Dictionary, len(pixels), optimizationBufferLimit))
 		input.Close()
+		releaseZlibReader(input)
 		if err != nil || len(pixels) > optimizationBufferLimit {
 			return stream, ctx.Err()
 		}

@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"bytes"
 	"encoding/hex"
 	"math"
 	"strconv"
@@ -74,9 +75,9 @@ func (p *objectParser) fail(message string) error {
 	return &SyntaxError{Offset: p.base + int64(p.pos), Message: message}
 }
 
-// token 读取非分隔符组成的词法单元
-// 返回: string 词法单元，遇到分隔符或输入末尾时为空
-func (p *objectParser) token() string {
+// tokenBytes 读取非分隔符组成的词法单元原始切片，不分配字符串
+// 返回: []byte 词法单元切片，遇到分隔符或输入末尾时为空
+func (p *objectParser) tokenBytes() []byte {
 	p.skipSpace()
 	start := p.pos
 	for p.pos < len(p.data) && !isDelimiter(p.data[p.pos]) {
@@ -85,7 +86,13 @@ func (p *objectParser) token() string {
 	if p.pos == len(p.data) {
 		p.exhausted = true
 	}
-	return string(p.data[start:p.pos])
+	return p.data[start:p.pos]
+}
+
+// token 读取非分隔符组成的词法单元
+// 返回: string 词法单元，遇到分隔符或输入末尾时为空
+func (p *objectParser) token() string {
+	return string(p.tokenBytes())
 }
 
 // streamDataStart 校验流头换行，诊断模式允许单独CR或换行前的水平空白
@@ -167,7 +174,34 @@ func (p *objectParser) object() (Object, error) {
 			values = append(values, value)
 		}
 	}
-	token := p.token()
+	raw := p.tokenBytes()
+	if value, ok := parseFastInt(raw); ok {
+		if p.content {
+			return Integer(value), nil
+		}
+		saved := p.pos
+		genRaw := p.tokenBytes()
+		if generation, genOK := parseFastInt(genRaw); genOK && generation >= 0 && generation <= 65535 && (value > 0 || (value == 0 && p.warning != nil)) {
+			if refRaw := p.tokenBytes(); len(refRaw) == 1 && refRaw[0] == 'R' {
+				if value == 0 {
+					p.warning(Diagnostic{Offset: p.base + int64(saved), Message: "zero object number in indirect reference treated as null"})
+				}
+				return Reference{Number: value, Generation: generation}, nil
+			}
+		}
+		p.pos = saved
+		return Integer(value), nil
+	}
+	if len(raw) == 4 && bytes.Equal(raw, []byte("true")) {
+		return Boolean(true), nil
+	}
+	if len(raw) == 5 && bytes.Equal(raw, []byte("false")) {
+		return Boolean(false), nil
+	}
+	if len(raw) == 4 && bytes.Equal(raw, []byte("null")) {
+		return nil, nil
+	}
+	token := string(raw)
 	if p.content && p.warning != nil {
 		token = p.contentNumber(token)
 	}
@@ -175,14 +209,6 @@ func (p *objectParser) object() (Object, error) {
 		token = token[:len(token)-len("endobj")]
 		p.pos -= len("endobj")
 		p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "numeric object adjacent to endobj; numeric value retained"})
-	}
-	switch token {
-	case "true":
-		return Boolean(true), nil
-	case "false":
-		return Boolean(false), nil
-	case "null":
-		return nil, nil
 	}
 	if !validNumber(token) && !(p.warning != nil && validScientificNumber(token)) {
 		return nil, p.fail("invalid object token")
@@ -192,18 +218,23 @@ func (p *objectParser) object() (Object, error) {
 	}
 	if !strings.ContainsAny(token, ".eE") {
 		if value, err := strconv.ParseInt(token, 10, 64); err == nil {
+			if p.content {
+				return Integer(value), nil
+			}
 			saved := p.pos
-			generationToken := p.token()
+			genRaw := p.tokenBytes()
 			generation := int64(-1)
 			var err error
-			if validNumber(generationToken) && !strings.ContainsRune(generationToken, '.') {
-				generation, err = strconv.ParseInt(generationToken, 10, 64)
+			if len(genRaw) > 0 && validNumberBytes(genRaw) && bytes.IndexByte(genRaw, '.') < 0 {
+				generation, err = strconv.ParseInt(string(genRaw), 10, 64)
 			}
-			if err == nil && generation >= 0 && generation <= 65535 && (value > 0 || (value == 0 && p.warning != nil)) && p.token() == "R" {
-				if value == 0 {
-					p.warning(Diagnostic{Offset: p.base + int64(saved), Message: "zero object number in indirect reference treated as null"})
+			if err == nil && generation >= 0 && generation <= 65535 && (value > 0 || (value == 0 && p.warning != nil)) {
+				if refRaw := p.tokenBytes(); len(refRaw) == 1 && refRaw[0] == 'R' {
+					if value == 0 {
+						p.warning(Diagnostic{Offset: p.base + int64(saved), Message: "zero object number in indirect reference treated as null"})
+					}
+					return Reference{Number: value, Generation: generation}, nil
 				}
-				return Reference{Number: value, Generation: generation}, nil
 			}
 			p.pos = saved
 			return Integer(value), nil
@@ -214,6 +245,57 @@ func (p *objectParser) object() (Object, error) {
 		return nil, p.fail("number out of range")
 	}
 	return Real(value), nil
+}
+
+// parseFastInt 无分配解析常见十进制整数，超长或非纯整数交由通用路径处理
+// 入参: raw 原始词法字节
+// 返回: int64 整数值, bool 是否快速解析成功
+func parseFastInt(raw []byte) (int64, bool) {
+	if len(raw) == 0 || len(raw) > 18 {
+		return 0, false
+	}
+	i, neg := 0, false
+	if raw[0] == '-' {
+		neg = true
+		i = 1
+	} else if raw[0] == '+' {
+		i = 1
+	}
+	if i == len(raw) {
+		return 0, false
+	}
+	var value int64
+	for ; i < len(raw); i++ {
+		b := raw[i]
+		if b < '0' || b > '9' {
+			return 0, false
+		}
+		value = value*10 + int64(b-'0')
+	}
+	if neg {
+		value = -value
+	}
+	return value, true
+}
+
+// validNumberBytes 检查字节切片是否符合不含指数形式的PDF数字语法
+// 入参: raw 数字字节
+// 返回: bool 是否符合数字语法
+func validNumberBytes(raw []byte) bool {
+	if len(raw) > 0 && (raw[0] == '+' || raw[0] == '-') {
+		raw = raw[1:]
+	}
+	digits, dots := 0, 0
+	for _, b := range raw {
+		if b >= '0' && b <= '9' {
+			digits++
+		} else if b == '.' {
+			dots++
+		} else {
+			return false
+		}
+	}
+	return digits > 0 && dots <= 1
 }
 
 // validNumber 检查不含指数形式的PDF数字语法

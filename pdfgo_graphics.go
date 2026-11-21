@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"maps"
 	"math"
 )
 
@@ -150,14 +152,18 @@ type ImageMark struct {
 	Style    Style
 }
 
-// FormMark 保存普通表单的局部边界及到页面坐标的变换，不代表透明组
+// FormMark 保存表单的引用标识、局部边界、到页面坐标的变换、外层裁剪数量及可选透明组状态
 type FormMark struct {
-	Bounds Rectangle
-	Matrix Matrix
+	Ref        Reference
+	Stream     *Stream
+	Bounds     Rectangle
+	Matrix     Matrix
+	OuterClips int
+	Group      *GroupMark
 }
 
 // GroupMark 保存透明度组的边界不透明度和隔离方式，组内绘制使用独立状态
-// Page区分页面初始组与内容流中的表单组
+// Page区分页面初始组与内容流中的表单组，来自表单的透明组保留引用及局部坐标信息
 type GroupMark struct {
 	Page            bool
 	Alpha           float64
@@ -169,6 +175,11 @@ type GroupMark struct {
 	ColorSpace      *ColorSpace
 	ColorConversion ColorConversion
 	RenderingIntent Name
+	Ref             Reference
+	Stream          *Stream
+	Bounds          Rectangle
+	Matrix          Matrix
+	OuterClips      int
 }
 
 // MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标记的标签
@@ -416,6 +427,45 @@ func matrixProductSum(a, b, c, d float64) (float64, int) {
 	value += math.Ldexp(math.FMA(a, b, -x), xe-power) + math.Ldexp(math.FMA(c, d, -y), ye-power)
 	value, shift := math.Frexp(value)
 	return value, power + shift
+}
+
+// Fork 创建共享只读底层数据与并发安全缓存的独立工作视图，供多页并发读取使用
+// 视图固定内部图像解码并发度为1，避免外层并行调度过度订阅
+// 入参: source 可选数据源，nil沿用原数据源, warning 可选警告回调, shapeText 可选文字整形回调
+// 返回: *Reader 独立工作视图
+func (r *Reader) Fork(source io.ReaderAt, warning func(Diagnostic), shapeText TextShaper) *Reader {
+	if source == nil {
+		source = r.source
+	}
+	return &Reader{
+		Version:        r.Version,
+		Trailer:        r.Trailer,
+		source:         source,
+		size:           r.size,
+		originalSource: r.originalSource,
+		originalSize:   r.originalSize,
+		xref:           maps.Clone(r.xref),
+		cache:          r.cache,
+		loading:        make(map[Reference]bool),
+		deviceProfile:  r.deviceProfile,
+		security:       r.security,
+		warning:        warning,
+		textShaper:     shapeText,
+		decodeWorkers:  1,
+		jbig2Globals:   r.jbig2Globals,
+	}
+}
+
+// BindPage 将来源同一文档的页面浅拷贝绑定到当前工作视图，不修改原页面对象
+// 入参: page 原阅读器页面
+// 返回: *Page 绑定到当前视图的页面副本
+func (r *Reader) BindPage(page *Page) *Page {
+	if page == nil {
+		return nil
+	}
+	bound := *page
+	bound.reader = r
+	return &bound
 }
 
 // WalkPage 解释页面内容并按绘制顺序访问可准确表达的图元，注解由Page.Annotations读取
@@ -1671,7 +1721,8 @@ func (p *pageInterpreter) xobject(a []Object) error {
 	if kind != Name("Form") {
 		return &UnsupportedError{Feature: "XObject subtype"}
 	}
-	return p.form(stream)
+	formRef, _ := object.(Reference)
+	return p.formContentRef(stream, stream, formRef)
 }
 
 // image 解释外部或内联图像，统一遮罩、可见性和诊断处理
@@ -1781,6 +1832,13 @@ func (p *pageInterpreter) form(stream *Stream) error {
 // 入参: stream 绘制流, source 来源流
 // 返回: error 解析或访问错误
 func (p *pageInterpreter) formContent(stream, source *Stream) error {
+	return p.formContentRef(stream, source, Reference{})
+}
+
+// formContentRef 解释表单绘制数据并保留间接对象引用及外层裁剪计数
+// 入参: stream 绘制流, source 来源流, formRef 表单间接引用
+// 返回: error 解析或访问错误
+func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Reference) error {
 	if p.hidden {
 		return nil
 	}
@@ -1977,6 +2035,7 @@ func (p *pageInterpreter) formContent(stream, source *Stream) error {
 			return p.ctx.Err()
 		}
 	}
+	outerClips := len(child.state.style.Clips)
 	clip := Path{Segments: []Segment{{"M", []Point{m.Apply(Point{box.XMin, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMax})}}, {"L", []Point{m.Apply(Point{box.XMin, box.YMax})}}, {"C", nil}}}
 	child.state.style.Clips = append(append([]Path(nil), child.state.style.Clips...), clip)
 	child.patternMatrix = child.state.matrix
@@ -1999,7 +2058,15 @@ func (p *pageInterpreter) formContent(stream, source *Stream) error {
 		return interpreter.run(data)
 	}
 	if groupMark != nil && p.visitor.Group != nil {
-		return p.visitor.Group(*groupMark, func(visitor Visitor) error {
+		mark := *groupMark
+		if target == nil {
+			mark.Ref = formRef
+			mark.Stream = source
+		}
+		mark.Bounds = box
+		mark.Matrix = m
+		mark.OuterClips = outerClips
+		return p.visitor.Group(mark, func(visitor Visitor) error {
 			group := child
 			if visitor.MarkedContent == nil {
 				visitor.MarkedContent = child.visitor.MarkedContent
@@ -2024,7 +2091,12 @@ func (p *pageInterpreter) formContent(stream, source *Stream) error {
 		})
 	}
 	if groupMark == nil && p.visitor.Form != nil {
-		return p.visitor.Form(FormMark{Bounds: box, Matrix: m}, func(visitor Visitor) error {
+		mark := FormMark{Bounds: box, Matrix: m, OuterClips: outerClips}
+		if target == nil {
+			mark.Ref = formRef
+			mark.Stream = source
+		}
+		return p.visitor.Form(mark, func(visitor Visitor) error {
 			form := child
 			if visitor.MarkedContent == nil {
 				visitor.MarkedContent = child.visitor.MarkedContent
