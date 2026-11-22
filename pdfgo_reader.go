@@ -133,6 +133,167 @@ func newObjectCache(budget int64) *objectCache {
 	return &objectCache{objects: make(map[Reference]Object), streams: make(map[Reference]*objectCacheEntry), budget: budget}
 }
 
+// Open 打开PDF文件并读取交叉引用
+// 入参: path 文件路径
+// 返回: *Reader 阅读器, error 错误信息
+func Open(path string) (*Reader, error) {
+	return OpenWithPassword(path, nil)
+}
+
+// OpenWithPassword 使用已编码密码打开PDF，编码规则见NewReaderWithPassword
+// 入参: path 文件路径, password 用户或所有者密码，nil表示空密码
+// 返回: *Reader 阅读器, error 错误信息
+func OpenWithPassword(path string, password []byte) (*Reader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	r, err := NewReaderWithPassword(f, info.Size(), password)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	r.closer = f
+	return r, nil
+}
+
+// NewReader 从随机读取器读取PDF，源读取器仍由调用方管理
+// 按交叉引用读取对象，源读取器须在使用期间保持可读
+// 入参: source 随机读取器, size 文件字节数
+// 返回: *Reader 阅读器, error 错误信息
+func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
+	return NewReaderWithPassword(source, size, nil)
+}
+
+// NewReaderWithPassword 使用密码读取PDF，源读取器仍由调用方管理
+// 支持RC4、AES-128和AES-256；R2至R4使用PDFDocEncoding，R5/R6使用经SASLprep处理的UTF-8
+// 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码
+// 返回: *Reader 阅读器, error 错误信息
+func NewReaderWithPassword(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
+	return NewReaderWithOptions(source, size, ReaderOptions{Password: password})
+}
+
+// NewReaderWithUTF8Password 自动按安全处理器版本转换UTF-8密码并读取PDF
+// 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码的UTF-8字节
+// 返回: *Reader 阅读器, error 错误信息
+func NewReaderWithUTF8Password(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
+	return NewReaderWithOptions(source, size, ReaderOptions{Password: password, PasswordUTF8: true})
+}
+
+// NewReaderWithOptions 按读取选项打开PDF，源读取器仍由调用方管理
+// 入参: source 随机读取器, size 文件字节数, options 读取及外观选项
+// 返回: *Reader 阅读器, error 错误信息
+func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions) (*Reader, error) {
+	if size < 8 {
+		return nil, fmt.Errorf("invalid file size")
+	}
+	data := make([]byte, min(size, 1024))
+	if _, err := io.ReadFull(io.NewSectionReader(source, 0, size), data); err != nil {
+		return nil, err
+	}
+	header := bytes.Index(data[:min(len(data), 1024)], []byte("%PDF-"))
+	if header < 0 {
+		if options.Warning == nil || !bytes.HasPrefix(data, []byte("%")) {
+			return nil, fmt.Errorf("missing PDF header")
+		}
+		header = 0
+		options.Warning(Diagnostic{Message: "missing PDF header; validating document structure"})
+	}
+	data = data[header:]
+	end := bytes.IndexAny(data[:min(len(data), 32)], "\r\n")
+	if end < 0 {
+		return nil, fmt.Errorf("invalid PDF header")
+	}
+	version := "1.7"
+	if end >= 5 && bytes.HasPrefix(data, []byte("%PDF-")) {
+		version = string(bytes.Trim(data[5:end], "\x00\t\n\f\r "))
+	}
+	if version != "2.0" && (len(version) != 3 || version[0:2] != "1." || version[2] < '0' || version[2] > '7') {
+		if options.Warning == nil {
+			return nil, &UnsupportedError{Feature: "PDF version " + version}
+		}
+		options.Warning(Diagnostic{Message: "invalid PDF version " + version + "; using 1.7"})
+		version = "1.7"
+	}
+	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: newObjectCache(streamCacheBudget), loading: map[Reference]bool{}, jbig2Globals: newJBIG2GlobalsCache()}
+	r.originalSource, r.originalSize = source, size
+	r.warning = options.Warning
+	r.textShaper = options.ShapeText
+	if options.Workers > 0 {
+		r.decodeWorkers = options.Workers
+	}
+	err := r.loadCrossReferences()
+	if err != nil {
+		if options.Warning == nil || !readerStructuralError(err) {
+			return nil, err
+		}
+		index, trailer, scanErr := r.scanCrossReferences()
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		r.xref, r.Trailer = index, trailer
+		r.warning(Diagnostic{Message: "rebuilt cross-reference from validated object boundaries: " + err.Error()})
+	}
+	password := options.Password
+	if options.PasswordUTF8 {
+		password, err = r.encodePassword(password)
+		if err != nil {
+			return nil, err
+		}
+		defer clear(password)
+	}
+	if err := r.openSecurity(password); err != nil {
+		return nil, err
+	}
+	root, err := r.Resolve(r.Trailer["Root"])
+	if err != nil {
+		r.Close()
+		return nil, err
+	}
+	catalog, ok := root.(Dictionary)
+	if ok && catalog["Type"] == nil && catalog["Pages"] != nil && r.warning != nil {
+		r.warning(Diagnostic{Message: "missing catalog Type inferred from trailer Root and Pages"})
+	} else if !ok || catalog["Type"] != Name("Catalog") {
+		r.Close()
+		return nil, fmt.Errorf("missing document catalog")
+	}
+	if v, ok := catalog["Version"].(Name); ok && string(v) > r.Version {
+		r.Version = string(v)
+	}
+	return r, nil
+}
+
+// readerStructuralError 排除源读取、取消、关闭和安全错误，限定结构恢复范围
+// 入参: err 原始错误
+// 返回: bool 是否可以尝试结构恢复
+func readerStructuralError(err error) bool {
+	var read *ReadError
+	var unsupported *UnsupportedError
+	var security *objectSecurityError
+	return err != nil && !errors.As(err, &read) && !errors.As(err, &unsupported) && !errors.As(err, &security) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, ErrPassword)
+}
+
+// streamEndTypo 识别endstream关键字仅缺失一个字母的拼写，不匹配任意词
+// 入参: token 实际流尾关键字
+// 返回: bool 是否为单字母缺失
+func streamEndTypo(token string) bool {
+	const keyword = "endstream"
+	if len(token) != len(keyword)-1 {
+		return false
+	}
+	for i := range keyword {
+		if token == keyword[:i]+keyword[i+1:] {
+			return true
+		}
+	}
+	return false
+}
+
 // get 查询缓存对象，命中流缓存时更新最近使用顺序
 // 入参: ref 对象引用
 // 返回: Object 缓存对象, bool 是否命中
@@ -384,141 +545,6 @@ func (c *objectCache) evictLocked() {
 	}
 }
 
-// Open 打开PDF文件并读取交叉引用
-// 入参: path 文件路径
-// 返回: *Reader 阅读器, error 错误信息
-func Open(path string) (*Reader, error) {
-	return OpenWithPassword(path, nil)
-}
-
-// OpenWithPassword 使用已编码密码打开PDF，编码规则见NewReaderWithPassword
-// 入参: path 文件路径, password 用户或所有者密码，nil表示空密码
-// 返回: *Reader 阅读器, error 错误信息
-func OpenWithPassword(path string, password []byte) (*Reader, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	r, err := NewReaderWithPassword(f, info.Size(), password)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	r.closer = f
-	return r, nil
-}
-
-// NewReader 从随机读取器读取PDF，源读取器仍由调用方管理
-// 按交叉引用读取对象，源读取器须在使用期间保持可读
-// 入参: source 随机读取器, size 文件字节数
-// 返回: *Reader 阅读器, error 错误信息
-func NewReader(source io.ReaderAt, size int64) (*Reader, error) {
-	return NewReaderWithPassword(source, size, nil)
-}
-
-// NewReaderWithPassword 使用密码读取PDF，源读取器仍由调用方管理
-// 支持RC4、AES-128和AES-256；R2至R4使用PDFDocEncoding，R5/R6使用经SASLprep处理的UTF-8
-// 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码
-// 返回: *Reader 阅读器, error 错误信息
-func NewReaderWithPassword(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
-	return NewReaderWithOptions(source, size, ReaderOptions{Password: password})
-}
-
-// NewReaderWithUTF8Password 自动按安全处理器版本转换UTF-8密码并读取PDF
-// 入参: source 随机读取器, size 文件字节数, password 用户或所有者密码的UTF-8字节
-// 返回: *Reader 阅读器, error 错误信息
-func NewReaderWithUTF8Password(source io.ReaderAt, size int64, password []byte) (*Reader, error) {
-	return NewReaderWithOptions(source, size, ReaderOptions{Password: password, PasswordUTF8: true})
-}
-
-// NewReaderWithOptions 按读取选项打开PDF，源读取器仍由调用方管理
-// 入参: source 随机读取器, size 文件字节数, options 读取及外观选项
-// 返回: *Reader 阅读器, error 错误信息
-func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions) (*Reader, error) {
-	if size < 8 {
-		return nil, fmt.Errorf("invalid file size")
-	}
-	data := make([]byte, min(size, 1024))
-	if _, err := io.ReadFull(io.NewSectionReader(source, 0, size), data); err != nil {
-		return nil, err
-	}
-	header := bytes.Index(data[:min(len(data), 1024)], []byte("%PDF-"))
-	if header < 0 {
-		if options.Warning == nil || !bytes.HasPrefix(data, []byte("%")) {
-			return nil, fmt.Errorf("missing PDF header")
-		}
-		header = 0
-		options.Warning(Diagnostic{Message: "missing PDF header; validating document structure"})
-	}
-	data = data[header:]
-	end := bytes.IndexAny(data[:min(len(data), 32)], "\r\n")
-	if end < 0 {
-		return nil, fmt.Errorf("invalid PDF header")
-	}
-	version := "1.7"
-	if end >= 5 && bytes.HasPrefix(data, []byte("%PDF-")) {
-		version = string(bytes.Trim(data[5:end], "\x00\t\n\f\r "))
-	}
-	if version != "2.0" && (len(version) != 3 || version[0:2] != "1." || version[2] < '0' || version[2] > '7') {
-		if options.Warning == nil {
-			return nil, &UnsupportedError{Feature: "PDF version " + version}
-		}
-		options.Warning(Diagnostic{Message: "invalid PDF version " + version + "; using 1.7"})
-		version = "1.7"
-	}
-	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: newObjectCache(streamCacheBudget), loading: map[Reference]bool{}, jbig2Globals: newJBIG2GlobalsCache()}
-	r.originalSource, r.originalSize = source, size
-	r.warning = options.Warning
-	r.textShaper = options.ShapeText
-	if options.Workers > 0 {
-		r.decodeWorkers = options.Workers
-	}
-	err := r.loadCrossReferences()
-	if err != nil {
-		if options.Warning == nil || !readerStructuralError(err) {
-			return nil, err
-		}
-		index, trailer, scanErr := r.scanCrossReferences()
-		if scanErr != nil {
-			return nil, scanErr
-		}
-		r.xref, r.Trailer = index, trailer
-		r.warning(Diagnostic{Message: "rebuilt cross-reference from validated object boundaries: " + err.Error()})
-	}
-	password := options.Password
-	if options.PasswordUTF8 {
-		password, err = r.encodePassword(password)
-		if err != nil {
-			return nil, err
-		}
-		defer clear(password)
-	}
-	if err := r.openSecurity(password); err != nil {
-		return nil, err
-	}
-	root, err := r.Resolve(r.Trailer["Root"])
-	if err != nil {
-		r.Close()
-		return nil, err
-	}
-	catalog, ok := root.(Dictionary)
-	if ok && catalog["Type"] == nil && catalog["Pages"] != nil && r.warning != nil {
-		r.warning(Diagnostic{Message: "missing catalog Type inferred from trailer Root and Pages"})
-	} else if !ok || catalog["Type"] != Name("Catalog") {
-		r.Close()
-		return nil, fmt.Errorf("missing document catalog")
-	}
-	if v, ok := catalog["Version"].(Name); ok && string(v) > r.Version {
-		r.Version = string(v)
-	}
-	return r, nil
-}
-
 // Close 释放源数据、对象缓存和解密密钥，关闭Open持有的文件
 // 不关闭NewReader的外部数据源；关闭后不可继续读取，重复关闭不产生错误
 // 返回: error 关闭错误
@@ -767,16 +793,6 @@ func (r *Reader) insideIndexedStream(offset int64, target Reference) (bool, erro
 	}
 	length, ok := lengthObject.(Integer)
 	return !ok || length < 0 || offset-start < int64(length), nil
-}
-
-// readerStructuralError 排除源读取、取消、关闭和安全错误，限定结构恢复范围
-// 入参: err 原始错误
-// 返回: bool 是否可以尝试结构恢复
-func readerStructuralError(err error) bool {
-	var read *ReadError
-	var unsupported *UnsupportedError
-	var security *objectSecurityError
-	return err != nil && !errors.As(err, &read) && !errors.As(err, &unsupported) && !errors.As(err, &security) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, ErrPassword)
 }
 
 // Error 返回原始对象解密错误描述
@@ -1364,7 +1380,7 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 		if err != nil {
 			return ref, nil, err
 		}
-		value = &Stream{Dictionary: dict, Data: data, reader: r}
+		value = &Stream{Dictionary: dict, Data: data, Reference: ref, reader: r}
 		err = r.parseAt(start+actualLength, func(tail *objectParser) error {
 			token := tail.token()
 			if token != "endstream" && (r.warning == nil || !streamEndTypo(token)) {
@@ -1565,22 +1581,6 @@ func (r *Reader) streamExtent(start, length int64, ref Reference) (int64, int64,
 	}
 	r.warning(Diagnostic{Offset: start, Message: fmt.Sprintf("stream Length %d replaced by validated boundary length %d", length, actual)})
 	return actual, candidateEnd, nil
-}
-
-// streamEndTypo 识别endstream关键字仅缺失一个字母的拼写，不匹配任意词
-// 入参: token 实际流尾关键字
-// 返回: bool 是否为单字母缺失
-func streamEndTypo(token string) bool {
-	const keyword = "endstream"
-	if len(token) != len(keyword)-1 {
-		return false
-	}
-	for i := range keyword {
-		if token == keyword[:i]+keyword[i+1:] {
-			return true
-		}
-	}
-	return false
 }
 
 // objectBoundary 检查后续对象头或交叉引用边界，不解析后续对象内容

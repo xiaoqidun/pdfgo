@@ -22,6 +22,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"os"
 	"sort"
 
 	"github.com/xiaoqidun/j2kgo"
@@ -53,6 +54,382 @@ type jpxSampleImage struct {
 	ycc      bool
 	chroma   [2]float64
 	rows     *jpxRowReader
+}
+
+// jpxTargetSize 调色板图像保留完整分辨率，其余图像使用请求尺寸
+// 入参: ctx 取消上下文, data 容器数据, size 像素需求
+// 返回: image.Point 解码目标尺寸, error 容器或取消错误
+func jpxTargetSize(ctx context.Context, data []byte, size image.Point) (image.Point, error) {
+	if size.X <= 0 || size.Y <= 0 {
+		return image.Point{}, ctx.Err()
+	}
+	if bytes.HasPrefix(data, []byte{255, 79}) {
+		return size, ctx.Err()
+	}
+	err := walkJPXBoxes(data, func(name string, payload []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if name != "jp2h" {
+			return nil
+		}
+		return walkJPXBoxes(payload, func(name string, payload []byte) error {
+			if name == "pclr" {
+				size = image.Point{}
+			}
+			return ctx.Err()
+		})
+	})
+	return size, err
+}
+
+// jpxReduction 查询码流在目标尺寸下可用的分辨率缩减级数
+// 入参: ctx 取消上下文, data 容器数据, stream 码流数据, size 像素需求
+// 返回: int 缩减级数, error 容器、码流或取消错误
+func jpxReduction(ctx context.Context, data, stream []byte, size image.Point) (int, error) {
+	size, err := jpxTargetSize(ctx, data, size)
+	if err != nil || size == (image.Point{}) {
+		return 0, err
+	}
+	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), &j2kgo.DecodeOptions{Workers: 1})
+	if err != nil {
+		return 0, err
+	}
+	defer decoder.Close()
+	return decoder.Reduction(size)
+}
+
+// jpxSize 校验码流尺寸和分量缓冲，不依赖普通图像颜色模型或分配像素
+// 入参: data 原始码流
+// 返回: int 宽度, int 高度, int 分量数, error 头部或平台范围错误
+func jpxSize(data []byte) (int, int, int, error) {
+	if len(data) < 42 || !bytes.Equal(data[:4], []byte{255, 79, 255, 81}) {
+		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 size marker")
+	}
+	count := int(binary.BigEndian.Uint16(data[40:42]))
+	if count == 0 || len(data) < 42+3*count || int(binary.BigEndian.Uint16(data[4:6])) != 38+3*count {
+		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 component descriptors")
+	}
+	x, y := int64(binary.BigEndian.Uint32(data[8:12])), int64(binary.BigEndian.Uint32(data[12:16]))
+	x0, y0 := int64(binary.BigEndian.Uint32(data[16:20])), int64(binary.BigEndian.Uint32(data[20:24]))
+	maximum := int64(^uint(0) >> 1)
+	if x <= x0 || y <= y0 || x > maximum || y > maximum {
+		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 reference grid or platform range")
+	}
+	width, height := int(x-x0), int(y-y0)
+	if _, _, err := imageBufferSize(width, height, count*4); err != nil {
+		return 0, 0, 0, err
+	}
+	for n := 0; n < count; n++ {
+		if int(data[42+3*n]&127)+1 > 31 {
+			return 0, 0, 0, &UnsupportedError{Feature: "JPEG2000 component precision"}
+		}
+		if data[43+3*n] == 0 || data[44+3*n] == 0 {
+			return 0, 0, 0, fmt.Errorf("invalid JPEG2000 component sampling")
+		}
+	}
+	return width, height, count, nil
+}
+
+// jpxComponentMapping 解析JP2调色板和直接通道映射，保留原始采样精度
+// 入参: data 容器数据, components 码流分量
+// 返回: []jpxMapping 输出通道映射, error 容器错误
+func jpxComponentMapping(data []byte, components []*j2kgo.Component) ([]jpxMapping, error) {
+	if len(data) >= 2 && data[0] == 255 && data[1] == 79 {
+		return nil, nil
+	}
+	var palette, channelMap []byte
+	err := walkJPXBoxes(data, func(name string, payload []byte) error {
+		if name != "jp2h" {
+			return nil
+		}
+		return walkJPXBoxes(payload, func(name string, payload []byte) error {
+			switch name {
+			case "pclr":
+				if palette != nil {
+					return fmt.Errorf("duplicate JPEG2000 palette")
+				}
+				palette = payload
+			case "cmap":
+				if channelMap != nil {
+					return fmt.Errorf("duplicate JPEG2000 component mapping")
+				}
+				channelMap = payload
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if palette == nil && channelMap == nil {
+		return nil, nil
+	}
+	if len(channelMap) == 0 || len(channelMap)%4 != 0 {
+		return nil, fmt.Errorf("invalid JPEG2000 component mapping")
+	}
+	var columns [][]uint16
+	var depths []byte
+	if palette != nil {
+		if len(palette) < 3 {
+			return nil, fmt.Errorf("invalid JPEG2000 palette header")
+		}
+		entries, count := int(binary.BigEndian.Uint16(palette)), int(palette[2])
+		if entries == 0 || count == 0 || len(palette) < 3+count {
+			return nil, fmt.Errorf("invalid JPEG2000 palette dimensions")
+		}
+		depths = palette[3 : 3+count]
+		stride := 0
+		for _, depth := range depths {
+			bits := int(depth&127) + 1
+			if bits > 31 {
+				return nil, &UnsupportedError{Feature: "JPEG2000 palette precision"}
+			}
+			stride += (bits + 7) / 8
+		}
+		values := palette[3+count:]
+		if len(values) != entries*stride {
+			return nil, fmt.Errorf("invalid JPEG2000 palette data length")
+		}
+		columns = make([][]uint16, count)
+		for n := range columns {
+			columns[n] = make([]uint16, entries)
+		}
+		for row := 0; row < entries; row++ {
+			for n, depth := range depths {
+				bits := uint(depth&127) + 1
+				width := (bits + 7) / 8
+				v := uint64(0)
+				for _, b := range values[:width] {
+					v = v<<8 | uint64(b)
+				}
+				maximum := uint64(1)<<bits - 1
+				v &= maximum
+				if depth&128 != 0 {
+					v = (v + uint64(1)<<(bits-1)) & maximum
+				}
+				columns[n][row] = uint16((v*65535 + maximum/2) / maximum)
+				values = values[width:]
+			}
+		}
+	}
+	mapping := make([]jpxMapping, len(channelMap)/4)
+	for n := range mapping {
+		entry := channelMap[4*n:]
+		component, kind, column := int(binary.BigEndian.Uint16(entry)), entry[2], int(entry[3])
+		if component >= len(components) || kind > 1 || kind == 0 && column != 0 || kind == 1 && column >= len(columns) {
+			return nil, fmt.Errorf("invalid JPEG2000 mapped channel")
+		}
+		mapping[n] = jpxMapping{component: component, precision: int(components[component].Info().Precision)}
+		if kind == 1 {
+			mapping[n].palette = columns[column]
+			mapping[n].precision = int(depths[column]&127) + 1
+		}
+	}
+	return mapping, nil
+}
+
+// jpxChannels 解析颜色排序及全通道软遮罩，未指定软遮罩时忽略透明度
+// 入参: data 容器数据, planes 分量数, colors 颜色数, masked 是否使用软遮罩
+// 返回: []int 颜色平面, int 透明平面, error 通道错误
+func jpxChannels(data []byte, planes, colors int, masked bool) ([]int, int, error) {
+	channels := make([]int, colors)
+	for c := range channels {
+		channels[c] = c
+	}
+	alpha, defined := -1, false
+	coverage := make([]bool, colors)
+	if len(data) >= 2 && data[0] == 0xff && data[1] == 0x4f {
+		if planes == colors+1 {
+			alpha = colors
+		}
+	} else {
+		err := walkJPXBoxes(data, func(name string, payload []byte) error {
+			if name != "jp2h" {
+				return nil
+			}
+			return walkJPXBoxes(payload, func(name string, payload []byte) error {
+				if name != "cdef" {
+					return nil
+				}
+				defined = true
+				if len(payload) < 2 || len(payload) != 2+6*int(binary.BigEndian.Uint16(payload)) {
+					return fmt.Errorf("invalid JPEG2000 channel definition")
+				}
+				for c := range channels {
+					channels[c] = -1
+				}
+				for entry := payload[2:]; len(entry) > 0; entry = entry[6:] {
+					channel, kind, association := int(binary.BigEndian.Uint16(entry)), binary.BigEndian.Uint16(entry[2:]), int(binary.BigEndian.Uint16(entry[4:]))
+					if channel >= planes {
+						return fmt.Errorf("invalid JPEG2000 channel index")
+					}
+					switch kind {
+					case 0:
+						if association < 1 || association > colors || channels[association-1] != -1 {
+							return fmt.Errorf("invalid JPEG2000 color association")
+						}
+						channels[association-1] = channel
+					case 1, 2:
+						if masked && alpha != -1 && alpha != channel {
+							return fmt.Errorf("JPEG2000 soft mask requires one opacity channel")
+						}
+						alpha = channel
+						if association == 0 {
+							for c := range coverage {
+								coverage[c] = true
+							}
+						} else if association <= colors {
+							coverage[association-1] = true
+						} else {
+							return fmt.Errorf("invalid JPEG2000 opacity association")
+						}
+					case 65535:
+					default:
+						return fmt.Errorf("invalid JPEG2000 channel type")
+					}
+				}
+				return nil
+			})
+		})
+		if err != nil {
+			return nil, -1, err
+		}
+	}
+	if !defined && planes == colors+1 {
+		alpha = colors
+		for c := range coverage {
+			coverage[c] = true
+		}
+	}
+	for _, c := range channels {
+		if c < 0 || c >= planes || masked && c == alpha {
+			return nil, -1, fmt.Errorf("JPEG2000 color channels differ from color space")
+		}
+	}
+	if masked && alpha < 0 {
+		return nil, -1, fmt.Errorf("missing JPEG2000 opacity channel")
+	}
+	if masked {
+		for _, covered := range coverage {
+			if !covered {
+				return nil, -1, fmt.Errorf("JPEG2000 soft mask must cover all color channels")
+			}
+		}
+	}
+	if !masked {
+		alpha = -1
+	}
+	return channels, alpha, nil
+}
+
+// jpxCodestream 读取单码流容器，颜色空间由PDF字典确定
+// 入参: data JPEG2000编码数据
+// 返回: []byte 原始码流, error 容器错误
+func jpxCodestream(data []byte) ([]byte, error) {
+	if len(data) >= 2 && data[0] == 0xff && data[1] == 0x4f {
+		return data, nil
+	}
+	if len(data) < 12 || !bytes.Equal(data[:12], []byte{0, 0, 0, 12, 'j', 'P', ' ', ' ', 13, 10, 135, 10}) {
+		return nil, fmt.Errorf("invalid JPEG2000 container signature")
+	}
+	var stream []byte
+	err := walkJPXBoxes(data, func(name string, payload []byte) error {
+		switch name {
+		case "jp2c":
+			if stream != nil {
+				return &UnsupportedError{Feature: "multiple JPEG2000 codestreams"}
+			}
+			stream = payload
+		case "jp2h":
+			return walkJPXBoxes(payload, func(name string, payload []byte) error {
+				switch name {
+				case "cdef":
+					if len(payload) < 2 {
+						return fmt.Errorf("invalid JPEG2000 channel definition")
+					}
+					n := int(binary.BigEndian.Uint16(payload))
+					if len(payload) != 2+6*n {
+						return fmt.Errorf("invalid JPEG2000 channel definition")
+					}
+				}
+				return nil
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(stream) == 0 {
+		return nil, fmt.Errorf("missing JPEG2000 codestream")
+	}
+	return stream, nil
+}
+
+// walkJPXBoxes 访问单层JPEG2000数据盒，支持扩展长度和末尾数据盒
+// 入参: data 数据盒序列, visit 数据盒访问函数
+// 返回: error 边界或访问错误
+func walkJPXBoxes(data []byte, visit func(string, []byte) error) error {
+	for len(data) > 0 {
+		if len(data) < 8 {
+			return fmt.Errorf("truncated JPEG2000 box")
+		}
+		length, header := uint64(binary.BigEndian.Uint32(data)), uint64(8)
+		if length == 1 {
+			if len(data) < 16 {
+				return fmt.Errorf("truncated JPEG2000 box length")
+			}
+			length, header = binary.BigEndian.Uint64(data[8:]), 16
+		} else if length == 0 {
+			length = uint64(len(data))
+		}
+		if length < header || length > uint64(len(data)) {
+			return fmt.Errorf("invalid JPEG2000 box length")
+		}
+		if err := visit(string(data[4:8]), data[header:length]); err != nil {
+			return err
+		}
+		data = data[length:]
+	}
+	return nil
+}
+
+// JPXLosslessContext 查询JPEG2000图像流的无损编码标志及最大分量位深，仅解析头部不解码像素
+// 非JPXDecode图像返回false、0和nil错误
+// 入参: ctx 取消上下文
+// 返回: bool 是否无损编码, int 最大分量位深, error 容器、码流或取消错误
+func (i *Image) JPXLosslessContext(ctx context.Context) (bool, int, error) {
+	if err := ctx.Err(); err != nil {
+		return false, 0, err
+	}
+	if i == nil || i.Stream == nil {
+		return false, 0, nil
+	}
+	if i.reader != nil && i.reader.closed {
+		return false, 0, os.ErrClosed
+	}
+	data, _, err := i.encodedFileContext(ctx, "JPXDecode")
+	if err != nil || data == nil {
+		return false, 0, err
+	}
+	stream, err := jpxCodestream(data)
+	if err != nil {
+		return false, 0, err
+	}
+	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), &j2kgo.DecodeOptions{Workers: 1})
+	if err != nil {
+		return false, 0, err
+	}
+	info := decoder.Info()
+	_ = decoder.Close()
+	maxBitDepth := 0
+	for _, component := range info.Components {
+		if int(component.Precision) > maxBitDepth {
+			maxBitDepth = int(component.Precision)
+		}
+	}
+	return info.Lossless, maxBitDepth, ctx.Err()
 }
 
 // jpxMaskMode 读取JPEG2000内嵌软遮罩模式
@@ -511,33 +888,6 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	return out, nil
 }
 
-// jpxTargetSize 调色板图像保留完整分辨率，其余图像使用请求尺寸
-// 入参: ctx 取消上下文, data 容器数据, size 像素需求
-// 返回: image.Point 解码目标尺寸, error 容器或取消错误
-func jpxTargetSize(ctx context.Context, data []byte, size image.Point) (image.Point, error) {
-	if size.X <= 0 || size.Y <= 0 {
-		return image.Point{}, ctx.Err()
-	}
-	if bytes.HasPrefix(data, []byte{255, 79}) {
-		return size, ctx.Err()
-	}
-	err := walkJPXBoxes(data, func(name string, payload []byte) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if name != "jp2h" {
-			return nil
-		}
-		return walkJPXBoxes(payload, func(name string, payload []byte) error {
-			if name == "pclr" {
-				size = image.Point{}
-			}
-			return ctx.Err()
-		})
-	})
-	return size, err
-}
-
 // jpxDecodeOptions 构造JPEG2000解码选项并透传并发上限
 // 入参: withWarning 是否附带诊断回调
 // 返回: *j2kgo.DecodeOptions 解码选项
@@ -551,316 +901,4 @@ func (i *Image) jpxDecodeOptions(withWarning bool) *j2kgo.DecodeOptions {
 		options.Warning = func(err error) { i.Warning(Diagnostic{Message: err.Error()}) }
 	}
 	return options
-}
-
-// jpxReduction 查询码流在目标尺寸下可用的分辨率缩减级数
-// 入参: ctx 取消上下文, data 容器数据, stream 码流数据, size 像素需求
-// 返回: int 缩减级数, error 容器、码流或取消错误
-func jpxReduction(ctx context.Context, data, stream []byte, size image.Point) (int, error) {
-	size, err := jpxTargetSize(ctx, data, size)
-	if err != nil || size == (image.Point{}) {
-		return 0, err
-	}
-	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), &j2kgo.DecodeOptions{Workers: 1})
-	if err != nil {
-		return 0, err
-	}
-	defer decoder.Close()
-	return decoder.Reduction(size)
-}
-
-// jpxSize 校验码流尺寸和分量缓冲，不依赖普通图像颜色模型或分配像素
-// 入参: data 原始码流
-// 返回: int 宽度, int 高度, int 分量数, error 头部或平台范围错误
-func jpxSize(data []byte) (int, int, int, error) {
-	if len(data) < 42 || !bytes.Equal(data[:4], []byte{255, 79, 255, 81}) {
-		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 size marker")
-	}
-	count := int(binary.BigEndian.Uint16(data[40:42]))
-	if count == 0 || len(data) < 42+3*count || int(binary.BigEndian.Uint16(data[4:6])) != 38+3*count {
-		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 component descriptors")
-	}
-	x, y := int64(binary.BigEndian.Uint32(data[8:12])), int64(binary.BigEndian.Uint32(data[12:16]))
-	x0, y0 := int64(binary.BigEndian.Uint32(data[16:20])), int64(binary.BigEndian.Uint32(data[20:24]))
-	maximum := int64(^uint(0) >> 1)
-	if x <= x0 || y <= y0 || x > maximum || y > maximum {
-		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 reference grid or platform range")
-	}
-	width, height := int(x-x0), int(y-y0)
-	if _, _, err := imageBufferSize(width, height, count*4); err != nil {
-		return 0, 0, 0, err
-	}
-	for n := 0; n < count; n++ {
-		if int(data[42+3*n]&127)+1 > 31 {
-			return 0, 0, 0, &UnsupportedError{Feature: "JPEG2000 component precision"}
-		}
-		if data[43+3*n] == 0 || data[44+3*n] == 0 {
-			return 0, 0, 0, fmt.Errorf("invalid JPEG2000 component sampling")
-		}
-	}
-	return width, height, count, nil
-}
-
-// jpxComponentMapping 解析JP2调色板和直接通道映射，保留原始采样精度
-// 入参: data 容器数据, components 码流分量
-// 返回: []jpxMapping 输出通道映射, error 容器错误
-func jpxComponentMapping(data []byte, components []*j2kgo.Component) ([]jpxMapping, error) {
-	if len(data) >= 2 && data[0] == 255 && data[1] == 79 {
-		return nil, nil
-	}
-	var palette, channelMap []byte
-	err := walkJPXBoxes(data, func(name string, payload []byte) error {
-		if name != "jp2h" {
-			return nil
-		}
-		return walkJPXBoxes(payload, func(name string, payload []byte) error {
-			switch name {
-			case "pclr":
-				if palette != nil {
-					return fmt.Errorf("duplicate JPEG2000 palette")
-				}
-				palette = payload
-			case "cmap":
-				if channelMap != nil {
-					return fmt.Errorf("duplicate JPEG2000 component mapping")
-				}
-				channelMap = payload
-			}
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	if palette == nil && channelMap == nil {
-		return nil, nil
-	}
-	if len(channelMap) == 0 || len(channelMap)%4 != 0 {
-		return nil, fmt.Errorf("invalid JPEG2000 component mapping")
-	}
-	var columns [][]uint16
-	var depths []byte
-	if palette != nil {
-		if len(palette) < 3 {
-			return nil, fmt.Errorf("invalid JPEG2000 palette header")
-		}
-		entries, count := int(binary.BigEndian.Uint16(palette)), int(palette[2])
-		if entries == 0 || count == 0 || len(palette) < 3+count {
-			return nil, fmt.Errorf("invalid JPEG2000 palette dimensions")
-		}
-		depths = palette[3 : 3+count]
-		stride := 0
-		for _, depth := range depths {
-			bits := int(depth&127) + 1
-			if bits > 31 {
-				return nil, &UnsupportedError{Feature: "JPEG2000 palette precision"}
-			}
-			stride += (bits + 7) / 8
-		}
-		values := palette[3+count:]
-		if len(values) != entries*stride {
-			return nil, fmt.Errorf("invalid JPEG2000 palette data length")
-		}
-		columns = make([][]uint16, count)
-		for n := range columns {
-			columns[n] = make([]uint16, entries)
-		}
-		for row := 0; row < entries; row++ {
-			for n, depth := range depths {
-				bits := uint(depth&127) + 1
-				width := (bits + 7) / 8
-				v := uint64(0)
-				for _, b := range values[:width] {
-					v = v<<8 | uint64(b)
-				}
-				maximum := uint64(1)<<bits - 1
-				v &= maximum
-				if depth&128 != 0 {
-					v = (v + uint64(1)<<(bits-1)) & maximum
-				}
-				columns[n][row] = uint16((v*65535 + maximum/2) / maximum)
-				values = values[width:]
-			}
-		}
-	}
-	mapping := make([]jpxMapping, len(channelMap)/4)
-	for n := range mapping {
-		entry := channelMap[4*n:]
-		component, kind, column := int(binary.BigEndian.Uint16(entry)), entry[2], int(entry[3])
-		if component >= len(components) || kind > 1 || kind == 0 && column != 0 || kind == 1 && column >= len(columns) {
-			return nil, fmt.Errorf("invalid JPEG2000 mapped channel")
-		}
-		mapping[n] = jpxMapping{component: component, precision: int(components[component].Info().Precision)}
-		if kind == 1 {
-			mapping[n].palette = columns[column]
-			mapping[n].precision = int(depths[column]&127) + 1
-		}
-	}
-	return mapping, nil
-}
-
-// jpxChannels 解析颜色排序及全通道软遮罩，未指定软遮罩时忽略透明度
-// 入参: data 容器数据, planes 分量数, colors 颜色数, masked 是否使用软遮罩
-// 返回: []int 颜色平面, int 透明平面, error 通道错误
-func jpxChannels(data []byte, planes, colors int, masked bool) ([]int, int, error) {
-	channels := make([]int, colors)
-	for c := range channels {
-		channels[c] = c
-	}
-	alpha, defined := -1, false
-	coverage := make([]bool, colors)
-	if len(data) >= 2 && data[0] == 0xff && data[1] == 0x4f {
-		if planes == colors+1 {
-			alpha = colors
-		}
-	} else {
-		err := walkJPXBoxes(data, func(name string, payload []byte) error {
-			if name != "jp2h" {
-				return nil
-			}
-			return walkJPXBoxes(payload, func(name string, payload []byte) error {
-				if name != "cdef" {
-					return nil
-				}
-				defined = true
-				if len(payload) < 2 || len(payload) != 2+6*int(binary.BigEndian.Uint16(payload)) {
-					return fmt.Errorf("invalid JPEG2000 channel definition")
-				}
-				for c := range channels {
-					channels[c] = -1
-				}
-				for entry := payload[2:]; len(entry) > 0; entry = entry[6:] {
-					channel, kind, association := int(binary.BigEndian.Uint16(entry)), binary.BigEndian.Uint16(entry[2:]), int(binary.BigEndian.Uint16(entry[4:]))
-					if channel >= planes {
-						return fmt.Errorf("invalid JPEG2000 channel index")
-					}
-					switch kind {
-					case 0:
-						if association < 1 || association > colors || channels[association-1] != -1 {
-							return fmt.Errorf("invalid JPEG2000 color association")
-						}
-						channels[association-1] = channel
-					case 1, 2:
-						if masked && alpha != -1 && alpha != channel {
-							return fmt.Errorf("JPEG2000 soft mask requires one opacity channel")
-						}
-						alpha = channel
-						if association == 0 {
-							for c := range coverage {
-								coverage[c] = true
-							}
-						} else if association <= colors {
-							coverage[association-1] = true
-						} else {
-							return fmt.Errorf("invalid JPEG2000 opacity association")
-						}
-					case 65535:
-					default:
-						return fmt.Errorf("invalid JPEG2000 channel type")
-					}
-				}
-				return nil
-			})
-		})
-		if err != nil {
-			return nil, -1, err
-		}
-	}
-	if !defined && planes == colors+1 {
-		alpha = colors
-		for c := range coverage {
-			coverage[c] = true
-		}
-	}
-	for _, c := range channels {
-		if c < 0 || c >= planes || masked && c == alpha {
-			return nil, -1, fmt.Errorf("JPEG2000 color channels differ from color space")
-		}
-	}
-	if masked && alpha < 0 {
-		return nil, -1, fmt.Errorf("missing JPEG2000 opacity channel")
-	}
-	if masked {
-		for _, covered := range coverage {
-			if !covered {
-				return nil, -1, fmt.Errorf("JPEG2000 soft mask must cover all color channels")
-			}
-		}
-	}
-	if !masked {
-		alpha = -1
-	}
-	return channels, alpha, nil
-}
-
-// jpxCodestream 读取单码流容器，颜色空间由PDF字典确定
-// 入参: data JPEG2000编码数据
-// 返回: []byte 原始码流, error 容器错误
-func jpxCodestream(data []byte) ([]byte, error) {
-	if len(data) >= 2 && data[0] == 0xff && data[1] == 0x4f {
-		return data, nil
-	}
-	if len(data) < 12 || !bytes.Equal(data[:12], []byte{0, 0, 0, 12, 'j', 'P', ' ', ' ', 13, 10, 135, 10}) {
-		return nil, fmt.Errorf("invalid JPEG2000 container signature")
-	}
-	var stream []byte
-	err := walkJPXBoxes(data, func(name string, payload []byte) error {
-		switch name {
-		case "jp2c":
-			if stream != nil {
-				return &UnsupportedError{Feature: "multiple JPEG2000 codestreams"}
-			}
-			stream = payload
-		case "jp2h":
-			return walkJPXBoxes(payload, func(name string, payload []byte) error {
-				switch name {
-				case "cdef":
-					if len(payload) < 2 {
-						return fmt.Errorf("invalid JPEG2000 channel definition")
-					}
-					n := int(binary.BigEndian.Uint16(payload))
-					if len(payload) != 2+6*n {
-						return fmt.Errorf("invalid JPEG2000 channel definition")
-					}
-				}
-				return nil
-			})
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(stream) == 0 {
-		return nil, fmt.Errorf("missing JPEG2000 codestream")
-	}
-	return stream, nil
-}
-
-// walkJPXBoxes 访问单层JPEG2000数据盒，支持扩展长度和末尾数据盒
-// 入参: data 数据盒序列, visit 数据盒访问函数
-// 返回: error 边界或访问错误
-func walkJPXBoxes(data []byte, visit func(string, []byte) error) error {
-	for len(data) > 0 {
-		if len(data) < 8 {
-			return fmt.Errorf("truncated JPEG2000 box")
-		}
-		length, header := uint64(binary.BigEndian.Uint32(data)), uint64(8)
-		if length == 1 {
-			if len(data) < 16 {
-				return fmt.Errorf("truncated JPEG2000 box length")
-			}
-			length, header = binary.BigEndian.Uint64(data[8:]), 16
-		} else if length == 0 {
-			length = uint64(len(data))
-		}
-		if length < header || length > uint64(len(data)) {
-			return fmt.Errorf("invalid JPEG2000 box length")
-		}
-		if err := visit(string(data[4:8]), data[header:length]); err != nil {
-			return err
-		}
-		data = data[length:]
-	}
-	return nil
 }

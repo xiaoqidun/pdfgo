@@ -47,11 +47,12 @@ var flateReaderPool sync.Pool
 // emptyZlibStream 保存空数据的合法zlib流，用于在归还解码器时解除原输入引用
 var emptyZlibStream = []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}
 
-// Stream 保存流字典及未经解码的数据
+// Stream 保存流字典、未经解码的数据及间接对象引用
 // 阅读器返回的流解码需与所属Reader串行调用，并保持数据源可读
 type Stream struct {
 	Dictionary Dictionary
 	Data       []byte
+	Reference  Reference
 	reader     *Reader
 	decrypted  bool
 	compressed bool
@@ -61,132 +62,6 @@ type Stream struct {
 type contextInput struct {
 	ctx    context.Context
 	reader io.Reader
-}
-
-// Decode 解码通用流过滤器，图像专用过滤器由图像接口处理
-// 阅读器返回的流按需解析参数引用，手工构造的流需提供直接参数
-// 返回: []byte 解码数据, error 错误信息
-func (s *Stream) Decode() ([]byte, error) {
-	return s.DecodeContext(context.Background())
-}
-
-// DecodeContext 解码通用流过滤器，在读取及样本处理间检查取消
-// 阅读器返回的流需与所属Reader串行调用，并保持数据源可读
-// 入参: ctx 取消上下文
-// 返回: []byte 独立解码数据, error 解码或取消错误
-func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
-	var warning func(Diagnostic)
-	if s.reader != nil {
-		warning = s.reader.warning
-	}
-	return s.decodeContext(ctx, warning)
-}
-
-// decodeContext 按调用方诊断策略解码流，图像使用自身的宽容读取配置
-// 入参: ctx 取消上下文, warning 恢复诊断，空值表示严格解码
-// 返回: []byte 独立解码数据, error 解码或取消错误
-func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([]byte, error) {
-	return s.decodeContextLimit(ctx, warning, 0)
-}
-
-// decodeContextLimit 为对象流索引重建限制原始及解码数据，仅允许无预测的Flate过滤器
-// 入参: ctx 取消上下文, warning 恢复诊断, limit 数据上限，零值沿用通用解码
-// 返回: []byte 独立解码数据, error 解码、超限或取消错误
-func (s *Stream) decodeContextLimit(ctx context.Context, warning func(Diagnostic), limit int64) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	filters, params, err := s.filterChain(s.reader)
-	if err != nil {
-		return nil, err
-	}
-	data := s.Data
-	if limit > 0 && int64(len(data)) > limit {
-		return nil, fmt.Errorf("stream recovery decode limit exceeded")
-	}
-	for i, filter := range filters {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		name := filter.(Name)
-		dict, _ := params[i].(Dictionary)
-		if limit > 0 {
-			predictor, err := integerDefault(dict, "Predictor", 1)
-			if name != "FlateDecode" || err != nil || predictor != 1 {
-				return nil, fmt.Errorf("unsupported bounded object stream filter")
-			}
-		}
-		var err error
-		switch name {
-		case "Crypt":
-			if i != 0 || dict["Name"] != nil && dict["Name"] != Name("Identity") {
-				return nil, &UnsupportedError{Feature: "stream crypt filter"}
-			}
-		case "FlateDecode":
-			encoded := data
-			var reader io.ReadCloser
-			reader, err = acquireZlibReader(bytes.NewReader(data))
-			if err == nil {
-				var input io.Reader = &contextInput{ctx: ctx, reader: reader}
-				if limit > 0 {
-					input = io.LimitReader(input, limit+1)
-				}
-				data, err = readAllEstimated(input, estimateFlateCapacity(s.Dictionary, len(encoded), limit))
-				closeErr := reader.Close()
-				releaseZlibReader(reader)
-				if limit > 0 && int64(len(data)) > limit {
-					return nil, fmt.Errorf("stream recovery decode limit exceeded")
-				}
-				if err == nil {
-					err = closeErr
-				}
-				if warning != nil && ctx.Err() == nil && (errors.Is(err, zlib.ErrChecksum) || err == io.ErrUnexpectedEOF && completeFlatePayload(ctx, encoded, data)) {
-					message := "Flate checksum truncated; complete compressed data retained"
-					if errors.Is(err, zlib.ErrChecksum) {
-						message = "Flate checksum mismatch; complete compressed data retained"
-					}
-					warning(Diagnostic{Message: message})
-					err = nil
-				}
-			}
-		case "LZWDecode":
-			var early int64
-			early, err = integerDefault(dict, "EarlyChange", 1)
-			if err == nil {
-				data, _, err = decodeLZWBytesContext(ctx, data, early)
-			}
-		case "ASCIIHexDecode":
-			data, err = decodeASCIIHexContext(ctx, data, warning)
-		case "ASCII85Decode":
-			data, err = decodeASCII85Context(ctx, data)
-		case "RunLengthDecode":
-			data, err = decodeRunLength(ctx, data)
-		default:
-			return nil, &UnsupportedError{Feature: "stream filter " + string(name)}
-		}
-		if canceled := ctx.Err(); canceled != nil {
-			return nil, canceled
-		}
-		if err != nil {
-			return nil, err
-		}
-		if name == "FlateDecode" || name == "LZWDecode" {
-			data, err = restorePredictorContext(ctx, data, dict)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if len(filters) == 0 || len(filters) == 1 && filters[0] == Name("Crypt") {
-		data = bytes.Clone(data)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return data, nil
 }
 
 // completeFlatePayload 验证完整压缩块及截断校验尾部，不恢复截断压缩数据
@@ -211,9 +86,6 @@ func completeFlatePayload(ctx context.Context, encoded, decoded []byte) bool {
 	}
 	return bytes.Equal(encoded[len(encoded)-source.Len():], expected[:source.Len()])
 }
-
-// pdfObject 将流标记为PDF对象
-func (*Stream) pdfObject() {}
 
 // decodeASCIIHexContext 按校验后的长度解码十六进制流，补齐末尾半字节
 // 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
@@ -290,104 +162,6 @@ func asciiHexSize(ctx context.Context, data []byte, warning func(Diagnostic)) (i
 		return len(data), digits/2 + digits%2, ctx.Err()
 	}
 	return 0, 0, fmt.Errorf("missing ASCIIHex terminator")
-}
-
-// filterChain 解析过滤器及解码参数的间接引用，不修改源字典
-// 入参: reader 关联阅读器，nil表示不解析间接引用
-// 返回: Array 过滤器, Array 对应参数, error 错误信息
-func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
-	resolve := func(value Object) (Object, error) {
-		if reader != nil {
-			return reader.Resolve(value)
-		}
-		return value, nil
-	}
-	filter, err := resolve(s.Dictionary["Filter"])
-	if err != nil {
-		return nil, nil, err
-	}
-	if filter == nil {
-		return nil, nil, nil
-	}
-	parameters, err := resolve(s.Dictionary["DecodeParms"])
-	if err != nil {
-		return nil, nil, err
-	}
-	var filters Array
-	switch v := filter.(type) {
-	case nil:
-	case Name:
-		filters = Array{v}
-	case Array:
-		filters = append(Array(nil), v...)
-	default:
-		return nil, nil, fmt.Errorf("invalid stream filter")
-	}
-	params := make(Array, len(filters))
-	switch v := parameters.(type) {
-	case nil:
-	case Dictionary:
-		if len(filters) != 1 {
-			return nil, nil, fmt.Errorf("invalid filter parameters")
-		}
-		params[0] = v
-	case Array:
-		if len(v) != len(filters) {
-			if reader == nil || reader.warning == nil {
-				return nil, nil, fmt.Errorf("filter parameter count mismatch")
-			}
-			reader.warning(Diagnostic{Message: "filter parameter count mismatch; positional parameters and missing defaults retained"})
-		}
-		copy(params, v)
-	default:
-		return nil, nil, fmt.Errorf("invalid filter parameters")
-	}
-	for i, filter := range filters {
-		filters[i], err = resolve(filter)
-		if err != nil {
-			return nil, nil, err
-		}
-		if _, ok := filters[i].(Name); !ok {
-			return nil, nil, fmt.Errorf("filter is not a name")
-		}
-		if reader != nil && reader.warning != nil {
-			if name, ok := streamFilterAliases[filters[i].(Name)]; ok {
-				reader.warning(Diagnostic{Message: "abbreviated stream filter expanded: " + string(filters[i].(Name))})
-				filters[i] = name
-			}
-			for _, name := range []Name{"FlateDecode", "LZWDecode", "ASCIIHexDecode", "ASCII85Decode", "RunLengthDecode", "CCITTFaxDecode", "DCTDecode", "JPXDecode", "JBIG2Decode", "Crypt"} {
-				if filters[i] != name && strings.EqualFold(string(filters[i].(Name)), string(name)) {
-					reader.warning(Diagnostic{Message: "stream filter name case normalized: " + string(filters[i].(Name))})
-					filters[i] = name
-					break
-				}
-			}
-		}
-		params[i], err = resolve(params[i])
-		if err != nil {
-			return nil, nil, err
-		}
-		if params[i] != nil {
-			dict, ok := params[i].(Dictionary)
-			if !ok {
-				return nil, nil, fmt.Errorf("invalid decode parameters")
-			}
-			if reader != nil {
-				resolved := make(Dictionary, len(dict))
-				for key, value := range dict {
-					resolved[key], err = resolve(value)
-					if err != nil {
-						return nil, nil, err
-					}
-				}
-				params[i] = resolved
-			}
-		}
-	}
-	if s.decrypted && len(filters) > 0 && filters[0] == Name("Crypt") {
-		return filters[1:], params[1:], nil
-	}
-	return filters, params, nil
 }
 
 // decodeLZWBytes 解码LZW并返回结束码占用的字节数，供内联图像界定数据边界
@@ -830,16 +604,6 @@ func restorePredictorContext(ctx context.Context, data []byte, params Dictionary
 	return out, ctx.Err()
 }
 
-// Read 检查取消状态后读取数据
-// 入参: p 数据缓冲区
-// 返回: int 已读字节数, error 读取错误
-func (r *contextInput) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.reader.Read(p)
-}
-
 // packedSample 读取按高位优先排列的图像分量
 // 入参: data 行数据, index 分量索引, depth 分量位深
 // 返回: uint16 分量值
@@ -937,4 +701,241 @@ func readAllEstimated(input io.Reader, hint int) ([]byte, error) {
 	}
 	_, err := buf.ReadFrom(input)
 	return buf.Bytes(), err
+}
+
+// Decode 解码通用流过滤器，图像专用过滤器由图像接口处理
+// 阅读器返回的流按需解析参数引用，手工构造的流需提供直接参数
+// 返回: []byte 解码数据, error 错误信息
+func (s *Stream) Decode() ([]byte, error) {
+	return s.DecodeContext(context.Background())
+}
+
+// DecodeContext 解码通用流过滤器，在读取及样本处理间检查取消
+// 阅读器返回的流需与所属Reader串行调用，并保持数据源可读
+// 入参: ctx 取消上下文
+// 返回: []byte 独立解码数据, error 解码或取消错误
+func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
+	var warning func(Diagnostic)
+	if s.reader != nil {
+		warning = s.reader.warning
+	}
+	return s.decodeContext(ctx, warning)
+}
+
+// decodeContext 按调用方诊断策略解码流，图像使用自身的宽容读取配置
+// 入参: ctx 取消上下文, warning 恢复诊断，空值表示严格解码
+// 返回: []byte 独立解码数据, error 解码或取消错误
+func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([]byte, error) {
+	return s.decodeContextLimit(ctx, warning, 0)
+}
+
+// decodeContextLimit 为对象流索引重建限制原始及解码数据，仅允许无预测的Flate过滤器
+// 入参: ctx 取消上下文, warning 恢复诊断, limit 数据上限，零值沿用通用解码
+// 返回: []byte 独立解码数据, error 解码、超限或取消错误
+func (s *Stream) decodeContextLimit(ctx context.Context, warning func(Diagnostic), limit int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	filters, params, err := s.filterChain(s.reader)
+	if err != nil {
+		return nil, err
+	}
+	data := s.Data
+	if limit > 0 && int64(len(data)) > limit {
+		return nil, fmt.Errorf("stream recovery decode limit exceeded")
+	}
+	for i, filter := range filters {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		name := filter.(Name)
+		dict, _ := params[i].(Dictionary)
+		if limit > 0 {
+			predictor, err := integerDefault(dict, "Predictor", 1)
+			if name != "FlateDecode" || err != nil || predictor != 1 {
+				return nil, fmt.Errorf("unsupported bounded object stream filter")
+			}
+		}
+		var err error
+		switch name {
+		case "Crypt":
+			if i != 0 || dict["Name"] != nil && dict["Name"] != Name("Identity") {
+				return nil, &UnsupportedError{Feature: "stream crypt filter"}
+			}
+		case "FlateDecode":
+			encoded := data
+			var reader io.ReadCloser
+			reader, err = acquireZlibReader(bytes.NewReader(data))
+			if err == nil {
+				var input io.Reader = &contextInput{ctx: ctx, reader: reader}
+				if limit > 0 {
+					input = io.LimitReader(input, limit+1)
+				}
+				data, err = readAllEstimated(input, estimateFlateCapacity(s.Dictionary, len(encoded), limit))
+				closeErr := reader.Close()
+				releaseZlibReader(reader)
+				if limit > 0 && int64(len(data)) > limit {
+					return nil, fmt.Errorf("stream recovery decode limit exceeded")
+				}
+				if err == nil {
+					err = closeErr
+				}
+				if warning != nil && ctx.Err() == nil && (errors.Is(err, zlib.ErrChecksum) || err == io.ErrUnexpectedEOF && completeFlatePayload(ctx, encoded, data)) {
+					message := "Flate checksum truncated; complete compressed data retained"
+					if errors.Is(err, zlib.ErrChecksum) {
+						message = "Flate checksum mismatch; complete compressed data retained"
+					}
+					warning(Diagnostic{Message: message})
+					err = nil
+				}
+			}
+		case "LZWDecode":
+			var early int64
+			early, err = integerDefault(dict, "EarlyChange", 1)
+			if err == nil {
+				data, _, err = decodeLZWBytesContext(ctx, data, early)
+			}
+		case "ASCIIHexDecode":
+			data, err = decodeASCIIHexContext(ctx, data, warning)
+		case "ASCII85Decode":
+			data, err = decodeASCII85Context(ctx, data)
+		case "RunLengthDecode":
+			data, err = decodeRunLength(ctx, data)
+		default:
+			return nil, &UnsupportedError{Feature: "stream filter " + string(name)}
+		}
+		if canceled := ctx.Err(); canceled != nil {
+			return nil, canceled
+		}
+		if err != nil {
+			return nil, err
+		}
+		if name == "FlateDecode" || name == "LZWDecode" {
+			data, err = restorePredictorContext(ctx, data, dict)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(filters) == 0 || len(filters) == 1 && filters[0] == Name("Crypt") {
+		data = bytes.Clone(data)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// pdfObject 将流标记为PDF对象
+func (*Stream) pdfObject() {}
+
+// filterChain 解析过滤器及解码参数的间接引用，不修改源字典
+// 入参: reader 关联阅读器，nil表示不解析间接引用
+// 返回: Array 过滤器, Array 对应参数, error 错误信息
+func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
+	resolve := func(value Object) (Object, error) {
+		if reader != nil {
+			return reader.Resolve(value)
+		}
+		return value, nil
+	}
+	filter, err := resolve(s.Dictionary["Filter"])
+	if err != nil {
+		return nil, nil, err
+	}
+	if filter == nil {
+		return nil, nil, nil
+	}
+	parameters, err := resolve(s.Dictionary["DecodeParms"])
+	if err != nil {
+		return nil, nil, err
+	}
+	var filters Array
+	switch v := filter.(type) {
+	case nil:
+	case Name:
+		filters = Array{v}
+	case Array:
+		filters = append(Array(nil), v...)
+	default:
+		return nil, nil, fmt.Errorf("invalid stream filter")
+	}
+	params := make(Array, len(filters))
+	switch v := parameters.(type) {
+	case nil:
+	case Dictionary:
+		if len(filters) != 1 {
+			return nil, nil, fmt.Errorf("invalid filter parameters")
+		}
+		params[0] = v
+	case Array:
+		if len(v) != len(filters) {
+			if reader == nil || reader.warning == nil {
+				return nil, nil, fmt.Errorf("filter parameter count mismatch")
+			}
+			reader.warning(Diagnostic{Message: "filter parameter count mismatch; positional parameters and missing defaults retained"})
+		}
+		copy(params, v)
+	default:
+		return nil, nil, fmt.Errorf("invalid filter parameters")
+	}
+	for i, filter := range filters {
+		filters[i], err = resolve(filter)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, ok := filters[i].(Name); !ok {
+			return nil, nil, fmt.Errorf("filter is not a name")
+		}
+		if reader != nil && reader.warning != nil {
+			if name, ok := streamFilterAliases[filters[i].(Name)]; ok {
+				reader.warning(Diagnostic{Message: "abbreviated stream filter expanded: " + string(filters[i].(Name))})
+				filters[i] = name
+			}
+			for _, name := range []Name{"FlateDecode", "LZWDecode", "ASCIIHexDecode", "ASCII85Decode", "RunLengthDecode", "CCITTFaxDecode", "DCTDecode", "JPXDecode", "JBIG2Decode", "Crypt"} {
+				if filters[i] != name && strings.EqualFold(string(filters[i].(Name)), string(name)) {
+					reader.warning(Diagnostic{Message: "stream filter name case normalized: " + string(filters[i].(Name))})
+					filters[i] = name
+					break
+				}
+			}
+		}
+		params[i], err = resolve(params[i])
+		if err != nil {
+			return nil, nil, err
+		}
+		if params[i] != nil {
+			dict, ok := params[i].(Dictionary)
+			if !ok {
+				return nil, nil, fmt.Errorf("invalid decode parameters")
+			}
+			if reader != nil {
+				resolved := make(Dictionary, len(dict))
+				for key, value := range dict {
+					resolved[key], err = resolve(value)
+					if err != nil {
+						return nil, nil, err
+					}
+				}
+				params[i] = resolved
+			}
+		}
+	}
+	if s.decrypted && len(filters) > 0 && filters[0] == Name("Crypt") {
+		return filters[1:], params[1:], nil
+	}
+	return filters, params, nil
+}
+
+// Read 检查取消状态后读取数据
+// 入参: p 数据缓冲区
+// 返回: int 已读字节数, error 读取错误
+func (r *contextInput) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }

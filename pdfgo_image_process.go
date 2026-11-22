@@ -126,3 +126,33 @@ func (p *ImageProcess) ValuesAt(x, y int) ([4]float64, float64) {
 	channels := i.Space.Components() + 1
 	return values, float64(i.Pix[offset*channels+channels-1]) / 65535
 }
+
+// Opaque 检查原生过程色图像透明度，不执行逐像素色域变换
+// 返回: bool 是否完全不透明
+func (p *ImageProcess) Opaque() bool {
+	if p == nil || p.source == nil || p.process == nil {
+		return false
+	}
+	i := p.source
+	if i.Rect.Empty() {
+		return true
+	}
+	if i.ColorantAlpha != nil {
+		for _, alpha := range i.ColorantAlpha {
+			if alpha != 65535 {
+				return false
+			}
+		}
+		return true
+	}
+	if i.processOnly {
+		return true
+	}
+	channels := i.Space.Components() + 1
+	for offset := channels - 1; offset < len(i.Pix); offset += channels {
+		if i.Pix[offset] != 65535 {
+			return false
+		}
+	}
+	return true
+}
