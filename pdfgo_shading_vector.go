@@ -27,6 +27,44 @@ type gradientVector struct {
 	parts     []*gradientFunction
 }
 
+// projectedTintStops 提取单个输出分量的精确断点，不缩减函数输出数量
+// 入参: f 着色函数, channel 输出分量
+// 返回: []GradientStop 定义域中的线性分段
+func projectedTintStops(f *tintFunction, channel int) []GradientStop {
+	positions := []float64{f.domain[0], f.domain[1]}
+	if f.sampled && f.encoded[0] != f.encoded[1] {
+		for i := 0; i < f.size; i++ {
+			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
+			if x > f.domain[0] && x < f.domain[1] {
+				positions = append(positions, x)
+			}
+		}
+	}
+	slices.Sort(positions)
+	raw := *f
+	raw.values = slices.Clone(f.values)
+	raw.outputRange = nil
+	if f.sampled {
+		for c := 0; c < f.channels; c++ {
+			raw.values[2*c], raw.values[2*c+1] = math.Inf(-1), math.Inf(1)
+		}
+	}
+	values := make([]float64, f.channels)
+	var stops []GradientStop
+	for _, x := range slices.Compact(positions) {
+		raw.colorInto(x, values)
+		stops = append(stops, GradientStop{Position: functionPosition(x, f.domain[0], f.domain[1]), Values: [4]float64{values[channel]}})
+	}
+	limits := f.outputRange
+	if f.sampled {
+		limits = f.values
+	}
+	if limits != nil {
+		stops = clipGradientValues(stops, limits[2*channel:2*channel+2])
+	}
+	return stops
+}
+
 // readGradientVector 解析多分量采样、指数、拼接及计算器函数
 // 入参: object 函数对象, channels 输出数量, depth 嵌套深度
 // 返回: *gradientVector 分量函数, error 格式或求值错误
@@ -258,44 +296,6 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 		}
 	}
 	return f, nil
-}
-
-// projectedTintStops 提取单个输出分量的精确断点，不缩减函数输出数量
-// 入参: f 着色函数, channel 输出分量
-// 返回: []GradientStop 定义域中的线性分段
-func projectedTintStops(f *tintFunction, channel int) []GradientStop {
-	positions := []float64{f.domain[0], f.domain[1]}
-	if f.sampled && f.encoded[0] != f.encoded[1] {
-		for i := 0; i < f.size; i++ {
-			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
-			if x > f.domain[0] && x < f.domain[1] {
-				positions = append(positions, x)
-			}
-		}
-	}
-	slices.Sort(positions)
-	raw := *f
-	raw.values = slices.Clone(f.values)
-	raw.outputRange = nil
-	if f.sampled {
-		for c := 0; c < f.channels; c++ {
-			raw.values[2*c], raw.values[2*c+1] = math.Inf(-1), math.Inf(1)
-		}
-	}
-	values := make([]float64, f.channels)
-	var stops []GradientStop
-	for _, x := range slices.Compact(positions) {
-		raw.colorInto(x, values)
-		stops = append(stops, GradientStop{Position: functionPosition(x, f.domain[0], f.domain[1]), Values: [4]float64{values[channel]}})
-	}
-	limits := f.outputRange
-	if f.sampled {
-		limits = f.values
-	}
-	if limits != nil {
-		stops = clipGradientValues(stops, limits[2*channel:2*channel+2])
-	}
-	return stops
 }
 
 // deviceNWideGradient 组合多分量渐变与备用空间映射，保留精确分段

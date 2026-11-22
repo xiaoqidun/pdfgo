@@ -23,6 +23,44 @@ import (
 	"maps"
 )
 
+// compactGrayPixels 将八位灰度精确打包为一、二或四位样本，不改变归一化值
+// 入参: ctx 取消上下文, pixels 已校验的灰度样本, width 宽度, height 高度
+// 返回: []byte 打包结果，不能降位深时为空, int 位深, error 取消错误
+func compactGrayPixels(ctx context.Context, pixels []byte, width, height int) ([]byte, int, error) {
+	step := byte(255)
+	bits := 1
+	for i, value := range pixels {
+		if i&65535 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+		}
+		if value%step == 0 {
+			continue
+		}
+		if step == 255 && value%85 == 0 {
+			step, bits = 85, 2
+		} else if value%17 == 0 {
+			step, bits = 17, 4
+		} else {
+			return nil, 8, ctx.Err()
+		}
+	}
+	row := (width*bits + 7) / 8
+	packed := make([]byte, row*height)
+	for y := range height {
+		for x := range width {
+			if x&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, 0, err
+				}
+			}
+			packed[y*row+x*bits/8] |= (pixels[y*width+x] / step) << uint(8-bits-x*bits%8)
+		}
+	}
+	return packed, bits, ctx.Err()
+}
+
 // encodeLosslessPixels 编码降采样后的线稿，避免JPEG引入边缘振铃
 // 入参: ctx 取消上下文, source 原始流, img 图片, channels 通道数
 // 返回: *Stream 输出流, error 编码错误
@@ -252,42 +290,4 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		}
 	}
 	return best, ctx.Err()
-}
-
-// compactGrayPixels 将八位灰度精确打包为一、二或四位样本，不改变归一化值
-// 入参: ctx 取消上下文, pixels 已校验的灰度样本, width 宽度, height 高度
-// 返回: []byte 打包结果，不能降位深时为空, int 位深, error 取消错误
-func compactGrayPixels(ctx context.Context, pixels []byte, width, height int) ([]byte, int, error) {
-	step := byte(255)
-	bits := 1
-	for i, value := range pixels {
-		if i&65535 == 0 {
-			if err := ctx.Err(); err != nil {
-				return nil, 0, err
-			}
-		}
-		if value%step == 0 {
-			continue
-		}
-		if step == 255 && value%85 == 0 {
-			step, bits = 85, 2
-		} else if value%17 == 0 {
-			step, bits = 17, 4
-		} else {
-			return nil, 8, ctx.Err()
-		}
-	}
-	row := (width*bits + 7) / 8
-	packed := make([]byte, row*height)
-	for y := range height {
-		for x := range width {
-			if x&4095 == 0 {
-				if err := ctx.Err(); err != nil {
-					return nil, 0, err
-				}
-			}
-			packed[y*row+x*bits/8] |= (pixels[y*width+x] / step) << uint(8-bits-x*bits%8)
-		}
-	}
-	return packed, bits, ctx.Err()
 }

@@ -54,6 +54,14 @@ type meshBits struct {
 	pos  int
 }
 
+// meshBernstein 计算三次伯恩斯坦基函数
+// 入参: t 参数
+// 返回: [4]float64 基函数值
+func meshBernstein(t float64) [4]float64 {
+	s := 1 - t
+	return [4]float64{s * s * s, 3 * t * s * s, 3 * t * t * s, t * t * t}
+}
+
 // UsesFunction 判断颜色分量是否需在插值后经过函数变换
 // 返回: bool 是否使用颜色函数
 func (g *MeshGradient) UsesFunction() bool {
@@ -204,14 +212,6 @@ func (g *MeshGradient) functionValues(x float64) ([4]float64, error) {
 // 返回: [4]float64 备用空间分量, error 颜色错误
 func (g *MeshGradient) colorValues(input []float64) ([4]float64, error) {
 	return shadingColorValues(g.Space, g.tint, g.lab, input)
-}
-
-// meshBernstein 计算三次伯恩斯坦基函数
-// 入参: t 参数
-// 返回: [4]float64 基函数值
-func meshBernstein(t float64) [4]float64 {
-	s := 1 - t
-	return [4]float64{s * s * s, 3 * t * s * s, 3 * t * t * s, t * t * t}
 }
 
 // read 读取指定位数的无符号整数

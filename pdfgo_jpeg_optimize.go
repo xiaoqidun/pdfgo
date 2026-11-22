@@ -68,6 +68,9 @@ type jpegScan struct {
 // 入参: ctx 取消上下文, data JPEG原始数据
 // 返回: []byte 优化数据, error 编码错误
 func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid JPEG context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -283,6 +286,134 @@ func readJPEGScan(ctx context.Context, data []byte) (*jpegScan, error) {
 	return nil, fmt.Errorf("missing JPEG scan")
 }
 
+// jpegScanTail 校验最后扫描至结束标记之间的表、应用及注释片段，不丢弃原字节
+// 入参: ctx 取消上下文, data JPEG编码, pos 扫描后偏移
+// 返回: error 片段或取消错误
+func jpegScanTail(ctx context.Context, data []byte, pos int) error {
+	for pos < len(data) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if data[pos] != 255 {
+			return fmt.Errorf("invalid JPEG scan tail")
+		}
+		for pos < len(data) && data[pos] == 255 {
+			if pos&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			pos++
+		}
+		if pos == len(data) {
+			break
+		}
+		marker := data[pos]
+		pos++
+		if marker == 0xd9 {
+			return ctx.Err()
+		}
+		if marker == 1 {
+			continue
+		}
+		if !(marker >= 0xe0 && marker <= 0xef || marker == 0xfe || marker == 0xc4 || marker == 0xcc || marker == 0xdb || marker == 0xdd) {
+			return fmt.Errorf("invalid JPEG scan tail marker")
+		}
+		if pos+2 > len(data) {
+			break
+		}
+		size := int(binary.BigEndian.Uint16(data[pos:]))
+		if size < 2 || size > len(data)-pos {
+			return fmt.Errorf("invalid JPEG scan tail length")
+		}
+		pos += size
+	}
+	return fmt.Errorf("missing JPEG end marker")
+}
+
+// optimalJPEGHuffman 限制码长至16位并预留全1填充码
+// 入参: frequency 符号频数
+// 返回: jpegHuffman 优化码表
+func optimalJPEGHuffman(frequency [256]uint64) jpegHuffman {
+	var weights [513]uint64
+	var parents [513]int
+	var active []int
+	var symbols []int
+	for i, count := range frequency {
+		if count > 0 {
+			weights[i] = count
+			active = append(active, i)
+			symbols = append(symbols, i)
+		}
+	}
+	if len(symbols) == 0 {
+		return jpegHuffman{}
+	}
+	weights[256] = 1
+	active = append(active, 256)
+	next := 257
+	for len(active) > 1 {
+		slices.SortFunc(active, func(a, b int) int {
+			if weights[a] < weights[b] {
+				return -1
+			}
+			if weights[a] > weights[b] {
+				return 1
+			}
+			return b - a
+		})
+		a, b := active[0], active[1]
+		weights[next], parents[a], parents[b] = weights[a]+weights[b], next, next
+		active = append(active[2:], next)
+		next++
+	}
+	var counts [257]int
+	for _, symbol := range append(slices.Clone(symbols), 256) {
+		depth := 0
+		for parents[symbol] != 0 {
+			depth++
+			symbol = parents[symbol]
+		}
+		counts[depth]++
+	}
+	for i := 256; i > 16; i-- {
+		for counts[i] > 0 {
+			j := i - 2
+			for counts[j] == 0 {
+				j--
+			}
+			counts[i] -= 2
+			counts[i-1]++
+			counts[j+1] += 2
+			counts[j]--
+		}
+	}
+	for i := 16; i > 0; i-- {
+		if counts[i] > 0 {
+			counts[i]--
+			break
+		}
+	}
+	slices.SortFunc(symbols, func(a, b int) int {
+		if frequency[a] > frequency[b] {
+			return -1
+		}
+		if frequency[a] < frequency[b] {
+			return 1
+		}
+		return a - b
+	})
+	h := jpegHuffman{}
+	for i := 1; i <= 16; i++ {
+		h.counts[i-1] = byte(counts[i])
+	}
+	for _, symbol := range symbols {
+		h.values = append(h.values, byte(symbol))
+	}
+	_ = h.prepare()
+	return h
+}
+
 // prepare 构造霍夫曼编解码索引
 // 返回: error 码表错误
 func (h *jpegHuffman) prepare() error {
@@ -447,134 +578,6 @@ func (s *jpegScan) walk(ctx context.Context, data []byte, visit func(int, byte, 
 		return 0, err
 	}
 	return r.pos, nil
-}
-
-// jpegScanTail 校验最后扫描至结束标记之间的表、应用及注释片段，不丢弃原字节
-// 入参: ctx 取消上下文, data JPEG编码, pos 扫描后偏移
-// 返回: error 片段或取消错误
-func jpegScanTail(ctx context.Context, data []byte, pos int) error {
-	for pos < len(data) {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if data[pos] != 255 {
-			return fmt.Errorf("invalid JPEG scan tail")
-		}
-		for pos < len(data) && data[pos] == 255 {
-			if pos&4095 == 0 {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-			}
-			pos++
-		}
-		if pos == len(data) {
-			break
-		}
-		marker := data[pos]
-		pos++
-		if marker == 0xd9 {
-			return ctx.Err()
-		}
-		if marker == 1 {
-			continue
-		}
-		if !(marker >= 0xe0 && marker <= 0xef || marker == 0xfe || marker == 0xc4 || marker == 0xcc || marker == 0xdb || marker == 0xdd) {
-			return fmt.Errorf("invalid JPEG scan tail marker")
-		}
-		if pos+2 > len(data) {
-			break
-		}
-		size := int(binary.BigEndian.Uint16(data[pos:]))
-		if size < 2 || size > len(data)-pos {
-			return fmt.Errorf("invalid JPEG scan tail length")
-		}
-		pos += size
-	}
-	return fmt.Errorf("missing JPEG end marker")
-}
-
-// optimalJPEGHuffman 限制码长至16位并预留全1填充码
-// 入参: frequency 符号频数
-// 返回: jpegHuffman 优化码表
-func optimalJPEGHuffman(frequency [256]uint64) jpegHuffman {
-	var weights [513]uint64
-	var parents [513]int
-	var active []int
-	var symbols []int
-	for i, count := range frequency {
-		if count > 0 {
-			weights[i] = count
-			active = append(active, i)
-			symbols = append(symbols, i)
-		}
-	}
-	if len(symbols) == 0 {
-		return jpegHuffman{}
-	}
-	weights[256] = 1
-	active = append(active, 256)
-	next := 257
-	for len(active) > 1 {
-		slices.SortFunc(active, func(a, b int) int {
-			if weights[a] < weights[b] {
-				return -1
-			}
-			if weights[a] > weights[b] {
-				return 1
-			}
-			return b - a
-		})
-		a, b := active[0], active[1]
-		weights[next], parents[a], parents[b] = weights[a]+weights[b], next, next
-		active = append(active[2:], next)
-		next++
-	}
-	var counts [257]int
-	for _, symbol := range append(slices.Clone(symbols), 256) {
-		depth := 0
-		for parents[symbol] != 0 {
-			depth++
-			symbol = parents[symbol]
-		}
-		counts[depth]++
-	}
-	for i := 256; i > 16; i-- {
-		for counts[i] > 0 {
-			j := i - 2
-			for counts[j] == 0 {
-				j--
-			}
-			counts[i] -= 2
-			counts[i-1]++
-			counts[j+1] += 2
-			counts[j]--
-		}
-	}
-	for i := 16; i > 0; i-- {
-		if counts[i] > 0 {
-			counts[i]--
-			break
-		}
-	}
-	slices.SortFunc(symbols, func(a, b int) int {
-		if frequency[a] > frequency[b] {
-			return -1
-		}
-		if frequency[a] < frequency[b] {
-			return 1
-		}
-		return a - b
-	})
-	h := jpegHuffman{}
-	for i := 1; i <= 16; i++ {
-		h.counts[i-1] = byte(counts[i])
-	}
-	for _, symbol := range symbols {
-		h.values = append(h.values, byte(symbol))
-	}
-	_ = h.prepare()
-	return h
 }
 
 // put 写入高位优先的编码位

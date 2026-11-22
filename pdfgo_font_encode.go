@@ -33,6 +33,78 @@ type fontEncodingNode struct {
 	entry    *fontEncodedGlyph
 }
 
+// encodeFontSequence 选择可完整覆盖原文的编码，不在连字匹配失败时丢弃字符
+// 入参: ctx 取消上下文, text 原文, lookup 单字符编码, sequences 多字符编码
+// 返回: []*fontEncodedGlyph 只读编码与字形, error 缺字或取消错误
+func encodeFontSequence(ctx context.Context, text string, lookup map[rune]fontEncodedGlyph, sequences map[string]fontEncodedGlyph) ([]*fontEncodedGlyph, error) {
+	singles := make(map[rune]*fontEncodedGlyph, len(lookup))
+	for ch, entry := range lookup {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		singles[ch] = &entry
+	}
+	root := fontEncodingNode{}
+	for value, entry := range sequences {
+		node := &root
+		for _, ch := range value {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if node.children == nil {
+				node.children = make(map[rune]*fontEncodingNode)
+			}
+			if node.children[ch] == nil {
+				node.children[ch] = &fontEncodingNode{}
+			}
+			node = node.children[ch]
+		}
+		node.entry = &entry
+	}
+	runes := []rune(text)
+	next := make([]int, len(runes))
+	entries := make([]*fontEncodedGlyph, len(runes))
+	for i := len(runes) - 1; i >= 0; i-- {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if i+1 == len(runes) || next[i+1] != 0 {
+			if entry, ok := singles[runes[i]]; ok {
+				entries[i], next[i] = entry, i+1
+				continue
+			}
+		}
+		node := &root
+		for j := i; j < len(runes); j++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			node = node.children[runes[j]]
+			if node == nil {
+				break
+			}
+			if node.entry != nil && (j+1 == len(runes) || next[j+1] != 0) {
+				entries[i], next[i] = node.entry, j+1
+			}
+		}
+	}
+	result := entries[:0]
+	for i := 0; i < len(runes); i = next[i] {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if next[i] == 0 {
+			return nil, &UnsupportedError{Feature: fmt.Sprintf("font cannot encode text at U+%04X", runes[i])}
+		}
+		result = append(result, entries[i])
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	clear(entries[len(result):])
+	return result, nil
+}
+
 // Encode 将Unicode文本编码为源字体字符码，不执行整形、换行或字体替换
 // 优先使用可完整编码的单字符序列；缺少映射或字形时返回错误，不返回部分结果
 // 入参: text Unicode文本
@@ -271,76 +343,4 @@ func (f *Font) encodingGlyph(ctx context.Context, code string) (Glyph, bool, err
 		return Glyph{}, false, nil
 	}
 	return glyphs[0], true, nil
-}
-
-// encodeFontSequence 选择可完整覆盖原文的编码，不在连字匹配失败时丢弃字符
-// 入参: ctx 取消上下文, text 原文, lookup 单字符编码, sequences 多字符编码
-// 返回: []*fontEncodedGlyph 只读编码与字形, error 缺字或取消错误
-func encodeFontSequence(ctx context.Context, text string, lookup map[rune]fontEncodedGlyph, sequences map[string]fontEncodedGlyph) ([]*fontEncodedGlyph, error) {
-	singles := make(map[rune]*fontEncodedGlyph, len(lookup))
-	for ch, entry := range lookup {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		singles[ch] = &entry
-	}
-	root := fontEncodingNode{}
-	for value, entry := range sequences {
-		node := &root
-		for _, ch := range value {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if node.children == nil {
-				node.children = make(map[rune]*fontEncodingNode)
-			}
-			if node.children[ch] == nil {
-				node.children[ch] = &fontEncodingNode{}
-			}
-			node = node.children[ch]
-		}
-		node.entry = &entry
-	}
-	runes := []rune(text)
-	next := make([]int, len(runes))
-	entries := make([]*fontEncodedGlyph, len(runes))
-	for i := len(runes) - 1; i >= 0; i-- {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if i+1 == len(runes) || next[i+1] != 0 {
-			if entry, ok := singles[runes[i]]; ok {
-				entries[i], next[i] = entry, i+1
-				continue
-			}
-		}
-		node := &root
-		for j := i; j < len(runes); j++ {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			node = node.children[runes[j]]
-			if node == nil {
-				break
-			}
-			if node.entry != nil && (j+1 == len(runes) || next[j+1] != 0) {
-				entries[i], next[i] = node.entry, j+1
-			}
-		}
-	}
-	result := entries[:0]
-	for i := 0; i < len(runes); i = next[i] {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if next[i] == 0 {
-			return nil, &UnsupportedError{Feature: fmt.Sprintf("font cannot encode text at U+%04X", runes[i])}
-		}
-		result = append(result, entries[i])
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	clear(entries[len(result):])
-	return result, nil
 }

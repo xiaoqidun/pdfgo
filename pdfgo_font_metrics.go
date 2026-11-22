@@ -63,72 +63,6 @@ type cffFontMetrics struct {
 	defaultWidth, nominalWidth float64
 }
 
-// set 覆盖指定范围，保留两端旧值并合并相邻同值范围
-// 入参: first 起始CID, last 结束CID, value 度量
-func (m *cidMetrics[T]) set(first, last uint32, value T) {
-	i := sort.Search(len(m.ranges), func(i int) bool { return m.ranges[i].last >= first })
-	j := sort.Search(len(m.ranges), func(i int) bool { return m.ranges[i].first > last })
-	var replacement [3]cidMetricRange[T]
-	n := 0
-	if i < j && m.ranges[i].first < first {
-		replacement[n] = m.ranges[i]
-		replacement[n].last = first - 1
-		n++
-	}
-	replacement[n] = cidMetricRange[T]{first: first, last: last, value: value}
-	n++
-	if i < j && m.ranges[j-1].last > last {
-		replacement[n] = m.ranges[j-1]
-		replacement[n].first = last + 1
-		n++
-	}
-	m.ranges = slices.Replace(m.ranges, i, j, replacement[:n]...)
-	for k := max(i-1, 0); k+1 < len(m.ranges) && k <= i+n; {
-		if m.ranges[k].last+1 == m.ranges[k+1].first && m.ranges[k].value == m.ranges[k+1].value {
-			m.ranges[k].last = m.ranges[k+1].last
-			m.ranges = slices.Delete(m.ranges, k+1, k+2)
-		} else {
-			k++
-		}
-	}
-}
-
-// get 查找CID的显式度量，未声明时交由字体使用默认值
-// 入参: cid 字符标识
-// 返回: T 度量, bool 是否存在
-func (m *cidMetrics[T]) get(cid uint32) (T, bool) {
-	i := sort.Search(len(m.ranges), func(i int) bool { return m.ranges[i].last >= cid })
-	if i < len(m.ranges) && m.ranges[i].first <= cid {
-		return m.ranges[i].value, true
-	}
-	var zero T
-	return zero, false
-}
-
-// load 在首次实际解码时读取度量资源，取消后允许重新读取
-// 入参: ctx 取消上下文
-// 返回: *type1FontMetrics Type1资源, *cffFontMetrics CFF资源, error 读取或取消错误
-func (m *fontProgramMetrics) load(ctx context.Context) (*type1FontMetrics, *cffFontMetrics, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	if m.type1Metrics == nil && m.cffMetrics == nil {
-		var err error
-		if m.type1 {
-			m.type1Metrics, err = readType1FontMetrics(ctx, m.program)
-		} else {
-			m.cffMetrics, err = readCFFFontMetrics(ctx, m.program)
-		}
-		if err != nil {
-			m.type1Metrics, m.cffMetrics = nil, nil
-			return nil, nil, err
-		}
-	}
-	return m.type1Metrics, m.cffMetrics, ctx.Err()
-}
-
 // readType1FontMetrics 读取PFA或PFB的矩阵及字形索引，不执行字形指令
 // 入参: ctx 取消上下文, data 内嵌Type1程序
 // 返回: *type1FontMetrics 度量资源, error 结构或取消错误
@@ -325,60 +259,6 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 		return nil, fmt.Errorf("Type1 metrics lack CharStrings")
 	}
 	return &type1FontMetrics{matrix: matrix, lenIV: lenIV, glyphs: glyphs, subrs: subrs}, ctx.Err()
-}
-
-// glyphWidth 仅解密所选字形及必要子程序，转换为千分之一横向字宽
-// 入参: ctx 取消上下文, name 实际字形名称
-// 返回: float64 横向字宽, error 字形度量或取消错误
-func (m *type1FontMetrics) glyphWidth(ctx context.Context, name string) (float64, error) {
-	raw, ok := m.glyphs[name]
-	if !ok {
-		return 0, fmt.Errorf("Type1 glyph %s lacks metrics", name)
-	}
-	data, err := type1MetricDecrypt(ctx, raw, 4330, m.lenIV)
-	if err != nil {
-		return 0, err
-	}
-	steps := 0
-	args := make([]float64, 0, 24)
-	width, found, err := type1MetricWidth(ctx, data, m.subrs, m.lenIV, &args, &steps, 0)
-	if err != nil {
-		return 0, fmt.Errorf("Type1 glyph %s metrics: %w", name, err)
-	}
-	if !found {
-		return 0, fmt.Errorf("Type1 glyph %s lacks width", name)
-	}
-	x := (m.matrix[0]*width.X + m.matrix[2]*width.Y) * 1000
-	y := (m.matrix[1]*width.X + m.matrix[3]*width.Y) * 1000
-	if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
-		return 0, fmt.Errorf("invalid Type1 glyph %s width", name)
-	}
-	if y != 0 {
-		return 0, &UnsupportedError{Feature: "nonhorizontal Type1 glyph metrics"}
-	}
-	return x, ctx.Err()
-}
-
-// type1MetricBinary 按声明长度读取二进制字形，不解释数据中的词项
-// 返回: []byte 原始字形数据, error 长度或分隔符错误
-func (s *type1EncodingScanner) type1MetricBinary() ([]byte, error) {
-	length, err := strconv.Atoi(s.next())
-	if err != nil || length < 0 {
-		return nil, fmt.Errorf("invalid Type1 metric charstring length")
-	}
-	if token := s.next(); token != "RD" && token != "-|" {
-		return nil, fmt.Errorf("missing Type1 metric charstring data")
-	}
-	if s.pos >= len(s.data) || !type1EncodingSpace(s.data[s.pos]) {
-		return nil, fmt.Errorf("missing Type1 metric charstring separator")
-	}
-	s.pos++
-	if length > len(s.data)-s.pos {
-		return nil, fmt.Errorf("truncated Type1 metric charstring")
-	}
-	raw := s.data[s.pos : s.pos+length]
-	s.pos += length
-	return raw, nil
 }
 
 // type1MetricDecrypt 解密Type1数据并移除随机前缀，负前缀长度表示明文
@@ -579,6 +459,126 @@ func readCFFFontMetrics(ctx context.Context, data []byte) (*cffFontMetrics, erro
 		}
 	}
 	return metrics, ctx.Err()
+}
+
+// set 覆盖指定范围，保留两端旧值并合并相邻同值范围
+// 入参: first 起始CID, last 结束CID, value 度量
+func (m *cidMetrics[T]) set(first, last uint32, value T) {
+	i := sort.Search(len(m.ranges), func(i int) bool { return m.ranges[i].last >= first })
+	j := sort.Search(len(m.ranges), func(i int) bool { return m.ranges[i].first > last })
+	var replacement [3]cidMetricRange[T]
+	n := 0
+	if i < j && m.ranges[i].first < first {
+		replacement[n] = m.ranges[i]
+		replacement[n].last = first - 1
+		n++
+	}
+	replacement[n] = cidMetricRange[T]{first: first, last: last, value: value}
+	n++
+	if i < j && m.ranges[j-1].last > last {
+		replacement[n] = m.ranges[j-1]
+		replacement[n].first = last + 1
+		n++
+	}
+	m.ranges = slices.Replace(m.ranges, i, j, replacement[:n]...)
+	for k := max(i-1, 0); k+1 < len(m.ranges) && k <= i+n; {
+		if m.ranges[k].last+1 == m.ranges[k+1].first && m.ranges[k].value == m.ranges[k+1].value {
+			m.ranges[k].last = m.ranges[k+1].last
+			m.ranges = slices.Delete(m.ranges, k+1, k+2)
+		} else {
+			k++
+		}
+	}
+}
+
+// get 查找CID的显式度量，未声明时交由字体使用默认值
+// 入参: cid 字符标识
+// 返回: T 度量, bool 是否存在
+func (m *cidMetrics[T]) get(cid uint32) (T, bool) {
+	i := sort.Search(len(m.ranges), func(i int) bool { return m.ranges[i].last >= cid })
+	if i < len(m.ranges) && m.ranges[i].first <= cid {
+		return m.ranges[i].value, true
+	}
+	var zero T
+	return zero, false
+}
+
+// load 在首次实际解码时读取度量资源，取消后允许重新读取
+// 入参: ctx 取消上下文
+// 返回: *type1FontMetrics Type1资源, *cffFontMetrics CFF资源, error 读取或取消错误
+func (m *fontProgramMetrics) load(ctx context.Context) (*type1FontMetrics, *cffFontMetrics, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if m.type1Metrics == nil && m.cffMetrics == nil {
+		var err error
+		if m.type1 {
+			m.type1Metrics, err = readType1FontMetrics(ctx, m.program)
+		} else {
+			m.cffMetrics, err = readCFFFontMetrics(ctx, m.program)
+		}
+		if err != nil {
+			m.type1Metrics, m.cffMetrics = nil, nil
+			return nil, nil, err
+		}
+	}
+	return m.type1Metrics, m.cffMetrics, ctx.Err()
+}
+
+// glyphWidth 仅解密所选字形及必要子程序，转换为千分之一横向字宽
+// 入参: ctx 取消上下文, name 实际字形名称
+// 返回: float64 横向字宽, error 字形度量或取消错误
+func (m *type1FontMetrics) glyphWidth(ctx context.Context, name string) (float64, error) {
+	raw, ok := m.glyphs[name]
+	if !ok {
+		return 0, fmt.Errorf("Type1 glyph %s lacks metrics", name)
+	}
+	data, err := type1MetricDecrypt(ctx, raw, 4330, m.lenIV)
+	if err != nil {
+		return 0, err
+	}
+	steps := 0
+	args := make([]float64, 0, 24)
+	width, found, err := type1MetricWidth(ctx, data, m.subrs, m.lenIV, &args, &steps, 0)
+	if err != nil {
+		return 0, fmt.Errorf("Type1 glyph %s metrics: %w", name, err)
+	}
+	if !found {
+		return 0, fmt.Errorf("Type1 glyph %s lacks width", name)
+	}
+	x := (m.matrix[0]*width.X + m.matrix[2]*width.Y) * 1000
+	y := (m.matrix[1]*width.X + m.matrix[3]*width.Y) * 1000
+	if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+		return 0, fmt.Errorf("invalid Type1 glyph %s width", name)
+	}
+	if y != 0 {
+		return 0, &UnsupportedError{Feature: "nonhorizontal Type1 glyph metrics"}
+	}
+	return x, ctx.Err()
+}
+
+// type1MetricBinary 按声明长度读取二进制字形，不解释数据中的词项
+// 返回: []byte 原始字形数据, error 长度或分隔符错误
+func (s *type1EncodingScanner) type1MetricBinary() ([]byte, error) {
+	length, err := strconv.Atoi(s.next())
+	if err != nil || length < 0 {
+		return nil, fmt.Errorf("invalid Type1 metric charstring length")
+	}
+	if token := s.next(); token != "RD" && token != "-|" {
+		return nil, fmt.Errorf("missing Type1 metric charstring data")
+	}
+	if s.pos >= len(s.data) || !type1EncodingSpace(s.data[s.pos]) {
+		return nil, fmt.Errorf("missing Type1 metric charstring separator")
+	}
+	s.pos++
+	if length > len(s.data)-s.pos {
+		return nil, fmt.Errorf("truncated Type1 metric charstring")
+	}
+	raw := s.data[s.pos : s.pos+length]
+	s.pos += length
+	return raw, nil
 }
 
 // glyphWidth 从所选CFF字形读取实际字宽，不按字体名称替代度量

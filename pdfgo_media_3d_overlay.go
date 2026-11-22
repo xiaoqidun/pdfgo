@@ -20,6 +20,30 @@ import (
 	"math"
 )
 
+// threeDBinding 计算视口或注解区域的绑定倍率
+// 入参: binding 绑定方式, box 目标区域
+// 返回: float64 倍率, error 方式或尺寸错误
+func threeDBinding(binding Name, box Rectangle) (float64, error) {
+	if binding == "Absolute" {
+		return 1, nil
+	}
+	w, h := box.XMax-box.XMin, box.YMax-box.YMin
+	if math.IsNaN(w) || math.IsNaN(h) || math.IsInf(w, 0) || math.IsInf(h, 0) || w <= 0 || h <= 0 {
+		return 0, fmt.Errorf("invalid 3D binding dimensions")
+	}
+	switch binding {
+	case "W":
+		return w, nil
+	case "H":
+		return h, nil
+	case "Min":
+		return min(w, h), nil
+	case "Max":
+		return max(w, h), nil
+	}
+	return 0, fmt.Errorf("invalid 3D binding")
+}
+
 // ScaleFactor 按PDF标准表305计算投影倍率，不按模型包围盒重新适配
 // 透视投影的相机坐标还需除以各自的z坐标；返回值不含视口平移
 // 入参: viewBox 三维视口, annotationBox 注解区域
@@ -59,30 +83,6 @@ func (p ThreeDProjection) ScaleFactor(viewBox, annotationBox Rectangle) (float64
 		return 0, fmt.Errorf("invalid 3D projection scale")
 	}
 	return scale, nil
-}
-
-// threeDBinding 计算视口或注解区域的绑定倍率
-// 入参: binding 绑定方式, box 目标区域
-// 返回: float64 倍率, error 方式或尺寸错误
-func threeDBinding(binding Name, box Rectangle) (float64, error) {
-	if binding == "Absolute" {
-		return 1, nil
-	}
-	w, h := box.XMax-box.XMin, box.YMax-box.YMin
-	if math.IsNaN(w) || math.IsNaN(h) || math.IsInf(w, 0) || math.IsInf(h, 0) || w <= 0 || h <= 0 {
-		return 0, fmt.Errorf("invalid 3D binding dimensions")
-	}
-	switch binding {
-	case "W":
-		return w, nil
-	case "H":
-		return h, nil
-	case "Min":
-		return min(w, h), nil
-	case "Max":
-		return max(w, h), nil
-	}
-	return 0, fmt.Errorf("invalid 3D binding")
 }
 
 // WalkThreeDOverlay 解释选定正交视图的叠加外观，映射到页面用户空间并裁剪到三维视口

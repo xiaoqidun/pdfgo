@@ -49,6 +49,13 @@ func NewCalRGBColorSpace(white, black, gamma [3]float64, matrix [9]float64) (*Co
 	return (&Reader{}).readCalibratedSpace(Array{Name("CalRGB"), dict})
 }
 
+// deviceCMYKRGB 按内置印刷配置文件将未标定CMYK分量转换为sRGB
+// 入参: values CMYK单位分量
+// 返回: [3]float64 RGB单位分量
+func deviceCMYKRGB(values []float64) [3]float64 {
+	return DeviceCMYKToSRGB(values[0], values[1], values[2], values[3])
+}
+
 // Device 判断分量是否属于原始设备空间，不将校准色的RGB显示结果视为设备源色
 // 返回: bool 是否原始设备空间
 func (s *ColorSpace) Device() bool {
@@ -271,13 +278,6 @@ func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) 
 		return (.3*(1-values[0]) + .59*(1-values[1]) + .11*(1-values[2])) * (1 - values[3]), nil
 	}
 	return 0, &UnsupportedError{Feature: "luminosity color space " + string(s.Model)}
-}
-
-// deviceCMYKRGB 按内置印刷配置文件将未标定CMYK分量转换为sRGB
-// 入参: values CMYK单位分量
-// 返回: [3]float64 RGB单位分量
-func deviceCMYKRGB(values []float64) [3]float64 {
-	return DeviceCMYKToSRGB(values[0], values[1], values[2], values[3])
 }
 
 // validate 检查颜色分量数与单位范围

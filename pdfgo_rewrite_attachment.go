@@ -40,6 +40,67 @@ type AttachmentAction struct {
 	NewWindow *bool
 }
 
+// appendRewriteObject 分配未被源文件及其他替换占用的对象编号
+// 入参: objects 输出对象, number 已分配最大编号, value 新对象
+// 返回: Reference 对象引用, error 编号越界错误
+func appendRewriteObject(objects map[Reference]Object, number *int64, value Object) (Reference, error) {
+	if *number >= math.MaxInt32-1024 {
+		return Reference{}, fmt.Errorf("PDF object number exceeds output limit")
+	}
+	*number++
+	ref := Reference{Number: *number}
+	objects[ref] = value
+	return ref, nil
+}
+
+// rewriteNameTree 按原始字节顺序构建名称树，每个节点最多保存64项
+// 入参: ctx 取消上下文, keys 有序键, values 名称映射, objects 输出对象, number 最大对象编号
+// 返回: Dictionary 名称树根节点, error 分配或取消错误
+func rewriteNameTree(ctx context.Context, keys []string, values map[string]Object, objects map[Reference]Object, number *int64) (Dictionary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(keys) <= 64 {
+		pairs := make(Array, 0, len(keys)*2)
+		for _, key := range keys {
+			pairs = append(pairs, String(key), values[key])
+		}
+		return Dictionary{"Names": pairs}, nil
+	}
+	nodes := make([]Dictionary, 0, (len(keys)-1)/64+1)
+	for start := 0; start < len(keys); start += 64 {
+		end := min(start+64, len(keys))
+		child, err := rewriteNameTree(ctx, keys[start:end], values, objects, number)
+		if err != nil {
+			return nil, err
+		}
+		child["Limits"] = Array{String(keys[start]), String(keys[end-1])}
+		nodes = append(nodes, child)
+	}
+	for len(nodes) > 1 {
+		parents := make([]Dictionary, 0, (len(nodes)-1)/64+1)
+		for start := 0; start < len(nodes); start += 64 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			end := min(start+64, len(nodes))
+			kids := make(Array, 0, end-start)
+			for _, child := range nodes[start:end] {
+				ref, err := appendRewriteObject(objects, number, child)
+				if err != nil {
+					return nil, err
+				}
+				kids = append(kids, ref)
+			}
+			limits := Array{nodes[start]["Limits"].(Array)[0], nodes[end-1]["Limits"].(Array)[1]}
+			parents = append(parents, Dictionary{"Kids": kids, "Limits": limits})
+		}
+		nodes = parents
+	}
+	delete(nodes[0], "Limits")
+	return nodes[0], nil
+}
+
 // attachmentReplacements 更新附件名称树，保留其他名称树及未修改的文件引用
 // 入参: ctx 取消上下文, options 替换配置, result 已有替换对象
 // 返回: map[string]Object 动作使用的附件引用, error 名称树、附件或取消错误
@@ -179,65 +240,4 @@ func (r *Reader) attachmentReplacements(ctx context.Context, options RewriteOpti
 	}
 	result[root] = updated
 	return files, nil
-}
-
-// appendRewriteObject 分配未被源文件及其他替换占用的对象编号
-// 入参: objects 输出对象, number 已分配最大编号, value 新对象
-// 返回: Reference 对象引用, error 编号越界错误
-func appendRewriteObject(objects map[Reference]Object, number *int64, value Object) (Reference, error) {
-	if *number >= math.MaxInt32-1024 {
-		return Reference{}, fmt.Errorf("PDF object number exceeds output limit")
-	}
-	*number++
-	ref := Reference{Number: *number}
-	objects[ref] = value
-	return ref, nil
-}
-
-// rewriteNameTree 按原始字节顺序构建名称树，每个节点最多保存64项
-// 入参: ctx 取消上下文, keys 有序键, values 名称映射, objects 输出对象, number 最大对象编号
-// 返回: Dictionary 名称树根节点, error 分配或取消错误
-func rewriteNameTree(ctx context.Context, keys []string, values map[string]Object, objects map[Reference]Object, number *int64) (Dictionary, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if len(keys) <= 64 {
-		pairs := make(Array, 0, len(keys)*2)
-		for _, key := range keys {
-			pairs = append(pairs, String(key), values[key])
-		}
-		return Dictionary{"Names": pairs}, nil
-	}
-	nodes := make([]Dictionary, 0, (len(keys)-1)/64+1)
-	for start := 0; start < len(keys); start += 64 {
-		end := min(start+64, len(keys))
-		child, err := rewriteNameTree(ctx, keys[start:end], values, objects, number)
-		if err != nil {
-			return nil, err
-		}
-		child["Limits"] = Array{String(keys[start]), String(keys[end-1])}
-		nodes = append(nodes, child)
-	}
-	for len(nodes) > 1 {
-		parents := make([]Dictionary, 0, (len(nodes)-1)/64+1)
-		for start := 0; start < len(nodes); start += 64 {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			end := min(start+64, len(nodes))
-			kids := make(Array, 0, end-start)
-			for _, child := range nodes[start:end] {
-				ref, err := appendRewriteObject(objects, number, child)
-				if err != nil {
-					return nil, err
-				}
-				kids = append(kids, ref)
-			}
-			limits := Array{nodes[start]["Limits"].(Array)[0], nodes[end-1]["Limits"].(Array)[1]}
-			parents = append(parents, Dictionary{"Kids": kids, "Limits": limits})
-		}
-		nodes = parents
-	}
-	delete(nodes[0], "Limits")
-	return nodes[0], nil
 }

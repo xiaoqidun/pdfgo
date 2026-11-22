@@ -60,6 +60,44 @@ func NewColorantGroup(space *ColorSpace, device *ColorantDevice) (*ColorantGroup
 	return group, nil
 }
 
+// colorantUnit 判断透明参数或色料值是否在有限单位范围
+// 入参: value 待校验值
+// 返回: bool 是否有效
+func colorantUnit(value float64) bool {
+	return value >= 0 && value <= 1
+}
+
+// colorantPremultiplied 读取预乘分量，透明颜色不参与计算
+// 入参: pixel 像素, component 通道下标
+// 返回: float64 预乘分量
+func colorantPremultiplied(pixel ColorantPixel, component int) float64 {
+	if pixel.Alpha == 0 {
+		return 0
+	}
+	return pixel.Values[component] * pixel.Alpha
+}
+
+// colorantGroupComponent 移除初始背景贡献并还原单位组颜色
+// 入参: initial 初始背景, result 累计结果, component 通道下标
+// 返回: float64 组分量
+func colorantGroupComponent(initial, result ColorantPixel, component int) float64 {
+	if initial.Alpha == 0 && result.Alpha == result.Effect {
+		return result.Values[component]
+	}
+	return math.Max(0, math.Min(1, (colorantPremultiplied(result, component)-colorantPremultiplied(initial, component)*(1-result.Effect))/result.Effect))
+}
+
+// colorantSpotBlend 按减色规则混合专色，指定模式按标准替换为Normal
+// 入参: backdrop 背景浓度, source 源浓度, mode 过程色混合模式
+// 返回: float64 专色混合浓度
+func colorantSpotBlend(backdrop, source float64, mode Name) float64 {
+	switch mode {
+	case "", "Normal", "Compatible", "Difference", "Exclusion", "Hue", "Saturation", "Color", "Luminosity":
+		return source
+	}
+	return 1 - separableBlend(1-backdrop, 1-source, mode)
+}
+
 // Components 返回组过程色及设备专色的总分量数
 // 返回: int 分量数，无效定义为零
 func (g *ColorantGroup) Components() int {
@@ -427,42 +465,4 @@ func (g *ColorantGroup) sameDevice(source *ColorantGroup) bool {
 		}
 	}
 	return true
-}
-
-// colorantUnit 判断透明参数或色料值是否在有限单位范围
-// 入参: value 待校验值
-// 返回: bool 是否有效
-func colorantUnit(value float64) bool {
-	return value >= 0 && value <= 1
-}
-
-// colorantPremultiplied 读取预乘分量，透明颜色不参与计算
-// 入参: pixel 像素, component 通道下标
-// 返回: float64 预乘分量
-func colorantPremultiplied(pixel ColorantPixel, component int) float64 {
-	if pixel.Alpha == 0 {
-		return 0
-	}
-	return pixel.Values[component] * pixel.Alpha
-}
-
-// colorantGroupComponent 移除初始背景贡献并还原单位组颜色
-// 入参: initial 初始背景, result 累计结果, component 通道下标
-// 返回: float64 组分量
-func colorantGroupComponent(initial, result ColorantPixel, component int) float64 {
-	if initial.Alpha == 0 && result.Alpha == result.Effect {
-		return result.Values[component]
-	}
-	return math.Max(0, math.Min(1, (colorantPremultiplied(result, component)-colorantPremultiplied(initial, component)*(1-result.Effect))/result.Effect))
-}
-
-// colorantSpotBlend 按减色规则混合专色，指定模式按标准替换为Normal
-// 入参: backdrop 背景浓度, source 源浓度, mode 过程色混合模式
-// 返回: float64 专色混合浓度
-func colorantSpotBlend(backdrop, source float64, mode Name) float64 {
-	switch mode {
-	case "", "Normal", "Compatible", "Difference", "Exclusion", "Hue", "Saturation", "Color", "Luminosity":
-		return source
-	}
-	return 1 - separableBlend(1-backdrop, 1-source, mode)
 }

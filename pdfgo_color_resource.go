@@ -19,6 +19,31 @@ import (
 	"fmt"
 )
 
+// cloneColorantDictionary 复制需重映射的属性字典，不改变共享资源
+// 入参: source 源字典
+// 返回: Dictionary 独立浅副本
+func cloneColorantDictionary(source Dictionary) Dictionary {
+	result := make(Dictionary, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+// colorSpaceFamily 取得已解析颜色空间的族名
+// 入参: value 颜色空间定义
+// 返回: Name 族名，定义无效时为空
+func colorSpaceFamily(value Object) Name {
+	if name, ok := value.(Name); ok {
+		return name
+	}
+	if array, ok := value.(Array); ok && len(array) != 0 {
+		name, _ := array[0].(Name)
+		return name
+	}
+	return ""
+}
+
 // SetDeviceColorProfile 设置未标定设备色的ICC配置，不覆盖显式颜色空间及Default资源
 // 仅应用到与配置通道数一致的Device颜色空间，不执行打样或改变输入PDF；需在页面解释前调用
 // 入参: profile 独立ICC数据，nil清除；调用后可修改输入切片
@@ -281,31 +306,6 @@ func (r *Reader) remapNChannelAttributes(space Array, resources Dictionary, rema
 	}
 	space[4] = attrs
 	return space, nil
-}
-
-// cloneColorantDictionary 复制需重映射的属性字典，不改变共享资源
-// 入参: source 源字典
-// 返回: Dictionary 独立浅副本
-func cloneColorantDictionary(source Dictionary) Dictionary {
-	result := make(Dictionary, len(source))
-	for key, value := range source {
-		result[key] = value
-	}
-	return result
-}
-
-// colorSpaceFamily 取得已解析颜色空间的族名
-// 入参: value 颜色空间定义
-// 返回: Name 族名，定义无效时为空
-func colorSpaceFamily(value Object) Name {
-	if name, ok := value.(Name); ok {
-		return name
-	}
-	if array, ok := value.(Array); ok && len(array) != 0 {
-		name, _ := array[0].(Name)
-		return name
-	}
-	return ""
 }
 
 // resourceBlendingSpace 解析当前资源中的混合空间及默认设备色

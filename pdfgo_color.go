@@ -57,6 +57,37 @@ func normalizeRenderingIntent(intent Name) Name {
 	}
 }
 
+// calRGBAdapt 在锥体响应空间执行对角变换，返回未截断的XYZ分量
+// 入参: xyz 源色度, scale 锥体响应比例
+// 返回: [3]float64 目标色度
+func calRGBAdapt(xyz, scale [3]float64) [3]float64 {
+	cone := bradford(xyz)
+	for i := range cone {
+		cone[i] *= scale[i]
+	}
+	return [3]float64{.9869929*cone[0] - .1470543*cone[1] + .1599627*cone[2], .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2], -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]}
+}
+
+// bradford 将XYZ变换到用于白点适应的锥体响应空间
+// 入参: v XYZ分量
+// 返回: [3]float64 锥体响应分量
+func bradford(v [3]float64) [3]float64 {
+	return [3]float64{0.8951*v[0] + 0.2664*v[1] - 0.1614*v[2], -0.7502*v[0] + 1.7135*v[1] + 0.0367*v[2], 0.0389*v[0] - 0.0685*v[1] + 1.0296*v[2]}
+}
+
+// srgbComponent 将线性分量映射到sRGB编码范围
+// 入参: v 线性颜色分量
+// 返回: uint16 16位sRGB分量
+func srgbComponent(v float64) uint16 {
+	v = math.Max(0, math.Min(1, v))
+	if v <= 0.0031308 {
+		v *= 12.92
+	} else {
+		v = 1.055*math.Pow(v, 1/2.4) - 0.055
+	}
+	return uint16(math.Round(v * 65535))
+}
+
 // paint 将页面颜色操作数转换为画刷，索引色保留基色空间分量
 // 入参: values 颜色分量
 // 返回: Paint 画刷, error 无效分量
@@ -382,24 +413,6 @@ func (s *calRGBSpace) compatibleBlackPoint(white, black [3]float64) error {
 	return nil
 }
 
-// calRGBAdapt 在锥体响应空间执行对角变换，返回未截断的XYZ分量
-// 入参: xyz 源色度, scale 锥体响应比例
-// 返回: [3]float64 目标色度
-func calRGBAdapt(xyz, scale [3]float64) [3]float64 {
-	cone := bradford(xyz)
-	for i := range cone {
-		cone[i] *= scale[i]
-	}
-	return [3]float64{.9869929*cone[0] - .1470543*cone[1] + .1599627*cone[2], .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2], -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]}
-}
-
-// bradford 将XYZ变换到用于白点适应的锥体响应空间
-// 入参: v XYZ分量
-// 返回: [3]float64 锥体响应分量
-func bradford(v [3]float64) [3]float64 {
-	return [3]float64{0.8951*v[0] + 0.2664*v[1] - 0.1614*v[2], -0.7502*v[0] + 1.7135*v[1] + 0.0367*v[2], 0.0389*v[0] - 0.0685*v[1] + 1.0296*v[2]}
-}
-
 // color 应用CalRGB矩阵及白点适应，输出sRGB颜色
 // 入参: a 第一分量, b 第二分量, c 第三分量，各分量范围为0至1
 // 返回: color.NRGBA64 非预乘sRGB颜色
@@ -421,17 +434,4 @@ func (s *calRGBSpace) color(a, b, c float64) color.NRGBA64 {
 func (s *calRGBSpace) linearXYZ(a, b, c float64) [3]float64 {
 	m := s.matrix
 	return [3]float64{m[0]*a + m[3]*b + m[6]*c + s.offset[0], m[1]*a + m[4]*b + m[7]*c + s.offset[1], m[2]*a + m[5]*b + m[8]*c + s.offset[2]}
-}
-
-// srgbComponent 将线性分量映射到sRGB编码范围
-// 入参: v 线性颜色分量
-// 返回: uint16 16位sRGB分量
-func srgbComponent(v float64) uint16 {
-	v = math.Max(0, math.Min(1, v))
-	if v <= 0.0031308 {
-		v *= 12.92
-	} else {
-		v = 1.055*math.Pow(v, 1/2.4) - 0.055
-	}
-	return uint16(math.Round(v * 65535))
 }

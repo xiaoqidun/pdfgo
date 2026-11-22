@@ -43,6 +43,23 @@ type TilingPattern struct {
 	empty         bool
 }
 
+// patternBaseColor 按底层颜色空间解释无色图案的颜色分量
+// 入参: paint 当前画刷, space 底层色空间, operands 颜色分量, intent 渲染意图
+// 返回: error 分量或颜色转换错误
+func patternBaseColor(paint *Paint, space *patternColorSpace, operands []Object, intent Name) error {
+	values, err := numbers(operands, space.components)
+	if err != nil {
+		return err
+	}
+	base, err := space.convert(values, intent)
+	if err != nil {
+		return err
+	}
+	base.Alpha = paint.Alpha
+	*paint = base
+	return nil
+}
+
 // Walk 独立解释图案单元内容，保留图案边界与无色图案的基色
 // 入参: ctx 取消上下文, base 无色图案基色, visitor 绘制访问器
 // 返回: error 解析或访问错误
@@ -220,21 +237,4 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	}
 	p.tilingPatterns[name] = pattern
 	return pattern, nil
-}
-
-// patternBaseColor 按底层颜色空间解释无色图案的颜色分量
-// 入参: paint 当前画刷, space 底层色空间, operands 颜色分量, intent 渲染意图
-// 返回: error 分量或颜色转换错误
-func patternBaseColor(paint *Paint, space *patternColorSpace, operands []Object, intent Name) error {
-	values, err := numbers(operands, space.components)
-	if err != nil {
-		return err
-	}
-	base, err := space.convert(values, intent)
-	if err != nil {
-		return err
-	}
-	base.Alpha = paint.Alpha
-	*paint = base
-	return nil
 }

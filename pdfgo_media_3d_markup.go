@@ -29,6 +29,34 @@ type ThreeDMarkup struct {
 	Dictionary Dictionary
 }
 
+// ThreeDArtworkChecksum 计算三维模型数据的MD5，不将PDF流过滤器编码计入模型内容
+// 校验仅用于检测模型变化，不用于安全认证
+// 入参: ctx 取消上下文, stream 三维模型流
+// 返回: [16]byte 校验和, error 解码或取消错误
+func ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16]byte, error) {
+	var result [16]byte
+	if ctx == nil || stream == nil {
+		return result, fmt.Errorf("invalid 3D artwork checksum source")
+	}
+	data, err := stream.DecodeContext(ctx)
+	if err != nil {
+		return result, err
+	}
+	hash := md5.New()
+	for len(data) != 0 {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		n := min(len(data), 1<<20)
+		if _, err := hash.Write(data[:n]); err != nil {
+			return result, err
+		}
+		data = data[n:]
+	}
+	copy(result[:], hash.Sum(nil))
+	return result, ctx.Err()
+}
+
 // MatchesView 比较同一Reader内的视图对象身份，不将参数相同的不同视图合并
 // 入参: view 当前选定视图
 // 返回: bool 是否为绑定视图
@@ -175,32 +203,4 @@ func (r *Reader) threeDAnnotationNames(ctx context.Context, annotations []Annota
 		names[name] = append(names[name], annotation)
 	}
 	return names, nil
-}
-
-// ThreeDArtworkChecksum 计算三维模型数据的MD5，不将PDF流过滤器编码计入模型内容
-// 校验仅用于检测模型变化，不用于安全认证
-// 入参: ctx 取消上下文, stream 三维模型流
-// 返回: [16]byte 校验和, error 解码或取消错误
-func ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16]byte, error) {
-	var result [16]byte
-	if ctx == nil || stream == nil {
-		return result, fmt.Errorf("invalid 3D artwork checksum source")
-	}
-	data, err := stream.DecodeContext(ctx)
-	if err != nil {
-		return result, err
-	}
-	hash := md5.New()
-	for len(data) != 0 {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		n := min(len(data), 1<<20)
-		if _, err := hash.Write(data[:n]); err != nil {
-			return result, err
-		}
-		data = data[n:]
-	}
-	copy(result[:], hash.Sum(nil))
-	return result, ctx.Err()
 }

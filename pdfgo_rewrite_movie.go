@@ -21,6 +21,22 @@ import (
 	"math"
 )
 
+// rewriteMovieTime 写出非负时间，超出32位整数范围时采用大端64位字节串
+// 入参: value 已校验的时间和时间单位
+// 返回: Object 时间值或二元数组
+func rewriteMovieTime(value MovieTime) Object {
+	var time Object = Integer(value.Value)
+	if value.Value > math.MaxInt32 {
+		data := make(String, 8)
+		binary.BigEndian.PutUint64(data, uint64(value.Value))
+		time = data
+	}
+	if value.Scale != 0 {
+		return Array{time, Integer(value.Scale)}
+	}
+	return time
+}
+
 // movieActions 校验视频目标并准备独立的播放动作，不读取或播放媒体文件
 // 入参: ctx 取消上下文, options 替换配置, added 新增视频注解引用
 // 返回: map[*MovieAction]Dictionary 视频动作, error 目标、参数或取消错误
@@ -199,20 +215,4 @@ func (r *Reader) rewriteMovieActivation(ctx context.Context, dict Dictionary) (D
 		}
 	}
 	return result, ctx.Err()
-}
-
-// rewriteMovieTime 写出非负时间，超出32位整数范围时采用大端64位字节串
-// 入参: value 已校验的时间和时间单位
-// 返回: Object 时间值或二元数组
-func rewriteMovieTime(value MovieTime) Object {
-	var time Object = Integer(value.Value)
-	if value.Value > math.MaxInt32 {
-		data := make(String, 8)
-		binary.BigEndian.PutUint64(data, uint64(value.Value))
-		time = data
-	}
-	if value.Scale != 0 {
-		return Array{time, Integer(value.Scale)}
-	}
-	return time
 }

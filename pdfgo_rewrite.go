@@ -85,6 +85,44 @@ type LinkRegion struct {
 	Quads [][4]Point
 }
 
+// rewriteInformation 校验信息字典修改并隔离调用方的数据
+// 入参: ctx 取消上下文, changes 待修改字段
+// 返回: Dictionary 独立修改集, error 字段或取消错误
+func rewriteInformation(ctx context.Context, changes Dictionary) (Dictionary, error) {
+	result := make(Dictionary, len(changes))
+	for key, value := range changes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if value == nil {
+			result[key] = nil
+			continue
+		}
+		if key == "Trapped" {
+			if value != Name("True") && value != Name("False") && value != Name("Unknown") {
+				return nil, fmt.Errorf("invalid document trapping state")
+			}
+			result[key] = value
+			continue
+		}
+		text, ok := value.(String)
+		if !ok {
+			return nil, fmt.Errorf("document information requires a text string")
+		}
+		decoded, err := DecodeTextString(text)
+		if err != nil {
+			return nil, err
+		}
+		if key == "CreationDate" || key == "ModDate" {
+			if _, err := ParseDate(decoded); err != nil {
+				return nil, err
+			}
+		}
+		result[key] = String(slices.Clone(text))
+	}
+	return result, ctx.Err()
+}
+
 // RewriteTo 一次写出图像、文字、链接、附件及事件修改，保留外观和未知属性
 // 指定目标时替换原主动作；已有GoTo动作保留后续动作，其他动作整体替换
 // 独占链接保留原引用；共享链接按页面复制，带结构标记的共享链接不能单独拆分
@@ -175,44 +213,6 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 		r.Version = max(r.Version, "1.4")
 	}
 	return r.rewriteTo(ctx, writer, options.Optimization, replacements, lazyImages, information)
-}
-
-// rewriteInformation 校验信息字典修改并隔离调用方的数据
-// 入参: ctx 取消上下文, changes 待修改字段
-// 返回: Dictionary 独立修改集, error 字段或取消错误
-func rewriteInformation(ctx context.Context, changes Dictionary) (Dictionary, error) {
-	result := make(Dictionary, len(changes))
-	for key, value := range changes {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if value == nil {
-			result[key] = nil
-			continue
-		}
-		if key == "Trapped" {
-			if value != Name("True") && value != Name("False") && value != Name("Unknown") {
-				return nil, fmt.Errorf("invalid document trapping state")
-			}
-			result[key] = value
-			continue
-		}
-		text, ok := value.(String)
-		if !ok {
-			return nil, fmt.Errorf("document information requires a text string")
-		}
-		decoded, err := DecodeTextString(text)
-		if err != nil {
-			return nil, err
-		}
-		if key == "CreationDate" || key == "ModDate" {
-			if _, err := ParseDate(decoded); err != nil {
-				return nil, err
-			}
-		}
-		result[key] = String(slices.Clone(text))
-	}
-	return result, ctx.Err()
 }
 
 // actionSequences 遍历待写动作序列，不改变各序列内部顺序

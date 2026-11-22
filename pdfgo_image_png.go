@@ -84,13 +84,6 @@ type pngPrecisionImage struct {
 	image.Image
 }
 
-// NRGBA64At 读取非预乘颜色及独立透明度
-// 入参: x 横坐标, y 纵坐标
-// 返回: color.NRGBA64 十六位颜色
-func (p *pngPrecisionImage) NRGBA64At(x, y int) color.NRGBA64 {
-	return imageNRGBA64At(p.Image, x, y)
-}
-
 // EncodePNG 按行无损编码图像，保留颜色精度及透明度，不展开整幅延迟图像
 // 图像解码由调用方完成，取消或写入失败时输出可能不完整
 // 入参: ctx 取消上下文, writer 输出流, source 已解码图像
@@ -255,54 +248,6 @@ func newPNGImageEncoderWithCompression(ctx context.Context, writer io.Writer, bo
 		s.compressed = imageCompressor(&s.chunks)
 	}
 	return s, nil
-}
-
-// writeRow 写入当前样本行并交换前后行缓冲，不保留已写像素
-// 返回: error 取消、过滤或写入错误
-func (s *pngImageEncoder) writeRow() error {
-	filtered, err := pngFilterRow(s.output.ctx, s.row, s.previous, s.pixelBytes, &s.filters)
-	if err != nil {
-		return err
-	}
-	for len(filtered) != 0 {
-		if err := s.output.ctx.Err(); err != nil {
-			return err
-		}
-		n := min(32768, len(filtered))
-		if _, err := s.compressed.Write(filtered[:n]); err != nil {
-			return err
-		}
-		filtered = filtered[n:]
-	}
-	s.row, s.previous = s.previous, s.row
-	return s.output.ctx.Err()
-}
-
-// finish 完成压缩数据及标准结束块，错误时不补写结束标记
-// 返回: error 取消或写入错误
-func (s *pngImageEncoder) finish() error {
-	if err := s.output.ctx.Err(); err != nil {
-		return err
-	}
-	if err := s.compressed.Close(); err != nil {
-		return err
-	}
-	if err := s.chunks.flush(); err != nil {
-		return err
-	}
-	return writePNGChunk(s.output, "IEND", nil)
-}
-
-// release 解除输出引用并归还压缩器，取消或写入失败后同样释放
-func (s *pngImageEncoder) release() {
-	if s.compressed != nil {
-		if s.optimized {
-			releaseOptimizationCompressor(s.compressed)
-		} else {
-			releaseImageCompressor(s.compressed)
-		}
-		s.compressed = nil
-	}
 }
 
 // pngJPXRow 批量读取分量行并按采样间隔展开，保留通道顺序、调色板及透明度精度
@@ -740,6 +685,76 @@ func newPNGResampleRows(r *imageResample) (*pngResampleRows, error) {
 	return s, nil
 }
 
+// pngInterpolate 按原有累加顺序插值非负样本，保留半值向上舍入
+// 入参: a 左上样本, b 右上样本, c 左下样本, d 右下样本, x 横向比例, y 纵向比例
+// 返回: uint16 插值样本
+func pngInterpolate(a, b, c, d uint16, x, y float64) uint16 {
+	value := float64(a) * (1 - x) * (1 - y)
+	value += float64(b) * x * (1 - y)
+	value += float64(c) * (1 - x) * y
+	value += float64(d) * x * y
+	integer := uint16(value)
+	if value-float64(integer) >= .5 {
+		integer++
+	}
+	return integer
+}
+
+// NRGBA64At 读取非预乘颜色及独立透明度
+// 入参: x 横坐标, y 纵坐标
+// 返回: color.NRGBA64 十六位颜色
+func (p *pngPrecisionImage) NRGBA64At(x, y int) color.NRGBA64 {
+	return imageNRGBA64At(p.Image, x, y)
+}
+
+// writeRow 写入当前样本行并交换前后行缓冲，不保留已写像素
+// 返回: error 取消、过滤或写入错误
+func (s *pngImageEncoder) writeRow() error {
+	filtered, err := pngFilterRow(s.output.ctx, s.row, s.previous, s.pixelBytes, &s.filters)
+	if err != nil {
+		return err
+	}
+	for len(filtered) != 0 {
+		if err := s.output.ctx.Err(); err != nil {
+			return err
+		}
+		n := min(32768, len(filtered))
+		if _, err := s.compressed.Write(filtered[:n]); err != nil {
+			return err
+		}
+		filtered = filtered[n:]
+	}
+	s.row, s.previous = s.previous, s.row
+	return s.output.ctx.Err()
+}
+
+// finish 完成压缩数据及标准结束块，错误时不补写结束标记
+// 返回: error 取消或写入错误
+func (s *pngImageEncoder) finish() error {
+	if err := s.output.ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.compressed.Close(); err != nil {
+		return err
+	}
+	if err := s.chunks.flush(); err != nil {
+		return err
+	}
+	return writePNGChunk(s.output, "IEND", nil)
+}
+
+// release 解除输出引用并归还压缩器，取消或写入失败后同样释放
+func (s *pngImageEncoder) release() {
+	if s.compressed != nil {
+		if s.optimized {
+			releaseOptimizationCompressor(s.compressed)
+		} else {
+			releaseImageCompressor(s.compressed)
+		}
+		s.compressed = nil
+	}
+}
+
 // prepare 更新颜色及遮罩行缓存，在读取样本期间检查取消
 // 入参: ctx 取消上下文, y 输出行坐标
 // 返回: error 取消错误
@@ -840,21 +855,6 @@ func (s *pngResampleRows) red(x int) uint16 {
 	column := s.x[x-s.resample.bounds.Min.X]
 	a, b, c, d := s.rows[0][column.left], s.rows[0][column.right], s.rows[1][column.left], s.rows[1][column.right]
 	return pngInterpolate(a.R, b.R, c.R, d.R, column.weight, s.weightY)
-}
-
-// pngInterpolate 按原有累加顺序插值非负样本，保留半值向上舍入
-// 入参: a 左上样本, b 右上样本, c 左下样本, d 右下样本, x 横向比例, y 纵向比例
-// 返回: uint16 插值样本
-func pngInterpolate(a, b, c, d uint16, x, y float64) uint16 {
-	value := float64(a) * (1 - x) * (1 - y)
-	value += float64(b) * x * (1 - y)
-	value += float64(c) * (1 - x) * y
-	value += float64(d) * x * y
-	integer := uint16(value)
-	if value-float64(integer) >= .5 {
-		integer++
-	}
-	return integer
 }
 
 // Write 在写入前后检查取消，不接受未报告错误的短写

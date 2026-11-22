@@ -395,11 +395,21 @@ func walkJPXBoxes(data []byte, visit func(string, []byte) error) error {
 	return nil
 }
 
+// JPXLossless 查询JPEG2000图像流的无损编码标志及最大分量位深，仅解析头部不解码像素
+// 非JPXDecode图像返回false、0和nil错误
+// 返回: bool 是否无损编码, int 最大分量位深, error 容器或码流错误
+func (i *Image) JPXLossless() (bool, int, error) {
+	return i.JPXLosslessContext(context.Background())
+}
+
 // JPXLosslessContext 查询JPEG2000图像流的无损编码标志及最大分量位深，仅解析头部不解码像素
 // 非JPXDecode图像返回false、0和nil错误
 // 入参: ctx 取消上下文
 // 返回: bool 是否无损编码, int 最大分量位深, error 容器、码流或取消错误
 func (i *Image) JPXLosslessContext(ctx context.Context) (bool, int, error) {
+	if ctx == nil {
+		return false, 0, fmt.Errorf("invalid image context")
+	}
 	if err := ctx.Err(); err != nil {
 		return false, 0, err
 	}

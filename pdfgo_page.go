@@ -51,6 +51,9 @@ type pageAttributes struct {
 // 入参: ctx 取消上下文, visit 页面访问函数
 // 返回: error 错误信息
 func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid page context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -180,6 +183,9 @@ func (p *Page) Content() ([]byte, error) {
 // 入参: ctx 取消上下文，在流解码及写出间检查, writer 输出流
 // 返回: int64 已写字节数, error 解码或写入错误，出错时可能已有部分输出
 func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("invalid page content context")
+	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}

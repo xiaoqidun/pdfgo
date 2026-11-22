@@ -26,6 +26,23 @@ type TransferFunction struct {
 	functions [4]*ColorFunction
 }
 
+// transferChannel 区分标准主色通道及非主色的灰度回退
+// 入参: colorant 原生分量名称
+// 返回: int 传递通道, bool 是否标准主色
+func transferChannel(colorant Name) (int, bool) {
+	switch colorant {
+	case "Red", "Cyan":
+		return 0, true
+	case "Green", "Magenta":
+		return 1, true
+	case "Blue", "Yellow":
+		return 2, true
+	case "Gray", "Black":
+		return 3, true
+	}
+	return 3, false
+}
+
 // ReadTransferFunction 解析单函数或四通道数组，恒等函数返回空值
 // 入参: object 传递函数定义或Identity
 // 返回: *TransferFunction 已解析函数, error 引用或函数错误
@@ -249,23 +266,6 @@ func (r *Reader) halftoneTransfer(h *Halftone) (*TransferFunction, bool, error) 
 	}
 	function, err := r.ReadTransferFunction(value)
 	return function, true, err
-}
-
-// transferChannel 区分标准主色通道及非主色的灰度回退
-// 入参: colorant 原生分量名称
-// 返回: int 传递通道, bool 是否标准主色
-func transferChannel(colorant Name) (int, bool) {
-	switch colorant {
-	case "Red", "Cyan":
-		return 0, true
-	case "Green", "Magenta":
-		return 1, true
-	case "Blue", "Yellow":
-		return 2, true
-	case "Gray", "Black":
-		return 3, true
-	}
-	return 3, false
 }
 
 // SelectChannels 保留不透明通道的函数，其余通道使用恒等设备默认值

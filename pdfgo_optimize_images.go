@@ -28,6 +28,203 @@ import (
 	"slices"
 )
 
+// imagePlacementKey 保存图片在局部坐标系中的线性变换分量
+type imagePlacementKey struct {
+	ref Reference
+	a   float64
+	b   float64
+	c   float64
+	d   float64
+}
+
+// cachedFormImages 缓存具有独立资源字典的表单内部图片变换及异常状态
+type cachedFormImages struct {
+	placements  []imagePlacementKey
+	unsafe      []Reference
+	opaqueError bool
+}
+
+// imageAllGray 检查图像所有像素是否均满足红绿蓝分量相等
+// 入参: ctx 取消上下文, img 待检测图像
+// 返回: bool 是否全灰, error 取消错误
+func imageAllGray(ctx context.Context, img image.Image) (bool, error) {
+	switch img.(type) {
+	case *image.Gray, *image.Gray16:
+		return true, ctx.Err()
+	}
+	b := img.Bounds()
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if (x-b.Min.X)&4095 == 4095 {
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+			}
+			c := imageNRGBAAt(img, x, y)
+			if c.R != c.G || c.G != c.B {
+				return false, nil
+			}
+		}
+	}
+	return true, ctx.Err()
+}
+
+// pdfImagePhotographic 判断PDF有损重编时图像是否适合采用JPEG编码
+// 入参: ctx 取消上下文, img 图像, gray 是否灰度目标
+// 返回: bool 是否适合JPEG, error 取消错误
+func pdfImagePhotographic(ctx context.Context, img image.Image, gray bool) (bool, error) {
+	if !gray {
+		return photographicImage(ctx, img)
+	}
+	b := img.Bounds()
+	var seen [256]bool
+	unique, count, edges := 0, 0, 0
+	for y := b.Min.Y; y < b.Max.Y; y += max(1, b.Dy()/128) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		for x := b.Min.X; x < b.Max.X; x += max(1, b.Dx()/128) {
+			c := imageNRGBAAt(img, x, y).R
+			if !seen[c] {
+				seen[c] = true
+				unique++
+			}
+			if x+1 < b.Max.X {
+				d := imageNRGBAAt(img, x+1, y).R
+				if math.Abs(float64(c)-float64(d)) > 40 {
+					edges++
+				}
+				count++
+			}
+		}
+	}
+	return unique > 32 && edges*20 < count, ctx.Err()
+}
+
+// stripInlineStreams 将对象树中直嵌的流替换为12字节占位引用，避免体积估算重复计费
+// 入参: value PDF对象, depth 嵌套深度
+// 返回: Object 替换后的对象, bool 是否发生变更
+func stripInlineStreams(value Object, depth int) (Object, bool) {
+	if depth > 64 {
+		return value, false
+	}
+	switch v := value.(type) {
+	case *Stream:
+		return Reference{Number: 10000000}, true
+	case Dictionary:
+		var out Dictionary
+		for k, item := range v {
+			replaced, changed := stripInlineStreams(item, depth+1)
+			if changed {
+				if out == nil {
+					out = maps.Clone(v)
+				}
+				out[k] = replaced
+			}
+		}
+		if out != nil {
+			return out, true
+		}
+	case Array:
+		var out Array
+		for i, item := range v {
+			replaced, changed := stripInlineStreams(item, depth+1)
+			if changed {
+				if out == nil {
+					out = slices.Clone(v)
+				}
+				out[i] = replaced
+			}
+		}
+		if out != nil {
+			return out, true
+		}
+	}
+	return value, false
+}
+
+// pdfStreamByteSize 估算PDF流写出后的总字节数，用于比较候选流与原流体积
+// 入参: ctx 取消上下文, s 流对象
+// 返回: int64 字节总数
+func pdfStreamByteSize(ctx context.Context, s *Stream) int64 {
+	if s == nil {
+		return math.MaxInt64
+	}
+	dict := maps.Clone(s.Dictionary)
+	dict["Length"] = Integer(len(s.Data))
+	if stripped, changed := stripInlineStreams(dict, 0); changed {
+		dict = stripped.(Dictionary)
+	}
+	out := pdfOutput{ctx: ctx, writer: io.Discard}
+	if err := out.object(dict, Reference{}, 0, false); err != nil {
+		return int64(len(s.Data))
+	}
+	return out.count + int64(len(s.Data)) + 18
+}
+
+// pdfObjectsEqual 递归比较两个PDF对象的结构等价性，超深或流对象不等时返回否
+// 入参: a 对象一, b 对象二, depth 递归深度
+// 返回: bool 是否结构等价
+func pdfObjectsEqual(a, b Object, depth int) bool {
+	if depth > 32 {
+		return false
+	}
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	switch va := a.(type) {
+	case Boolean:
+		vb, ok := b.(Boolean)
+		return ok && va == vb
+	case Integer:
+		vb, ok := b.(Integer)
+		return ok && va == vb
+	case Real:
+		vb, ok := b.(Real)
+		return ok && va == vb
+	case Name:
+		vb, ok := b.(Name)
+		return ok && va == vb
+	case Reference:
+		vb, ok := b.(Reference)
+		return ok && va == vb
+	case String:
+		vb, ok := b.(String)
+		return ok && bytes.Equal(va, vb)
+	case Array:
+		vb, ok := b.(Array)
+		if !ok || len(va) != len(vb) {
+			return false
+		}
+		for i := range va {
+			if !pdfObjectsEqual(va[i], vb[i], depth+1) {
+				return false
+			}
+		}
+		return true
+	case Dictionary:
+		vb, ok := b.(Dictionary)
+		if !ok || len(va) != len(vb) {
+			return false
+		}
+		for k, av := range va {
+			bv, exists := vb[k]
+			if !exists || !pdfObjectsEqual(av, bv, depth+1) {
+				return false
+			}
+		}
+		return true
+	case *Stream:
+		vb, ok := b.(*Stream)
+		return ok && va == vb
+	default:
+		return false
+	}
+}
+
 // optimizeJPXImage 在有损模式下优化JPEG2000图片，支持设备色、校准色与索引色转sRGB或灰度
 // 入参: ctx 取消上下文, stream 原始流, options 有损配置, size 两轴像素需求, colorResources 可选默认颜色空间资源, ignoreSMask 是否忽略外部软遮罩
 // 返回: *Stream 更小输出或原始流, error 取消或编码错误
@@ -222,66 +419,6 @@ func (r *Reader) isInvertedCMYKDecodeValue(value Object) bool {
 	return values[0] == 1 && values[1] == 0 && values[2] == 1 && values[3] == 0 && values[4] == 1 && values[5] == 0 && values[6] == 1 && values[7] == 0
 }
 
-// imageAllGray 检查图像所有像素是否均满足红绿蓝分量相等
-// 入参: ctx 取消上下文, img 待检测图像
-// 返回: bool 是否全灰, error 取消错误
-func imageAllGray(ctx context.Context, img image.Image) (bool, error) {
-	switch img.(type) {
-	case *image.Gray, *image.Gray16:
-		return true, ctx.Err()
-	}
-	b := img.Bounds()
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		for x := b.Min.X; x < b.Max.X; x++ {
-			if (x-b.Min.X)&4095 == 4095 {
-				if err := ctx.Err(); err != nil {
-					return false, err
-				}
-			}
-			c := imageNRGBAAt(img, x, y)
-			if c.R != c.G || c.G != c.B {
-				return false, nil
-			}
-		}
-	}
-	return true, ctx.Err()
-}
-
-// pdfImagePhotographic 判断PDF有损重编时图像是否适合采用JPEG编码
-// 入参: ctx 取消上下文, img 图像, gray 是否灰度目标
-// 返回: bool 是否适合JPEG, error 取消错误
-func pdfImagePhotographic(ctx context.Context, img image.Image, gray bool) (bool, error) {
-	if !gray {
-		return photographicImage(ctx, img)
-	}
-	b := img.Bounds()
-	var seen [256]bool
-	unique, count, edges := 0, 0, 0
-	for y := b.Min.Y; y < b.Max.Y; y += max(1, b.Dy()/128) {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		for x := b.Min.X; x < b.Max.X; x += max(1, b.Dx()/128) {
-			c := imageNRGBAAt(img, x, y).R
-			if !seen[c] {
-				seen[c] = true
-				unique++
-			}
-			if x+1 < b.Max.X {
-				d := imageNRGBAAt(img, x+1, y).R
-				if math.Abs(float64(c)-float64(d)) > 40 {
-					edges++
-				}
-				count++
-			}
-		}
-	}
-	return unique > 32 && edges*20 < count, ctx.Err()
-}
-
 // encodePDFImageLossy 将已转换的8位目标图像编码为PDF流，原JPEG直接重编，严格保证通道数与ColorSpace一致
 // 入参: ctx 取消上下文, orig 原始流, img 已缩放图像, wantGray 是否目标灰度, options 压缩配置, sourceJPEG 原流是否为JPEG编码
 // 返回: *Stream 编码后的图像流或空值, error 取消或编码错误
@@ -352,67 +489,6 @@ func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img imag
 	result.Dictionary["Width"] = Integer(jpegSource.Bounds().Dx())
 	result.Dictionary["Height"] = Integer(jpegSource.Bounds().Dy())
 	return result, ctx.Err()
-}
-
-// stripInlineStreams 将对象树中直嵌的流替换为12字节占位引用，避免体积估算重复计费
-// 入参: value PDF对象, depth 嵌套深度
-// 返回: Object 替换后的对象, bool 是否发生变更
-func stripInlineStreams(value Object, depth int) (Object, bool) {
-	if depth > 64 {
-		return value, false
-	}
-	switch v := value.(type) {
-	case *Stream:
-		return Reference{Number: 10000000}, true
-	case Dictionary:
-		var out Dictionary
-		for k, item := range v {
-			replaced, changed := stripInlineStreams(item, depth+1)
-			if changed {
-				if out == nil {
-					out = maps.Clone(v)
-				}
-				out[k] = replaced
-			}
-		}
-		if out != nil {
-			return out, true
-		}
-	case Array:
-		var out Array
-		for i, item := range v {
-			replaced, changed := stripInlineStreams(item, depth+1)
-			if changed {
-				if out == nil {
-					out = slices.Clone(v)
-				}
-				out[i] = replaced
-			}
-		}
-		if out != nil {
-			return out, true
-		}
-	}
-	return value, false
-}
-
-// pdfStreamByteSize 估算PDF流写出后的总字节数，用于比较候选流与原流体积
-// 入参: ctx 取消上下文, s 流对象
-// 返回: int64 字节总数
-func pdfStreamByteSize(ctx context.Context, s *Stream) int64 {
-	if s == nil {
-		return math.MaxInt64
-	}
-	dict := maps.Clone(s.Dictionary)
-	dict["Length"] = Integer(len(s.Data))
-	if stripped, changed := stripInlineStreams(dict, 0); changed {
-		dict = stripped.(Dictionary)
-	}
-	out := pdfOutput{ctx: ctx, writer: io.Discard}
-	if err := out.object(dict, Reference{}, 0, false); err != nil {
-		return int64(len(s.Data))
-	}
-	return out.count + int64(len(s.Data)) + 18
 }
 
 // isSMaskOpaque 检测软遮罩流是否全部不透明，超限或无法解码时保守返回否
@@ -561,22 +637,6 @@ func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters,
 		return nil, nil
 	}
 	return &inner, ctx.Err()
-}
-
-// imagePlacementKey 保存图片在局部坐标系中的线性变换分量
-type imagePlacementKey struct {
-	ref Reference
-	a   float64
-	b   float64
-	c   float64
-	d   float64
-}
-
-// cachedFormImages 缓存具有独立资源字典的表单内部图片变换及异常状态
-type cachedFormImages struct {
-	placements  []imagePlacementKey
-	unsafe      []Reference
-	opaqueError bool
 }
 
 // imageOutputSizes 汇总页面、表单、注释外观及平铺图案中的图片最大显示尺寸，Type3字形图仅禁降采样
@@ -1300,66 +1360,6 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		delete(sizes, ref)
 	}
 	return sizes, ctx.Err()
-}
-
-// pdfObjectsEqual 递归比较两个PDF对象的结构等价性，超深或流对象不等时返回否
-// 入参: a 对象一, b 对象二, depth 递归深度
-// 返回: bool 是否结构等价
-func pdfObjectsEqual(a, b Object, depth int) bool {
-	if depth > 32 {
-		return false
-	}
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	switch va := a.(type) {
-	case Boolean:
-		vb, ok := b.(Boolean)
-		return ok && va == vb
-	case Integer:
-		vb, ok := b.(Integer)
-		return ok && va == vb
-	case Real:
-		vb, ok := b.(Real)
-		return ok && va == vb
-	case Name:
-		vb, ok := b.(Name)
-		return ok && va == vb
-	case Reference:
-		vb, ok := b.(Reference)
-		return ok && va == vb
-	case String:
-		vb, ok := b.(String)
-		return ok && bytes.Equal(va, vb)
-	case Array:
-		vb, ok := b.(Array)
-		if !ok || len(va) != len(vb) {
-			return false
-		}
-		for i := range va {
-			if !pdfObjectsEqual(va[i], vb[i], depth+1) {
-				return false
-			}
-		}
-		return true
-	case Dictionary:
-		vb, ok := b.(Dictionary)
-		if !ok || len(va) != len(vb) {
-			return false
-		}
-		for k, av := range va {
-			bv, exists := vb[k]
-			if !exists || !pdfObjectsEqual(av, bv, depth+1) {
-				return false
-			}
-		}
-		return true
-	case *Stream:
-		vb, ok := b.(*Stream)
-		return ok && va == vb
-	default:
-		return false
-	}
 }
 
 // imageDefaultColorResources 在文档存在Default设备色资源时映射各图像引用的默认色空间，多页冲突时拒绝转换

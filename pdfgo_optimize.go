@@ -97,6 +97,146 @@ type streamOptJob struct {
 	err            error
 }
 
+// optimizeWorkers 按配置与运行平台计算并行工作协程数，WASM环境恒返回1
+// 入参: parallelism 用户指定的并发数，非正数时按处理器核数自动选择
+// 返回: int 有效工作协程数
+func optimizeWorkers(parallelism int) int {
+	if runtime.GOOS == "js" || runtime.GOARCH == "wasm" {
+		return 1
+	}
+	if parallelism > 0 {
+		return parallelism
+	}
+	return max(1, runtime.GOMAXPROCS(0))
+}
+
+// syncWarning 包装可恢复诊断回调以支持多协程并发上报
+// 入参: warning 原始警告回调
+// 返回: func(Diagnostic) 并发安全的警告回调
+func syncWarning(warning func(Diagnostic)) func(Diagnostic) {
+	if warning == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	return func(d Diagnostic) {
+		mu.Lock()
+		defer mu.Unlock()
+		warning(d)
+	}
+}
+
+// minUintBytes 计算无符号整数大端表示所需的最小字节数
+// 入参: v 非负整数
+// 返回: int 所需字节数
+func minUintBytes(v uint64) int {
+	switch {
+	case v == 0:
+		return 0
+	case v <= 0xff:
+		return 1
+	case v <= 0xffff:
+		return 2
+	case v <= 0xffffff:
+		return 3
+	case v <= 0xffffffff:
+		return 4
+	case v <= 0xffffffffff:
+		return 5
+	case v <= 0xffffffffffff:
+		return 6
+	case v <= 0xffffffffffffff:
+		return 7
+	default:
+		return 8
+	}
+}
+
+// putBigEndianBytes 将无符号整数按大端序写入定长目标切片
+// 入参: dst 目标切片, v 无符号整数
+func putBigEndianBytes(dst []byte, v uint64) {
+	for i := len(dst) - 1; i >= 0; i-- {
+		dst[i] = byte(v)
+		v >>= 8
+	}
+}
+
+// streamHasFilter 判断流字典终端过滤器是否为指定名称
+// 入参: dict 流字典, target 目标过滤器名称
+// 返回: bool 是否匹配
+func streamHasFilter(dict Dictionary, target Name) bool {
+	switch f := dict["Filter"].(type) {
+	case Name:
+		return f == target
+	case Array:
+		return len(f) > 0 && f[len(f)-1] == target
+	default:
+		return false
+	}
+}
+
+// compressPDFBytes 以最高无损等级编码单个流
+// 入参: ctx 取消上下文, data 原始数据
+// 返回: []byte 压缩数据, error 压缩错误
+func compressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
+	return compressPDFBytesLevel(ctx, data, zlib.BestCompression)
+}
+
+// compressPDFBytesLevel 按指定zlib级别编码单个流
+// 入参: ctx 取消上下文, data 原始数据, level zlib压缩级别
+// 返回: []byte 压缩数据, error 压缩错误
+func compressPDFBytesLevel(ctx context.Context, data []byte, level int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var result bytes.Buffer
+	writer := optimizationCompressorLevel(&result, level)
+	defer releaseOptimizationCompressorLevel(writer, level)
+	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		n := min(len(data), 64<<10)
+		if _, err := writer.Write(data[:n]); err != nil {
+			return nil, err
+		}
+		data = data[n:]
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result.Bytes(), nil
+}
+
+// recompressPDFBytes 流式重压缩已有Flate编码，不持有完整解码副本且只采用更小结果
+// 入参: ctx 取消上下文, data 原始编码
+// 返回: []byte 更小编码或原文, error 取消错误
+func recompressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	input, err := acquireZlibReader(bytes.NewReader(data))
+	if err != nil {
+		return data, ctx.Err()
+	}
+	defer func() {
+		input.Close()
+		releaseZlibReader(input)
+	}()
+	var result bytes.Buffer
+	output := &optimizationBuffer{buffer: &result, limit: min(len(data), optimizationBufferLimit)}
+	encoder := optimizationCompressor(output)
+	defer releaseOptimizationCompressor(encoder)
+	n, err := io.Copy(encoder, io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1))
+	closeErr := encoder.Close()
+	if err != nil || closeErr != nil || n > optimizationBufferLimit || result.Len() >= len(data) {
+		return data, ctx.Err()
+	}
+	return result.Bytes(), ctx.Err()
+}
+
 // OptimizeTo 重写PDF对象及资源，保留未知字典、表单、附件、导航和加密配置
 // 无损模式只改变表示与压缩；有损模式可重新编码可安全识别的RGB或灰度图片
 // 签名文件原样交付，不修改签名；出错时应丢弃本次输出，Reader须保持源数据可读
@@ -110,6 +250,9 @@ func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options Optim
 // 入参: ctx 取消上下文, writer 输出流, options 优化配置, replacements 替换对象, lazyImages 延迟编码替换图像, information 信息字典修改
 // 返回: OptimizeReport 写出结果, error 读写错误
 func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options OptimizeOptions, replacements map[Reference]Object, lazyImages map[Reference]*lazyReplacementImage, information Dictionary) (report OptimizeReport, err error) {
+	if r == nil || ctx == nil {
+		return report, fmt.Errorf("invalid PDF optimize context")
+	}
 	if r.closed {
 		return report, os.ErrClosed
 	}
@@ -1294,34 +1437,6 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 	return err
 }
 
-// optimizeWorkers 按配置与运行平台计算并行工作协程数，WASM环境恒返回1
-// 入参: parallelism 用户指定的并发数，非正数时按处理器核数自动选择
-// 返回: int 有效工作协程数
-func optimizeWorkers(parallelism int) int {
-	if runtime.GOOS == "js" || runtime.GOARCH == "wasm" {
-		return 1
-	}
-	if parallelism > 0 {
-		return parallelism
-	}
-	return max(1, runtime.GOMAXPROCS(0))
-}
-
-// syncWarning 包装可恢复诊断回调以支持多协程并发上报
-// 入参: warning 原始警告回调
-// 返回: func(Diagnostic) 并发安全的警告回调
-func syncWarning(warning func(Diagnostic)) func(Diagnostic) {
-	if warning == nil {
-		return nil
-	}
-	var mu sync.Mutex
-	return func(d Diagnostic) {
-		mu.Lock()
-		defer mu.Unlock()
-		warning(d)
-	}
-}
-
 // workerReader 创建共享只读数据与并发安全缓存的轻量阅读器副本，供并行工作协程独占使用
 // 副本隔离交叉引用表并将内部图像解码并发度固定为1，避免外层并行池满载时引发竞态或过度订阅
 // 入参: warning 并发安全的警告回调
@@ -1469,118 +1584,6 @@ func (r *Reader) executeStreamJob(ctx context.Context, job *streamOptJob) {
 	}
 	job.outValue = value
 	job.outLazyMask = maskStream
-}
-
-// minUintBytes 计算无符号整数大端表示所需的最小字节数
-// 入参: v 非负整数
-// 返回: int 所需字节数
-func minUintBytes(v uint64) int {
-	switch {
-	case v == 0:
-		return 0
-	case v <= 0xff:
-		return 1
-	case v <= 0xffff:
-		return 2
-	case v <= 0xffffff:
-		return 3
-	case v <= 0xffffffff:
-		return 4
-	case v <= 0xffffffffff:
-		return 5
-	case v <= 0xffffffffffff:
-		return 6
-	case v <= 0xffffffffffffff:
-		return 7
-	default:
-		return 8
-	}
-}
-
-// putBigEndianBytes 将无符号整数按大端序写入定长目标切片
-// 入参: dst 目标切片, v 无符号整数
-func putBigEndianBytes(dst []byte, v uint64) {
-	for i := len(dst) - 1; i >= 0; i-- {
-		dst[i] = byte(v)
-		v >>= 8
-	}
-}
-
-// streamHasFilter 判断流字典终端过滤器是否为指定名称
-// 入参: dict 流字典, target 目标过滤器名称
-// 返回: bool 是否匹配
-func streamHasFilter(dict Dictionary, target Name) bool {
-	switch f := dict["Filter"].(type) {
-	case Name:
-		return f == target
-	case Array:
-		return len(f) > 0 && f[len(f)-1] == target
-	default:
-		return false
-	}
-}
-
-// compressPDFBytes 以最高无损等级编码单个流
-// 入参: ctx 取消上下文, data 原始数据
-// 返回: []byte 压缩数据, error 压缩错误
-func compressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
-	return compressPDFBytesLevel(ctx, data, zlib.BestCompression)
-}
-
-// compressPDFBytesLevel 按指定zlib级别编码单个流
-// 入参: ctx 取消上下文, data 原始数据, level zlib压缩级别
-// 返回: []byte 压缩数据, error 压缩错误
-func compressPDFBytesLevel(ctx context.Context, data []byte, level int) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	var result bytes.Buffer
-	writer := optimizationCompressorLevel(&result, level)
-	defer releaseOptimizationCompressorLevel(writer, level)
-	for len(data) > 0 {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		n := min(len(data), 64<<10)
-		if _, err := writer.Write(data[:n]); err != nil {
-			return nil, err
-		}
-		data = data[n:]
-	}
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return result.Bytes(), nil
-}
-
-// recompressPDFBytes 流式重压缩已有Flate编码，不持有完整解码副本且只采用更小结果
-// 入参: ctx 取消上下文, data 原始编码
-// 返回: []byte 更小编码或原文, error 取消错误
-func recompressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	input, err := acquireZlibReader(bytes.NewReader(data))
-	if err != nil {
-		return data, ctx.Err()
-	}
-	defer func() {
-		input.Close()
-		releaseZlibReader(input)
-	}()
-	var result bytes.Buffer
-	output := &optimizationBuffer{buffer: &result, limit: min(len(data), optimizationBufferLimit)}
-	encoder := optimizationCompressor(output)
-	defer releaseOptimizationCompressor(encoder)
-	n, err := io.Copy(encoder, io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1))
-	closeErr := encoder.Close()
-	if err != nil || closeErr != nil || n > optimizationBufferLimit || result.Len() >= len(data) {
-		return data, ctx.Err()
-	}
-	return result.Bytes(), ctx.Err()
 }
 
 // optimizeStreamSize 优化流编码并按已知显示尺寸缩小图片

@@ -30,6 +30,29 @@ type GlyphWidth struct {
 	Width float64
 }
 
+// glyphResourceCMap 生成仅包含所需CID的双字节横排编码，未列出的字符映射到缺省字形
+// 入参: ctx 取消上下文, cids 有序CID, info 字符集标识
+// 返回: *Stream 编码流, error 取消错误
+func glyphResourceCMap(ctx context.Context, cids []uint16, info Dictionary) (*Stream, error) {
+	var content strings.Builder
+	content.WriteString("/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n")
+	fmt.Fprintf(&content, "/CIDSystemInfo << /Registry <%X> /Ordering <%X> /Supplement %d >> def\n", []byte(info["Registry"].(String)), []byte(info["Ordering"].(String)), info["Supplement"])
+	content.WriteString("/CMapName /Glyph-H def\n/CMapType 1 def\n/WMode 0 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n")
+	for start := 0; start < len(cids); start += 100 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		part := cids[start:min(start+100, len(cids))]
+		fmt.Fprintf(&content, "%d begincidchar\n", len(part))
+		for _, cid := range part {
+			fmt.Fprintf(&content, "<%04X> %d\n", cid, cid)
+		}
+		content.WriteString("endcidchar\n")
+	}
+	content.WriteString("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n")
+	return &Stream{Data: []byte(content.String()), Dictionary: Dictionary{"Type": Name("CMap"), "CMapName": Name("Glyph-H"), "CIDSystemInfo": maps.Clone(info), "WMode": Integer(0)}}, nil
+}
+
 // GlyphFont 复用内嵌程序建立横排复合字体，使指定字形不受源字符编码限制
 // 返回字体仅编码指定字形，Dictionary可作为同一阅读器中的字体资源，原文语义和定位由调用方保留
 // 不修改源字典、字符映射或字体程序；调用方提供的字宽须与字体程序一致
@@ -159,29 +182,6 @@ func (f *Font) GlyphFontContext(ctx context.Context, glyphs []GlyphWidth) (*Font
 	}
 	resource := Dictionary{"Type": Name("Font"), "Subtype": Name("Type0"), "BaseFont": Name(name), "Encoding": encoding, "DescendantFonts": Array{child}}
 	return f.reader.ReadFontContext(ctx, resource)
-}
-
-// glyphResourceCMap 生成仅包含所需CID的双字节横排编码，未列出的字符映射到缺省字形
-// 入参: ctx 取消上下文, cids 有序CID, info 字符集标识
-// 返回: *Stream 编码流, error 取消错误
-func glyphResourceCMap(ctx context.Context, cids []uint16, info Dictionary) (*Stream, error) {
-	var content strings.Builder
-	content.WriteString("/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n")
-	fmt.Fprintf(&content, "/CIDSystemInfo << /Registry <%X> /Ordering <%X> /Supplement %d >> def\n", []byte(info["Registry"].(String)), []byte(info["Ordering"].(String)), info["Supplement"])
-	content.WriteString("/CMapName /Glyph-H def\n/CMapType 1 def\n/WMode 0 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n")
-	for start := 0; start < len(cids); start += 100 {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		part := cids[start:min(start+100, len(cids))]
-		fmt.Fprintf(&content, "%d begincidchar\n", len(part))
-		for _, cid := range part {
-			fmt.Fprintf(&content, "<%04X> %d\n", cid, cid)
-		}
-		content.WriteString("endcidchar\n")
-	}
-	content.WriteString("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n")
-	return &Stream{Data: []byte(content.String()), Dictionary: Dictionary{"Type": Name("CMap"), "CMapName": Name("Glyph-H"), "CIDSystemInfo": maps.Clone(info), "WMode": Integer(0)}}, nil
 }
 
 // glyphResourceMapping 按字体程序建立GID到CID映射，不沿用原PDF字符编码

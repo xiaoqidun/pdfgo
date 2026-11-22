@@ -57,92 +57,15 @@ type pngCompactPaletteImage struct {
 	indices map[color.NRGBA]uint8
 }
 
-// ColorModel 返回本次编码的调色板
-// 返回: color.Model 索引色模型
-func (p *pngCompactPaletteImage) ColorModel() color.Model {
-	return p.palette
-}
-
-// ColorIndexAt 读取像素对应的调色板索引
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: uint8 颜色索引，坐标越界时为0
-func (p *pngCompactPaletteImage) ColorIndexAt(x, y int) uint8 {
-	if !image.Pt(x, y).In(p.Bounds()) {
-		return 0
-	}
-	return p.indices[imageNRGBAAt(p.Image, x, y)]
-}
-
-// ColorModel 返回八位灰度模型
-// 返回: color.Model 灰度颜色模型
-func (p *pngCompactGrayImage) ColorModel() color.Model {
-	return color.GrayModel
-}
-
-// At 读取已确认灰度的像素分量
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.Color 八位灰度颜色
-func (p *pngCompactGrayImage) At(x, y int) color.Color {
-	return color.Gray{Y: imageNRGBAAt(p.Image, x, y).R}
-}
-
-// ColorModel 返回候选编码的非预乘颜色模型
-// 返回: color.Model 八位非预乘颜色模型
-func (p *pngCompactImage) ColorModel() color.Model {
-	return color.NRGBAModel
-}
-
-// Opaque 返回颜色扫描得到的不透明状态
-// 返回: bool 图像是否完全不透明
-func (p *pngCompactImage) Opaque() bool {
-	return p.opaque
-}
-
-// At 读取八位非预乘颜色，保证标准库PNG编码复用一致的反预乘与钳位语义
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.Color 八位非预乘颜色
-func (p *pngCompactImage) At(x, y int) color.Color {
-	return imageNRGBAAt(p.Image, x, y)
-}
-
-// NRGBAAt 直接读取原始像素，避免通过颜色接口分配临时值
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.NRGBA 八位非预乘颜色
-func (p *pngCompactImage) NRGBAAt(x, y int) color.NRGBA {
-	return imageNRGBAAt(p.Image, x, y)
-}
-
-// Get 取出本次优化的编码缓冲
-// 返回: *png.EncoderBuffer 可复用缓冲或空值
-func (p *pngOptimizationBuffers) Get() *png.EncoderBuffer {
-	buffer := p.buffer
-	p.buffer = nil
-	return buffer
-}
-
-// Put 归还本次优化的编码缓冲
-// 入参: buffer 编码缓冲
-func (p *pngOptimizationBuffers) Put(buffer *png.EncoderBuffer) {
-	p.buffer = buffer
-}
-
-// Write 写入受限缓冲区
-// 入参: data 编码数据
-// 返回: int 已写字节数, error 容量错误
-func (b *optimizationBuffer) Write(data []byte) (int, error) {
-	if len(data) > b.limit-b.buffer.Len() {
-		b.exceeded = true
-		return 0, io.ErrShortBuffer
-	}
-	return b.buffer.Write(data)
-}
-
 // OptimizeImageResource 优化资源图片，有损模式允许无元数据的不透明照片改用JPEG
 // 调用方须按返回数据更新格式声明；固定格式导出应使用OptimizeImageSize
 // 不修改输入；返回值可能引用输入，调用方应视为只读
 // 入参: ctx 取消上下文, data 图片数据, options 压缩配置, size 像素需求
 // 返回: []byte 更小的图片数据, error 编码错误
 func OptimizeImageResource(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	if err := options.Validate(); err != nil {
 		return nil, err
 	}
@@ -193,6 +116,9 @@ func EncodeImageResource(ctx context.Context, source image.Image, options Compre
 // 入参: ctx 取消上下文, source 已解码图像, options 压缩配置, resource 是否允许更换格式
 // 返回: []byte 图片编码, error 参数、编码或取消错误
 func encodeImage(ctx context.Context, source image.Image, options CompressionOptions, resource bool) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	if err := options.Validate(); err != nil {
 		return nil, err
 	}
@@ -1016,4 +942,84 @@ func compactJPEG(ctx context.Context, img image.Image, best []byte, quality int)
 		best = encoded
 	}
 	return best, ctx.Err()
+}
+
+// ColorModel 返回本次编码的调色板
+// 返回: color.Model 索引色模型
+func (p *pngCompactPaletteImage) ColorModel() color.Model {
+	return p.palette
+}
+
+// ColorIndexAt 读取像素对应的调色板索引
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: uint8 颜色索引，坐标越界时为0
+func (p *pngCompactPaletteImage) ColorIndexAt(x, y int) uint8 {
+	if !image.Pt(x, y).In(p.Bounds()) {
+		return 0
+	}
+	return p.indices[imageNRGBAAt(p.Image, x, y)]
+}
+
+// ColorModel 返回八位灰度模型
+// 返回: color.Model 灰度颜色模型
+func (p *pngCompactGrayImage) ColorModel() color.Model {
+	return color.GrayModel
+}
+
+// At 读取已确认灰度的像素分量
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 八位灰度颜色
+func (p *pngCompactGrayImage) At(x, y int) color.Color {
+	return color.Gray{Y: imageNRGBAAt(p.Image, x, y).R}
+}
+
+// ColorModel 返回候选编码的非预乘颜色模型
+// 返回: color.Model 八位非预乘颜色模型
+func (p *pngCompactImage) ColorModel() color.Model {
+	return color.NRGBAModel
+}
+
+// Opaque 返回颜色扫描得到的不透明状态
+// 返回: bool 图像是否完全不透明
+func (p *pngCompactImage) Opaque() bool {
+	return p.opaque
+}
+
+// At 读取八位非预乘颜色，保证标准库PNG编码复用一致的反预乘与钳位语义
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 八位非预乘颜色
+func (p *pngCompactImage) At(x, y int) color.Color {
+	return imageNRGBAAt(p.Image, x, y)
+}
+
+// NRGBAAt 直接读取原始像素，避免通过颜色接口分配临时值
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.NRGBA 八位非预乘颜色
+func (p *pngCompactImage) NRGBAAt(x, y int) color.NRGBA {
+	return imageNRGBAAt(p.Image, x, y)
+}
+
+// Get 取出本次优化的编码缓冲
+// 返回: *png.EncoderBuffer 可复用缓冲或空值
+func (p *pngOptimizationBuffers) Get() *png.EncoderBuffer {
+	buffer := p.buffer
+	p.buffer = nil
+	return buffer
+}
+
+// Put 归还本次优化的编码缓冲
+// 入参: buffer 编码缓冲
+func (p *pngOptimizationBuffers) Put(buffer *png.EncoderBuffer) {
+	p.buffer = buffer
+}
+
+// Write 写入受限缓冲区
+// 入参: data 编码数据
+// 返回: int 已写字节数, error 容量错误
+func (b *optimizationBuffer) Write(data []byte) (int, error) {
+	if len(data) > b.limit-b.buffer.Len() {
+		b.exceeded = true
+		return 0, io.ErrShortBuffer
+	}
+	return b.buffer.Write(data)
 }

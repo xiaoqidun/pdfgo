@@ -24,60 +24,6 @@ import (
 // affineValue 保存常数项及各输入分量的系数
 type affineValue []float64
 
-// constant 判断表达式是否与输入无关
-// 返回: bool 是否常量
-func (v affineValue) constant() bool {
-	for _, c := range v[1:] {
-		if c != 0 {
-			return false
-		}
-	}
-	return true
-}
-
-// identityTransfer 验证单个或四通道传递函数在整个单位区间内严格恒等
-// 入参: object 传递函数定义
-// 返回: bool 是否恒等, error 函数或引用错误
-func (r *Reader) identityTransfer(object Object) (bool, error) {
-	object, err := r.Resolve(object)
-	if err != nil {
-		return false, err
-	}
-	functions := Array{object}
-	if array, ok := object.(Array); ok {
-		if len(array) != 4 {
-			return false, fmt.Errorf("invalid transfer function array")
-		}
-		functions = array
-	}
-	for _, object := range functions {
-		object, err := r.Resolve(object)
-		if err != nil {
-			return false, err
-		}
-		if object == Name("Identity") {
-			continue
-		}
-		function, err := r.readGradientFunction(object, 1, 0)
-		if err != nil {
-			return false, err
-		}
-		if function.linear == nil {
-			return false, nil
-		}
-		stops := function.linear([2]float64{0, 1})
-		if len(stops) < 2 || stops[0].Position != 0 || stops[len(stops)-1].Position != 1 {
-			return false, nil
-		}
-		for _, stop := range stops {
-			if stop.Values[0] != stop.Position {
-				return false, nil
-			}
-		}
-	}
-	return true, nil
-}
-
 // affineCalculator 符号执行计算器函数，保留多输入仿射关系
 // 入参: data 函数内容, inputs 输入分量数, outputs 输出分量数
 // 返回: []affineValue 输出表达式, error 格式或非仿射运算错误
@@ -198,4 +144,58 @@ func affineCalculator(data []byte, inputs, outputs int) ([]affineValue, error) {
 		return nil, fmt.Errorf("invalid calculator result")
 	}
 	return stack, nil
+}
+
+// constant 判断表达式是否与输入无关
+// 返回: bool 是否常量
+func (v affineValue) constant() bool {
+	for _, c := range v[1:] {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// identityTransfer 验证单个或四通道传递函数在整个单位区间内严格恒等
+// 入参: object 传递函数定义
+// 返回: bool 是否恒等, error 函数或引用错误
+func (r *Reader) identityTransfer(object Object) (bool, error) {
+	object, err := r.Resolve(object)
+	if err != nil {
+		return false, err
+	}
+	functions := Array{object}
+	if array, ok := object.(Array); ok {
+		if len(array) != 4 {
+			return false, fmt.Errorf("invalid transfer function array")
+		}
+		functions = array
+	}
+	for _, object := range functions {
+		object, err := r.Resolve(object)
+		if err != nil {
+			return false, err
+		}
+		if object == Name("Identity") {
+			continue
+		}
+		function, err := r.readGradientFunction(object, 1, 0)
+		if err != nil {
+			return false, err
+		}
+		if function.linear == nil {
+			return false, nil
+		}
+		stops := function.linear([2]float64{0, 1})
+		if len(stops) < 2 || stops[0].Position != 0 || stops[len(stops)-1].Position != 1 {
+			return false, nil
+		}
+		for _, stop := range stops {
+			if stop.Values[0] != stop.Position {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }

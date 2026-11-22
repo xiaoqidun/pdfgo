@@ -37,37 +37,6 @@ type jpegFrame struct {
 	displayMetadata bool
 }
 
-// encodedImageDimensions 只读取单层JPEG或JPEG2000图像头，不为无效字典推测尺寸
-// 入参: stream 图像编码流
-// 返回: int 编码宽度, int 编码高度, error 不可确定的尺寸或编码错误
-func (r *Reader) encodedImageDimensions(stream *Stream) (int, int, error) {
-	filters, _, err := stream.filterChain(r)
-	if err != nil {
-		return 0, 0, err
-	}
-	if len(filters) == 1 {
-		switch filters[0] {
-		case Name("DCTDecode"):
-			config, err := jpeg.DecodeConfig(bytes.NewReader(stream.Data))
-			if err == nil && (config.Height <= 0 || config.Width <= 0 || config.Width > jpegRecoveryPixelLimit/config.Height) {
-				return 0, 0, fmt.Errorf("JPEG dimension recovery exceeds sample budget")
-			}
-			return config.Width, config.Height, err
-		case Name("JPXDecode"):
-			data, err := jpxCodestream(stream.Data)
-			if err != nil {
-				return 0, 0, err
-			}
-			width, height, _, err := jpxSize(data)
-			if err == nil && (height <= 0 || width <= 0 || width > jpegRecoveryPixelLimit/height) {
-				return 0, 0, fmt.Errorf("JPEG2000 dimension recovery exceeds sample budget")
-			}
-			return width, height, err
-		}
-	}
-	return 0, 0, fmt.Errorf("image encoding has no independent dimensions")
-}
-
 // jpegEncodingImage 为不透明八位图像复用预乘视图，避免编码器逐像素接口分配
 // 入参: ctx 取消上下文, source 待编码图像
 // 返回: image.Image 只读编码视图, error 取消错误
@@ -86,98 +55,6 @@ func jpegEncodingImage(ctx context.Context, source image.Image) (image.Image, er
 	return &image.RGBA{Pix: s.Pix, Stride: s.Stride, Rect: s.Rect}, nil
 }
 
-// JPEGFile 返回可脱离PDF字典直接显示的JPEG，移除PDF忽略的方向和配置文件
-// 返回: []byte 未重编码的JPEG或空值, error 解码参数错误
-func (i *Image) JPEGFile() ([]byte, error) {
-	return i.JPEGFileContext(context.Background())
-}
-
-// JPEGFileContext 返回可直接复用的JPEG，移除显示元数据期间检查取消
-// 支持灰度、RGB及符合Adobe反相约定的四通道CMYK图像直通，不重编码像素
-// 入参: ctx 取消上下文
-// 返回: []byte 未重编码的JPEG或空值, error 参数、编码或取消错误
-func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	invertedCMYK := i.ColorSpace == Name("DeviceCMYK") && i.isInvertedCMYKDecode()
-	if i.ImageMask || !invertedCMYK && (len(i.Decode) != 0 || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB")) {
-		return nil, nil
-	}
-	masked, err := i.HasMask()
-	if err != nil || masked {
-		return nil, err
-	}
-	data, params, err := i.encodedFileContext(ctx, "DCTDecode")
-	if err != nil {
-		return nil, err
-	}
-	if data == nil {
-		return nil, nil
-	}
-	data, frame, transform, tagged, err := i.jpegReadTransformContext(ctx, data, params)
-	if err != nil {
-		return nil, err
-	}
-	reader := func() io.Reader { return bytes.NewReader(data) }
-	if invertedCMYK && frame.components == 4 && !tagged {
-		marker := jpegAdobeMarker(transform)
-		reader = func() io.Reader {
-			return io.MultiReader(bytes.NewReader(data[:2]), bytes.NewReader(marker), bytes.NewReader(data[2:]))
-		}
-	}
-	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: reader()})
-	if err != nil {
-		return nil, err
-	}
-	if config.Width != i.Width || config.Height != i.Height {
-		if i.Warning == nil {
-			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
-		}
-		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using complete image data dimensions %dx%d", config.Width, config.Height)})
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if frame.components == 1 && i.ColorSpace == Name("DeviceGray") || frame.components == 3 && i.ColorSpace == Name("DeviceRGB") && transform == (config.ColorModel == color.YCbCrModel) {
-		if frame.displayMetadata {
-			return jpegDisplayFileContext(ctx, data)
-		}
-		return data, nil
-	}
-	if invertedCMYK && frame.components == 4 && config.ColorModel == color.CMYKModel {
-		if frame.displayMetadata {
-			data, err = jpegDisplayFileContext(ctx, data)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if !tagged {
-			marker := jpegAdobeMarker(transform)
-			out := make([]byte, len(data)+len(marker))
-			copy(out, data[:2])
-			copy(out[2:], marker)
-			copy(out[2+len(marker):], data[2:])
-			return out, nil
-		}
-		return data, nil
-	}
-	return nil, nil
-}
-
-// isInvertedCMYKDecode 判断解码数组是否为标准四通道反相映射
-// 返回: bool 是否为反相四通道解码
-func (i *Image) isInvertedCMYKDecode() bool {
-	if len(i.Decode) != 8 {
-		return false
-	}
-	values, err := i.reader.numberArray(i.Decode, 8)
-	if err != nil {
-		return false
-	}
-	return values[0] == 1 && values[1] == 0 && values[2] == 1 && values[3] == 0 && values[4] == 1 && values[5] == 0 && values[6] == 1 && values[7] == 0
-}
-
 // jpegAdobeMarker 构建四通道CMYK或YCCK的Adobe APP14标记
 // 入参: transform 是否采用YCCK颜色变换
 // 返回: []byte 16字节APP14标记段
@@ -187,113 +64,6 @@ func jpegAdobeMarker(transform bool) []byte {
 		marker[15] = 2
 	}
 	return marker
-}
-
-// jpegTransformContext 解析DCT颜色规则并检查标记扫描取消
-// 入参: ctx 取消上下文, data JPEG数据, params DCT参数
-// 返回: jpegFrame 采样布局, bool 颜色变换, bool Adobe标记, error 参数或取消错误
-func (i *Image) jpegTransformContext(ctx context.Context, data []byte, params Dictionary) (jpegFrame, bool, bool, error) {
-	frame, adobe, tagged, err := jpegColorInfoContext(ctx, data)
-	if err != nil {
-		return jpegFrame{}, false, false, err
-	}
-	components := frame.components
-	transform := components == 3
-	if tagged {
-		if components == 3 && adobe != 0 && adobe != 1 || components == 4 && adobe != 0 && adobe != 2 {
-			return jpegFrame{}, false, false, fmt.Errorf("invalid Adobe JPEG color transform")
-		}
-		transform = adobe != 0
-	} else if (components == 3 || components == 4) && params["ColorTransform"] != nil {
-		value, err := i.reader.Resolve(params["ColorTransform"])
-		if err != nil {
-			return jpegFrame{}, false, false, err
-		}
-		if value != Integer(0) && value != Integer(1) {
-			return jpegFrame{}, false, false, fmt.Errorf("invalid JPEG ColorTransform")
-		}
-		transform = value == Integer(1)
-	}
-	return frame, transform, tagged, nil
-}
-
-// jpegSamplesContext 按PDF的DCT颜色规则解码，在读取和逐行变换间检查取消
-// 入参: ctx 取消上下文, data JPEG数据, params DCT解码参数
-// 返回: image.Image 原始颜色样本, error 参数、解码或取消错误
-func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dictionary) (image.Image, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	data, frame, transform, tagged, err := i.jpegReadTransformContext(ctx, data, params)
-	if err != nil {
-		return nil, err
-	}
-	components := frame.components
-	reader := func() io.Reader { return bytes.NewReader(data) }
-	if components == 4 && !tagged {
-		marker := jpegAdobeMarker(transform)
-		reader = func() io.Reader {
-			return io.MultiReader(bytes.NewReader(data[:2]), bytes.NewReader(marker), bytes.NewReader(data[2:]))
-		}
-	}
-	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: reader()})
-	if err != nil {
-		return nil, err
-	}
-	if config.Width != i.Width || config.Height != i.Height {
-		if i.Warning == nil {
-			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
-		}
-		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using image data dimensions %dx%d", config.Width, config.Height)})
-	}
-	if err := frame.sampleSize(); err != nil {
-		return nil, err
-	}
-	if components == 4 || components == 3 && (config.ColorModel != color.YCbCrModel || !transform) {
-		if _, _, err := imageBufferSize(config.Width, config.Height, 4); err != nil {
-			return nil, err
-		}
-	}
-	result, err := jpeg.Decode(&contextInput{ctx: ctx, reader: reader()})
-	if err != nil {
-		return nil, err
-	}
-	if cmyk, ok := result.(*image.CMYK); ok {
-		for n := range cmyk.Pix {
-			if n&4095 == 0 {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-			}
-			cmyk.Pix[n] = 255 - cmyk.Pix[n]
-		}
-		return &packedCMYKImage{data: cmyk.Pix, rect: cmyk.Rect, stride: cmyk.Stride, depth: 8}, nil
-	}
-	if components != 3 {
-		return result, nil
-	}
-	ycbcr, rawYCbCr := result.(*image.YCbCr)
-	if transform == rawYCbCr {
-		return result, nil
-	}
-	out := image.NewRGBA(result.Bounds())
-	for y := out.Rect.Min.Y; y < out.Rect.Max.Y; y++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		for x := out.Rect.Min.X; x < out.Rect.Max.X; x++ {
-			var red, green, blue uint8
-			if rawYCbCr {
-				value := ycbcr.YCbCrAt(x, y)
-				red, green, blue = value.Y, value.Cb, value.Cr
-			} else {
-				r, g, b, _ := result.At(x, y).RGBA()
-				red, green, blue = color.YCbCrToRGB(uint8(r>>8), uint8(g>>8), uint8(b>>8))
-			}
-			out.SetRGBA(x, y, color.RGBA{R: red, G: green, B: blue, A: 255})
-		}
-	}
-	return out, nil
 }
 
 // jpegColorInfoContext 分段扫描JPEG标记及渐进数据，限制取消检查间隔
@@ -426,74 +196,6 @@ func jpegReadSegmentsContext(ctx context.Context, data []byte, visit func(byte, 
 	return jpegFrame{}, 0, false, fmt.Errorf("missing JPEG end marker")
 }
 
-// jpegReadTransformContext 仅在完整样本可严格解码时恢复结束标记及扫描外冗余数据
-// 入参: ctx 取消上下文, data JPEG数据, params DCT参数
-// 返回: []byte 有效编码, jpegFrame 采样布局, bool 颜色变换, bool Adobe标记, error 解码或取消错误
-func (i *Image) jpegReadTransformContext(ctx context.Context, data []byte, params Dictionary) ([]byte, jpegFrame, bool, bool, error) {
-	frame, transform, tagged, err := i.jpegTransformContext(ctx, data, params)
-	if err == nil && i.Warning != nil && (frame.width != i.Width || frame.height != i.Height) {
-		data, err = i.jpegDimensionFileContext(ctx, data, frame, params)
-		if err == nil {
-			frame, transform, tagged, err = i.jpegTransformContext(ctx, data, params)
-		}
-		return data, frame, transform, tagged, err
-	}
-	if err == nil || i.Warning == nil || ctx.Err() != nil {
-		return data, frame, transform, tagged, err
-	}
-	originalErr := err
-	if len(data) < 2 || data[0] != 255 || data[1] != 216 || len(data) > imageBufferLimit()-2 {
-		return nil, jpegFrame{}, false, false, originalErr
-	}
-	candidate := make([]byte, 0, len(data)+2)
-	for position := 0; position < len(data); {
-		if err := ctx.Err(); err != nil {
-			return nil, jpegFrame{}, false, false, err
-		}
-		end := position + min(65536, len(data)-position)
-		candidate = append(candidate, data[position:end]...)
-		position = end
-	}
-	if data[len(data)-2] != 255 || data[len(data)-1] != 217 {
-		candidate = append(candidate, 255, 217)
-	}
-	candidate, err = jpegRestoreFramePrefix(ctx, candidate)
-	if err != nil {
-		return nil, jpegFrame{}, false, false, err
-	}
-	var normalized []byte
-	position := 0
-	frame, _, _, err = jpegReadSegmentsContext(ctx, candidate, nil, func(start, end int) error {
-		normalized = append(normalized, candidate[position:start]...)
-		position = end
-		return ctx.Err()
-	})
-	if err != nil {
-		return nil, jpegFrame{}, false, false, err
-	}
-	if position != 0 {
-		normalized = append(normalized, candidate[position:]...)
-		candidate = normalized
-	}
-	if err := frame.sampleSize(); err != nil {
-		return nil, jpegFrame{}, false, false, err
-	}
-	if frame.height <= 0 || frame.width <= 0 || frame.width > jpegRecoveryPixelLimit/frame.height {
-		return nil, jpegFrame{}, false, false, fmt.Errorf("JPEG framing recovery exceeds sample budget")
-	}
-	validation := *i
-	validation.Width, validation.Height, validation.Warning = frame.width, frame.height, nil
-	if _, err := validation.jpegSamplesContext(ctx, candidate, params); err != nil {
-		return nil, jpegFrame{}, false, false, err
-	}
-	frame, transform, tagged, err = i.jpegTransformContext(ctx, candidate, params)
-	if err != nil {
-		return nil, jpegFrame{}, false, false, err
-	}
-	i.Warning(Diagnostic{Message: fmt.Sprintf("recovered JPEG framing after complete sample validation: %v", originalErr)})
-	return candidate, frame, transform, tagged, ctx.Err()
-}
-
 // jpegRestoreFramePrefix 保留原量化数据，仅恢复被前一片段长度吞入的帧标记前缀
 // 入参: ctx 取消上下文, data 待完整解码验证的JPEG副本
 // 返回: []byte 恢复标记前缀的编码或原编码, error 取消错误
@@ -521,101 +223,6 @@ func jpegRestoreFramePrefix(ctx context.Context, data []byte) ([]byte, error) {
 			return data, nil
 		}
 		position += length + 2
-	}
-	return data, ctx.Err()
-}
-
-// jpegDimensionFileContext 用完整扫描验证字典高度候选，禁止截去额外MCU行或按损坏高度分配巨幅图像
-// 入参: ctx 取消上下文, data JPEG数据, frame 原编码布局, params DCT参数
-// 返回: []byte 已验证的编码副本或原编码, error 不完整扫描、预算或取消错误
-func (i *Image) jpegDimensionFileContext(ctx context.Context, data []byte, frame jpegFrame, params Dictionary) ([]byte, error) {
-	validate := func(encoded []byte, width, height int) error {
-		if width <= 0 || height <= 0 || width > jpegRecoveryPixelLimit/height {
-			return fmt.Errorf("JPEG dimension recovery exceeds sample budget")
-		}
-		validation := *i
-		validation.Width, validation.Height, validation.Warning = width, height, nil
-		_, err := validation.jpegSamplesContext(ctx, encoded, params)
-		return err
-	}
-	maxH, maxV := 1, 1
-	for n := 0; n < min(frame.components, len(frame.sampling)); n++ {
-		maxH = max(maxH, frame.sampling[n][0])
-		maxV = max(maxV, frame.sampling[n][1])
-	}
-	if !frame.progressive && frame.width == i.Width && i.Height > 0 && i.Height < frame.height && (frame.width+8*maxH-1)/(8*maxH) > 8 {
-		frameStart, scanStart, scanCount := 0, 0, 0
-		_, _, _, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
-			switch marker {
-			case 0xc0, 0xc1:
-				if frameStart != 0 {
-					return fmt.Errorf("multiple JPEG frames cannot recover dimensions")
-				}
-				for data[start+1] == 255 {
-					start++
-				}
-				frameStart = start + 5
-			case 0xda:
-				scanCount++
-				for data[start+1] == 255 {
-					start++
-				}
-				if start+4 < end && int(data[start+4]) == frame.components {
-					scanStart = end
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		if frameStart != 0 && scanStart != 0 && scanCount == 1 {
-			end := scanStart
-			for end+1 < len(data) {
-				if end&4095 == 0 {
-					if err := ctx.Err(); err != nil {
-						return nil, err
-					}
-				}
-				if data[end] != 255 {
-					end++
-					continue
-				}
-				marker := data[end+1]
-				if marker == 0 || marker >= 0xd0 && marker <= 0xd7 {
-					end += 2
-					continue
-				}
-				if marker == 255 {
-					end++
-					continue
-				}
-				break
-			}
-			if end > scanStart && end+1 < len(data) && data[end+1] == 217 && data[end-1] != 0 {
-				unit := 8 * maxV
-				firstHeight := (i.Height + unit - 1) / unit * unit
-				for _, height := range [2]int{firstHeight, firstHeight + unit} {
-					if height >= frame.height || height > 65535 {
-						continue
-					}
-					candidate := bytes.Clone(data)
-					binary.BigEndian.PutUint16(candidate[frameStart:], uint16(height))
-					if err := validate(candidate, frame.width, height); err == nil {
-						probe := make([]byte, end+1)
-						copy(probe, candidate[:end-1])
-						probe[end-1], probe[end] = 255, 217
-						if err := validate(probe, frame.width, height); err != nil && ctx.Err() == nil {
-							i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG frame height %d disagrees with complete scan; recovered verified height %d", frame.height, height)})
-							return candidate, nil
-						}
-					}
-				}
-			}
-		}
-	}
-	if err := validate(data, frame.width, frame.height); err != nil {
-		return nil, err
 	}
 	return data, ctx.Err()
 }
@@ -725,6 +332,402 @@ func jpegMetadataProfileContext(ctx context.Context, data []byte, stripColor boo
 		profile = append(profile, part...)
 	}
 	return metadata, profile, frame, adobe, tagged, true, ctx.Err()
+}
+
+// encodedImageDimensions 只读取单层JPEG或JPEG2000图像头，不为无效字典推测尺寸
+// 入参: stream 图像编码流
+// 返回: int 编码宽度, int 编码高度, error 不可确定的尺寸或编码错误
+func (r *Reader) encodedImageDimensions(stream *Stream) (int, int, error) {
+	filters, _, err := stream.filterChain(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(filters) == 1 {
+		switch filters[0] {
+		case Name("DCTDecode"):
+			config, err := jpeg.DecodeConfig(bytes.NewReader(stream.Data))
+			if err == nil && (config.Height <= 0 || config.Width <= 0 || config.Width > jpegRecoveryPixelLimit/config.Height) {
+				return 0, 0, fmt.Errorf("JPEG dimension recovery exceeds sample budget")
+			}
+			return config.Width, config.Height, err
+		case Name("JPXDecode"):
+			data, err := jpxCodestream(stream.Data)
+			if err != nil {
+				return 0, 0, err
+			}
+			width, height, _, err := jpxSize(data)
+			if err == nil && (height <= 0 || width <= 0 || width > jpegRecoveryPixelLimit/height) {
+				return 0, 0, fmt.Errorf("JPEG2000 dimension recovery exceeds sample budget")
+			}
+			return width, height, err
+		}
+	}
+	return 0, 0, fmt.Errorf("image encoding has no independent dimensions")
+}
+
+// JPEGFile 返回可脱离PDF字典直接显示的JPEG，移除PDF忽略的方向和配置文件
+// 返回: []byte 未重编码的JPEG或空值, error 解码参数错误
+func (i *Image) JPEGFile() ([]byte, error) {
+	return i.JPEGFileContext(context.Background())
+}
+
+// JPEGFileContext 返回可直接复用的JPEG，移除显示元数据期间检查取消
+// 支持灰度、RGB及符合Adobe反相约定的四通道CMYK图像直通，不重编码像素
+// 入参: ctx 取消上下文
+// 返回: []byte 未重编码的JPEG或空值, error 参数、编码或取消错误
+func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	invertedCMYK := i.ColorSpace == Name("DeviceCMYK") && i.isInvertedCMYKDecode()
+	if i.ImageMask || !invertedCMYK && (len(i.Decode) != 0 || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB")) {
+		return nil, nil
+	}
+	masked, err := i.HasMask()
+	if err != nil || masked {
+		return nil, err
+	}
+	data, params, err := i.encodedFileContext(ctx, "DCTDecode")
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
+	}
+	data, frame, transform, tagged, err := i.jpegReadTransformContext(ctx, data, params)
+	if err != nil {
+		return nil, err
+	}
+	reader := func() io.Reader { return bytes.NewReader(data) }
+	if invertedCMYK && frame.components == 4 && !tagged {
+		marker := jpegAdobeMarker(transform)
+		reader = func() io.Reader {
+			return io.MultiReader(bytes.NewReader(data[:2]), bytes.NewReader(marker), bytes.NewReader(data[2:]))
+		}
+	}
+	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: reader()})
+	if err != nil {
+		return nil, err
+	}
+	if config.Width != i.Width || config.Height != i.Height {
+		if i.Warning == nil {
+			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
+		}
+		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using complete image data dimensions %dx%d", config.Width, config.Height)})
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if frame.components == 1 && i.ColorSpace == Name("DeviceGray") || frame.components == 3 && i.ColorSpace == Name("DeviceRGB") && transform == (config.ColorModel == color.YCbCrModel) {
+		if frame.displayMetadata {
+			return jpegDisplayFileContext(ctx, data)
+		}
+		return data, nil
+	}
+	if invertedCMYK && frame.components == 4 && config.ColorModel == color.CMYKModel {
+		if frame.displayMetadata {
+			data, err = jpegDisplayFileContext(ctx, data)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !tagged {
+			marker := jpegAdobeMarker(transform)
+			out := make([]byte, len(data)+len(marker))
+			copy(out, data[:2])
+			copy(out[2:], marker)
+			copy(out[2+len(marker):], data[2:])
+			return out, nil
+		}
+		return data, nil
+	}
+	return nil, nil
+}
+
+// isInvertedCMYKDecode 判断解码数组是否为标准四通道反相映射
+// 返回: bool 是否为反相四通道解码
+func (i *Image) isInvertedCMYKDecode() bool {
+	if len(i.Decode) != 8 {
+		return false
+	}
+	values, err := i.reader.numberArray(i.Decode, 8)
+	if err != nil {
+		return false
+	}
+	return values[0] == 1 && values[1] == 0 && values[2] == 1 && values[3] == 0 && values[4] == 1 && values[5] == 0 && values[6] == 1 && values[7] == 0
+}
+
+// jpegTransformContext 解析DCT颜色规则并检查标记扫描取消
+// 入参: ctx 取消上下文, data JPEG数据, params DCT参数
+// 返回: jpegFrame 采样布局, bool 颜色变换, bool Adobe标记, error 参数或取消错误
+func (i *Image) jpegTransformContext(ctx context.Context, data []byte, params Dictionary) (jpegFrame, bool, bool, error) {
+	frame, adobe, tagged, err := jpegColorInfoContext(ctx, data)
+	if err != nil {
+		return jpegFrame{}, false, false, err
+	}
+	components := frame.components
+	transform := components == 3
+	if tagged {
+		if components == 3 && adobe != 0 && adobe != 1 || components == 4 && adobe != 0 && adobe != 2 {
+			return jpegFrame{}, false, false, fmt.Errorf("invalid Adobe JPEG color transform")
+		}
+		transform = adobe != 0
+	} else if (components == 3 || components == 4) && params["ColorTransform"] != nil {
+		value, err := i.reader.Resolve(params["ColorTransform"])
+		if err != nil {
+			return jpegFrame{}, false, false, err
+		}
+		if value != Integer(0) && value != Integer(1) {
+			return jpegFrame{}, false, false, fmt.Errorf("invalid JPEG ColorTransform")
+		}
+		transform = value == Integer(1)
+	}
+	return frame, transform, tagged, nil
+}
+
+// jpegSamplesContext 按PDF的DCT颜色规则解码，在读取和逐行变换间检查取消
+// 入参: ctx 取消上下文, data JPEG数据, params DCT解码参数
+// 返回: image.Image 原始颜色样本, error 参数、解码或取消错误
+func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dictionary) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	data, frame, transform, tagged, err := i.jpegReadTransformContext(ctx, data, params)
+	if err != nil {
+		return nil, err
+	}
+	components := frame.components
+	reader := func() io.Reader { return bytes.NewReader(data) }
+	if components == 4 && !tagged {
+		marker := jpegAdobeMarker(transform)
+		reader = func() io.Reader {
+			return io.MultiReader(bytes.NewReader(data[:2]), bytes.NewReader(marker), bytes.NewReader(data[2:]))
+		}
+	}
+	config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: reader()})
+	if err != nil {
+		return nil, err
+	}
+	if config.Width != i.Width || config.Height != i.Height {
+		if i.Warning == nil {
+			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
+		}
+		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using image data dimensions %dx%d", config.Width, config.Height)})
+	}
+	if err := frame.sampleSize(); err != nil {
+		return nil, err
+	}
+	if components == 4 || components == 3 && (config.ColorModel != color.YCbCrModel || !transform) {
+		if _, _, err := imageBufferSize(config.Width, config.Height, 4); err != nil {
+			return nil, err
+		}
+	}
+	result, err := jpeg.Decode(&contextInput{ctx: ctx, reader: reader()})
+	if err != nil {
+		return nil, err
+	}
+	if cmyk, ok := result.(*image.CMYK); ok {
+		for n := range cmyk.Pix {
+			if n&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			cmyk.Pix[n] = 255 - cmyk.Pix[n]
+		}
+		return &packedCMYKImage{data: cmyk.Pix, rect: cmyk.Rect, stride: cmyk.Stride, depth: 8}, nil
+	}
+	if components != 3 {
+		return result, nil
+	}
+	ycbcr, rawYCbCr := result.(*image.YCbCr)
+	if transform == rawYCbCr {
+		return result, nil
+	}
+	out := image.NewRGBA(result.Bounds())
+	for y := out.Rect.Min.Y; y < out.Rect.Max.Y; y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for x := out.Rect.Min.X; x < out.Rect.Max.X; x++ {
+			var red, green, blue uint8
+			if rawYCbCr {
+				value := ycbcr.YCbCrAt(x, y)
+				red, green, blue = value.Y, value.Cb, value.Cr
+			} else {
+				r, g, b, _ := result.At(x, y).RGBA()
+				red, green, blue = color.YCbCrToRGB(uint8(r>>8), uint8(g>>8), uint8(b>>8))
+			}
+			out.SetRGBA(x, y, color.RGBA{R: red, G: green, B: blue, A: 255})
+		}
+	}
+	return out, nil
+}
+
+// jpegReadTransformContext 仅在完整样本可严格解码时恢复结束标记及扫描外冗余数据
+// 入参: ctx 取消上下文, data JPEG数据, params DCT参数
+// 返回: []byte 有效编码, jpegFrame 采样布局, bool 颜色变换, bool Adobe标记, error 解码或取消错误
+func (i *Image) jpegReadTransformContext(ctx context.Context, data []byte, params Dictionary) ([]byte, jpegFrame, bool, bool, error) {
+	frame, transform, tagged, err := i.jpegTransformContext(ctx, data, params)
+	if err == nil && i.Warning != nil && (frame.width != i.Width || frame.height != i.Height) {
+		data, err = i.jpegDimensionFileContext(ctx, data, frame, params)
+		if err == nil {
+			frame, transform, tagged, err = i.jpegTransformContext(ctx, data, params)
+		}
+		return data, frame, transform, tagged, err
+	}
+	if err == nil || i.Warning == nil || ctx.Err() != nil {
+		return data, frame, transform, tagged, err
+	}
+	originalErr := err
+	if len(data) < 2 || data[0] != 255 || data[1] != 216 || len(data) > imageBufferLimit()-2 {
+		return nil, jpegFrame{}, false, false, originalErr
+	}
+	candidate := make([]byte, 0, len(data)+2)
+	for position := 0; position < len(data); {
+		if err := ctx.Err(); err != nil {
+			return nil, jpegFrame{}, false, false, err
+		}
+		end := position + min(65536, len(data)-position)
+		candidate = append(candidate, data[position:end]...)
+		position = end
+	}
+	if data[len(data)-2] != 255 || data[len(data)-1] != 217 {
+		candidate = append(candidate, 255, 217)
+	}
+	candidate, err = jpegRestoreFramePrefix(ctx, candidate)
+	if err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	var normalized []byte
+	position := 0
+	frame, _, _, err = jpegReadSegmentsContext(ctx, candidate, nil, func(start, end int) error {
+		normalized = append(normalized, candidate[position:start]...)
+		position = end
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	if position != 0 {
+		normalized = append(normalized, candidate[position:]...)
+		candidate = normalized
+	}
+	if err := frame.sampleSize(); err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	if frame.height <= 0 || frame.width <= 0 || frame.width > jpegRecoveryPixelLimit/frame.height {
+		return nil, jpegFrame{}, false, false, fmt.Errorf("JPEG framing recovery exceeds sample budget")
+	}
+	validation := *i
+	validation.Width, validation.Height, validation.Warning = frame.width, frame.height, nil
+	if _, err := validation.jpegSamplesContext(ctx, candidate, params); err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	frame, transform, tagged, err = i.jpegTransformContext(ctx, candidate, params)
+	if err != nil {
+		return nil, jpegFrame{}, false, false, err
+	}
+	i.Warning(Diagnostic{Message: fmt.Sprintf("recovered JPEG framing after complete sample validation: %v", originalErr)})
+	return candidate, frame, transform, tagged, ctx.Err()
+}
+
+// jpegDimensionFileContext 用完整扫描验证字典高度候选，禁止截去额外MCU行或按损坏高度分配巨幅图像
+// 入参: ctx 取消上下文, data JPEG数据, frame 原编码布局, params DCT参数
+// 返回: []byte 已验证的编码副本或原编码, error 不完整扫描、预算或取消错误
+func (i *Image) jpegDimensionFileContext(ctx context.Context, data []byte, frame jpegFrame, params Dictionary) ([]byte, error) {
+	validate := func(encoded []byte, width, height int) error {
+		if width <= 0 || height <= 0 || width > jpegRecoveryPixelLimit/height {
+			return fmt.Errorf("JPEG dimension recovery exceeds sample budget")
+		}
+		validation := *i
+		validation.Width, validation.Height, validation.Warning = width, height, nil
+		_, err := validation.jpegSamplesContext(ctx, encoded, params)
+		return err
+	}
+	maxH, maxV := 1, 1
+	for n := 0; n < min(frame.components, len(frame.sampling)); n++ {
+		maxH = max(maxH, frame.sampling[n][0])
+		maxV = max(maxV, frame.sampling[n][1])
+	}
+	if !frame.progressive && frame.width == i.Width && i.Height > 0 && i.Height < frame.height && (frame.width+8*maxH-1)/(8*maxH) > 8 {
+		frameStart, scanStart, scanCount := 0, 0, 0
+		_, _, _, err := jpegColorSegmentsContext(ctx, data, func(marker byte, start, end int) error {
+			switch marker {
+			case 0xc0, 0xc1:
+				if frameStart != 0 {
+					return fmt.Errorf("multiple JPEG frames cannot recover dimensions")
+				}
+				for data[start+1] == 255 {
+					start++
+				}
+				frameStart = start + 5
+			case 0xda:
+				scanCount++
+				for data[start+1] == 255 {
+					start++
+				}
+				if start+4 < end && int(data[start+4]) == frame.components {
+					scanStart = end
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if frameStart != 0 && scanStart != 0 && scanCount == 1 {
+			end := scanStart
+			for end+1 < len(data) {
+				if end&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				if data[end] != 255 {
+					end++
+					continue
+				}
+				marker := data[end+1]
+				if marker == 0 || marker >= 0xd0 && marker <= 0xd7 {
+					end += 2
+					continue
+				}
+				if marker == 255 {
+					end++
+					continue
+				}
+				break
+			}
+			if end > scanStart && end+1 < len(data) && data[end+1] == 217 && data[end-1] != 0 {
+				unit := 8 * maxV
+				firstHeight := (i.Height + unit - 1) / unit * unit
+				for _, height := range [2]int{firstHeight, firstHeight + unit} {
+					if height >= frame.height || height > 65535 {
+						continue
+					}
+					candidate := bytes.Clone(data)
+					binary.BigEndian.PutUint16(candidate[frameStart:], uint16(height))
+					if err := validate(candidate, frame.width, height); err == nil {
+						probe := make([]byte, end+1)
+						copy(probe, candidate[:end-1])
+						probe[end-1], probe[end] = 255, 217
+						if err := validate(probe, frame.width, height); err != nil && ctx.Err() == nil {
+							i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG frame height %d disagrees with complete scan; recovered verified height %d", frame.height, height)})
+							return candidate, nil
+						}
+					}
+				}
+			}
+		}
+	}
+	if err := validate(data, frame.width, frame.height); err != nil {
+		return nil, err
+	}
+	return data, ctx.Err()
 }
 
 // sampleSize 校验JPEG解码器的采样平面及渐进系数缓冲

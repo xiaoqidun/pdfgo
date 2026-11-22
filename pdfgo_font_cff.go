@@ -169,14 +169,6 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 	return result, nil
 }
 
-// cffFontMapping 读取CID或内置字符编码到字形编号的映射，不重新解释轮廓
-// 入参: data CFF数据, composite 是否为复合字体, encoding PDF基础编码, differences PDF编码差异
-// 入参: identity 是否允许非CID字形身份映射, programType 字体容器类型
-// 返回: map[uint32]uint16 字符码或CID到字形编号的映射, map[uint32]string 字符码到字形名称的映射, error 错误信息
-func cffFontMapping(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool, programType Name) (map[uint32]uint16, map[uint32]string, error) {
-	return cffFontMappingWithGlyphMap(data, composite, encoding, differences, identity, programType, nil)
-}
-
 // cffFontMappingWithGlyphMap 读取CFF字形选择，非CID程序优先使用明确的CIDToGIDMap
 // 入参: data CFF数据, composite 复合字体, encoding 基础编码, differences 编码差异
 // 入参: identity 非CID程序是否允许编号映射, programType 容器类型, glyphMap 原始CID到GID表

@@ -32,6 +32,59 @@ type TextReplacement struct {
 	Text  string
 }
 
+// CompactText 合并相邻且显式重设文字矩阵的文字对象，不跨越内容标记及图形状态边界
+// 入参: ctx 取消上下文, data 解码页面内容
+// 返回: []byte 精简内容，未变化时为nil, error 解析或取消错误
+func CompactText(ctx context.Context, data []byte) ([]byte, error) {
+	var output bytes.Buffer
+	position, endText, beginText := 0, -1, -1
+	mode, clipped := int64(0), false
+	var stack []int64
+	err := walkOperationsBorrowed(ctx, data, func(op Operation) error {
+		switch op.Operator {
+		case "q":
+			stack = append(stack, mode)
+		case "Q":
+			if len(stack) > 0 {
+				mode, stack = stack[len(stack)-1], stack[:len(stack)-1]
+			}
+		case "Tr":
+			if len(op.Operands) == 1 {
+				value, ok := op.Operands[0].(Integer)
+				if ok {
+					mode = int64(value)
+				}
+			}
+		}
+		clipped = clipped || mode >= 4
+		if op.Operator == "Tm" && len(op.Operands) == 6 && beginText >= 0 {
+			output.Write(data[position:endText])
+			position = beginText + 2
+		}
+		if op.Operator == "BT" && endText >= 0 && len(op.Operands) == 0 {
+			beginText = int(op.Offset)
+		} else {
+			beginText = -1
+			endText = -1
+			if op.Operator == "ET" && len(op.Operands) == 0 && !clipped {
+				endText = int(op.Offset)
+			}
+		}
+		if op.Operator == "ET" {
+			clipped = false
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if position == 0 {
+		return nil, ctx.Err()
+	}
+	output.Write(data[position:])
+	return output.Bytes(), ctx.Err()
+}
+
 // textReplacements 按页写入标准替换文本，复制内容流以隔离共享资源
 // 入参: ctx 取消上下文, changes 页面替换区段, result 已有替换对象, deferCompress 是否延后至内容变换阶段压缩, compressLevel 流压缩级别
 // 返回: map[Reference][]byte 待变换的未压缩页面内容, bool 是否修改内容, error 参数、内容或取消错误
@@ -249,57 +302,4 @@ func (r *Reader) transformPageContent(ctx context.Context, transform func(contex
 		result[page.Reference] = dict
 		return ctx.Err()
 	})
-}
-
-// CompactText 合并相邻且显式重设文字矩阵的文字对象，不跨越内容标记及图形状态边界
-// 入参: ctx 取消上下文, data 解码页面内容
-// 返回: []byte 精简内容，未变化时为nil, error 解析或取消错误
-func CompactText(ctx context.Context, data []byte) ([]byte, error) {
-	var output bytes.Buffer
-	position, endText, beginText := 0, -1, -1
-	mode, clipped := int64(0), false
-	var stack []int64
-	err := walkOperationsBorrowed(ctx, data, func(op Operation) error {
-		switch op.Operator {
-		case "q":
-			stack = append(stack, mode)
-		case "Q":
-			if len(stack) > 0 {
-				mode, stack = stack[len(stack)-1], stack[:len(stack)-1]
-			}
-		case "Tr":
-			if len(op.Operands) == 1 {
-				value, ok := op.Operands[0].(Integer)
-				if ok {
-					mode = int64(value)
-				}
-			}
-		}
-		clipped = clipped || mode >= 4
-		if op.Operator == "Tm" && len(op.Operands) == 6 && beginText >= 0 {
-			output.Write(data[position:endText])
-			position = beginText + 2
-		}
-		if op.Operator == "BT" && endText >= 0 && len(op.Operands) == 0 {
-			beginText = int(op.Offset)
-		} else {
-			beginText = -1
-			endText = -1
-			if op.Operator == "ET" && len(op.Operands) == 0 && !clipped {
-				endText = int(op.Offset)
-			}
-		}
-		if op.Operator == "ET" {
-			clipped = false
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if position == 0 {
-		return nil, ctx.Err()
-	}
-	output.Write(data[position:])
-	return output.Bytes(), ctx.Err()
 }

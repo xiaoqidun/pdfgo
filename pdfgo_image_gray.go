@@ -28,61 +28,6 @@ type mappedGrayImage struct {
 	byteExact bool
 }
 
-// ColorModel 返回映射结果可无损表达的灰度模型
-// 返回: color.Model 颜色模型
-func (s *mappedGrayImage) ColorModel() color.Model {
-	if s.byteExact {
-		return color.GrayModel
-	}
-	return color.Gray16Model
-}
-
-// Bounds 返回原始采样边界
-// 返回: image.Rectangle 图像边界
-func (s *mappedGrayImage) Bounds() image.Rectangle { return s.source.rect }
-
-// Opaque 返回灰度图像的不透明状态
-// 返回: bool 是否不透明
-func (s *mappedGrayImage) Opaque() bool { return true }
-
-// At 读取映射后的灰度，边界外返回零值
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.Color 灰度颜色
-func (s *mappedGrayImage) At(x, y int) color.Color {
-	value := s.Gray16At(x, y)
-	if s.byteExact {
-		return color.Gray{Y: byte(value.Y >> 8)}
-	}
-	return value
-}
-
-// Gray16At 直接读取映射后的十六位灰度
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.Gray16 灰度颜色
-func (s *mappedGrayImage) Gray16At(x, y int) color.Gray16 {
-	if !image.Pt(x, y).In(s.Bounds()) {
-		return color.Gray16{}
-	}
-	line := s.source.data[(y-s.source.rect.Min.Y)*s.source.stride:]
-	return color.Gray16{Y: s.lookup[packedSample(line, int64(x-s.source.rect.Min.X), s.source.depth)]}
-}
-
-// NRGBA64At 直接读取非预乘颜色，避免逐像素颜色接口转换
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.NRGBA64 非预乘颜色
-func (s *mappedGrayImage) NRGBA64At(x, y int) color.NRGBA64 {
-	value := s.Gray16At(x, y).Y
-	return color.NRGBA64{R: value, G: value, B: value, A: 65535}
-}
-
-// RGBA64At 直接读取预乘颜色，保留灰度精度
-// 入参: x 横向坐标, y 纵向坐标
-// 返回: color.RGBA64 预乘颜色
-func (s *mappedGrayImage) RGBA64At(x, y int) color.RGBA64 {
-	value := s.Gray16At(x, y).Y
-	return color.RGBA64{R: value, G: value, B: value, A: 65535}
-}
-
 // decodeGrayImageContext 应用灰度映射，紧凑样本保持延迟展开
 // 入参: ctx 取消上下文, samples 独立样本, lower 映射起点, upper 映射终点
 // 返回: image.Image 灰度图像，不支持的样本类型为空, error 尺寸或取消错误
@@ -179,4 +124,59 @@ func decodeGrayImageContext(ctx context.Context, samples image.Image, lower, upp
 		return out8, nil
 	}
 	return out16, nil
+}
+
+// ColorModel 返回映射结果可无损表达的灰度模型
+// 返回: color.Model 颜色模型
+func (s *mappedGrayImage) ColorModel() color.Model {
+	if s.byteExact {
+		return color.GrayModel
+	}
+	return color.Gray16Model
+}
+
+// Bounds 返回原始采样边界
+// 返回: image.Rectangle 图像边界
+func (s *mappedGrayImage) Bounds() image.Rectangle { return s.source.rect }
+
+// Opaque 返回灰度图像的不透明状态
+// 返回: bool 是否不透明
+func (s *mappedGrayImage) Opaque() bool { return true }
+
+// At 读取映射后的灰度，边界外返回零值
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 灰度颜色
+func (s *mappedGrayImage) At(x, y int) color.Color {
+	value := s.Gray16At(x, y)
+	if s.byteExact {
+		return color.Gray{Y: byte(value.Y >> 8)}
+	}
+	return value
+}
+
+// Gray16At 直接读取映射后的十六位灰度
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Gray16 灰度颜色
+func (s *mappedGrayImage) Gray16At(x, y int) color.Gray16 {
+	if !image.Pt(x, y).In(s.Bounds()) {
+		return color.Gray16{}
+	}
+	line := s.source.data[(y-s.source.rect.Min.Y)*s.source.stride:]
+	return color.Gray16{Y: s.lookup[packedSample(line, int64(x-s.source.rect.Min.X), s.source.depth)]}
+}
+
+// NRGBA64At 直接读取非预乘颜色，避免逐像素颜色接口转换
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.NRGBA64 非预乘颜色
+func (s *mappedGrayImage) NRGBA64At(x, y int) color.NRGBA64 {
+	value := s.Gray16At(x, y).Y
+	return color.NRGBA64{R: value, G: value, B: value, A: 65535}
+}
+
+// RGBA64At 直接读取预乘颜色，保留灰度精度
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.RGBA64 预乘颜色
+func (s *mappedGrayImage) RGBA64At(x, y int) color.RGBA64 {
+	value := s.Gray16At(x, y).Y
+	return color.RGBA64{R: value, G: value, B: value, A: 65535}
 }

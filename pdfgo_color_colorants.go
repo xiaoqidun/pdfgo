@@ -78,6 +78,40 @@ func NewColorantDevice(space *ColorSpace, spots []Name) (*ColorantDevice, error)
 	return device, nil
 }
 
+// colorantProcessPaint 建立原生过程画刷，保留单位分量与设备四色
+// 入参: values 过程分量, space 过程空间, intent 渲染意图
+// 返回: Paint 原生画刷, error 颜色变换错误
+func colorantProcessPaint(values [4]float64, space *ColorSpace, intent Name) (Paint, error) {
+	rgb, err := space.SRGB(values[:space.Components()], intent)
+	if err != nil {
+		return Paint{}, err
+	}
+	paint := Paint{SourceSpace: space.Model, Space: space, Values: values, RGB: rgb, Alpha: 1}
+	if space.Device() && space.Model == "DeviceCMYK" {
+		paint.CMYK = &values
+	}
+	return paint, nil
+}
+
+// newColorantPaint 复制已裁切的源浓度，不使用备用函数区间替代源浓度
+// 入参: space 色料定义, tints 源浓度
+// 返回: *ColorantPaint 独立浓度快照
+func newColorantPaint(space *ColorantSpace, tints []float64) *ColorantPaint {
+	if space == nil {
+		return nil
+	}
+	result := &ColorantPaint{Space: space}
+	if len(tints) <= len(result.values) {
+		result.Tints = result.values[:len(tints)]
+	} else {
+		result.Tints = make([]float64, len(tints))
+	}
+	for i, value := range tints {
+		result.Tints[i] = math.Max(0, math.Min(1, value))
+	}
+	return result
+}
+
 // CompositeOpaque 按不透明分色套印规则合成原生通道，显式零值仍标记命名通道
 // 入参: out 输出缓冲，可与backdrop相同, backdrop 过程色及专色背景, source 已求值的原生色料, overprint 是否保留未标记通道
 // 返回: error 分量错误或仍需合成备用色，错误时不修改输出
@@ -458,38 +492,4 @@ func (d *ColorantDevice) native(names []Name, tints []float64, intent Name) (Col
 		result.Process = &paint
 	}
 	return result, nil
-}
-
-// colorantProcessPaint 建立原生过程画刷，保留单位分量与设备四色
-// 入参: values 过程分量, space 过程空间, intent 渲染意图
-// 返回: Paint 原生画刷, error 颜色变换错误
-func colorantProcessPaint(values [4]float64, space *ColorSpace, intent Name) (Paint, error) {
-	rgb, err := space.SRGB(values[:space.Components()], intent)
-	if err != nil {
-		return Paint{}, err
-	}
-	paint := Paint{SourceSpace: space.Model, Space: space, Values: values, RGB: rgb, Alpha: 1}
-	if space.Device() && space.Model == "DeviceCMYK" {
-		paint.CMYK = &values
-	}
-	return paint, nil
-}
-
-// newColorantPaint 复制已裁切的源浓度，不使用备用函数区间替代源浓度
-// 入参: space 色料定义, tints 源浓度
-// 返回: *ColorantPaint 独立浓度快照
-func newColorantPaint(space *ColorantSpace, tints []float64) *ColorantPaint {
-	if space == nil {
-		return nil
-	}
-	result := &ColorantPaint{Space: space}
-	if len(tints) <= len(result.values) {
-		result.Tints = result.values[:len(tints)]
-	} else {
-		result.Tints = make([]float64, len(tints))
-	}
-	for i, value := range tints {
-		result.Tints[i] = math.Max(0, math.Min(1, value))
-	}
-	return result
 }

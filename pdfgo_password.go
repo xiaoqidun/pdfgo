@@ -885,50 +885,6 @@ var passwordLeft = [][2]rune{
 	{0x100000, 0x10fffd},
 }
 
-// encodePassword 按加密版本转换用户输入，不改变调用方的密码字节
-// 入参: password UTF-8密码
-// 返回: []byte 已编码密码, error 编码或准备错误
-func (r *Reader) encodePassword(password []byte) ([]byte, error) {
-	object, err := r.Resolve(r.Trailer["Encrypt"])
-	if err != nil || object == nil {
-		return nil, err
-	}
-	dict, ok := object.(Dictionary)
-	if !ok {
-		return nil, fmt.Errorf("invalid encryption dictionary")
-	}
-	revision, _ := dict["R"].(Integer)
-	if revision >= 5 {
-		return preparePassword(password)
-	}
-	if !utf8.Valid(password) {
-		return nil, ErrPassword
-	}
-	result := make([]byte, 0, len(password))
-	for _, c := range string(password) {
-		found := false
-		for code := 0; code < 256; code++ {
-			decoded := rune(code)
-			if mapped, ok := pdfDocCharacters[byte(code)]; ok {
-				if mapped == 0 {
-					continue
-				}
-				decoded = mapped
-			}
-			if decoded == c {
-				result = append(result, byte(code))
-				found = true
-				break
-			}
-		}
-		if !found {
-			clear(result)
-			return nil, ErrPassword
-		}
-	}
-	return result, nil
-}
-
 // preparePassword 执行RFC4013的查询字符串准备及Unicode3.2双向文字检查
 // 入参: password UTF-8密码
 // 返回: []byte SASLprep结果, error 准备错误
@@ -995,4 +951,48 @@ func preparePassword(password []byte) ([]byte, error) {
 func passwordRangeContains(ranges [][2]rune, value rune) bool {
 	i := sort.Search(len(ranges), func(i int) bool { return ranges[i][1] >= value })
 	return i < len(ranges) && ranges[i][0] <= value
+}
+
+// encodePassword 按加密版本转换用户输入，不改变调用方的密码字节
+// 入参: password UTF-8密码
+// 返回: []byte 已编码密码, error 编码或准备错误
+func (r *Reader) encodePassword(password []byte) ([]byte, error) {
+	object, err := r.Resolve(r.Trailer["Encrypt"])
+	if err != nil || object == nil {
+		return nil, err
+	}
+	dict, ok := object.(Dictionary)
+	if !ok {
+		return nil, fmt.Errorf("invalid encryption dictionary")
+	}
+	revision, _ := dict["R"].(Integer)
+	if revision >= 5 {
+		return preparePassword(password)
+	}
+	if !utf8.Valid(password) {
+		return nil, ErrPassword
+	}
+	result := make([]byte, 0, len(password))
+	for _, c := range string(password) {
+		found := false
+		for code := 0; code < 256; code++ {
+			decoded := rune(code)
+			if mapped, ok := pdfDocCharacters[byte(code)]; ok {
+				if mapped == 0 {
+					continue
+				}
+				decoded = mapped
+			}
+			if decoded == c {
+				result = append(result, byte(code))
+				found = true
+				break
+			}
+		}
+		if !found {
+			clear(result)
+			return nil, ErrPassword
+		}
+	}
+	return result, nil
 }

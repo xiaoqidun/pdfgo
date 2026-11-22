@@ -27,6 +27,57 @@ type meshLinearVertex struct {
 	value float64
 }
 
+// meshLinearClamp 裁切三个顶点的分量，仅在整个三角形内保持线性时返回成功
+// 入参: values 顶点分量, low 下界, high 上界
+// 返回: [3]float64 裁切后的分量, bool 是否保持线性
+func meshLinearClamp(values [3]float64, low, high float64) ([3]float64, bool) {
+	lower, upper := min(values[0], values[1], values[2]), max(values[0], values[1], values[2])
+	if low != high && (lower < low && upper > low || lower < high && upper > high) {
+		return values, false
+	}
+	for i, value := range values {
+		values[i] = math.Max(low, math.Min(high, value))
+	}
+	return values, true
+}
+
+// clipMeshLinear 沿函数输入等值线裁切凸多边形，保持顶点顺序
+// 入参: dst 输出缓冲, source 原多边形, boundary 裁切值, lower 是否保留下界一侧
+// 返回: []meshLinearVertex 裁切后的顶点
+func clipMeshLinear(dst, source []meshLinearVertex, boundary float64, lower bool) []meshLinearVertex {
+	if len(source) == 0 {
+		return dst
+	}
+	a := source[len(source)-1]
+	inside := func(value float64) bool {
+		return lower && value >= boundary || !lower && value <= boundary
+	}
+	appendVertex := func(vertex meshLinearVertex) {
+		if len(dst) == 0 || dst[len(dst)-1] != vertex {
+			dst = append(dst, vertex)
+		}
+	}
+	for _, b := range source {
+		if inside(a.value) != inside(b.value) {
+			left, right := a, b
+			if left.value > right.value {
+				left, right = right, left
+			}
+			t := functionPosition(boundary, left.value, right.value)
+			point := Point{functionValue(t, left.point.X, right.point.X), functionValue(t, left.point.Y, right.point.Y)}
+			appendVertex(meshLinearVertex{point, boundary})
+		}
+		if inside(b.value) {
+			appendVertex(b)
+		}
+		a = b
+	}
+	if len(dst) > 1 && dst[0] == dst[len(dst)-1] {
+		dst = dst[:len(dst)-1]
+	}
+	return dst
+}
+
 // LinearTriangles 将连续分段线性颜色函数及专色变换展开为三角形，不改变源网格
 // 入参: index 三角形索引，不计曲面数量
 // 返回: []MeshTriangle 使用Space颜色分量且无需再求值函数的三角形, error 参数错误或无法等价展开的UnsupportedError
@@ -38,6 +89,9 @@ func (g *MeshGradient) LinearTriangles(index int) ([]MeshTriangle, error) {
 // 入参: ctx 取消上下文, index 三角形索引，不计曲面数量
 // 返回: []MeshTriangle 使用Space颜色分量的独立三角形, error 参数、转换或取消错误
 func (g *MeshGradient) LinearTrianglesContext(ctx context.Context, index int) ([]MeshTriangle, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid mesh gradient context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -201,55 +255,4 @@ func (g *MeshGradient) linearTintColors(triangle MeshTriangle) ([3][4]float64, e
 		}
 	}
 	return result, nil
-}
-
-// meshLinearClamp 裁切三个顶点的分量，仅在整个三角形内保持线性时返回成功
-// 入参: values 顶点分量, low 下界, high 上界
-// 返回: [3]float64 裁切后的分量, bool 是否保持线性
-func meshLinearClamp(values [3]float64, low, high float64) ([3]float64, bool) {
-	lower, upper := min(values[0], values[1], values[2]), max(values[0], values[1], values[2])
-	if low != high && (lower < low && upper > low || lower < high && upper > high) {
-		return values, false
-	}
-	for i, value := range values {
-		values[i] = math.Max(low, math.Min(high, value))
-	}
-	return values, true
-}
-
-// clipMeshLinear 沿函数输入等值线裁切凸多边形，保持顶点顺序
-// 入参: dst 输出缓冲, source 原多边形, boundary 裁切值, lower 是否保留下界一侧
-// 返回: []meshLinearVertex 裁切后的顶点
-func clipMeshLinear(dst, source []meshLinearVertex, boundary float64, lower bool) []meshLinearVertex {
-	if len(source) == 0 {
-		return dst
-	}
-	a := source[len(source)-1]
-	inside := func(value float64) bool {
-		return lower && value >= boundary || !lower && value <= boundary
-	}
-	appendVertex := func(vertex meshLinearVertex) {
-		if len(dst) == 0 || dst[len(dst)-1] != vertex {
-			dst = append(dst, vertex)
-		}
-	}
-	for _, b := range source {
-		if inside(a.value) != inside(b.value) {
-			left, right := a, b
-			if left.value > right.value {
-				left, right = right, left
-			}
-			t := functionPosition(boundary, left.value, right.value)
-			point := Point{functionValue(t, left.point.X, right.point.X), functionValue(t, left.point.Y, right.point.Y)}
-			appendVertex(meshLinearVertex{point, boundary})
-		}
-		if inside(b.value) {
-			appendVertex(b)
-		}
-		a = b
-	}
-	if len(dst) > 1 && dst[0] == dst[len(dst)-1] {
-		dst = dst[:len(dst)-1]
-	}
-	return dst
 }

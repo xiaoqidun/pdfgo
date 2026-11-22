@@ -385,66 +385,6 @@ func validateFontCmap(ctx context.Context, table []byte) error {
 	return ctx.Err()
 }
 
-// simpleGlyphContext 按字符表或字形名称选择字形，名称解析响应本次取消
-// 入参: ctx 取消上下文, code 原始字符码, name 编码名称
-// 返回: uint16 字形编号, error 映射或取消错误
-func (f *Font) simpleGlyphContext(ctx context.Context, code uint32, name string) (uint16, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if f.symbolic {
-		id, err := cmapGlyph(f.simpleCmap, code)
-		if err != nil || f.cmapEncoding != "Symbol" {
-			return id, err
-		}
-		for _, base := range [...]uint32{0xF000, 0xF100, 0xF200} {
-			candidate, err := cmapGlyph(f.simpleCmap, base+code)
-			if err != nil {
-				return 0, err
-			}
-			if candidate != 0 {
-				if id != 0 && id != candidate {
-					return 0, fmt.Errorf("ambiguous symbol cmap")
-				}
-				id = candidate
-			}
-		}
-		return id, nil
-	}
-	if name == "" || name == ".notdef" {
-		return 0, nil
-	}
-	if f.simpleCmap == nil {
-		return f.post.lookupContext(ctx, name)
-	}
-	var codepoint uint32
-	mapped := false
-	if f.cmapEncoding == "MacRomanEncoding" {
-		for index, glyphName := range pdfMacRomanNames {
-			if index == 219 {
-				glyphName = "Euro"
-			}
-			if glyphName == name {
-				codepoint, mapped = uint32(index), true
-				break
-			}
-		}
-	} else {
-		text, found := glyphNameUnicode(name)
-		character, size := utf8.DecodeRuneInString(text)
-		if found && size == len(text) && size != 0 {
-			codepoint, mapped = uint32(character), true
-		}
-	}
-	if mapped {
-		id, err := cmapUnicodeGlyph(f.simpleCmap, codepoint)
-		if err != nil || id != 0 {
-			return id, err
-		}
-	}
-	return f.post.lookupContext(ctx, name)
-}
-
 // cmapUnicodeGlyph 查询Unicode字符，格式8按声明的宽字符前缀匹配编码值
 // 入参: table 已校验字符表, code Unicode字符
 // 返回: uint16 字形编号, error 映射或编码冲突错误
@@ -635,4 +575,64 @@ func cmapGlyph(table []byte, code uint32) (uint16, error) {
 		return 0, &UnsupportedError{Feature: fmt.Sprintf("TrueType cmap format %d", u16(0))}
 	}
 	return 0, nil
+}
+
+// simpleGlyphContext 按字符表或字形名称选择字形，名称解析响应本次取消
+// 入参: ctx 取消上下文, code 原始字符码, name 编码名称
+// 返回: uint16 字形编号, error 映射或取消错误
+func (f *Font) simpleGlyphContext(ctx context.Context, code uint32, name string) (uint16, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if f.symbolic {
+		id, err := cmapGlyph(f.simpleCmap, code)
+		if err != nil || f.cmapEncoding != "Symbol" {
+			return id, err
+		}
+		for _, base := range [...]uint32{0xF000, 0xF100, 0xF200} {
+			candidate, err := cmapGlyph(f.simpleCmap, base+code)
+			if err != nil {
+				return 0, err
+			}
+			if candidate != 0 {
+				if id != 0 && id != candidate {
+					return 0, fmt.Errorf("ambiguous symbol cmap")
+				}
+				id = candidate
+			}
+		}
+		return id, nil
+	}
+	if name == "" || name == ".notdef" {
+		return 0, nil
+	}
+	if f.simpleCmap == nil {
+		return f.post.lookupContext(ctx, name)
+	}
+	var codepoint uint32
+	mapped := false
+	if f.cmapEncoding == "MacRomanEncoding" {
+		for index, glyphName := range pdfMacRomanNames {
+			if index == 219 {
+				glyphName = "Euro"
+			}
+			if glyphName == name {
+				codepoint, mapped = uint32(index), true
+				break
+			}
+		}
+	} else {
+		text, found := glyphNameUnicode(name)
+		character, size := utf8.DecodeRuneInString(text)
+		if found && size == len(text) && size != 0 {
+			codepoint, mapped = uint32(character), true
+		}
+	}
+	if mapped {
+		id, err := cmapUnicodeGlyph(f.simpleCmap, codepoint)
+		if err != nil || id != 0 {
+			return id, err
+		}
+	}
+	return f.post.lookupContext(ctx, name)
 }

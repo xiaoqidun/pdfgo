@@ -194,6 +194,9 @@ func (r *Reader) StructureTree() (*StructureTree, error) {
 // 入参: ctx 取消上下文, tag 原始角色, accepts 支持的角色判断函数
 // 返回: Name 匹配角色, bool 是否匹配, error 解析、类型或取消错误
 func (r *Reader) ResolveStructureRole(ctx context.Context, tag Name, accepts func(Name) bool) (Name, bool, error) {
+	if r == nil || ctx == nil {
+		return "", false, fmt.Errorf("invalid structure context")
+	}
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
@@ -244,6 +247,9 @@ func (r *Reader) ResolveStructureRole(ctx context.Context, tag Name, accepts fun
 // 入参: ctx 取消上下文, visit 零基层级和结构项的访问函数
 // 返回: error 解析、结构、循环、取消或访问错误
 func (r *Reader) WalkStructure(ctx context.Context, visit func(int, StructureItem) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid structure context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -307,6 +313,9 @@ func (r *Reader) WalkStructure(ctx context.Context, visit func(int, StructureIte
 // 入参: ctx 取消上下文, item 结构元素
 // 返回: []StructureAttribute 属性列表, error 解析、结构或取消错误
 func (r *Reader) StructureAttributes(ctx context.Context, item StructureItem) ([]StructureAttribute, error) {
+	if r == nil || ctx == nil {
+		return nil, fmt.Errorf("invalid structure context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -399,6 +408,9 @@ func (r *Reader) StructureAttributes(ctx context.Context, item StructureItem) ([
 // 入参: ctx 取消上下文, visit 标识及结构元素的访问函数
 // 返回: error 名称树、元素标识、取消或访问错误
 func (r *Reader) WalkStructureIDs(ctx context.Context, visit func(string, StructureItem) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid structure context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -431,6 +443,9 @@ func (r *Reader) WalkStructureIDs(ctx context.Context, visit func(string, Struct
 // 入参: ctx 取消上下文, visit 父元素引用访问函数
 // 返回: error 数字树、元素引用、取消或访问错误
 func (r *Reader) WalkStructureParents(ctx context.Context, visit func(StructureParent) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid structure context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

@@ -33,14 +33,33 @@ type Redaction struct {
 	Alignment         int
 }
 
+// annotationQuadrilateral 校验逆时针凸四边形，兼容既有文字标记的Z序坐标
+// 入参: points 原始顶点
+// 返回: [4]Point 逆时针顶点, error 坐标或几何错误
+func annotationQuadrilateral(points [4]Point) ([4]Point, error) {
+	for _, point := range points {
+		if math.IsNaN(point.X) || math.IsNaN(point.Y) || math.IsInf(point.X, 0) || math.IsInf(point.Y, 0) {
+			return points, fmt.Errorf("invalid annotation quadrilateral coordinates")
+		}
+	}
+	cross := func(a, b, c Point) float64 { return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X) }
+	if cross(points[0], points[1], points[2]) < 0 && cross(points[1], points[2], points[3]) > 0 {
+		points = [4]Point{points[2], points[3], points[1], points[0]}
+	}
+	for i := range points {
+		turn := cross(points[i], points[(i+1)%4], points[(i+2)%4])
+		if turn <= 0 || math.IsNaN(turn) || math.IsInf(turn, 0) {
+			return points, fmt.Errorf("invalid annotation quadrilateral")
+		}
+	}
+	return points, nil
+}
+
 // ReadRedaction 读取删改注解的区域及覆盖属性，不执行内容移除或覆盖绘制
 // 入参: ctx 取消上下文, annotation 删改注解
 // 返回: Redaction 删改信息, error 类型、区域或覆盖属性错误
 func (r *Reader) ReadRedaction(ctx context.Context, annotation Annotation) (Redaction, error) {
 	var redaction Redaction
-	if annotation.Subtype != "Redact" {
-		return redaction, fmt.Errorf("annotation is not a redaction")
-	}
 	var err error
 	redaction.Regions, err = r.ReadRedactionRegions(ctx, annotation)
 	if err != nil {
@@ -135,6 +154,9 @@ func (r *Reader) ReadRedaction(ctx context.Context, annotation Annotation) (Reda
 // 入参: ctx 取消上下文, annotation 删改注解
 // 返回: [][4]Point 逆时针四边形, error 类型或几何错误
 func (r *Reader) ReadRedactionRegions(ctx context.Context, annotation Annotation) ([][4]Point, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid redaction context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -183,28 +205,6 @@ func (r *Reader) ReadRedactionRegions(ctx context.Context, annotation Annotation
 		regions = append(regions, quad)
 	}
 	return regions, nil
-}
-
-// annotationQuadrilateral 校验逆时针凸四边形，兼容既有文字标记的Z序坐标
-// 入参: points 原始顶点
-// 返回: [4]Point 逆时针顶点, error 坐标或几何错误
-func annotationQuadrilateral(points [4]Point) ([4]Point, error) {
-	for _, point := range points {
-		if math.IsNaN(point.X) || math.IsNaN(point.Y) || math.IsInf(point.X, 0) || math.IsInf(point.Y, 0) {
-			return points, fmt.Errorf("invalid annotation quadrilateral coordinates")
-		}
-	}
-	cross := func(a, b, c Point) float64 { return (b.X-a.X)*(c.Y-a.Y) - (b.Y-a.Y)*(c.X-a.X) }
-	if cross(points[0], points[1], points[2]) < 0 && cross(points[1], points[2], points[3]) > 0 {
-		points = [4]Point{points[2], points[3], points[1], points[0]}
-	}
-	for i := range points {
-		turn := cross(points[i], points[(i+1)%4], points[(i+2)%4])
-		if turn <= 0 || math.IsNaN(turn) || math.IsInf(turn, 0) {
-			return points, fmt.Errorf("invalid annotation quadrilateral")
-		}
-	}
-	return points, nil
 }
 
 // redactionAppearance 生成待删改区域的笔画预览，不使用应用删改后的覆盖属性

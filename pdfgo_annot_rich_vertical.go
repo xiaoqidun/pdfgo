@@ -50,6 +50,30 @@ type annotationRichVerticalDecoration struct {
 	x, y, height, size float64
 }
 
+// annotationRichVerticalBounds 计算原字体的竖排边界，横排字体按正立字框置入单元
+// 入参: glyph 字符, state 默认文字状态, size 默认字号, pen 列内位置
+// 返回: Rectangle 字形边界, float64 推进量, Point 横排字体定位补偿, error 度量错误
+func annotationRichVerticalBounds(glyph annotationRichGlyph, state graphicsState, size, pen float64) (Rectangle, float64, Point, error) {
+	n := annotationRichSize(glyph, size)
+	if n == 0 {
+		return Rectangle{}, 0, Point{}, nil
+	}
+	state.font, state.rise = glyph.font.font, state.rise+glyph.style.rise
+	letter := glyph.letter
+	var offset Point
+	if !state.font.Vertical {
+		box := Rectangle{0, -200, letter.width, 800}
+		if b := state.font.BoundingBox; b != nil && b.XMin < b.XMax && b.YMin < b.YMax {
+			box = *b
+		}
+		metrics := VerticalMetrics{Origin: Point{(box.XMin + box.XMax) / 2, box.YMax}, Advance: -max(1000, box.YMax-box.YMin)}
+		letter.vertical = &metrics
+		offset = Point{-metrics.Origin.X * n * state.hscale / 1000, -metrics.Origin.Y * n / 1000}
+	}
+	box, advance, err := annotationVerticalBounds(letter, state, n, pen)
+	return box, advance, offset, err
+}
+
 // write 生成混合字体竖排外观，文字裁剪与装饰分别绘制
 // 入参: ctx 取消上下文, content 外观内容
 // 返回: error 布局、度量或取消错误
@@ -280,30 +304,6 @@ func (v annotationRichVertical) columns(ctx context.Context, size float64) ([]an
 		}
 	}
 	return columns, total, ctx.Err()
-}
-
-// annotationRichVerticalBounds 计算原字体的竖排边界，横排字体按正立字框置入单元
-// 入参: glyph 字符, state 默认文字状态, size 默认字号, pen 列内位置
-// 返回: Rectangle 字形边界, float64 推进量, Point 横排字体定位补偿, error 度量错误
-func annotationRichVerticalBounds(glyph annotationRichGlyph, state graphicsState, size, pen float64) (Rectangle, float64, Point, error) {
-	n := annotationRichSize(glyph, size)
-	if n == 0 {
-		return Rectangle{}, 0, Point{}, nil
-	}
-	state.font, state.rise = glyph.font.font, state.rise+glyph.style.rise
-	letter := glyph.letter
-	var offset Point
-	if !state.font.Vertical {
-		box := Rectangle{0, -200, letter.width, 800}
-		if b := state.font.BoundingBox; b != nil && b.XMin < b.XMax && b.YMin < b.YMax {
-			box = *b
-		}
-		metrics := VerticalMetrics{Origin: Point{(box.XMin + box.XMax) / 2, box.YMax}, Advance: -max(1000, box.YMax-box.YMin)}
-		letter.vertical = &metrics
-		offset = Point{-metrics.Origin.X * n * state.hscale / 1000, -metrics.Origin.Y * n / 1000}
-	}
-	box, advance, err := annotationVerticalBounds(letter, state, n, pen)
-	return box, advance, offset, err
 }
 
 // decorate 绘制竖排右侧下划线和居中删除线，装饰颜色及字号取自声明元素

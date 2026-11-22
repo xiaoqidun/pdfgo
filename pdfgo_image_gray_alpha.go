@@ -28,13 +28,6 @@ type pngGrayAlphaImage struct {
 	image.Image
 }
 
-// NRGBA64At 读取原始非预乘样本，不经透明度往返换算
-// 入参: x 横坐标, y 纵坐标
-// 返回: color.NRGBA64 原始颜色及透明度
-func (p *pngGrayAlphaImage) NRGBA64At(x, y int) color.NRGBA64 {
-	return imageNRGBA64At(p.Image, x, y)
-}
-
 // compactPNGGray 逐行编码灰度候选，支持精确降位和独立透明通道
 // 入参: ctx 取消上下文, img 已验证灰度图像, depth 可精确表示样本的位深, alpha 是否保留透明通道, best 已有候选
 // 返回: []byte 更小的编码, error 编码或取消错误
@@ -111,4 +104,11 @@ func compactPNGGray(ctx context.Context, img image.Image, depth int, alpha bool,
 		best = out.Bytes()
 	}
 	return best, ctx.Err()
+}
+
+// NRGBA64At 读取原始非预乘样本，不经透明度往返换算
+// 入参: x 横坐标, y 纵坐标
+// 返回: color.NRGBA64 原始颜色及透明度
+func (p *pngGrayAlphaImage) NRGBA64At(x, y int) color.NRGBA64 {
+	return imageNRGBA64At(p.Image, x, y)
 }

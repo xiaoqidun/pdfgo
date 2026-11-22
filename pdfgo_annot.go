@@ -161,6 +161,9 @@ func (p *Page) Annotations() ([]Annotation, error) {
 // 入参: ctx 取消上下文
 // 返回: []Annotation 注解信息, error 错误信息
 func (p *Page) AnnotationsContext(ctx context.Context) ([]Annotation, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid annotation context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -294,10 +297,13 @@ func (r *Reader) WalkAnnotationAppearance(ctx context.Context, page *Page, annot
 // 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器, parent 引用表单状态，可为空
 // 返回: error 外观或访问错误
 func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annotation Annotation, visitor Visitor, parent *pageInterpreter) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid annotation context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if page.reader != r {
+	if page == nil || page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
 	}
 	if !annotation.IsStandard() {

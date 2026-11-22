@@ -52,6 +52,122 @@ func isDelimiter(b byte) bool {
 	return isSpace(b)
 }
 
+// parseFastInt 无分配解析常见十进制整数，超长或非纯整数交由通用路径处理
+// 入参: raw 原始词法字节
+// 返回: int64 整数值, bool 是否快速解析成功
+func parseFastInt(raw []byte) (int64, bool) {
+	if len(raw) == 0 || len(raw) > 18 {
+		return 0, false
+	}
+	i, neg := 0, false
+	if raw[0] == '-' {
+		neg = true
+		i = 1
+	} else if raw[0] == '+' {
+		i = 1
+	}
+	if i == len(raw) {
+		return 0, false
+	}
+	var value int64
+	for ; i < len(raw); i++ {
+		b := raw[i]
+		if b < '0' || b > '9' {
+			return 0, false
+		}
+		value = value*10 + int64(b-'0')
+	}
+	if neg {
+		value = -value
+	}
+	return value, true
+}
+
+// validNumberBytes 检查字节切片是否符合不含指数形式的PDF数字语法
+// 入参: raw 数字字节
+// 返回: bool 是否符合数字语法
+func validNumberBytes(raw []byte) bool {
+	if len(raw) > 0 && (raw[0] == '+' || raw[0] == '-') {
+		raw = raw[1:]
+	}
+	digits, dots := 0, 0
+	for _, b := range raw {
+		if b >= '0' && b <= '9' {
+			digits++
+		} else if b == '.' {
+			dots++
+		} else {
+			return false
+		}
+	}
+	return digits > 0 && dots <= 1
+}
+
+// validNumber 检查不含指数形式的PDF数字语法
+// 入参: s 数字文本
+// 返回: bool 是否符合数字语法
+func validNumber(s string) bool {
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		s = s[1:]
+	}
+	digits, dots := 0, 0
+	for _, b := range []byte(s) {
+		if b >= '0' && b <= '9' {
+			digits++
+		} else if b == '.' {
+			dots++
+		} else {
+			return false
+		}
+	}
+	return digits > 0 && dots <= 1
+}
+
+// validScientificNumber 识别有限十进制指数语法，不允许NaN、Inf和非十进制形式
+// 入参: s 数字文本
+// 返回: bool 是否为十进制指数语法
+func validScientificNumber(s string) bool {
+	for i, b := range []byte(s) {
+		if b != 'e' && b != 'E' {
+			continue
+		}
+		if !validNumber(s[:i]) {
+			return false
+		}
+		exponent := s[i+1:]
+		if len(exponent) > 0 && (exponent[0] == '+' || exponent[0] == '-') {
+			exponent = exponent[1:]
+		}
+		if exponent == "" {
+			return false
+		}
+		for _, digit := range []byte(exponent) {
+			if digit < '0' || digit > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// fontNamePart 限定可恢复的未转义字体名称片段，不接收PDF结构关键字
+// 入参: part 空白分隔的名称片段
+// 返回: bool 是否为普通字体标识符
+func fontNamePart(part string) bool {
+	switch part {
+	case "obj", "endobj", "stream", "endstream", "xref", "trailer", "startxref", "true", "false", "null", "R":
+		return false
+	}
+	for _, b := range []byte(part) {
+		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '_' || b == '+' || b == ',' || b == '.' {
+			continue
+		}
+		return false
+	}
+	return part != ""
+}
+
 // skipSpace 跳过空白与注释
 func (p *objectParser) skipSpace() {
 	for p.pos < len(p.data) {
@@ -245,105 +361,6 @@ func (p *objectParser) object() (Object, error) {
 		return nil, p.fail("number out of range")
 	}
 	return Real(value), nil
-}
-
-// parseFastInt 无分配解析常见十进制整数，超长或非纯整数交由通用路径处理
-// 入参: raw 原始词法字节
-// 返回: int64 整数值, bool 是否快速解析成功
-func parseFastInt(raw []byte) (int64, bool) {
-	if len(raw) == 0 || len(raw) > 18 {
-		return 0, false
-	}
-	i, neg := 0, false
-	if raw[0] == '-' {
-		neg = true
-		i = 1
-	} else if raw[0] == '+' {
-		i = 1
-	}
-	if i == len(raw) {
-		return 0, false
-	}
-	var value int64
-	for ; i < len(raw); i++ {
-		b := raw[i]
-		if b < '0' || b > '9' {
-			return 0, false
-		}
-		value = value*10 + int64(b-'0')
-	}
-	if neg {
-		value = -value
-	}
-	return value, true
-}
-
-// validNumberBytes 检查字节切片是否符合不含指数形式的PDF数字语法
-// 入参: raw 数字字节
-// 返回: bool 是否符合数字语法
-func validNumberBytes(raw []byte) bool {
-	if len(raw) > 0 && (raw[0] == '+' || raw[0] == '-') {
-		raw = raw[1:]
-	}
-	digits, dots := 0, 0
-	for _, b := range raw {
-		if b >= '0' && b <= '9' {
-			digits++
-		} else if b == '.' {
-			dots++
-		} else {
-			return false
-		}
-	}
-	return digits > 0 && dots <= 1
-}
-
-// validNumber 检查不含指数形式的PDF数字语法
-// 入参: s 数字文本
-// 返回: bool 是否符合数字语法
-func validNumber(s string) bool {
-	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
-		s = s[1:]
-	}
-	digits, dots := 0, 0
-	for _, b := range []byte(s) {
-		if b >= '0' && b <= '9' {
-			digits++
-		} else if b == '.' {
-			dots++
-		} else {
-			return false
-		}
-	}
-	return digits > 0 && dots <= 1
-}
-
-// validScientificNumber 识别有限十进制指数语法，不允许NaN、Inf和非十进制形式
-// 入参: s 数字文本
-// 返回: bool 是否为十进制指数语法
-func validScientificNumber(s string) bool {
-	for i, b := range []byte(s) {
-		if b != 'e' && b != 'E' {
-			continue
-		}
-		if !validNumber(s[:i]) {
-			return false
-		}
-		exponent := s[i+1:]
-		if len(exponent) > 0 && (exponent[0] == '+' || exponent[0] == '-') {
-			exponent = exponent[1:]
-		}
-		if exponent == "" {
-			return false
-		}
-		for _, digit := range []byte(exponent) {
-			if digit < '0' || digit > '9' {
-				return false
-			}
-		}
-		return true
-	}
-	return false
 }
 
 // name 读取名称并解除十六进制转义
@@ -541,21 +558,4 @@ func (p *objectParser) dictionary() (Object, error) {
 		}
 		value[name] = entry
 	}
-}
-
-// fontNamePart 限定可恢复的未转义字体名称片段，不接收PDF结构关键字
-// 入参: part 空白分隔的名称片段
-// 返回: bool 是否为普通字体标识符
-func fontNamePart(part string) bool {
-	switch part {
-	case "obj", "endobj", "stream", "endstream", "xref", "trailer", "startxref", "true", "false", "null", "R":
-		return false
-	}
-	for _, b := range []byte(part) {
-		if b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '_' || b == '+' || b == ',' || b == '.' {
-			continue
-		}
-		return false
-	}
-	return part != ""
 }

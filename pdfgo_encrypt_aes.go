@@ -25,6 +25,53 @@ import (
 	"fmt"
 )
 
+// aes256PasswordHash 按R5或算法2.B派生密码摘要
+// 入参: password 截断后的密码, salt 盐, user 所有者认证使用的U条目, revision 版本
+// 返回: []byte 32字节摘要
+func aes256PasswordHash(password, salt, user []byte, revision int) []byte {
+	h := sha256.New()
+	h.Write(password)
+	h.Write(salt)
+	h.Write(user)
+	key := h.Sum(nil)
+	if revision == 5 {
+		return key
+	}
+	buffer := make([]byte, 64*(len(password)+64+len(user)))
+	defer clear(buffer)
+	for round, last := 0, 0; round < 64 || last > round-32; round++ {
+		size := len(password) + len(key) + len(user)
+		copy(buffer, password)
+		copy(buffer[len(password):], key)
+		copy(buffer[len(password)+len(key):], user)
+		for i := 1; i < 64; i++ {
+			copy(buffer[i*size:], buffer[:size])
+		}
+		data := buffer[:size*64]
+		block, _ := aes.NewCipher(key[:16])
+		cipher.NewCBCEncrypter(block, key[16:32]).CryptBlocks(data, data)
+		selector := 0
+		for _, b := range data[:16] {
+			selector += int(b)
+		}
+		switch selector % 3 {
+		case 0:
+			sum := sha256.Sum256(data)
+			key = append(key[:0], sum[:]...)
+		case 1:
+			sum := sha512.Sum384(data)
+			key = append(key[:0], sum[:]...)
+		case 2:
+			sum := sha512.Sum512(data)
+			key = append(key[:0], sum[:]...)
+		}
+		last = int(data[len(data)-1])
+	}
+	result := bytes.Clone(key[:32])
+	clear(key)
+	return result
+}
+
 // openAES256Security 认证R5/R6密码并校验AES-256文件密钥和权限
 // 入参: dict 加密字典, password 已编码密码, revision 安全处理器版本
 // 返回: error 认证或参数错误
@@ -145,51 +192,4 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 	r.security = s
 	valid = true
 	return nil
-}
-
-// aes256PasswordHash 按R5或算法2.B派生密码摘要
-// 入参: password 截断后的密码, salt 盐, user 所有者认证使用的U条目, revision 版本
-// 返回: []byte 32字节摘要
-func aes256PasswordHash(password, salt, user []byte, revision int) []byte {
-	h := sha256.New()
-	h.Write(password)
-	h.Write(salt)
-	h.Write(user)
-	key := h.Sum(nil)
-	if revision == 5 {
-		return key
-	}
-	buffer := make([]byte, 64*(len(password)+64+len(user)))
-	defer clear(buffer)
-	for round, last := 0, 0; round < 64 || last > round-32; round++ {
-		size := len(password) + len(key) + len(user)
-		copy(buffer, password)
-		copy(buffer[len(password):], key)
-		copy(buffer[len(password)+len(key):], user)
-		for i := 1; i < 64; i++ {
-			copy(buffer[i*size:], buffer[:size])
-		}
-		data := buffer[:size*64]
-		block, _ := aes.NewCipher(key[:16])
-		cipher.NewCBCEncrypter(block, key[16:32]).CryptBlocks(data, data)
-		selector := 0
-		for _, b := range data[:16] {
-			selector += int(b)
-		}
-		switch selector % 3 {
-		case 0:
-			sum := sha256.Sum256(data)
-			key = append(key[:0], sum[:]...)
-		case 1:
-			sum := sha512.Sum384(data)
-			key = append(key[:0], sum[:]...)
-		case 2:
-			sum := sha512.Sum512(data)
-			key = append(key[:0], sum[:]...)
-		}
-		last = int(data[len(data)-1])
-	}
-	result := bytes.Clone(key[:32])
-	clear(key)
-	return result
 }

@@ -63,36 +63,6 @@ type RadialGradient struct {
 	domain                 [2]float64
 }
 
-// ColorAt 在源颜色空间内插值，再按渲染意图转换为sRGB
-// 入参: position 归一化轴位置，范围外使用端点颜色
-// 返回: [3]float64 sRGB颜色, error 无效渐变或颜色变换错误
-func (g *AxialGradient) ColorAt(position float64) ([3]float64, error) {
-	values, err := g.ValuesAt(position)
-	return gradientRGB(values, err, g.Space, g.Intent)
-}
-
-// ColorAt 在源颜色空间内插值，再按渲染意图转换为sRGB
-// 入参: position 归一化双圆插值位置，范围外使用端点颜色
-// 返回: [3]float64 sRGB颜色, error 无效渐变或颜色变换错误
-func (g *RadialGradient) ColorAt(position float64) ([3]float64, error) {
-	values, err := g.ValuesAt(position)
-	return gradientRGB(values, err, g.Space, g.Intent)
-}
-
-// ValuesAt 按原始函数计算轴向渐变的源颜色分量
-// 入参: position 归一化轴位置，范围外使用端点
-// 返回: [4]float64 源空间分量, error 无效求值
-func (g *AxialGradient) ValuesAt(position float64) ([4]float64, error) {
-	return gradientValues(g.Stops, g.function, g.domain, position)
-}
-
-// ValuesAt 按原始函数计算径向渐变的源颜色分量
-// 入参: position 归一化双圆插值位置，范围外使用端点
-// 返回: [4]float64 源空间分量, error 无效求值
-func (g *RadialGradient) ValuesAt(position float64) ([4]float64, error) {
-	return gradientValues(g.Stops, g.function, g.domain, position)
-}
-
 // gradientValues 优先计算原始函数，保留非线性、定义域和边界语义
 // 入参: stops 线性分段, function 原始函数, domain 着色定义域, position 归一化位置
 // 返回: [4]float64 源空间分量, error 无效参数或结果
@@ -139,6 +109,259 @@ func gradientRGB(values [4]float64, err error, space *ColorSpace, intent Name) (
 		return [3]float64{}, fmt.Errorf("invalid gradient evaluation")
 	}
 	return space.SRGB(values[:space.Components()], intent)
+}
+
+// shadingRectangle 将着色边界转换为页面坐标的闭合路径
+// 入参: box 矩形边界, matrix 坐标变换
+// 返回: Path 矩形路径
+func shadingRectangle(box Rectangle, matrix Matrix) Path {
+	return Path{Segments: []Segment{
+		{"M", []Point{matrix.Apply(Point{box.XMin, box.YMin})}},
+		{"L", []Point{matrix.Apply(Point{box.XMax, box.YMin})}},
+		{"L", []Point{matrix.Apply(Point{box.XMax, box.YMax})}},
+		{"L", []Point{matrix.Apply(Point{box.XMin, box.YMax})}},
+		{"C", nil},
+	}}
+}
+
+// shadingColorValues 将源分量转换到备用空间，保留专色和Lab转换顺序
+// 入参: space 输出空间, tint 专色变换, lab Lab变换, input 源颜色分量
+// 返回: [4]float64 输出分量, error 颜色错误
+func shadingColorValues(space *ColorSpace, tint *deviceNSpace, lab *labSpace, input []float64) ([4]float64, error) {
+	var values [4]float64
+	if tint != nil {
+		var err error
+		values, err = tint.values(input...)
+		if err != nil {
+			return values, err
+		}
+	} else {
+		if len(input) > len(values) {
+			return values, fmt.Errorf("invalid shading output component count")
+		}
+		copy(values[:], input)
+	}
+	if lab != nil {
+		c := lab.color(values[0], values[1], values[2])
+		values = [4]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
+	}
+	if tint == nil && lab == nil && space != nil && space.profile != nil && space.profile.ranges != nil {
+		for _, value := range values[:space.Components()] {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return values, fmt.Errorf("nonfinite shading color")
+			}
+		}
+		return space.profile.normalize(values[:space.Components()]), nil
+	}
+	for i, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return values, fmt.Errorf("nonfinite shading color")
+		}
+		values[i] = math.Max(0, math.Min(1, value))
+	}
+	return values, nil
+}
+
+// deviceNColorFunction 组合渐变与专色变换，保留可精确展开的分段及专色分量
+// 入参: source 渐变函数, tint 专色定义
+// 返回: *gradientFunction 备用颜色空间函数
+func deviceNColorFunction(source *gradientFunction, tint *deviceNSpace) *gradientFunction {
+	mapped := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+		values, err := source.evaluate(x)
+		if err != nil {
+			return values, err
+		}
+		return tint.values(values[:tint.components]...)
+	}}
+	if tint.expressions != nil && tint.lab == nil && tint.nested == nil {
+		mapped = iccGradientFunction(deviceNGradientFunction(source, tint.input, tint.output, tint.expressions), tint.alternate.profile)
+	}
+	if tint.transform != nil && tint.lab == nil && tint.nested == nil {
+		composed := iccGradientFunction(composeGradientFunction(source, tint.transform), tint.alternate.profile)
+		mapped.linear = composed.linear
+	}
+	mapped.colorants, mapped.colorant = tint.colorants, gradientColorantFunction(source, tint.components)
+	return mapped
+}
+
+// clipGradientValues 增加截断断点，无法保留边界位置时不生成分段
+// 入参: stops 源分段, bounds 各分量下界与上界
+// 返回: []GradientStop 截断后的分段，不可精确表达时为空
+func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
+	if len(stops) == 0 {
+		return nil
+	}
+	result := make([]GradientStop, 0, len(stops))
+	for i, stop := range stops {
+		if i > 0 && stops[i-1].Position < stop.Position {
+			a := stops[i-1]
+			var storage [8]float64
+			positions := storage[:0]
+			for c := 0; c < len(bounds)/2; c++ {
+				if a.Values[c] == stop.Values[c] {
+					continue
+				}
+				lower, upper := min(a.Values[c], stop.Values[c]), max(a.Values[c], stop.Values[c])
+				first := functionPosition(bounds[2*c], a.Values[c], stop.Values[c])
+				last := functionPosition(bounds[2*c+1], a.Values[c], stop.Values[c])
+				if bounds[2*c] != bounds[2*c+1] && first == last && first > 0 && first < 1 {
+					return nil
+				}
+				for _, bound := range bounds[c*2 : c*2+2] {
+					t := functionPosition(bound, a.Values[c], stop.Values[c])
+					if bound > lower && bound < upper && (t <= 0 || t >= 1) {
+						return nil
+					}
+					if t > 0 && t < 1 {
+						position := gradientPosition(a.Position, stop.Position, t)
+						if position <= a.Position || position >= stop.Position {
+							return nil
+						}
+						positions = append(positions, t)
+					}
+				}
+			}
+			slices.Sort(positions)
+			var previous float64
+			for i, t := range slices.Compact(positions) {
+				v := GradientStop{Position: gradientPosition(a.Position, stop.Position, t)}
+				if i > 0 && v.Position <= previous {
+					return nil
+				}
+				previous = v.Position
+				for c := range v.Values {
+					v.Values[c] = functionValue(t, a.Values[c], stop.Values[c])
+				}
+				result = append(result, v)
+			}
+		}
+		result = append(result, stop)
+	}
+	for i := range result {
+		for c := 0; c < len(bounds)/2; c++ {
+			result[i].Values[c] = math.Max(bounds[2*c], math.Min(bounds[2*c+1], result[i].Values[c]))
+		}
+	}
+	return slices.Compact(result)
+}
+
+// gradientUnitBounds 返回设备或ICC分量的单位区间
+// 入参: channels 分量数
+// 返回: []float64 分量上下界
+func gradientUnitBounds(channels int) []float64 {
+	bounds := make([]float64, channels*2)
+	for i := 0; i < channels; i++ {
+		bounds[i*2+1] = 1
+	}
+	return bounds
+}
+
+// gradientPosition 映射单位位置到有序区间，精确保留端点并限制舍入误差
+// 入参: start 区间起点, end 区间终点, position 单位位置
+// 返回: float64 区间位置
+func gradientPosition(start, end, position float64) float64 {
+	if position == 0 {
+		return start
+	}
+	if position == 1 {
+		return end
+	}
+	return math.Max(start, math.Min(end, functionValue(position, start, end)))
+}
+
+// gradientInterval 截取或反向映射线性分段，保留定义域外常量和不连续边界
+// 入参: stops 原分段, start 起始参数, end 终止参数
+// 返回: []GradientStop 归一化分段
+func gradientInterval(stops []GradientStop, start, end float64) []GradientStop {
+	if len(stops) == 0 {
+		return nil
+	}
+	if start > end {
+		result := gradientInterval(stops, end, start)
+		slices.Reverse(result)
+		for i := range result {
+			result[i].Position = 1 - result[i].Position
+		}
+		return result
+	}
+	first, last := 0, 0
+	if start != end {
+		first, _ = slices.BinarySearchFunc(stops, start, func(stop GradientStop, position float64) int { return cmp.Compare(stop.Position, position) })
+		for first < len(stops) && stops[first].Position == start {
+			first++
+		}
+		last, _ = slices.BinarySearchFunc(stops, end, func(stop GradientStop, position float64) int { return cmp.Compare(stop.Position, position) })
+		for last < len(stops) && stops[last].Position == end {
+			last++
+		}
+	}
+	result := make([]GradientStop, 1, last-first+2)
+	result[0] = GradientStop{Position: 0, Values: gradientValue(stops, start)}
+	if start != end {
+		for _, stop := range stops[first:last] {
+			stop.Position = functionPosition(stop.Position, start, end)
+			result = append(result, stop)
+		}
+	}
+	return slices.Compact(append(result, GradientStop{Position: 1, Values: gradientValue(stops, end)}))
+}
+
+// gradientValue 计算线性分段在给定位置的颜色，重复位置使用右侧分段
+// 入参: stops 原分段, position 归一化位置
+// 返回: [4]float64 颜色分量
+func gradientValue(stops []GradientStop, position float64) [4]float64 {
+	return gradientValueSide(stops, position, false)
+}
+
+// gradientValueSide 按指定侧取得重复断点处的颜色
+// 入参: stops 分段, position 位置, left 是否取左极限
+// 返回: [4]float64 颜色分量
+func gradientValueSide(stops []GradientStop, position float64, left bool) [4]float64 {
+	if position < stops[0].Position {
+		return stops[0].Values
+	}
+	for i := 1; i < len(stops); i++ {
+		if position < stops[i].Position || left && position == stops[i].Position && stops[i-1].Position < position {
+			a, b := stops[i-1], stops[i]
+			t := functionPosition(position, a.Position, b.Position)
+			var value [4]float64
+			for c := range value {
+				value[c] = functionValue(t, a.Values[c], b.Values[c])
+			}
+			return value
+		}
+	}
+	return stops[len(stops)-1].Values
+}
+
+// ColorAt 在源颜色空间内插值，再按渲染意图转换为sRGB
+// 入参: position 归一化轴位置，范围外使用端点颜色
+// 返回: [3]float64 sRGB颜色, error 无效渐变或颜色变换错误
+func (g *AxialGradient) ColorAt(position float64) ([3]float64, error) {
+	values, err := g.ValuesAt(position)
+	return gradientRGB(values, err, g.Space, g.Intent)
+}
+
+// ColorAt 在源颜色空间内插值，再按渲染意图转换为sRGB
+// 入参: position 归一化双圆插值位置，范围外使用端点颜色
+// 返回: [3]float64 sRGB颜色, error 无效渐变或颜色变换错误
+func (g *RadialGradient) ColorAt(position float64) ([3]float64, error) {
+	values, err := g.ValuesAt(position)
+	return gradientRGB(values, err, g.Space, g.Intent)
+}
+
+// ValuesAt 按原始函数计算轴向渐变的源颜色分量
+// 入参: position 归一化轴位置，范围外使用端点
+// 返回: [4]float64 源空间分量, error 无效求值
+func (g *AxialGradient) ValuesAt(position float64) ([4]float64, error) {
+	return gradientValues(g.Stops, g.function, g.domain, position)
+}
+
+// ValuesAt 按原始函数计算径向渐变的源颜色分量
+// 入参: position 归一化双圆插值位置，范围外使用端点
+// 返回: [4]float64 源空间分量, error 无效求值
+func (g *RadialGradient) ValuesAt(position float64) ([4]float64, error) {
+	return gradientValues(g.Stops, g.function, g.domain, position)
 }
 
 // numberArray 解析指定长度的数值数组
@@ -364,19 +587,6 @@ func (p *pageInterpreter) shadingFill(operands []Object, offset int64) error {
 		return fmt.Errorf("missing shading bounds")
 	}
 	return p.visitor.Path(PathMark{Sequence: p.sequence, Path: shadingRectangle(p.bounds, Identity()), Style: style, Fill: true})
-}
-
-// shadingRectangle 将着色边界转换为页面坐标的闭合路径
-// 入参: box 矩形边界, matrix 坐标变换
-// 返回: Path 矩形路径
-func shadingRectangle(box Rectangle, matrix Matrix) Path {
-	return Path{Segments: []Segment{
-		{"M", []Point{matrix.Apply(Point{box.XMin, box.YMin})}},
-		{"L", []Point{matrix.Apply(Point{box.XMax, box.YMin})}},
-		{"L", []Point{matrix.Apply(Point{box.XMax, box.YMax})}},
-		{"L", []Point{matrix.Apply(Point{box.XMin, box.YMax})}},
-		{"C", nil},
-	}}
 }
 
 // shadingPaint 解析轴向或径向着色的坐标及颜色函数
@@ -607,44 +817,6 @@ func (r *Reader) readShadingColorSpace(object Object, effective bool) (*ColorSpa
 	return space, nil, nil, space.Components(), nil
 }
 
-// shadingColorValues 将源分量转换到备用空间，保留专色和Lab转换顺序
-// 入参: space 输出空间, tint 专色变换, lab Lab变换, input 源颜色分量
-// 返回: [4]float64 输出分量, error 颜色错误
-func shadingColorValues(space *ColorSpace, tint *deviceNSpace, lab *labSpace, input []float64) ([4]float64, error) {
-	var values [4]float64
-	if tint != nil {
-		var err error
-		values, err = tint.values(input...)
-		if err != nil {
-			return values, err
-		}
-	} else {
-		if len(input) > len(values) {
-			return values, fmt.Errorf("invalid shading output component count")
-		}
-		copy(values[:], input)
-	}
-	if lab != nil {
-		c := lab.color(values[0], values[1], values[2])
-		values = [4]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}
-	}
-	if tint == nil && lab == nil && space != nil && space.profile != nil && space.profile.ranges != nil {
-		for _, value := range values[:space.Components()] {
-			if math.IsNaN(value) || math.IsInf(value, 0) {
-				return values, fmt.Errorf("nonfinite shading color")
-			}
-		}
-		return space.profile.normalize(values[:space.Components()]), nil
-	}
-	for i, value := range values {
-		if math.IsNaN(value) || math.IsInf(value, 0) {
-			return values, fmt.Errorf("nonfinite shading color")
-		}
-		values[i] = math.Max(0, math.Min(1, value))
-	}
-	return values, nil
-}
-
 // readDeviceNGradient 组合原始或已按资源校验的多色渐变，不线性化非线性嵌套
 // 入参: space 多色定义, function 渐变函数, domain 输入区间, effective 是否已按资源校验并替换
 // 返回: []GradientStop 分段, *ColorSpace 输出空间, *gradientFunction 颜色函数, error 定义或函数错误
@@ -666,176 +838,4 @@ func (r *Reader) readDeviceNGradient(space Array, function Object, domain [2]flo
 		stops = clipGradientValues(mapped.linear(domain), gradientUnitBounds(tint.alternate.Components()))
 	}
 	return stops, tint.alternate, mapped, nil
-}
-
-// deviceNColorFunction 组合渐变与专色变换，保留可精确展开的分段及专色分量
-// 入参: source 渐变函数, tint 专色定义
-// 返回: *gradientFunction 备用颜色空间函数
-func deviceNColorFunction(source *gradientFunction, tint *deviceNSpace) *gradientFunction {
-	mapped := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
-		values, err := source.evaluate(x)
-		if err != nil {
-			return values, err
-		}
-		return tint.values(values[:tint.components]...)
-	}}
-	if tint.expressions != nil && tint.lab == nil && tint.nested == nil {
-		mapped = iccGradientFunction(deviceNGradientFunction(source, tint.input, tint.output, tint.expressions), tint.alternate.profile)
-	}
-	if tint.transform != nil && tint.lab == nil && tint.nested == nil {
-		composed := iccGradientFunction(composeGradientFunction(source, tint.transform), tint.alternate.profile)
-		mapped.linear = composed.linear
-	}
-	mapped.colorants, mapped.colorant = tint.colorants, gradientColorantFunction(source, tint.components)
-	return mapped
-}
-
-// clipGradientValues 增加截断断点，无法保留边界位置时不生成分段
-// 入参: stops 源分段, bounds 各分量下界与上界
-// 返回: []GradientStop 截断后的分段，不可精确表达时为空
-func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
-	if len(stops) == 0 {
-		return nil
-	}
-	result := make([]GradientStop, 0, len(stops))
-	for i, stop := range stops {
-		if i > 0 && stops[i-1].Position < stop.Position {
-			a := stops[i-1]
-			var storage [8]float64
-			positions := storage[:0]
-			for c := 0; c < len(bounds)/2; c++ {
-				if a.Values[c] == stop.Values[c] {
-					continue
-				}
-				lower, upper := min(a.Values[c], stop.Values[c]), max(a.Values[c], stop.Values[c])
-				first := functionPosition(bounds[2*c], a.Values[c], stop.Values[c])
-				last := functionPosition(bounds[2*c+1], a.Values[c], stop.Values[c])
-				if bounds[2*c] != bounds[2*c+1] && first == last && first > 0 && first < 1 {
-					return nil
-				}
-				for _, bound := range bounds[c*2 : c*2+2] {
-					t := functionPosition(bound, a.Values[c], stop.Values[c])
-					if bound > lower && bound < upper && (t <= 0 || t >= 1) {
-						return nil
-					}
-					if t > 0 && t < 1 {
-						position := gradientPosition(a.Position, stop.Position, t)
-						if position <= a.Position || position >= stop.Position {
-							return nil
-						}
-						positions = append(positions, t)
-					}
-				}
-			}
-			slices.Sort(positions)
-			var previous float64
-			for i, t := range slices.Compact(positions) {
-				v := GradientStop{Position: gradientPosition(a.Position, stop.Position, t)}
-				if i > 0 && v.Position <= previous {
-					return nil
-				}
-				previous = v.Position
-				for c := range v.Values {
-					v.Values[c] = functionValue(t, a.Values[c], stop.Values[c])
-				}
-				result = append(result, v)
-			}
-		}
-		result = append(result, stop)
-	}
-	for i := range result {
-		for c := 0; c < len(bounds)/2; c++ {
-			result[i].Values[c] = math.Max(bounds[2*c], math.Min(bounds[2*c+1], result[i].Values[c]))
-		}
-	}
-	return slices.Compact(result)
-}
-
-// gradientUnitBounds 返回设备或ICC分量的单位区间
-// 入参: channels 分量数
-// 返回: []float64 分量上下界
-func gradientUnitBounds(channels int) []float64 {
-	bounds := make([]float64, channels*2)
-	for i := 0; i < channels; i++ {
-		bounds[i*2+1] = 1
-	}
-	return bounds
-}
-
-// gradientPosition 映射单位位置到有序区间，精确保留端点并限制舍入误差
-// 入参: start 区间起点, end 区间终点, position 单位位置
-// 返回: float64 区间位置
-func gradientPosition(start, end, position float64) float64 {
-	if position == 0 {
-		return start
-	}
-	if position == 1 {
-		return end
-	}
-	return math.Max(start, math.Min(end, functionValue(position, start, end)))
-}
-
-// gradientInterval 截取或反向映射线性分段，保留定义域外常量和不连续边界
-// 入参: stops 原分段, start 起始参数, end 终止参数
-// 返回: []GradientStop 归一化分段
-func gradientInterval(stops []GradientStop, start, end float64) []GradientStop {
-	if len(stops) == 0 {
-		return nil
-	}
-	if start > end {
-		result := gradientInterval(stops, end, start)
-		slices.Reverse(result)
-		for i := range result {
-			result[i].Position = 1 - result[i].Position
-		}
-		return result
-	}
-	first, last := 0, 0
-	if start != end {
-		first, _ = slices.BinarySearchFunc(stops, start, func(stop GradientStop, position float64) int { return cmp.Compare(stop.Position, position) })
-		for first < len(stops) && stops[first].Position == start {
-			first++
-		}
-		last, _ = slices.BinarySearchFunc(stops, end, func(stop GradientStop, position float64) int { return cmp.Compare(stop.Position, position) })
-		for last < len(stops) && stops[last].Position == end {
-			last++
-		}
-	}
-	result := make([]GradientStop, 1, last-first+2)
-	result[0] = GradientStop{Position: 0, Values: gradientValue(stops, start)}
-	if start != end {
-		for _, stop := range stops[first:last] {
-			stop.Position = functionPosition(stop.Position, start, end)
-			result = append(result, stop)
-		}
-	}
-	return slices.Compact(append(result, GradientStop{Position: 1, Values: gradientValue(stops, end)}))
-}
-
-// gradientValue 计算线性分段在给定位置的颜色，重复位置使用右侧分段
-// 入参: stops 原分段, position 归一化位置
-// 返回: [4]float64 颜色分量
-func gradientValue(stops []GradientStop, position float64) [4]float64 {
-	return gradientValueSide(stops, position, false)
-}
-
-// gradientValueSide 按指定侧取得重复断点处的颜色
-// 入参: stops 分段, position 位置, left 是否取左极限
-// 返回: [4]float64 颜色分量
-func gradientValueSide(stops []GradientStop, position float64, left bool) [4]float64 {
-	if position < stops[0].Position {
-		return stops[0].Values
-	}
-	for i := 1; i < len(stops); i++ {
-		if position < stops[i].Position || left && position == stops[i].Position && stops[i-1].Position < position {
-			a, b := stops[i-1], stops[i]
-			t := functionPosition(position, a.Position, b.Position)
-			var value [4]float64
-			for c := range value {
-				value[c] = functionValue(t, a.Values[c], b.Values[c])
-			}
-			return value
-		}
-	}
-	return stops[len(stops)-1].Values
 }

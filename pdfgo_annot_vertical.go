@@ -44,6 +44,36 @@ type annotationVerticalColumn struct {
 	advance float64
 }
 
+// annotationVerticalBounds 按PDF纵向原点、字距及水平缩放计算字形边界与推进量
+// 入参: letter 字符, state 文字状态, size 字号, pen 当前纵向位置
+// 返回: Rectangle 字形边界, float64 纵向推进量, error 度量错误
+func annotationVerticalBounds(letter annotationLetter, state graphicsState, size, pen float64) (Rectangle, float64, error) {
+	if letter.vertical == nil {
+		return Rectangle{}, 0, fmt.Errorf("missing vertical glyph metrics")
+	}
+	box := Rectangle{0, -200, letter.width, 800}
+	if bounds := state.font.BoundingBox; bounds != nil && bounds.XMin < bounds.XMax && bounds.YMin < bounds.YMax {
+		box = *bounds
+	}
+	metric := letter.vertical
+	box = Rectangle{
+		(box.XMin - metric.Origin.X) * size * state.hscale / 1000,
+		(box.YMin-metric.Origin.Y)*size/1000 + state.rise + pen,
+		(box.XMax - metric.Origin.X) * size * state.hscale / 1000,
+		(box.YMax-metric.Origin.Y)*size/1000 + state.rise + pen,
+	}
+	advance := metric.Advance*size/1000 + state.spacing
+	if letter.word {
+		advance += state.wordSpacing
+	}
+	for _, n := range []float64{box.XMin, box.YMin, box.XMax, box.YMax, advance} {
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return Rectangle{}, 0, fmt.Errorf("vertical text dimensions overflow")
+		}
+	}
+	return box, advance, nil
+}
+
 // write 按字体纵向度量生成外观，自右向左分列，按Q调整文字块的水平对齐
 // 入参: p 默认文字状态, content 外观内容
 // 返回: error 排版、度量或取消错误
@@ -257,34 +287,4 @@ func (v annotationVerticalText) columns(ctx context.Context, state graphicsState
 		return nil, 0, fmt.Errorf("vertical text dimensions overflow")
 	}
 	return columns, total, ctx.Err()
-}
-
-// annotationVerticalBounds 按PDF纵向原点、字距及水平缩放计算字形边界与推进量
-// 入参: letter 字符, state 文字状态, size 字号, pen 当前纵向位置
-// 返回: Rectangle 字形边界, float64 纵向推进量, error 度量错误
-func annotationVerticalBounds(letter annotationLetter, state graphicsState, size, pen float64) (Rectangle, float64, error) {
-	if letter.vertical == nil {
-		return Rectangle{}, 0, fmt.Errorf("missing vertical glyph metrics")
-	}
-	box := Rectangle{0, -200, letter.width, 800}
-	if bounds := state.font.BoundingBox; bounds != nil && bounds.XMin < bounds.XMax && bounds.YMin < bounds.YMax {
-		box = *bounds
-	}
-	metric := letter.vertical
-	box = Rectangle{
-		(box.XMin - metric.Origin.X) * size * state.hscale / 1000,
-		(box.YMin-metric.Origin.Y)*size/1000 + state.rise + pen,
-		(box.XMax - metric.Origin.X) * size * state.hscale / 1000,
-		(box.YMax-metric.Origin.Y)*size/1000 + state.rise + pen,
-	}
-	advance := metric.Advance*size/1000 + state.spacing
-	if letter.word {
-		advance += state.wordSpacing
-	}
-	for _, n := range []float64{box.XMin, box.YMin, box.XMax, box.YMax, advance} {
-		if math.IsNaN(n) || math.IsInf(n, 0) {
-			return Rectangle{}, 0, fmt.Errorf("vertical text dimensions overflow")
-		}
-	}
-	return box, advance, nil
 }

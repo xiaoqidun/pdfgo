@@ -338,6 +338,9 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 // 返回: RichMedia 媒体信息, error 资源、配置或引用错误
 func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (RichMedia, error) {
 	result := RichMedia{}
+	if ctx == nil {
+		return result, fmt.Errorf("invalid rich media context")
+	}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}

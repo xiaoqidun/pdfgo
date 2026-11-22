@@ -28,6 +28,20 @@ type annotationBorder struct {
 	dash, color   Array
 }
 
+// writeAnnotationOperation 以PDF十进制数字编码外观操作，避免科学计数法
+// 入参: content 外观内容, operator 操作符, values 数值
+func writeAnnotationOperation(content *strings.Builder, operator string, values ...float64) {
+	var buffer [256]byte
+	data := buffer[:0]
+	for _, value := range values {
+		data = strconv.AppendFloat(data, value, 'f', -1, 64)
+		data = append(data, ' ')
+	}
+	data = append(data, operator...)
+	data = append(data, '\n')
+	content.Write(data)
+}
+
 // ReadAnnotationBackground 按PDF标准表189读取外观特征中的背景色，空值表示透明
 // 入参: annotation 注解，仅读取MK中的BG，不分析外观流
 // 返回: *[3]float64 设备RGB背景色, error 字典、颜色或引用错误
@@ -168,20 +182,6 @@ func (r *Reader) readAnnotationBorder(annotation Annotation) (*annotationBorder,
 		}
 	}
 	return &annotationBorder{width: width, rx: rx, ry: ry, style: style, dash: dash, color: color}, nil
-}
-
-// writeAnnotationOperation 以PDF十进制数字编码外观操作，避免科学计数法
-// 入参: content 外观内容, operator 操作符, values 数值
-func writeAnnotationOperation(content *strings.Builder, operator string, values ...float64) {
-	var buffer [256]byte
-	data := buffer[:0]
-	for _, value := range values {
-		data = strconv.AppendFloat(data, value, 'f', -1, 64)
-		data = append(data, ' ')
-	}
-	data = append(data, operator...)
-	data = append(data, '\n')
-	content.Write(data)
 }
 
 // writeAnnotationStroke 写入共享笔画参数，不生成路径

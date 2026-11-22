@@ -88,6 +88,28 @@ type Glyph struct {
 	WordSpace bool
 }
 
+// predefinedCodeUnicode 还原以Unicode编码命名的官方CMap字符，不推测其他编码
+// 入参: name 官方编码名称, raw 字符码
+// 返回: string Unicode文本, bool 是否为有效Unicode编码
+func predefinedCodeUnicode(name Name, raw []byte) (string, bool) {
+	encoding := string(name)
+	if !strings.HasPrefix(encoding, "Uni") {
+		return "", false
+	}
+	if strings.Contains(encoding, "-UCS2-") || strings.Contains(encoding, "-UTF16-") {
+		value, err := unicodeBytes(raw)
+		return value, err == nil
+	}
+	if strings.Contains(encoding, "-UTF8-") {
+		return string(raw), utf8.Valid(raw)
+	}
+	if strings.Contains(encoding, "-UTF32-") && len(raw) == 4 {
+		value := rune(codeNumber(raw))
+		return string(value), utf8.ValidRune(value)
+	}
+	return "", false
+}
+
 // ReadFont 读取字体资源及嵌入程序
 // 入参: object 字体字典或引用
 // 返回: *Font 字体资源, error 错误信息
@@ -1033,26 +1055,4 @@ func (f *Font) hasCIDGlyph(cid uint32) bool {
 		return id != 0 && (f.glyphCount == 0 || id < f.glyphCount)
 	}
 	return f.glyphCount == 0 || cid < f.glyphCount
-}
-
-// predefinedCodeUnicode 还原以Unicode编码命名的官方CMap字符，不推测其他编码
-// 入参: name 官方编码名称, raw 字符码
-// 返回: string Unicode文本, bool 是否为有效Unicode编码
-func predefinedCodeUnicode(name Name, raw []byte) (string, bool) {
-	encoding := string(name)
-	if !strings.HasPrefix(encoding, "Uni") {
-		return "", false
-	}
-	if strings.Contains(encoding, "-UCS2-") || strings.Contains(encoding, "-UTF16-") {
-		value, err := unicodeBytes(raw)
-		return value, err == nil
-	}
-	if strings.Contains(encoding, "-UTF8-") {
-		return string(raw), utf8.Valid(raw)
-	}
-	if strings.Contains(encoding, "-UTF32-") && len(raw) == 4 {
-		value := rune(codeNumber(raw))
-		return string(value), utf8.ValidRune(value)
-	}
-	return "", false
 }

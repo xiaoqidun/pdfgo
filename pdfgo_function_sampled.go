@@ -28,6 +28,34 @@ type sampledFunction struct {
 	order                          int
 }
 
+// sampledSplineSpan 计算Catmull-Rom样条权重，边界使用线性外推的虚拟样本
+// 入参: position 采样位置, size 样本数量
+// 返回: [4]int 样本索引, [4]float64 插值权重
+func sampledSplineSpan(position float64, size int) ([4]int, [4]float64) {
+	position = math.Max(0, math.Min(float64(size-1), position))
+	lower := int(position)
+	t := position - float64(lower)
+	if size < 4 {
+		return [4]int{lower, min(lower+1, size-1)}, [4]float64{1 - t, t}
+	}
+	t2, t3 := t*t, t*t*t
+	indices := [4]int{lower - 1, lower, lower + 1, lower + 2}
+	weights := [4]float64{-.5*t + t2 - .5*t3, 1 - 2.5*t2 + 1.5*t3, .5*t + 2*t2 - 1.5*t3, -.5*t2 + .5*t3}
+	if lower == 0 {
+		indices[0] = 0
+		weights[1] += 2 * weights[0]
+		weights[2] -= weights[0]
+		weights[0] = 0
+	}
+	if lower >= size-2 {
+		indices[2], indices[3] = min(indices[2], size-1), size-1
+		weights[2] += 2 * weights[3]
+		weights[1] -= weights[3]
+		weights[3] = 0
+	}
+	return indices, weights
+}
+
 // readSampledFunction 读取线性或三次插值采样函数并验证数据范围
 // 入参: stream 函数数据流, inputs 输入数量, outputs 输出数量
 // 返回: *sampledFunction 函数, error 格式或能力错误
@@ -204,32 +232,4 @@ func (f *sampledFunction) evaluateCubic(inputs, outputs []float64) {
 		value = functionValue(value/maxSample, f.decode[2*c], f.decode[2*c+1])
 		outputs[c] = math.Max(f.bounds[2*c], math.Min(f.bounds[2*c+1], value))
 	}
-}
-
-// sampledSplineSpan 计算Catmull-Rom样条权重，边界使用线性外推的虚拟样本
-// 入参: position 采样位置, size 样本数量
-// 返回: [4]int 样本索引, [4]float64 插值权重
-func sampledSplineSpan(position float64, size int) ([4]int, [4]float64) {
-	position = math.Max(0, math.Min(float64(size-1), position))
-	lower := int(position)
-	t := position - float64(lower)
-	if size < 4 {
-		return [4]int{lower, min(lower+1, size-1)}, [4]float64{1 - t, t}
-	}
-	t2, t3 := t*t, t*t*t
-	indices := [4]int{lower - 1, lower, lower + 1, lower + 2}
-	weights := [4]float64{-.5*t + t2 - .5*t3, 1 - 2.5*t2 + 1.5*t3, .5*t + 2*t2 - 1.5*t3, -.5*t2 + .5*t3}
-	if lower == 0 {
-		indices[0] = 0
-		weights[1] += 2 * weights[0]
-		weights[2] -= weights[0]
-		weights[0] = 0
-	}
-	if lower >= size-2 {
-		indices[2], indices[3] = min(indices[2], size-1), size-1
-		weights[2] += 2 * weights[3]
-		weights[1] -= weights[3]
-		weights[3] = 0
-	}
-	return indices, weights
 }

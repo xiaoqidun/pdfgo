@@ -107,6 +107,9 @@ func (r *Reader) ReadReferenceXObject(object Object) (ReferenceXObject, error) {
 // 入参: ctx 取消上下文, visit 区间访问函数
 // 返回: error 数字树、标签定义或访问错误
 func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRange) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid page label context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -190,6 +193,9 @@ func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRa
 // 入参: ctx 取消上下文, reference 引用目标
 // 返回: *Page 目标页面, error 页面缺失或标签结构错误
 func (r *Reader) ResolveReferencePage(ctx context.Context, reference ReferenceXObject) (*Page, error) {
+	if r == nil || ctx == nil {
+		return nil, fmt.Errorf("invalid reference page context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

@@ -311,6 +311,23 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 	}
 }
 
+// copyUnicodeMapContext 合并独立映射，在复制期间及完成前检查取消
+// 入参: ctx 取消上下文, target 目标映射, source 源映射
+// 返回: error 取消错误
+func copyUnicodeMapContext(ctx context.Context, target, source UnicodeMap) error {
+	index := 0
+	for code, text := range source {
+		if index&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		index++
+		target[code] = text
+	}
+	return ctx.Err()
+}
+
 // inherit 补齐基础映射的编码范围、字符集及书写方向
 func (c *cidCMap) inherit() {
 	if c.base == nil {
@@ -595,21 +612,4 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 		return nil, err
 	}
 	return mapping, nil
-}
-
-// copyUnicodeMapContext 合并独立映射，在复制期间及完成前检查取消
-// 入参: ctx 取消上下文, target 目标映射, source 源映射
-// 返回: error 取消错误
-func copyUnicodeMapContext(ctx context.Context, target, source UnicodeMap) error {
-	index := 0
-	for code, text := range source {
-		if index&255 == 0 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		}
-		index++
-		target[code] = text
-	}
-	return ctx.Err()
 }

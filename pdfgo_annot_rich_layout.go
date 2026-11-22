@@ -43,210 +43,6 @@ type annotationRichLine struct {
 	advance float64
 }
 
-// writeAnnotationRichText 生成富文本外观，保留混合字体、颜色和基线偏移
-// 入参: ctx 取消上下文, annotation 注解, object 富文本, flags 字段标志, frame 内框, border 边框, resources 外观资源, content 内容
-// 返回: error 富文本、布局或字体错误
-func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotation, object Object, flags Integer, frame Rectangle, border *annotationBorder, resources Dictionary, content *strings.Builder) error {
-	dict := annotation.Dictionary
-	align := Integer(0)
-	if value, err := r.Resolve(dict["Q"]); err != nil {
-		return err
-	} else if value != nil {
-		var ok bool
-		align, ok = value.(Integer)
-		if !ok || align < 0 || align > 2 {
-			return fmt.Errorf("invalid field justification")
-		}
-	}
-	paragraphs, err := r.readAnnotationRich(ctx, object, dict["DS"], int(align))
-	if err != nil {
-		return err
-	}
-	visible := false
-	for i := range paragraphs {
-		for j := range paragraphs[i].runs {
-			run := &paragraphs[i].runs[j]
-			if flags&(1<<13) != 0 {
-				run.text = strings.Repeat("*", utf8.RuneCountInString(run.text))
-			}
-			visible = visible || run.text != "" && (run.style.size == nil || *run.style.size != 0)
-		}
-	}
-	if !visible {
-		return nil
-	}
-	comb, err := r.annotationComb(dict, flags)
-	if err != nil {
-		return err
-	}
-	w, h := frame.XMax-frame.XMin, frame.YMax-frame.YMin
-	inset := math.Min(math.Max(1, border.width)+1, math.Min(w, h)/2)
-	x, y, width, height := frame.XMin+inset, frame.YMin+inset, w-2*inset, h-2*inset
-	if width <= 0 || height <= 0 {
-		return nil
-	}
-	p, name, stateContent, err := r.annotationTextState(ctx, dict["DA"], resources)
-	if err != nil {
-		return err
-	}
-	if p.state.font == nil || p.state.fontSize < 0 || p.state.hscale <= 0 {
-		return fmt.Errorf("invalid rich text default font")
-	}
-	clipWidth, clipHeight := width, height
-	matrix, width, height, err := annotationTextLayout(p.textMatrix, x, y, width, height)
-	if err != nil {
-		return err
-	}
-	fonts, err := r.newAnnotationRichFonts(ctx, resources, p.state.font, name, paragraphs)
-	if err != nil {
-		return err
-	}
-	glyphs, err := annotationRichGlyphs(ctx, fonts, paragraphs, comb > 0)
-	if err != nil {
-		return err
-	}
-	multiline := annotation.Subtype == "FreeText" || flags&(1<<12) != 0
-	if !multiline && len(paragraphs) > 1 {
-		all := glyphs[0]
-		for i := 1; i < len(glyphs); i++ {
-			if len(glyphs[i]) != 0 && len(all) != 0 {
-				style := glyphs[i][0].style
-				space := annotationRichGlyph{letter: annotationLetter{text: ' '}, style: style}
-				if style.size == nil || *style.size != 0 {
-					space.font, space.letter, err = fonts.selectLetter(*style, ' ')
-					if err != nil {
-						return err
-					}
-				}
-				all = append(all, space)
-			}
-			all = append(all, glyphs[i]...)
-		}
-		glyphs, paragraphs = [][]annotationRichGlyph{all}, paragraphs[:1]
-	}
-	if comb > 0 && len(glyphs[0]) > comb {
-		return fmt.Errorf("field value exceeds comb length")
-	}
-	state := p.state
-	if comb > 0 {
-		state.spacing, state.wordSpacing = 0, 0
-	}
-	if p.state.font.Vertical {
-		layout := annotationRichVertical{
-			glyphs: glyphs, paragraphs: paragraphs, state: state, defaults: stateContent, matrix: matrix,
-			frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
-			multiline: multiline, comb: comb, align: int(align),
-		}
-		return layout.write(ctx, content)
-	}
-	size := p.state.fontSize
-	if size == 0 {
-		low, high := 0.0, height
-		for range 32 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			candidate := (low + high) / 2
-			lines, total, err := annotationRichLayout(ctx, glyphs, paragraphs, state, candidate, width, multiline)
-			if err != nil {
-				return err
-			}
-			fits := total <= height
-			for _, line := range lines {
-				if comb > 0 {
-					for _, glyph := range line.glyphs {
-						fits = fits && annotationRichAdvance(glyph, state, candidate, false) <= width/float64(comb)
-					}
-				} else {
-					fits = fits && line.width <= width
-				}
-			}
-			if fits {
-				low = candidate
-			} else {
-				high = candidate
-			}
-		}
-		size = low
-		if size == 0 {
-			size = min(12, height)
-		}
-	}
-	lines, total, err := annotationRichLayout(ctx, glyphs, paragraphs, state, size, width, multiline)
-	if err != nil {
-		return err
-	}
-	content.WriteString("q\n")
-	writeAnnotationOperation(content, "re W n", x, y, clipWidth, clipHeight)
-	decorated := annotationRichDecorated(lines)
-	var decorations annotationRichDecorations
-	var decorationDefaults string
-	if decorated {
-		decorationDefaults, err = annotationRichDecorationDefaults(ctx, stateContent)
-		if err != nil {
-			return err
-		}
-		content.WriteString("q\n")
-	}
-	content.WriteString("BT\n")
-	top := y + height
-	if !multiline {
-		top = y + (height+total)/2
-	}
-	for _, line := range lines {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		left := x + float64(line.style.align)*(width-line.width)/2
-		baseline := top - line.ascent
-		firstCell := 0
-		if comb > 0 {
-			if line.style.align == 1 {
-				firstCell = (comb - len(line.glyphs)) / 2
-			} else if line.style.align == 2 {
-				firstCell = comb - len(line.glyphs)
-			}
-		}
-		for start := 0; start < len(line.glyphs); {
-			glyph := line.glyphs[start]
-			end := start + 1
-			for comb == 0 && end < len(line.glyphs) && line.glyphs[end].font == glyph.font && line.glyphs[end].style == glyph.style {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				end++
-			}
-			fontSize := annotationRichSize(glyph, size)
-			if comb > 0 {
-				left = x + (float64(firstCell+start)+.5)*width/float64(comb) - annotationRichAdvance(glyph, state, size, false)/2
-				if fontSize == 0 {
-					start = end
-					continue
-				}
-			}
-			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], p.state, stateContent, matrix, size, left, baseline); err != nil {
-				return err
-			}
-			runLeft := left
-			for i := start; i < end; i++ {
-				left += annotationRichAdvance(line.glyphs[i], state, size, i+1 < len(line.glyphs))
-			}
-			decorations.add(glyph, p.state, size, runLeft, baseline, left-runLeft)
-			start = end
-		}
-		top -= line.advance
-	}
-	content.WriteString("ET\n")
-	if decorated {
-		content.WriteString("Q\n")
-		if err := writeAnnotationRichDecorations(ctx, content, decorations.spans, decorationDefaults, matrix); err != nil {
-			return err
-		}
-	}
-	content.WriteString("Q\n")
-	return ctx.Err()
-}
-
 // annotationRichGlyphs 按富文本样式选择源编码，分格可保留零字号字符的位置
 // 入参: ctx 取消上下文, fonts 字体选择器, paragraphs 富文本, keepZero 是否保留零字号字符
 // 返回: [][]annotationRichGlyph 段落字符, error 字体、编码或布局错误
@@ -500,4 +296,208 @@ func annotationRichLayout(ctx context.Context, paragraphs [][]annotationRichGlyp
 		}
 	}
 	return lines, total, ctx.Err()
+}
+
+// writeAnnotationRichText 生成富文本外观，保留混合字体、颜色和基线偏移
+// 入参: ctx 取消上下文, annotation 注解, object 富文本, flags 字段标志, frame 内框, border 边框, resources 外观资源, content 内容
+// 返回: error 富文本、布局或字体错误
+func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotation, object Object, flags Integer, frame Rectangle, border *annotationBorder, resources Dictionary, content *strings.Builder) error {
+	dict := annotation.Dictionary
+	align := Integer(0)
+	if value, err := r.Resolve(dict["Q"]); err != nil {
+		return err
+	} else if value != nil {
+		var ok bool
+		align, ok = value.(Integer)
+		if !ok || align < 0 || align > 2 {
+			return fmt.Errorf("invalid field justification")
+		}
+	}
+	paragraphs, err := r.readAnnotationRich(ctx, object, dict["DS"], int(align))
+	if err != nil {
+		return err
+	}
+	visible := false
+	for i := range paragraphs {
+		for j := range paragraphs[i].runs {
+			run := &paragraphs[i].runs[j]
+			if flags&(1<<13) != 0 {
+				run.text = strings.Repeat("*", utf8.RuneCountInString(run.text))
+			}
+			visible = visible || run.text != "" && (run.style.size == nil || *run.style.size != 0)
+		}
+	}
+	if !visible {
+		return nil
+	}
+	comb, err := r.annotationComb(dict, flags)
+	if err != nil {
+		return err
+	}
+	w, h := frame.XMax-frame.XMin, frame.YMax-frame.YMin
+	inset := math.Min(math.Max(1, border.width)+1, math.Min(w, h)/2)
+	x, y, width, height := frame.XMin+inset, frame.YMin+inset, w-2*inset, h-2*inset
+	if width <= 0 || height <= 0 {
+		return nil
+	}
+	p, name, stateContent, err := r.annotationTextState(ctx, dict["DA"], resources)
+	if err != nil {
+		return err
+	}
+	if p.state.font == nil || p.state.fontSize < 0 || p.state.hscale <= 0 {
+		return fmt.Errorf("invalid rich text default font")
+	}
+	clipWidth, clipHeight := width, height
+	matrix, width, height, err := annotationTextLayout(p.textMatrix, x, y, width, height)
+	if err != nil {
+		return err
+	}
+	fonts, err := r.newAnnotationRichFonts(ctx, resources, p.state.font, name, paragraphs)
+	if err != nil {
+		return err
+	}
+	glyphs, err := annotationRichGlyphs(ctx, fonts, paragraphs, comb > 0)
+	if err != nil {
+		return err
+	}
+	multiline := annotation.Subtype == "FreeText" || flags&(1<<12) != 0
+	if !multiline && len(paragraphs) > 1 {
+		all := glyphs[0]
+		for i := 1; i < len(glyphs); i++ {
+			if len(glyphs[i]) != 0 && len(all) != 0 {
+				style := glyphs[i][0].style
+				space := annotationRichGlyph{letter: annotationLetter{text: ' '}, style: style}
+				if style.size == nil || *style.size != 0 {
+					space.font, space.letter, err = fonts.selectLetter(*style, ' ')
+					if err != nil {
+						return err
+					}
+				}
+				all = append(all, space)
+			}
+			all = append(all, glyphs[i]...)
+		}
+		glyphs, paragraphs = [][]annotationRichGlyph{all}, paragraphs[:1]
+	}
+	if comb > 0 && len(glyphs[0]) > comb {
+		return fmt.Errorf("field value exceeds comb length")
+	}
+	state := p.state
+	if comb > 0 {
+		state.spacing, state.wordSpacing = 0, 0
+	}
+	if p.state.font.Vertical {
+		layout := annotationRichVertical{
+			glyphs: glyphs, paragraphs: paragraphs, state: state, defaults: stateContent, matrix: matrix,
+			frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
+			multiline: multiline, comb: comb, align: int(align),
+		}
+		return layout.write(ctx, content)
+	}
+	size := p.state.fontSize
+	if size == 0 {
+		low, high := 0.0, height
+		for range 32 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			candidate := (low + high) / 2
+			lines, total, err := annotationRichLayout(ctx, glyphs, paragraphs, state, candidate, width, multiline)
+			if err != nil {
+				return err
+			}
+			fits := total <= height
+			for _, line := range lines {
+				if comb > 0 {
+					for _, glyph := range line.glyphs {
+						fits = fits && annotationRichAdvance(glyph, state, candidate, false) <= width/float64(comb)
+					}
+				} else {
+					fits = fits && line.width <= width
+				}
+			}
+			if fits {
+				low = candidate
+			} else {
+				high = candidate
+			}
+		}
+		size = low
+		if size == 0 {
+			size = min(12, height)
+		}
+	}
+	lines, total, err := annotationRichLayout(ctx, glyphs, paragraphs, state, size, width, multiline)
+	if err != nil {
+		return err
+	}
+	content.WriteString("q\n")
+	writeAnnotationOperation(content, "re W n", x, y, clipWidth, clipHeight)
+	decorated := annotationRichDecorated(lines)
+	var decorations annotationRichDecorations
+	var decorationDefaults string
+	if decorated {
+		decorationDefaults, err = annotationRichDecorationDefaults(ctx, stateContent)
+		if err != nil {
+			return err
+		}
+		content.WriteString("q\n")
+	}
+	content.WriteString("BT\n")
+	top := y + height
+	if !multiline {
+		top = y + (height+total)/2
+	}
+	for _, line := range lines {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		left := x + float64(line.style.align)*(width-line.width)/2
+		baseline := top - line.ascent
+		firstCell := 0
+		if comb > 0 {
+			if line.style.align == 1 {
+				firstCell = (comb - len(line.glyphs)) / 2
+			} else if line.style.align == 2 {
+				firstCell = comb - len(line.glyphs)
+			}
+		}
+		for start := 0; start < len(line.glyphs); {
+			glyph := line.glyphs[start]
+			end := start + 1
+			for comb == 0 && end < len(line.glyphs) && line.glyphs[end].font == glyph.font && line.glyphs[end].style == glyph.style {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				end++
+			}
+			fontSize := annotationRichSize(glyph, size)
+			if comb > 0 {
+				left = x + (float64(firstCell+start)+.5)*width/float64(comb) - annotationRichAdvance(glyph, state, size, false)/2
+				if fontSize == 0 {
+					start = end
+					continue
+				}
+			}
+			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], p.state, stateContent, matrix, size, left, baseline); err != nil {
+				return err
+			}
+			runLeft := left
+			for i := start; i < end; i++ {
+				left += annotationRichAdvance(line.glyphs[i], state, size, i+1 < len(line.glyphs))
+			}
+			decorations.add(glyph, p.state, size, runLeft, baseline, left-runLeft)
+			start = end
+		}
+		top -= line.advance
+	}
+	content.WriteString("ET\n")
+	if decorated {
+		content.WriteString("Q\n")
+		if err := writeAnnotationRichDecorations(ctx, content, decorations.spans, decorationDefaults, matrix); err != nil {
+			return err
+		}
+	}
+	content.WriteString("Q\n")
+	return ctx.Err()
 }

@@ -30,6 +30,49 @@ type GradientPosition struct {
 	radial     bool
 }
 
+// gradientRatio 缩放参数，避免中间乘除溢出，超出有限范围时保留端点方向
+// 入参: value 参数, numerator 分子尺度, denominator 非零分母尺度
+// 返回: float64 有限参数，非法参数仍返回NaN
+func gradientRatio(value, numerator, denominator float64) float64 {
+	if numerator == denominator {
+		return gradientFinite(value)
+	}
+	product := value * numerator
+	if product == 0 && value == 0 {
+		return value
+	}
+	if product != 0 && !math.IsInf(product, 0) {
+		if result := product / denominator; result != 0 && !math.IsInf(result, 0) {
+			return result
+		}
+	}
+	v, ve := math.Frexp(value)
+	n, ne := math.Frexp(numerator)
+	d, de := math.Frexp(denominator)
+	return gradientFinite(math.Ldexp(v*n/d, ve+ne-de))
+}
+
+// gradientFinite 保留参数符号，确保延伸颜色可以按有限端点求值
+// 入参: value 参数
+// 返回: float64 参数，溢出时取同方向的最大有限值
+func gradientFinite(value float64) float64 {
+	if math.IsInf(value, 0) {
+		return math.Copysign(math.MaxFloat64, value)
+	}
+	return value
+}
+
+// gradientCoordinate 缩放坐标差，跨有限端点溢出时先缩放端点
+// 入参: value 坐标, origin 原点, scale 非零尺度
+// 返回: float64 缩放后的坐标差
+func gradientCoordinate(value, origin, scale float64) float64 {
+	difference := value - origin
+	if math.IsInf(difference, 0) {
+		return value/scale - origin/scale
+	}
+	return difference / scale
+}
+
 // PreparePosition 准备轴向参数求值，不近似颜色函数或应用BBox
 // 返回: GradientPosition 只读几何, error 非有限坐标
 func (g *AxialGradient) PreparePosition() (GradientPosition, error) {
@@ -152,52 +195,9 @@ func (g GradientPosition) PositionAt(point Point) (float64, bool) {
 	return t, g.accept(t)
 }
 
-// gradientRatio 缩放参数，避免中间乘除溢出，超出有限范围时保留端点方向
-// 入参: value 参数, numerator 分子尺度, denominator 非零分母尺度
-// 返回: float64 有限参数，非法参数仍返回NaN
-func gradientRatio(value, numerator, denominator float64) float64 {
-	if numerator == denominator {
-		return gradientFinite(value)
-	}
-	product := value * numerator
-	if product == 0 && value == 0 {
-		return value
-	}
-	if product != 0 && !math.IsInf(product, 0) {
-		if result := product / denominator; result != 0 && !math.IsInf(result, 0) {
-			return result
-		}
-	}
-	v, ve := math.Frexp(value)
-	n, ne := math.Frexp(numerator)
-	d, de := math.Frexp(denominator)
-	return gradientFinite(math.Ldexp(v*n/d, ve+ne-de))
-}
-
-// gradientFinite 保留参数符号，确保延伸颜色可以按有限端点求值
-// 入参: value 参数
-// 返回: float64 参数，溢出时取同方向的最大有限值
-func gradientFinite(value float64) float64 {
-	if math.IsInf(value, 0) {
-		return math.Copysign(math.MaxFloat64, value)
-	}
-	return value
-}
-
 // accept 检查有限参数及两端延伸，不裁切有效参数
 // 入参: position 归一化参数
 // 返回: bool 是否可着色
 func (g GradientPosition) accept(position float64) bool {
 	return !math.IsNaN(position) && !math.IsInf(position, 0) && (position >= 0 || g.extend[0]) && (position <= 1 || g.extend[1])
-}
-
-// gradientCoordinate 缩放坐标差，跨有限端点溢出时先缩放端点
-// 入参: value 坐标, origin 原点, scale 非零尺度
-// 返回: float64 缩放后的坐标差
-func gradientCoordinate(value, origin, scale float64) float64 {
-	difference := value - origin
-	if math.IsInf(difference, 0) {
-		return value/scale - origin/scale
-	}
-	return difference / scale
 }

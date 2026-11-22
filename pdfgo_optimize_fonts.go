@@ -27,6 +27,198 @@ import (
 	"sync"
 )
 
+// compactTrueType 裁剪静态TrueType轮廓并保留编号、复合依赖、字符表和提示指令
+// 移除失效点阵与辅助提示表，按裁剪后轮廓长度自动选择loca格式并同步head表
+// 入参: ctx 取消上下文, data 字体程序, glyphs 可寻址字形
+// 返回: []byte 更小的程序或原文, error 取消错误
+func compactTrueType(ctx context.Context, data []byte, glyphs []uint16) ([]byte, error) {
+	if len(data) < 12 || binary.BigEndian.Uint32(data) != 0x10000 {
+		return data, nil
+	}
+	n := int(binary.BigEndian.Uint16(data[4:]))
+	if n == 0 || n > (len(data)-12)/16 {
+		return data, nil
+	}
+	tables := make(map[string][]byte, n)
+	for i := 0; i < n; i++ {
+		tag := string(data[12+i*16 : 16+i*16])
+		if _, exists := tables[tag]; exists {
+			return data, nil
+		}
+		switch tag {
+		case "cmap", "head", "hhea", "hmtx", "maxp", "OS/2", "post", "name", "glyf", "loca", "cvt ", "fpgm", "prep", "gasp", "kern", "vhea", "vmtx", "DSIG", "hdmx", "LTSH", "VDMX", "GDEF", "GPOS", "GSUB", "BASE", "MATH", "meta", "PCLT", "FFTM", "STAT", "EBDT", "EBLC", "EBSC", "JSTF", "MERG":
+		default:
+			return data, nil
+		}
+		table, err := fontTable(data, tag)
+		if err != nil {
+			return data, nil
+		}
+		tables[tag] = table
+	}
+	head, maxp, loca, glyf := tables["head"], tables["maxp"], tables["loca"], tables["glyf"]
+	if os2 := tables["OS/2"]; len(os2) >= 10 && binary.BigEndian.Uint16(os2[8:])&0x100 != 0 {
+		return data, nil
+	}
+	if len(head) < 54 || len(maxp) < 6 || loca == nil || glyf == nil {
+		return data, nil
+	}
+	count := int(binary.BigEndian.Uint16(maxp[4:]))
+	format := binary.BigEndian.Uint16(head[50:])
+	if format > 1 || len(loca) < (count+1)*(2+int(format)*2) {
+		return data, nil
+	}
+	offsets := make([]int, count+1)
+	for i := range offsets {
+		if format == 0 {
+			offsets[i] = int(binary.BigEndian.Uint16(loca[2*i:])) * 2
+		} else {
+			u := uint64(binary.BigEndian.Uint32(loca[4*i:]))
+			if u > uint64(len(glyf)) {
+				return data, nil
+			}
+			offsets[i] = int(u)
+		}
+		if offsets[i] > len(glyf) || i > 0 && offsets[i] < offsets[i-1] {
+			return data, nil
+		}
+	}
+	keep := make([]bool, count)
+	queue := append([]uint16{0}, glyphs...)
+	for len(queue) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		id := int(queue[len(queue)-1])
+		queue = queue[:len(queue)-1]
+		if id >= count {
+			return data, nil
+		}
+		if keep[id] {
+			continue
+		}
+		keep[id] = true
+		g := glyf[offsets[id]:offsets[id+1]]
+		if len(g) == 0 {
+			continue
+		}
+		if len(g) < 10 {
+			return data, nil
+		}
+		if int16(binary.BigEndian.Uint16(g)) >= 0 {
+			continue
+		}
+		for pos := 10; ; {
+			if pos+4 > len(g) {
+				return data, nil
+			}
+			flags := binary.BigEndian.Uint16(g[pos:])
+			child := binary.BigEndian.Uint16(g[pos+2:])
+			queue = append(queue, child)
+			pos += 4
+			if flags&1 != 0 {
+				pos += 4
+			} else {
+				pos += 2
+			}
+			if flags&8 != 0 {
+				pos += 2
+			}
+			if flags&64 != 0 {
+				pos += 4
+			}
+			if flags&128 != 0 {
+				pos += 8
+			}
+			if pos > len(g) {
+				return data, nil
+			}
+			if flags&32 == 0 {
+				break
+			}
+		}
+	}
+	var compact []byte
+	newOffsets := make([]int, count+1)
+	for id := 0; id <= count; id++ {
+		newOffsets[id] = len(compact)
+		if id < count && keep[id] {
+			compact = append(compact, glyf[offsets[id]:offsets[id+1]]...)
+			if len(compact)%2 != 0 {
+				compact = append(compact, 0)
+			}
+		}
+	}
+	if len(compact) == 0 {
+		return data, nil
+	}
+	newFormat := uint16(1)
+	if len(compact) <= 0x1fffe {
+		newFormat = 0
+	}
+	locations := make([]byte, 0, (count+1)*(2+int(newFormat)*2))
+	for _, off := range newOffsets {
+		if newFormat == 0 {
+			locations = binary.BigEndian.AppendUint16(locations, uint16(off/2))
+		} else {
+			locations = binary.BigEndian.AppendUint32(locations, uint32(off))
+		}
+	}
+	tables["glyf"], tables["loca"] = compact, locations
+	tables["head"] = bytes.Clone(head)
+	binary.BigEndian.PutUint16(tables["head"][50:], newFormat)
+	clear(tables["head"][8:12])
+	for _, tag := range []string{"DSIG", "EBDT", "EBLC", "EBSC", "hdmx", "LTSH", "VDMX", "JSTF", "MERG"} {
+		delete(tables, tag)
+	}
+	tableCount := len(tables)
+	entrySelector := 0
+	for 1<<(entrySelector+1) <= tableCount {
+		entrySelector++
+	}
+	searchRange := 1 << (entrySelector + 4)
+	rangeShift := tableCount*16 - searchRange
+	out := make([]byte, 12+tableCount*16)
+	binary.BigEndian.PutUint32(out, 0x10000)
+	binary.BigEndian.PutUint16(out[4:], uint16(tableCount))
+	binary.BigEndian.PutUint16(out[6:], uint16(searchRange))
+	binary.BigEndian.PutUint16(out[8:], uint16(entrySelector))
+	binary.BigEndian.PutUint16(out[10:], uint16(rangeShift))
+	headOffset := 0
+	for i, tag := range slices.Sorted(maps.Keys(tables)) {
+		payload := tables[tag]
+		offset := len(out)
+		out = append(out, payload...)
+		for len(out)%4 != 0 {
+			out = append(out, 0)
+		}
+		record := out[12+i*16:]
+		copy(record[:4], tag)
+		binary.BigEndian.PutUint32(record[4:], fontChecksum(out[offset:]))
+		binary.BigEndian.PutUint32(record[8:], uint32(offset))
+		binary.BigEndian.PutUint32(record[12:], uint32(len(payload)))
+		if tag == "head" {
+			headOffset = offset
+		}
+	}
+	binary.BigEndian.PutUint32(out[headOffset+8:], 0xb1b0afba-fontChecksum(out))
+	if len(out) >= len(data) {
+		return data, ctx.Err()
+	}
+	return out, ctx.Err()
+}
+
+// fontChecksum 计算四字节对齐的SFNT校验和
+// 入参: data 已补齐的数据
+// 返回: uint32 校验和
+func fontChecksum(data []byte) uint32 {
+	var sum uint32
+	for i := 0; i+4 <= len(data); i += 4 {
+		sum += binary.BigEndian.Uint32(data[i:])
+	}
+	return sum
+}
+
 // optimizationFontUpdates 准备更小的字体程序及稳定子集标识，支持有界并行并限制累计输出缓存
 // 入参: ctx 取消上下文, glyphs 字体用字, cached 原有缓存, workers 并行度
 // 返回: map[Reference]*Stream 字体输出, map[Reference]string 子集标识, error 读取错误
@@ -918,198 +1110,6 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		}
 	}
 	return ctx.Err()
-}
-
-// compactTrueType 裁剪静态TrueType轮廓并保留编号、复合依赖、字符表和提示指令
-// 移除失效点阵与辅助提示表，按裁剪后轮廓长度自动选择loca格式并同步head表
-// 入参: ctx 取消上下文, data 字体程序, glyphs 可寻址字形
-// 返回: []byte 更小的程序或原文, error 取消错误
-func compactTrueType(ctx context.Context, data []byte, glyphs []uint16) ([]byte, error) {
-	if len(data) < 12 || binary.BigEndian.Uint32(data) != 0x10000 {
-		return data, nil
-	}
-	n := int(binary.BigEndian.Uint16(data[4:]))
-	if n == 0 || n > (len(data)-12)/16 {
-		return data, nil
-	}
-	tables := make(map[string][]byte, n)
-	for i := 0; i < n; i++ {
-		tag := string(data[12+i*16 : 16+i*16])
-		if _, exists := tables[tag]; exists {
-			return data, nil
-		}
-		switch tag {
-		case "cmap", "head", "hhea", "hmtx", "maxp", "OS/2", "post", "name", "glyf", "loca", "cvt ", "fpgm", "prep", "gasp", "kern", "vhea", "vmtx", "DSIG", "hdmx", "LTSH", "VDMX", "GDEF", "GPOS", "GSUB", "BASE", "MATH", "meta", "PCLT", "FFTM", "STAT", "EBDT", "EBLC", "EBSC", "JSTF", "MERG":
-		default:
-			return data, nil
-		}
-		table, err := fontTable(data, tag)
-		if err != nil {
-			return data, nil
-		}
-		tables[tag] = table
-	}
-	head, maxp, loca, glyf := tables["head"], tables["maxp"], tables["loca"], tables["glyf"]
-	if os2 := tables["OS/2"]; len(os2) >= 10 && binary.BigEndian.Uint16(os2[8:])&0x100 != 0 {
-		return data, nil
-	}
-	if len(head) < 54 || len(maxp) < 6 || loca == nil || glyf == nil {
-		return data, nil
-	}
-	count := int(binary.BigEndian.Uint16(maxp[4:]))
-	format := binary.BigEndian.Uint16(head[50:])
-	if format > 1 || len(loca) < (count+1)*(2+int(format)*2) {
-		return data, nil
-	}
-	offsets := make([]int, count+1)
-	for i := range offsets {
-		if format == 0 {
-			offsets[i] = int(binary.BigEndian.Uint16(loca[2*i:])) * 2
-		} else {
-			u := uint64(binary.BigEndian.Uint32(loca[4*i:]))
-			if u > uint64(len(glyf)) {
-				return data, nil
-			}
-			offsets[i] = int(u)
-		}
-		if offsets[i] > len(glyf) || i > 0 && offsets[i] < offsets[i-1] {
-			return data, nil
-		}
-	}
-	keep := make([]bool, count)
-	queue := append([]uint16{0}, glyphs...)
-	for len(queue) > 0 {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		id := int(queue[len(queue)-1])
-		queue = queue[:len(queue)-1]
-		if id >= count {
-			return data, nil
-		}
-		if keep[id] {
-			continue
-		}
-		keep[id] = true
-		g := glyf[offsets[id]:offsets[id+1]]
-		if len(g) == 0 {
-			continue
-		}
-		if len(g) < 10 {
-			return data, nil
-		}
-		if int16(binary.BigEndian.Uint16(g)) >= 0 {
-			continue
-		}
-		for pos := 10; ; {
-			if pos+4 > len(g) {
-				return data, nil
-			}
-			flags := binary.BigEndian.Uint16(g[pos:])
-			child := binary.BigEndian.Uint16(g[pos+2:])
-			queue = append(queue, child)
-			pos += 4
-			if flags&1 != 0 {
-				pos += 4
-			} else {
-				pos += 2
-			}
-			if flags&8 != 0 {
-				pos += 2
-			}
-			if flags&64 != 0 {
-				pos += 4
-			}
-			if flags&128 != 0 {
-				pos += 8
-			}
-			if pos > len(g) {
-				return data, nil
-			}
-			if flags&32 == 0 {
-				break
-			}
-		}
-	}
-	var compact []byte
-	newOffsets := make([]int, count+1)
-	for id := 0; id <= count; id++ {
-		newOffsets[id] = len(compact)
-		if id < count && keep[id] {
-			compact = append(compact, glyf[offsets[id]:offsets[id+1]]...)
-			if len(compact)%2 != 0 {
-				compact = append(compact, 0)
-			}
-		}
-	}
-	if len(compact) == 0 {
-		return data, nil
-	}
-	newFormat := uint16(1)
-	if len(compact) <= 0x1fffe {
-		newFormat = 0
-	}
-	locations := make([]byte, 0, (count+1)*(2+int(newFormat)*2))
-	for _, off := range newOffsets {
-		if newFormat == 0 {
-			locations = binary.BigEndian.AppendUint16(locations, uint16(off/2))
-		} else {
-			locations = binary.BigEndian.AppendUint32(locations, uint32(off))
-		}
-	}
-	tables["glyf"], tables["loca"] = compact, locations
-	tables["head"] = bytes.Clone(head)
-	binary.BigEndian.PutUint16(tables["head"][50:], newFormat)
-	clear(tables["head"][8:12])
-	for _, tag := range []string{"DSIG", "EBDT", "EBLC", "EBSC", "hdmx", "LTSH", "VDMX", "JSTF", "MERG"} {
-		delete(tables, tag)
-	}
-	tableCount := len(tables)
-	entrySelector := 0
-	for 1<<(entrySelector+1) <= tableCount {
-		entrySelector++
-	}
-	searchRange := 1 << (entrySelector + 4)
-	rangeShift := tableCount*16 - searchRange
-	out := make([]byte, 12+tableCount*16)
-	binary.BigEndian.PutUint32(out, 0x10000)
-	binary.BigEndian.PutUint16(out[4:], uint16(tableCount))
-	binary.BigEndian.PutUint16(out[6:], uint16(searchRange))
-	binary.BigEndian.PutUint16(out[8:], uint16(entrySelector))
-	binary.BigEndian.PutUint16(out[10:], uint16(rangeShift))
-	headOffset := 0
-	for i, tag := range slices.Sorted(maps.Keys(tables)) {
-		payload := tables[tag]
-		offset := len(out)
-		out = append(out, payload...)
-		for len(out)%4 != 0 {
-			out = append(out, 0)
-		}
-		record := out[12+i*16:]
-		copy(record[:4], tag)
-		binary.BigEndian.PutUint32(record[4:], fontChecksum(out[offset:]))
-		binary.BigEndian.PutUint32(record[8:], uint32(offset))
-		binary.BigEndian.PutUint32(record[12:], uint32(len(payload)))
-		if tag == "head" {
-			headOffset = offset
-		}
-	}
-	binary.BigEndian.PutUint32(out[headOffset+8:], 0xb1b0afba-fontChecksum(out))
-	if len(out) >= len(data) {
-		return data, ctx.Err()
-	}
-	return out, ctx.Err()
-}
-
-// fontChecksum 计算四字节对齐的SFNT校验和
-// 入参: data 已补齐的数据
-// 返回: uint32 校验和
-func fontChecksum(data []byte) uint32 {
-	var sum uint32
-	for i := 0; i+4 <= len(data); i += 4 {
-		sum += binary.BigEndian.Uint32(data[i:])
-	}
-	return sum
 }
 
 // optimizationContentData 有界解码内容流并检查取消，拒绝外部流或超限膨胀

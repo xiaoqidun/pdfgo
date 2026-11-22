@@ -22,6 +22,53 @@ import (
 	"strings"
 )
 
+// writeRichLineCaption 在标题局部坐标写入段落，保留样式和行内基线偏移
+// 入参: ctx 取消上下文, content 内容, caption 富文本标题
+// 返回: error 取消错误
+func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption *annotationLineCaption) error {
+	decorated := annotationRichDecorated(caption.rich)
+	var decorations annotationRichDecorations
+	if decorated {
+		content.WriteString("q\n")
+	}
+	content.WriteString("BT\n")
+	state := graphicsState{hscale: 1}
+	top := caption.height / 2
+	for _, line := range caption.rich {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		left := -caption.width/2 + float64(line.style.align)*(caption.width-line.width)/2
+		baseline := top - line.ascent
+		for start := 0; start < len(line.glyphs); {
+			glyph := line.glyphs[start]
+			end := start + 1
+			for end < len(line.glyphs) && line.glyphs[end].font == glyph.font && line.glyphs[end].style == glyph.style {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				end++
+			}
+			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], state, "", Identity(), annotationCaptionSize, left, baseline); err != nil {
+				return err
+			}
+			runLeft := left
+			for _, current := range line.glyphs[start:end] {
+				left += annotationRichAdvance(current, state, annotationCaptionSize, false)
+			}
+			decorations.add(glyph, state, annotationCaptionSize, runLeft, baseline, left-runLeft)
+			start = end
+		}
+		top -= line.advance
+	}
+	content.WriteString("ET\n")
+	if decorated {
+		content.WriteString("Q\n")
+		return writeAnnotationRichDecorations(ctx, content, decorations.spans, "0 g\n", Identity())
+	}
+	return nil
+}
+
 // readRichLineCaption 读取直线富文本标题，共用字符编码及混合字体排版
 // 入参: ctx 取消上下文, page 所在页面, object 富文本, caption 标题位置
 // 返回: *annotationLineCaption 标题或空值, error 富文本、资源或字体错误
@@ -88,51 +135,4 @@ func (r *Reader) readRichLineCaption(ctx context.Context, page *Page, object Obj
 	}
 	caption.resources = resources
 	return caption, nil
-}
-
-// writeRichLineCaption 在标题局部坐标写入段落，保留样式和行内基线偏移
-// 入参: ctx 取消上下文, content 内容, caption 富文本标题
-// 返回: error 取消错误
-func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption *annotationLineCaption) error {
-	decorated := annotationRichDecorated(caption.rich)
-	var decorations annotationRichDecorations
-	if decorated {
-		content.WriteString("q\n")
-	}
-	content.WriteString("BT\n")
-	state := graphicsState{hscale: 1}
-	top := caption.height / 2
-	for _, line := range caption.rich {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		left := -caption.width/2 + float64(line.style.align)*(caption.width-line.width)/2
-		baseline := top - line.ascent
-		for start := 0; start < len(line.glyphs); {
-			glyph := line.glyphs[start]
-			end := start + 1
-			for end < len(line.glyphs) && line.glyphs[end].font == glyph.font && line.glyphs[end].style == glyph.style {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				end++
-			}
-			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], state, "", Identity(), annotationCaptionSize, left, baseline); err != nil {
-				return err
-			}
-			runLeft := left
-			for _, current := range line.glyphs[start:end] {
-				left += annotationRichAdvance(current, state, annotationCaptionSize, false)
-			}
-			decorations.add(glyph, state, annotationCaptionSize, runLeft, baseline, left-runLeft)
-			start = end
-		}
-		top -= line.advance
-	}
-	content.WriteString("ET\n")
-	if decorated {
-		content.WriteString("Q\n")
-		return writeAnnotationRichDecorations(ctx, content, decorations.spans, "0 g\n", Identity())
-	}
-	return nil
 }

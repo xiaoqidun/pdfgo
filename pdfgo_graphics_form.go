@@ -36,6 +36,46 @@ type formContent struct {
 	parsed     bool
 }
 
+// formOperationSize 估算操作及操作数占用，可变语义对象不参与重放
+// 入参: operation 内容操作
+// 返回: int 估算字节数, bool 是否可复用
+func formOperationSize(operation Operation) (int, bool) {
+	size := 128 + len(operation.Operator)
+	for _, operand := range operation.Operands {
+		cost, ok := formOperandSize(operand)
+		if !ok || cost > formCacheLimit-size {
+			return 0, false
+		}
+		size += cost
+	}
+	return size, true
+}
+
+// formOperandSize 估算标量及数组占用，不复用字典、引用或数据流
+// 入参: operand 操作数
+// 返回: int 估算字节数, bool 是否可复用
+func formOperandSize(operand Object) (int, bool) {
+	size := 64
+	switch value := operand.(type) {
+	case nil, Boolean, Integer, Real:
+	case Name:
+		size += len(value)
+	case String:
+		size += 2 * len(value)
+	case Array:
+		for _, item := range value {
+			cost, ok := formOperandSize(item)
+			if !ok || cost > formCacheLimit-size {
+				return 0, false
+			}
+			size += cost
+		}
+	default:
+		return 0, false
+	}
+	return size, size <= formCacheLimit
+}
+
 // formData 解码表单并有界保留内容，大型或超额表单仍正常访问
 // 入参: stream 表单数据流
 // 返回: []byte 解码内容, *formContent 可复用内容, error 解码或取消错误
@@ -117,44 +157,4 @@ func (p *pageInterpreter) contentColorSpace(value Object) (Object, error) {
 		}
 	}
 	return p.reader.Resolve(value)
-}
-
-// formOperationSize 估算操作及操作数占用，可变语义对象不参与重放
-// 入参: operation 内容操作
-// 返回: int 估算字节数, bool 是否可复用
-func formOperationSize(operation Operation) (int, bool) {
-	size := 128 + len(operation.Operator)
-	for _, operand := range operation.Operands {
-		cost, ok := formOperandSize(operand)
-		if !ok || cost > formCacheLimit-size {
-			return 0, false
-		}
-		size += cost
-	}
-	return size, true
-}
-
-// formOperandSize 估算标量及数组占用，不复用字典、引用或数据流
-// 入参: operand 操作数
-// 返回: int 估算字节数, bool 是否可复用
-func formOperandSize(operand Object) (int, bool) {
-	size := 64
-	switch value := operand.(type) {
-	case nil, Boolean, Integer, Real:
-	case Name:
-		size += len(value)
-	case String:
-		size += 2 * len(value)
-	case Array:
-		for _, item := range value {
-			cost, ok := formOperandSize(item)
-			if !ok || cost > formCacheLimit-size {
-				return 0, false
-			}
-			size += cost
-		}
-	default:
-		return 0, false
-	}
-	return size, size <= formCacheLimit
 }

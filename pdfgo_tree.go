@@ -25,6 +25,9 @@ import (
 // 入参: ctx 取消上下文, root 名称树根, visit 名称和值的访问函数
 // 返回: error 结构、重复名称、循环或访问错误
 func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(string, Object) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid name tree context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -136,6 +139,9 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 // 入参: ctx 取消上下文, root 数字树根, visit 数字键和值的访问函数
 // 返回: error 结构、重复键、循环或访问错误
 func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int64, Object) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid number tree context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -326,10 +332,316 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 	return ctx.Err()
 }
 
+// LookupNumberTree 按整数键在数字树中二分查找对应条目，值不预先解析
+// 遵循ISO 32000升序Nums与Limits剪枝，兼容邻接重叠Limits及命中无Limits子节点回退，配置Warning时跳过重复节点
+// 入参: ctx 取消上下文, root 数字树根, key 目标整数键
+// 返回: Object 命中值, bool 是否命中, error 结构、循环或取消错误
+func (r *Reader) LookupNumberTree(ctx context.Context, root Object, key int64) (Object, bool, error) {
+	if r == nil || ctx == nil {
+		return nil, false, fmt.Errorf("invalid number tree context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	seenRefs := make(map[Reference]bool)
+	seenDicts := make(map[uintptr]Dictionary)
+	return r.lookupNumberTreeNode(ctx, root, key, 0, seenRefs, seenDicts)
+}
+
+// lookupNumberTreeNode 递归查找数字树节点，优先按Limits剪枝与二分定位
+// 入参: ctx 取消上下文, node 当前节点对象, key 目标整数键, depth 递归深度, seenRefs 已访问引用, seenDicts 已访问字典
+// 返回: Object 命中值, bool 是否命中, error 结构、循环或取消错误
+func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int64, depth int, seenRefs map[Reference]bool, seenDicts map[uintptr]Dictionary) (Object, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if depth > 64 {
+		return nil, false, fmt.Errorf("number tree depth exceeded")
+	}
+	if ref, ok := node.(Reference); ok {
+		if seenRefs[ref] {
+			err := fmt.Errorf("repeated number tree node")
+			if !r.recoverAuxiliary(err) {
+				return nil, false, err
+			}
+			return nil, false, nil
+		}
+		seenRefs[ref] = true
+	}
+	resolved, err := r.Resolve(node)
+	if err != nil {
+		return nil, false, err
+	}
+	if resolved == nil {
+		return nil, false, nil
+	}
+	dict, ok := resolved.(Dictionary)
+	if !ok {
+		return nil, false, fmt.Errorf("invalid number tree node")
+	}
+	identity := reflect.ValueOf(dict).Pointer()
+	if _, exists := seenDicts[identity]; exists {
+		err := fmt.Errorf("repeated number tree node")
+		if !r.recoverAuxiliary(err) {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	seenDicts[identity] = dict
+	if depth > 0 {
+		if lo, hi, hasLimits, err := r.numberTreeLimits(dict["Limits"]); err != nil {
+			return nil, false, err
+		} else if hasLimits && (key < lo || key > hi) {
+			return nil, false, nil
+		}
+	}
+	if numsObj := dict["Nums"]; numsObj != nil {
+		numsVal, err := r.Resolve(numsObj)
+		if err != nil {
+			return nil, false, err
+		}
+		if numsVal != nil {
+			nums, ok := numsVal.(Array)
+			if !ok || len(nums)%2 != 0 {
+				return nil, false, fmt.Errorf("invalid number tree pairs")
+			}
+			if pairs := len(nums) / 2; pairs > 0 {
+				low, high := 0, pairs-1
+				ordered := true
+				for low <= high {
+					if err := ctx.Err(); err != nil {
+						return nil, false, err
+					}
+					mid := (low + high) / 2
+					keyVal, err := r.Resolve(nums[mid*2])
+					if err != nil {
+						return nil, false, err
+					}
+					keyInt, ok := keyVal.(Integer)
+					if !ok {
+						if err := fmt.Errorf("invalid number tree key"); !r.recoverAuxiliary(err) {
+							return nil, false, err
+						}
+						ordered = false
+						break
+					}
+					if int64(keyInt) == key {
+						return nums[mid*2+1], true, nil
+					}
+					if int64(keyInt) < key {
+						low = mid + 1
+					} else {
+						high = mid - 1
+					}
+				}
+				if !ordered {
+					for i := 0; i+1 < len(nums); i += 2 {
+						if err := ctx.Err(); err != nil {
+							return nil, false, err
+						}
+						keyVal, err := r.Resolve(nums[i])
+						if err != nil {
+							return nil, false, err
+						}
+						keyInt, ok := keyVal.(Integer)
+						if !ok {
+							if err := fmt.Errorf("invalid number tree key"); !r.recoverAuxiliary(err) {
+								return nil, false, err
+							}
+							continue
+						}
+						if int64(keyInt) == key {
+							return nums[i+1], true, nil
+						}
+					}
+				}
+			}
+		}
+	}
+	if kidsObj := dict["Kids"]; kidsObj != nil {
+		kidsVal, err := r.Resolve(kidsObj)
+		if err != nil {
+			return nil, false, err
+		}
+		if kidsVal != nil {
+			kids, ok := kidsVal.(Array)
+			if !ok {
+				return nil, false, fmt.Errorf("invalid number tree children")
+			}
+			if len(kids) != 0 {
+				low, high := 0, len(kids)-1
+				ordered := true
+				probed := -1
+				var tried map[int]bool
+				markTried := func(idx int) {
+					if tried == nil {
+						tried = make(map[int]bool)
+					}
+					tried[idx] = true
+				}
+				for low <= high {
+					if err := ctx.Err(); err != nil {
+						return nil, false, err
+					}
+					mid := (low + high) / 2
+					kidVal, err := r.Resolve(kids[mid])
+					if err != nil {
+						return nil, false, err
+					}
+					kidDict, ok := kidVal.(Dictionary)
+					if !ok {
+						ordered = false
+						break
+					}
+					lo, hi, hasLimits, err := r.numberTreeLimits(kidDict["Limits"])
+					if err != nil {
+						return nil, false, err
+					}
+					if !hasLimits {
+						ordered = false
+						break
+					}
+					if key < lo {
+						high = mid - 1
+					} else if key > hi {
+						low = mid + 1
+					} else {
+						probed = mid
+						markTried(mid)
+						val, found, err := r.lookupNumberTreeNode(ctx, kids[mid], key, depth+1, seenRefs, seenDicts)
+						if err != nil || found {
+							return val, found, err
+						}
+						break
+					}
+				}
+				if ordered {
+					leftEnd := high
+					if probed >= 0 {
+						leftEnd = probed - 1
+					}
+					for i := leftEnd; i >= 0; i-- {
+						if err := ctx.Err(); err != nil {
+							return nil, false, err
+						}
+						sibVal, err := r.Resolve(kids[i])
+						if err != nil {
+							return nil, false, err
+						}
+						sibDict, ok := sibVal.(Dictionary)
+						if !ok {
+							ordered = false
+							break
+						}
+						slo, shi, has, err := r.numberTreeLimits(sibDict["Limits"])
+						if err != nil {
+							return nil, false, err
+						}
+						if !has {
+							ordered = false
+							break
+						}
+						if key > shi {
+							break
+						}
+						if key >= slo {
+							markTried(i)
+							val, found, err := r.lookupNumberTreeNode(ctx, kids[i], key, depth+1, seenRefs, seenDicts)
+							if err != nil || found {
+								return val, found, err
+							}
+						}
+					}
+				}
+				if ordered && probed >= 0 {
+					for i := probed + 1; i < len(kids); i++ {
+						if err := ctx.Err(); err != nil {
+							return nil, false, err
+						}
+						sibVal, err := r.Resolve(kids[i])
+						if err != nil {
+							return nil, false, err
+						}
+						sibDict, ok := sibVal.(Dictionary)
+						if !ok {
+							ordered = false
+							break
+						}
+						slo, shi, has, err := r.numberTreeLimits(sibDict["Limits"])
+						if err != nil {
+							return nil, false, err
+						}
+						if !has {
+							ordered = false
+							break
+						}
+						if key < slo {
+							break
+						}
+						if key <= shi {
+							markTried(i)
+							val, found, err := r.lookupNumberTreeNode(ctx, kids[i], key, depth+1, seenRefs, seenDicts)
+							if err != nil || found {
+								return val, found, err
+							}
+						}
+					}
+				}
+				if !ordered {
+					for i, kid := range kids {
+						if tried[i] {
+							continue
+						}
+						val, found, err := r.lookupNumberTreeNode(ctx, kid, key, depth+1, seenRefs, seenDicts)
+						if err != nil || found {
+							return val, found, err
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil, false, nil
+}
+
+// numberTreeLimits 解析数字树节点的Limits上下界
+// 入参: obj Limits对象
+// 返回: int64 下界, int64 上界, bool 是否有效, error 解析错误
+func (r *Reader) numberTreeLimits(obj Object) (int64, int64, bool, error) {
+	if obj == nil {
+		return 0, 0, false, nil
+	}
+	val, err := r.Resolve(obj)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	arr, ok := val.(Array)
+	if !ok || len(arr) != 2 {
+		return 0, 0, false, nil
+	}
+	loVal, err := r.Resolve(arr[0])
+	if err != nil {
+		return 0, 0, false, err
+	}
+	hiVal, err := r.Resolve(arr[1])
+	if err != nil {
+		return 0, 0, false, err
+	}
+	lo, okLo := loVal.(Integer)
+	hi, okHi := hiVal.(Integer)
+	if !okLo || !okHi || lo > hi {
+		return 0, 0, false, nil
+	}
+	return int64(lo), int64(hi), true, nil
+}
+
 // WalkEmbeddedFiles 枚举文档名称树中的附件，不解码数据、不读取外部文件
 // 入参: ctx 取消上下文, visit 名称树原始键和文件说明的访问函数
 // 返回: error 名称树、文件说明或访问错误
 func (r *Reader) WalkEmbeddedFiles(ctx context.Context, visit func(string, FileSpecification) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid embedded files context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

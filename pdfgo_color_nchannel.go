@@ -22,6 +22,23 @@ type ProcessColorants struct {
 	Channels []int
 }
 
+// nChannelCMYKComponent 返回保留过程色的标准分量位置
+// 入参: name 色料名称
+// 返回: int 分量序号，非保留名称为-1
+func nChannelCMYKComponent(name Name) int {
+	switch name {
+	case "Cyan":
+		return 0
+	case "Magenta":
+		return 1
+	case "Yellow":
+		return 2
+	case "Black":
+		return 3
+	}
+	return -1
+}
+
 // CMYKMask 返回可直接在设备四色空间绘制的过程通道
 // 返回: [4]bool 参与绘制的四色通道, bool 是否为未校准设备四色
 func (p *ProcessColorants) CMYKMask() ([4]bool, bool) {
@@ -221,21 +238,4 @@ func (r *Reader) readNChannelSpots(attrs Dictionary, names []Name, process map[N
 		}
 	}
 	return spots, nil
-}
-
-// nChannelCMYKComponent 返回保留过程色的标准分量位置
-// 入参: name 色料名称
-// 返回: int 分量序号，非保留名称为-1
-func nChannelCMYKComponent(name Name) int {
-	switch name {
-	case "Cyan":
-		return 0
-	case "Magenta":
-		return 1
-	case "Yellow":
-		return 2
-	case "Black":
-		return 3
-	}
-	return -1
 }

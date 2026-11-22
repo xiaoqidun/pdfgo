@@ -57,6 +57,9 @@ type FileResolver func(context.Context, FileSpecification) ([]byte, error)
 // 入参: ctx 取消上下文, file 文件说明, resolver 外部文件读取器，可为空
 // 返回: []byte 文件数据, error 解码、取消或外部文件不可用
 func (r *Reader) ReadFileData(ctx context.Context, file FileSpecification, resolver FileResolver) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid file data context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

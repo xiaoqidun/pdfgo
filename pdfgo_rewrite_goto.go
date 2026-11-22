@@ -21,6 +21,38 @@ import (
 	"reflect"
 )
 
+// externalFileSpecification 生成外部文件说明，路径使用UTF-8字节及Unicode文件名
+// 入参: file 文件名称、文件系统及说明
+// 返回: Dictionary 文件说明, error 名称编码或内嵌文件错误
+func externalFileSpecification(file FileSpecification) (Dictionary, error) {
+	if file.Name == "" || file.Embedded != nil {
+		return nil, fmt.Errorf("invalid external file specification")
+	}
+	name, err := EncodeTextString(file.Name)
+	if err != nil {
+		return nil, err
+	}
+	dict := Dictionary{"Type": Name("Filespec"), "F": String(file.Name), "UF": name}
+	if file.FileSystem != "" {
+		dict["FS"] = file.FileSystem
+	}
+	if file.FileSystem == "URL" {
+		uri, err := navigationURI(file.Name)
+		if err != nil {
+			return nil, err
+		}
+		dict["F"], dict["UF"] = uri, String(bytes.Clone(uri))
+	}
+	if file.Description != "" {
+		description, err := EncodeTextString(file.Description)
+		if err != nil {
+			return nil, err
+		}
+		dict["Desc"] = description
+	}
+	return dict, nil
+}
+
 // rewriteExternalGoTo 生成跨文件跳转动作，不读取或执行目标文件
 // 入参: ctx 取消上下文, action 跨文件跳转
 // 返回: Dictionary 动作字典, error 文件、目标或路径错误
@@ -106,38 +138,6 @@ func (r *Reader) rewriteRemoteDestination(destination RemoteDestination) (Object
 		return nil, fmt.Errorf("invalid remote destination page")
 	}
 	return r.rewriteDestinationArray(Integer(destination.Page), destination.Mode, destination.Parameters)
-}
-
-// externalFileSpecification 生成外部文件说明，路径使用UTF-8字节及Unicode文件名
-// 入参: file 文件名称、文件系统及说明
-// 返回: Dictionary 文件说明, error 名称编码或内嵌文件错误
-func externalFileSpecification(file FileSpecification) (Dictionary, error) {
-	if file.Name == "" || file.Embedded != nil {
-		return nil, fmt.Errorf("invalid external file specification")
-	}
-	name, err := EncodeTextString(file.Name)
-	if err != nil {
-		return nil, err
-	}
-	dict := Dictionary{"Type": Name("Filespec"), "F": String(file.Name), "UF": name}
-	if file.FileSystem != "" {
-		dict["FS"] = file.FileSystem
-	}
-	if file.FileSystem == "URL" {
-		uri, err := navigationURI(file.Name)
-		if err != nil {
-			return nil, err
-		}
-		dict["F"], dict["UF"] = uri, String(bytes.Clone(uri))
-	}
-	if file.Description != "" {
-		description, err := EncodeTextString(file.Description)
-		if err != nil {
-			return nil, err
-		}
-		dict["Desc"] = description
-	}
-	return dict, nil
 }
 
 // navigationVersion 按对象去重计算动作链及文件说明所需的PDF版本

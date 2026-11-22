@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"context"
+	"fmt"
 	"image"
 )
 
@@ -37,6 +38,9 @@ func (i *Image) DecodeProcess(device *ColorantDevice, group *ColorSpace, softMas
 // 入参: ctx 解码取消上下文, device 输出设备, group 组混合空间，nil继承设备, softMask 是否用于软蒙版
 // 返回: *ImageProcess 独立只读采样，需要备用色时为nil, error 解码或取消错误
 func (i *Image) DecodeProcessContext(ctx context.Context, device *ColorantDevice, group *ColorSpace, softMask bool) (*ImageProcess, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

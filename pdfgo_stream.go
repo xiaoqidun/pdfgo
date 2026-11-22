@@ -733,6 +733,9 @@ func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([
 // 入参: ctx 取消上下文, warning 恢复诊断, limit 数据上限，零值沿用通用解码
 // 返回: []byte 独立解码数据, error 解码、超限或取消错误
 func (s *Stream) decodeContextLimit(ctx context.Context, warning func(Diagnostic), limit int64) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid stream context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

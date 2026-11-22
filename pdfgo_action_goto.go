@@ -53,6 +53,9 @@ type ExternalGoToAction struct {
 // 入参: ctx 取消上下文, object 动作字典或间接引用
 // 返回: ExternalGoToAction 目标信息, error 类型、必填项目或路径错误
 func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (ExternalGoToAction, error) {
+	if ctx == nil {
+		return ExternalGoToAction{}, fmt.Errorf("invalid action context")
+	}
 	if err := ctx.Err(); err != nil {
 		return ExternalGoToAction{}, err
 	}
@@ -179,6 +182,9 @@ func (r *Reader) ReadRemoteDestination(object Object) (RemoteDestination, error)
 // 入参: ctx 取消上下文, remote 已解析的远程目标
 // 返回: Destination 当前文档目标, error 命名目标、越界或页面树错误
 func (r *Reader) ResolveRemoteDestination(ctx context.Context, remote RemoteDestination) (Destination, error) {
+	if ctx == nil {
+		return Destination{}, fmt.Errorf("invalid destination context")
+	}
 	if err := ctx.Err(); err != nil {
 		return Destination{}, err
 	}
@@ -224,6 +230,9 @@ func (r *Reader) ResolveRemoteDestination(ctx context.Context, remote RemoteDest
 // 入参: ctx 取消上下文, target 子文件路径的一步
 // 返回: FileSpecification 内嵌文件说明, error 路径、目标缺失或结构错误
 func (r *Reader) ReadEmbeddedTargetFile(ctx context.Context, target EmbeddedTarget) (FileSpecification, error) {
+	if ctx == nil {
+		return FileSpecification{}, fmt.Errorf("invalid embedded target context")
+	}
 	if err := ctx.Err(); err != nil {
 		return FileSpecification{}, err
 	}

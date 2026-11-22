@@ -63,39 +63,6 @@ func annotationRichDecorated(lines []annotationRichLine) bool {
 	return false
 }
 
-// add 收集一段文字的祖先装饰，横向范围包括适用的字词间距
-// 入参: glyph 字符, state 文字状态, size 默认字号, x 起点, y 基线, width 推进量
-func (d *annotationRichDecorations) add(glyph annotationRichGlyph, state graphicsState, size, x, y, width float64) {
-	if annotationRichSize(glyph, size) == 0 || width == 0 {
-		return
-	}
-	start := len(d.spans)
-	for origin := glyph.style.decorations; origin != nil; origin = origin.parent {
-		fontSize := size
-		if origin.size != nil {
-			fontSize = *origin.size
-		}
-		if fontSize != 0 {
-			baseline := y + state.rise + origin.rise
-			if index, ok := d.last[origin]; ok {
-				previous := &d.spans[index]
-				if previous.y == baseline && previous.size == fontSize && previous.x+previous.width == x && previous.width*width > 0 {
-					previous.width += width
-					continue
-				}
-			}
-			d.spans = append(d.spans, annotationRichDecorationSpan{origin, x, baseline, width, fontSize})
-		}
-	}
-	slices.Reverse(d.spans[start:])
-	if len(d.spans) != start && d.last == nil {
-		d.last = make(map[*annotationRichDecoration]int)
-	}
-	for i := start; i < len(d.spans); i++ {
-		d.last[d.spans[i].origin] = i
-	}
-}
-
 // annotationRichDecorationDefaults 保留默认外观的填充状态，不在文字对象外重放文字操作
 // 入参: ctx 取消上下文, defaults 默认外观操作
 // 返回: string 默认绘制操作, error 操作或取消错误
@@ -151,4 +118,37 @@ func writeAnnotationRichDecorations(ctx context.Context, content *strings.Builde
 		content.WriteString("Q\n")
 	}
 	return nil
+}
+
+// add 收集一段文字的祖先装饰，横向范围包括适用的字词间距
+// 入参: glyph 字符, state 文字状态, size 默认字号, x 起点, y 基线, width 推进量
+func (d *annotationRichDecorations) add(glyph annotationRichGlyph, state graphicsState, size, x, y, width float64) {
+	if annotationRichSize(glyph, size) == 0 || width == 0 {
+		return
+	}
+	start := len(d.spans)
+	for origin := glyph.style.decorations; origin != nil; origin = origin.parent {
+		fontSize := size
+		if origin.size != nil {
+			fontSize = *origin.size
+		}
+		if fontSize != 0 {
+			baseline := y + state.rise + origin.rise
+			if index, ok := d.last[origin]; ok {
+				previous := &d.spans[index]
+				if previous.y == baseline && previous.size == fontSize && previous.x+previous.width == x && previous.width*width > 0 {
+					previous.width += width
+					continue
+				}
+			}
+			d.spans = append(d.spans, annotationRichDecorationSpan{origin, x, baseline, width, fontSize})
+		}
+	}
+	slices.Reverse(d.spans[start:])
+	if len(d.spans) != start && d.last == nil {
+		d.last = make(map[*annotationRichDecoration]int)
+	}
+	for i := start; i < len(d.spans); i++ {
+		d.last[d.spans[i].origin] = i
+	}
 }

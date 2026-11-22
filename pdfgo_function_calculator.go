@@ -64,17 +64,6 @@ func newCalculatorFunction(data []byte, warning func(Diagnostic)) (*calculatorFu
 	return &calculatorFunction{program: program, warning: warning}, nil
 }
 
-// evaluate 求值计算器，仅对确定的整数值和栈顶输出进行有界兼容
-// 入参: input 输入值, output 输出缓冲区
-// 返回: error 类型、算术或栈错误
-func (f *calculatorFunction) evaluate(input, output []float64) error {
-	return evaluateCalculatorRecovery(f.program, input, output, f.warning != nil, func() {
-		f.once.Do(func() {
-			f.warning(Diagnostic{Message: "calculator integral real operands or excess stack values recovered using declared outputs"})
-		})
-	})
-}
-
 // compileCalculator 按PDF语法编译计算器函数，不将条件代码块作为可操作对象
 // 入参: data 函数字节
 // 返回: []calculatorInstruction 指令序列, error 语法错误
@@ -472,4 +461,15 @@ func calculatorOperation(op string, values []calculatorValue) (calculatorValue, 
 		return calculatorInteger(int64(result)), nil
 	}
 	return calculatorValue{number: result}, nil
+}
+
+// evaluate 求值计算器，仅对确定的整数值和栈顶输出进行有界兼容
+// 入参: input 输入值, output 输出缓冲区
+// 返回: error 类型、算术或栈错误
+func (f *calculatorFunction) evaluate(input, output []float64) error {
+	return evaluateCalculatorRecovery(f.program, input, output, f.warning != nil, func() {
+		f.once.Do(func() {
+			f.warning(Diagnostic{Message: "calculator integral real operands or excess stack values recovered using declared outputs"})
+		})
+	})
 }

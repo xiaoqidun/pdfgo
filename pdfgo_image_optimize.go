@@ -45,27 +45,6 @@ type pngIDATReader struct {
 	offset int
 }
 
-// Read 读取下一个非空IDAT片段
-// 入参: data 读取缓冲
-// 返回: int 读取字节数, error 流结束标记
-func (r *pngIDATReader) Read(data []byte) (int, error) {
-	if len(data) == 0 {
-		return 0, nil
-	}
-	for r.index < len(r.chunks) {
-		chunk := r.chunks[r.index]
-		if chunk.kind != "IDAT" || r.offset >= len(chunk.data)-12 {
-			r.index++
-			r.offset = 0
-			continue
-		}
-		n := copy(data, chunk.data[8+r.offset:len(chunk.data)-4])
-		r.offset += n
-		return n, nil
-	}
-	return 0, io.EOF
-}
-
 // OptimizeImage 优化PNG或JPEG编码，只采用更小的结果，不改变尺寸和透明度
 // 无损保留像素与元数据，有损可降低RGB精度或JPEG质量；未知格式原样返回
 // 返回值可能引用输入数据；不修改输入，调用方应将结果视为只读
@@ -80,6 +59,9 @@ func OptimizeImage(ctx context.Context, data []byte, options CompressionOptions)
 // 入参: ctx 取消上下文, data 图片数据, options 压缩配置, size 像素需求
 // 返回: []byte 图片数据, error 编码错误
 func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	if err := options.Validate(); err != nil {
 		return nil, err
 	}
@@ -977,4 +959,25 @@ func writePNGChunk(w io.Writer, kind string, data ...[]byte) error {
 		}
 	}
 	return write(checksum[:])
+}
+
+// Read 读取下一个非空IDAT片段
+// 入参: data 读取缓冲
+// 返回: int 读取字节数, error 流结束标记
+func (r *pngIDATReader) Read(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	for r.index < len(r.chunks) {
+		chunk := r.chunks[r.index]
+		if chunk.kind != "IDAT" || r.offset >= len(chunk.data)-12 {
+			r.index++
+			r.offset = 0
+			continue
+		}
+		n := copy(data, chunk.data[8+r.offset:len(chunk.data)-4])
+		r.offset += n
+		return n, nil
+	}
+	return 0, io.EOF
 }

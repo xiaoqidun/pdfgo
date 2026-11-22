@@ -213,6 +213,54 @@ func iccLookupCurve(curve []float64, x float64) float64 {
 	return curve[i] + (x-float64(i))*(curve[i+1]-curve[i])
 }
 
+// iccIntentIndex 选择ICC查找表的渲染意图
+// 入参: intent PDF渲染意图
+// 返回: int 标签序号, error 未支持的意图
+func iccIntentIndex(intent Name) (int, error) {
+	switch intent {
+	case "", "RelativeColorimetric":
+		return 1, nil
+	case "Perceptual":
+		return 0, nil
+	case "Saturation":
+		return 2, nil
+	default:
+		return 0, &UnsupportedError{Feature: "ICC rendering intent " + string(intent)}
+	}
+}
+
+// iccXYZRGB 将D50色度适应到D65并编码为sRGB
+// 入参: xyz D50色度
+// 返回: [3]float64 单位sRGB分量
+func iccXYZRGB(xyz [3]float64) [3]float64 {
+	m := iccD50ToLinearSRGB
+	table := iccSRGBEncodeTable()
+	return [3]float64{
+		iccSRGBEncode(table, m[0]*xyz[0]+m[1]*xyz[1]+m[2]*xyz[2]),
+		iccSRGBEncode(table, m[3]*xyz[0]+m[4]*xyz[1]+m[5]*xyz[2]),
+		iccSRGBEncode(table, m[6]*xyz[0]+m[7]*xyz[1]+m[8]*xyz[2]),
+	}
+}
+
+// iccSRGBEncode 通过预计算表线性插值将线性分量编码为sRGB
+// 入参: table 编码查找表, v 线性分量
+// 返回: float64 单位sRGB分量
+func iccSRGBEncode(table *[8193]float32, v float64) float64 {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 1 {
+		return 1
+	}
+	if v <= 0.0031308 {
+		return 12.92 * v
+	}
+	x := v * 8192
+	i := int(x)
+	a := float64(table[i])
+	return a + (x-float64(i))*(float64(table[i+1])-a)
+}
+
 // evaluate 按矩阵、输入表、多维线性插值和输出表求值
 // 入参: values 单位输入分量
 // 返回: [4]float64 单位输出分量
@@ -332,22 +380,6 @@ func (s *iccLUT) interpolate3x3(index [4]int, fraction [4]float64) [4]float64 {
 	return [4]float64{l0 + dx*(l1-l0), a0 + dx*(a1-a0), b0 + dx*(b1-b0)}
 }
 
-// iccIntentIndex 选择ICC查找表的渲染意图
-// 入参: intent PDF渲染意图
-// 返回: int 标签序号, error 未支持的意图
-func iccIntentIndex(intent Name) (int, error) {
-	switch intent {
-	case "", "RelativeColorimetric":
-		return 1, nil
-	case "Perceptual":
-		return 0, nil
-	case "Saturation":
-		return 2, nil
-	default:
-		return 0, &UnsupportedError{Feature: "ICC rendering intent " + string(intent)}
-	}
-}
-
 // xyz 将设备分量变换到D50连接空间，保持色度值而非显示亮度
 // 入参: values 设备分量, intent 渲染意图
 // 返回: [3]float64 D50色度, error 意图错误
@@ -415,36 +447,4 @@ func (s *iccLUTSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
 		}
 	}
 	return lut.evaluate(pcs[:]), nil
-}
-
-// iccXYZRGB 将D50色度适应到D65并编码为sRGB
-// 入参: xyz D50色度
-// 返回: [3]float64 单位sRGB分量
-func iccXYZRGB(xyz [3]float64) [3]float64 {
-	m := iccD50ToLinearSRGB
-	table := iccSRGBEncodeTable()
-	return [3]float64{
-		iccSRGBEncode(table, m[0]*xyz[0]+m[1]*xyz[1]+m[2]*xyz[2]),
-		iccSRGBEncode(table, m[3]*xyz[0]+m[4]*xyz[1]+m[5]*xyz[2]),
-		iccSRGBEncode(table, m[6]*xyz[0]+m[7]*xyz[1]+m[8]*xyz[2]),
-	}
-}
-
-// iccSRGBEncode 通过预计算表线性插值将线性分量编码为sRGB
-// 入参: table 编码查找表, v 线性分量
-// 返回: float64 单位sRGB分量
-func iccSRGBEncode(table *[8193]float32, v float64) float64 {
-	if v <= 0 {
-		return 0
-	}
-	if v >= 1 {
-		return 1
-	}
-	if v <= 0.0031308 {
-		return 12.92 * v
-	}
-	x := v * 8192
-	i := int(x)
-	a := float64(table[i])
-	return a + (x-float64(i))*(float64(table[i+1])-a)
 }

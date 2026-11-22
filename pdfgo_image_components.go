@@ -331,6 +331,9 @@ func (i *Image) DecodeComponents() (*ImageComponents, error) {
 // 入参: ctx 取消上下文
 // 返回: *ImageComponents 独立颜色分量及透明度, error 解码或取消错误
 func (i *Image) DecodeComponentsContext(ctx context.Context) (*ImageComponents, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	result := &ImageComponents{}
 	if _, err := i.decodeImage(ctx, result, false); err != nil {
 		return nil, err

@@ -31,6 +31,17 @@ type annotationIconFit struct {
 	full bool
 }
 
+// writeAnnotationCircle 写入圆形闭合路径，不改变绘图样式
+// 入参: content 内容, x 横坐标, y 纵坐标, radius 半径
+func writeAnnotationCircle(content *strings.Builder, x, y, radius float64) {
+	k := radius * 4 * (math.Sqrt2 - 1) / 3
+	writeAnnotationOperation(content, "m", x+radius, y)
+	writeAnnotationOperation(content, "c", x+radius, y+k, x+k, y+radius, x, y+radius)
+	writeAnnotationOperation(content, "c", x-k, y+radius, x-radius, y+k, x-radius, y)
+	writeAnnotationOperation(content, "c", x-radius, y-k, x-k, y-radius, x, y-radius)
+	writeAnnotationOperation(content, "c h", x+k, y-radius, x+radius, y-k, x+radius, y)
+}
+
 // writeAnnotationPushButton 生成按钮正常图标及标题，组合区域等分属于排版选择
 // 入参: ctx 取消上下文, annotation 控件, mk 外观属性, frame 内框, border 边框, resources 外观资源, content 内容
 // 返回: error 图标、布局或文字错误
@@ -322,17 +333,6 @@ func (r *Reader) writeAnnotationButtonCaption(ctx context.Context, annotation An
 		annotation.Dictionary["DA"] = String("/" + escapeAnnotationName(name) + " 0 Tf 0 g")
 	}
 	return r.writeAnnotationText(ctx, annotation, mk, 0, frame, border, resources, content)
-}
-
-// writeAnnotationCircle 写入圆形闭合路径，不改变绘图样式
-// 入参: content 内容, x 横坐标, y 纵坐标, radius 半径
-func writeAnnotationCircle(content *strings.Builder, x, y, radius float64) {
-	k := radius * 4 * (math.Sqrt2 - 1) / 3
-	writeAnnotationOperation(content, "m", x+radius, y)
-	writeAnnotationOperation(content, "c", x+radius, y+k, x+k, y+radius, x, y+radius)
-	writeAnnotationOperation(content, "c", x-k, y+radius, x-radius, y+k, x-radius, y)
-	writeAnnotationOperation(content, "c", x-radius, y-k, x-k, y-radius, x, y-radius)
-	writeAnnotationOperation(content, "c h", x+k, y-radius, x+radius, y-k, x+radius, y)
 }
 
 // readAnnotationIconFit 读取标准图标适配规则，拉伸时忽略仅适用于等比的对齐数组

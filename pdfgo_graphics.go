@@ -323,6 +323,102 @@ type pageInterpreter struct {
 // 返回: Matrix 单位矩阵
 func Identity() Matrix { return Matrix{1, 0, 0, 1, 0, 0} }
 
+// matrixProductDifference 补偿乘积相减的舍入残差，检查溢出、下溢及严重相消
+// 入参: a 第一个乘数, b 第二个乘数, c 第三个乘数, d 第四个乘数
+// 返回: float64 乘积之差, bool 是否可直接用于求逆
+func matrixProductDifference(a, b, c, d float64) (float64, bool) {
+	x, y := a*b, c*d
+	value := x - y
+	if math.IsNaN(value) || math.IsInf(value, 0) || x == 0 && a != 0 && b != 0 || y == 0 && c != 0 && d != 0 {
+		return value, false
+	}
+	if x != 0 && y != 0 {
+		value = math.FMA(a, b, -y) + math.FMA(-c, d, y)
+	}
+	return value, x == 0 && y == 0 || math.Abs(value) >= 0x1p-1022 && math.Abs(value) >= 0x1p-48*math.Max(math.Abs(x), math.Abs(y))
+}
+
+// matrixProductSum 以尾数及指数累加两个乘积，保留乘法舍入残差
+// 入参: a 第一个乘数, b 第二个乘数, c 第三个乘数, d 第四个乘数
+// 返回: float64 结果尾数, int 二进制指数
+func matrixProductSum(a, b, c, d float64) (float64, int) {
+	a, ae := math.Frexp(a)
+	b, be := math.Frexp(b)
+	c, ce := math.Frexp(c)
+	d, de := math.Frexp(d)
+	x, y := a*b, c*d
+	xe, ye := ae+be, ce+de
+	power := max(xe, ye)
+	if x == 0 {
+		power = ye
+	} else if y == 0 {
+		power = xe
+	}
+	value := math.Ldexp(x, xe-power) + math.Ldexp(y, ye-power)
+	value += math.Ldexp(math.FMA(a, b, -x), xe-power) + math.Ldexp(math.FMA(c, d, -y), ye-power)
+	value, shift := math.Frexp(value)
+	return value, power + shift
+}
+
+// transformedBounds 计算仿射变换后矩形的轴对齐边界
+// 入参: box 原始矩形, matrix 坐标变换
+// 返回: Rectangle 变换后的边界
+func transformedBounds(box Rectangle, matrix Matrix) Rectangle {
+	result := Rectangle{XMin: math.Inf(1), YMin: math.Inf(1), XMax: math.Inf(-1), YMax: math.Inf(-1)}
+	for _, point := range [4]Point{{box.XMin, box.YMin}, {box.XMax, box.YMin}, {box.XMax, box.YMax}, {box.XMin, box.YMax}} {
+		point = matrix.Apply(point)
+		result.XMin, result.YMin = math.Min(result.XMin, point.X), math.Min(result.YMin, point.Y)
+		result.XMax, result.YMax = math.Max(result.XMax, point.X), math.Max(result.YMax, point.Y)
+	}
+	return result
+}
+
+// numbers 检查操作数数量并读取有限数值
+// 入参: operands 操作数, count 预期数量
+// 返回: []float64 数值列表, error 错误信息
+func numbers(operands []Object, count int) ([]float64, error) {
+	if len(operands) != count {
+		return nil, fmt.Errorf("expected %d operands, got %d", count, len(operands))
+	}
+	values := make([]float64, count)
+	for n, v := range operands {
+		switch v := v.(type) {
+		case Integer:
+			values[n] = float64(v)
+		case Real:
+			values[n] = float64(v)
+		default:
+			return nil, fmt.Errorf("nonnumeric operand")
+		}
+		if math.IsNaN(values[n]) || math.IsInf(values[n], 0) {
+			return nil, fmt.Errorf("nonfinite operand")
+		}
+	}
+	return values, nil
+}
+
+// graphicsOperandCount 获取固定数值操作符的参数数量，其他操作返回负数
+// 入参: operator 操作符
+// 返回: int 参数数量
+func graphicsOperandCount(operator string) int {
+	switch operator {
+	case "q", "Q", "h", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n", "W", "W*", "BT", "ET", "T*", "BX", "EX":
+		return 0
+	case "w", "J", "j", "M", "g", "G", "Tc", "Tw", "Tz", "TL", "Tr", "Ts":
+		return 1
+	case "m", "l", "Td", "TD", "d0":
+		return 2
+	case "rg", "RG":
+		return 3
+	case "v", "y", "re", "k", "K":
+		return 4
+	case "cm", "c", "Tm", "d1":
+		return 6
+	default:
+		return -1
+	}
+}
+
 // Mul 按当前矩阵乘以右侧矩阵进行坐标组合
 // 入参: n 右侧矩阵
 // 返回: Matrix 组合矩阵
@@ -392,48 +488,15 @@ func (m Matrix) MaxScale() float64 {
 	return scale * ((math.Hypot(a+d, b-c) + math.Hypot(a-d, b+c)) / 2)
 }
 
-// matrixProductDifference 补偿乘积相减的舍入残差，检查溢出、下溢及严重相消
-// 入参: a 第一个乘数, b 第二个乘数, c 第三个乘数, d 第四个乘数
-// 返回: float64 乘积之差, bool 是否可直接用于求逆
-func matrixProductDifference(a, b, c, d float64) (float64, bool) {
-	x, y := a*b, c*d
-	value := x - y
-	if math.IsNaN(value) || math.IsInf(value, 0) || x == 0 && a != 0 && b != 0 || y == 0 && c != 0 && d != 0 {
-		return value, false
-	}
-	if x != 0 && y != 0 {
-		value = math.FMA(a, b, -y) + math.FMA(-c, d, y)
-	}
-	return value, x == 0 && y == 0 || math.Abs(value) >= 0x1p-1022 && math.Abs(value) >= 0x1p-48*math.Max(math.Abs(x), math.Abs(y))
-}
-
-// matrixProductSum 以尾数及指数累加两个乘积，保留乘法舍入残差
-// 入参: a 第一个乘数, b 第二个乘数, c 第三个乘数, d 第四个乘数
-// 返回: float64 结果尾数, int 二进制指数
-func matrixProductSum(a, b, c, d float64) (float64, int) {
-	a, ae := math.Frexp(a)
-	b, be := math.Frexp(b)
-	c, ce := math.Frexp(c)
-	d, de := math.Frexp(d)
-	x, y := a*b, c*d
-	xe, ye := ae+be, ce+de
-	power := max(xe, ye)
-	if x == 0 {
-		power = ye
-	} else if y == 0 {
-		power = xe
-	}
-	value := math.Ldexp(x, xe-power) + math.Ldexp(y, ye-power)
-	value += math.Ldexp(math.FMA(a, b, -x), xe-power) + math.Ldexp(math.FMA(c, d, -y), ye-power)
-	value, shift := math.Frexp(value)
-	return value, power + shift
-}
-
 // Fork 创建共享只读底层数据与并发安全缓存的独立工作视图，供多页并发读取使用
 // 视图固定内部图像解码并发度为1，避免外层并行调度过度订阅
+// source为nil时沿用原数据源，调用方须在视图使用期间保持源Reader未关闭
 // 入参: source 可选数据源，nil沿用原数据源, warning 可选警告回调, shapeText 可选文字整形回调
 // 返回: *Reader 独立工作视图
 func (r *Reader) Fork(source io.ReaderAt, warning func(Diagnostic), shapeText TextShaper) *Reader {
+	if r == nil || r.closed {
+		return &Reader{closed: true}
+	}
 	originalSource := r.originalSource
 	if source == nil {
 		source = r.source
@@ -483,7 +546,13 @@ func (r *Reader) BindPage(page *Page) *Page {
 // 入参: ctx 取消上下文, page 页面, visitor 图元访问器
 // 返回: error 错误信息
 func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) error {
-	if page.reader != r {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid page context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if page == nil || page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
 	}
 	var groupSpace *ColorSpace
@@ -595,6 +664,9 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 // 入参: ctx 取消上下文, mark 文字绘制信息, index 字形下标, visitor 图元访问器
 // 返回: error 解析或访问错误
 func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, visitor Visitor) error {
+	if ctx == nil {
+		return fmt.Errorf("invalid Type3 glyph context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -666,19 +738,6 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 		interpreter.bounds = transformedBounds(*font.type3Bounds, interpreter.state.matrix)
 	}
 	return interpreter.run(data)
-}
-
-// transformedBounds 计算仿射变换后矩形的轴对齐边界
-// 入参: box 原始矩形, matrix 坐标变换
-// 返回: Rectangle 变换后的边界
-func transformedBounds(box Rectangle, matrix Matrix) Rectangle {
-	result := Rectangle{XMin: math.Inf(1), YMin: math.Inf(1), XMax: math.Inf(-1), YMax: math.Inf(-1)}
-	for _, point := range [4]Point{{box.XMin, box.YMin}, {box.XMax, box.YMin}, {box.XMax, box.YMax}, {box.XMin, box.YMax}} {
-		point = matrix.Apply(point)
-		result.XMin, result.YMin = math.Min(result.XMin, point.X), math.Min(result.YMin, point.Y)
-		result.XMax, result.YMax = math.Max(result.XMax, point.X), math.Max(result.YMax, point.Y)
-	}
-	return result
 }
 
 // run 解释单个页面或表单的完整内容
@@ -841,30 +900,6 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 		p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: fmt.Sprintf("marked content %s not preserved", mark.Tag)})
 	}
 	return nil
-}
-
-// numbers 检查操作数数量并读取有限数值
-// 入参: operands 操作数, count 预期数量
-// 返回: []float64 数值列表, error 错误信息
-func numbers(operands []Object, count int) ([]float64, error) {
-	if len(operands) != count {
-		return nil, fmt.Errorf("expected %d operands, got %d", count, len(operands))
-	}
-	values := make([]float64, count)
-	for n, v := range operands {
-		switch v := v.(type) {
-		case Integer:
-			values[n] = float64(v)
-		case Real:
-			values[n] = float64(v)
-		default:
-			return nil, fmt.Errorf("nonnumeric operand")
-		}
-		if math.IsNaN(values[n]) || math.IsInf(values[n], 0) {
-			return nil, fmt.Errorf("nonfinite operand")
-		}
-	}
-	return values, nil
 }
 
 // addPathSegment 分块保存路径坐标，各段限制容量且不复用已交付的存储
@@ -1519,28 +1554,6 @@ func (p *pageInterpreter) operationWarning(op Operation, message string) error {
 	}
 	p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: message})
 	return p.ctx.Err()
-}
-
-// graphicsOperandCount 获取固定数值操作符的参数数量，其他操作返回负数
-// 入参: operator 操作符
-// 返回: int 参数数量
-func graphicsOperandCount(operator string) int {
-	switch operator {
-	case "q", "Q", "h", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n", "W", "W*", "BT", "ET", "T*", "BX", "EX":
-		return 0
-	case "w", "J", "j", "M", "g", "G", "Tc", "Tw", "Tz", "TL", "Tr", "Ts":
-		return 1
-	case "m", "l", "Td", "TD", "d0":
-		return 2
-	case "rg", "RG":
-		return 3
-	case "v", "y", "re", "k", "K":
-		return 4
-	case "cm", "c", "Tm", "d1":
-		return 6
-	default:
-		return -1
-	}
 }
 
 // textState 验证活动字体，诊断模式为缺失文字对象保留已有文字矩阵

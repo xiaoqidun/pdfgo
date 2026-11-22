@@ -52,6 +52,118 @@ type annotationRichFontSelection struct {
 	fonts      [128]*annotationRichFont
 }
 
+// annotationRichStretchRank 为缺失宽度选择替代字体，窄类先向窄侧、宽类先向宽侧查找
+// 入参: wanted 请求宽度, actual 可用宽度
+// 返回: int 匹配优先级，数值越小越优先
+func annotationRichStretchRank(wanted, actual int) int {
+	if actual == 0 {
+		actual = 5
+	}
+	if wanted <= 5 {
+		if actual <= wanted {
+			return wanted - actual
+		}
+		return actual + 9
+	}
+	if actual >= wanted {
+		return actual - wanted
+	}
+	return 18 - actual
+}
+
+// annotationRichWeightRank 按CSS2字重替代顺序计算匹配优先级
+// 入参: wanted 请求字重, actual 可用字重
+// 返回: int 优先级，数值越小越优先
+func annotationRichWeightRank(wanted, actual int) int {
+	if wanted == actual {
+		return 0
+	}
+	if wanted == 400 && actual == 500 || wanted == 500 && actual == 400 {
+		return 1
+	}
+	if wanted <= 500 {
+		if actual < wanted {
+			return wanted - actual + 2
+		}
+		return actual + 1000
+	}
+	if actual > wanted {
+		return actual - wanted + 2
+	}
+	return 1000 - actual + 1000
+}
+
+// annotationRichFamily 将通用字体族映射到当前可生成的标准字体族
+// 入参: family CSS字体族
+// 返回: string 字体族
+func annotationRichFamily(family annotationRichFamilyName) string {
+	if !family.generic {
+		return family.name
+	}
+	switch strings.ToLower(family.name) {
+	case "serif":
+		return "Times"
+	case "sans-serif":
+		return "Helvetica"
+	case "monospace":
+		return "Courier"
+	}
+	return family.name
+}
+
+// annotationRichStandardFace 读取标准字体名称明确指定的家族和样式
+// 入参: name 字体名称
+// 返回: string 家族, int 字重, bool 斜体
+func annotationRichStandardFace(name string) (string, int, bool) {
+	switch name {
+	case "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique":
+		return "Helvetica", annotationRichFaceWeight(name), strings.Contains(name, "Oblique")
+	case "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique":
+		return "Courier", annotationRichFaceWeight(name), strings.Contains(name, "Oblique")
+	case "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic":
+		return "Times", annotationRichFaceWeight(name), strings.Contains(name, "Italic")
+	}
+	return "", 0, false
+}
+
+// annotationRichFaceWeight 读取标准字体名称的常规或粗体字重
+// 入参: name 标准字体名
+// 返回: int 字重
+func annotationRichFaceWeight(name string) int {
+	if strings.Contains(name, "Bold") {
+		return 700
+	}
+	return 400
+}
+
+// annotationRichStandardName 为标准家族选择最接近请求样式的字体
+// 入参: family 家族, weight 字重, italic 斜体
+// 返回: string 标准字体名，非标准家族为空
+func annotationRichStandardName(family string, weight int, italic bool) string {
+	var regular, bold, oblique, both string
+	switch {
+	case strings.EqualFold(family, "Helvetica"):
+		regular, bold, oblique, both = "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"
+	case strings.EqualFold(family, "Courier"):
+		regular, bold, oblique, both = "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"
+	case strings.EqualFold(family, "Times"):
+		regular, bold, oblique, both = "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"
+	default:
+		return ""
+	}
+	useBold := annotationRichWeightRank(weight, 700) < annotationRichWeightRank(weight, 400)
+	if italic && useBold {
+		return both
+	}
+	if italic {
+		return oblique
+	}
+	if useBold {
+		return bold
+	}
+	return regular
+}
+
 // letter 复用当前样式的字符字体，缓存冲突时仍按完整规则选择
 // 入参: ch Unicode字符
 // 返回: *annotationRichFont 字体, annotationLetter 编码和度量, error 字体或取消错误
@@ -422,116 +534,4 @@ func (s *annotationRichFonts) selectFont(style annotationRichStyle, covered func
 		}
 	}
 	return nil, nil
-}
-
-// annotationRichStretchRank 为缺失宽度选择替代字体，窄类先向窄侧、宽类先向宽侧查找
-// 入参: wanted 请求宽度, actual 可用宽度
-// 返回: int 匹配优先级，数值越小越优先
-func annotationRichStretchRank(wanted, actual int) int {
-	if actual == 0 {
-		actual = 5
-	}
-	if wanted <= 5 {
-		if actual <= wanted {
-			return wanted - actual
-		}
-		return actual + 9
-	}
-	if actual >= wanted {
-		return actual - wanted
-	}
-	return 18 - actual
-}
-
-// annotationRichWeightRank 按CSS2字重替代顺序计算匹配优先级
-// 入参: wanted 请求字重, actual 可用字重
-// 返回: int 优先级，数值越小越优先
-func annotationRichWeightRank(wanted, actual int) int {
-	if wanted == actual {
-		return 0
-	}
-	if wanted == 400 && actual == 500 || wanted == 500 && actual == 400 {
-		return 1
-	}
-	if wanted <= 500 {
-		if actual < wanted {
-			return wanted - actual + 2
-		}
-		return actual + 1000
-	}
-	if actual > wanted {
-		return actual - wanted + 2
-	}
-	return 1000 - actual + 1000
-}
-
-// annotationRichFamily 将通用字体族映射到当前可生成的标准字体族
-// 入参: family CSS字体族
-// 返回: string 字体族
-func annotationRichFamily(family annotationRichFamilyName) string {
-	if !family.generic {
-		return family.name
-	}
-	switch strings.ToLower(family.name) {
-	case "serif":
-		return "Times"
-	case "sans-serif":
-		return "Helvetica"
-	case "monospace":
-		return "Courier"
-	}
-	return family.name
-}
-
-// annotationRichStandardFace 读取标准字体名称明确指定的家族和样式
-// 入参: name 字体名称
-// 返回: string 家族, int 字重, bool 斜体
-func annotationRichStandardFace(name string) (string, int, bool) {
-	switch name {
-	case "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique":
-		return "Helvetica", annotationRichFaceWeight(name), strings.Contains(name, "Oblique")
-	case "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique":
-		return "Courier", annotationRichFaceWeight(name), strings.Contains(name, "Oblique")
-	case "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic":
-		return "Times", annotationRichFaceWeight(name), strings.Contains(name, "Italic")
-	}
-	return "", 0, false
-}
-
-// annotationRichFaceWeight 读取标准字体名称的常规或粗体字重
-// 入参: name 标准字体名
-// 返回: int 字重
-func annotationRichFaceWeight(name string) int {
-	if strings.Contains(name, "Bold") {
-		return 700
-	}
-	return 400
-}
-
-// annotationRichStandardName 为标准家族选择最接近请求样式的字体
-// 入参: family 家族, weight 字重, italic 斜体
-// 返回: string 标准字体名，非标准家族为空
-func annotationRichStandardName(family string, weight int, italic bool) string {
-	var regular, bold, oblique, both string
-	switch {
-	case strings.EqualFold(family, "Helvetica"):
-		regular, bold, oblique, both = "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"
-	case strings.EqualFold(family, "Courier"):
-		regular, bold, oblique, both = "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"
-	case strings.EqualFold(family, "Times"):
-		regular, bold, oblique, both = "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"
-	default:
-		return ""
-	}
-	useBold := annotationRichWeightRank(weight, 700) < annotationRichWeightRank(weight, 400)
-	if italic && useBold {
-		return both
-	}
-	if italic {
-		return oblique
-	}
-	if useBold {
-		return bold
-	}
-	return regular
 }

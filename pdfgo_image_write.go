@@ -35,120 +35,12 @@ type ImageWriteOptions struct {
 	PreblendBinary bool
 }
 
-// CreateImage 从像素创建独立PDF图像及软遮罩，不修改文档或分配间接对象编号
-// 入参: ctx 取消上下文, source 像素图像, options 可选编码参数，至多一项
-// 返回: *Image 图像描述及独立编码数据, error 参数、编码或关闭错误
-func (r *Reader) CreateImage(ctx context.Context, source image.Image, options ...ImageWriteOptions) (*Image, error) {
-	if ctx == nil || r == nil {
-		return nil, fmt.Errorf("invalid image creation context")
-	}
-	if r.closed {
-		return nil, os.ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if len(options) > 1 {
-		return nil, fmt.Errorf("too many image write options")
-	}
-	var settings ImageWriteOptions
-	if len(options) == 1 {
-		settings = options[0]
-	}
-	stream, mask, err := encodePDFImage(ctx, source, settings)
-	if err != nil {
-		return nil, err
-	}
-	if mask != nil {
-		stream.Dictionary["SMask"] = mask
-	}
-	return r.ReadImage(stream)
-}
-
-// ReplaceImagesTo 无损替换间接图像，保留页面布局、其他对象及原加密配置
-// 默认保留非预乘颜色和透明度的八位或十六位精度；不修改源对象，不替换遮罩图像或签名文档
-// 出错时应丢弃本次输出，Reader及图片须在调用期间保持可读
-// 入参: ctx 取消上下文, writer 输出流, images 图像引用与替换像素, options 可选替换参数，至多一项
-// 返回: OptimizeReport 写出结果, error 参数、编码或写入错误
-func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images map[Reference]image.Image, options ...ImageWriteOptions) (OptimizeReport, error) {
-	if len(options) > 1 {
-		return OptimizeReport{}, fmt.Errorf("too many image write options")
-	}
-	var settings ImageWriteOptions
-	if len(options) == 1 {
-		settings = options[0]
-	}
-	return r.RewriteTo(ctx, writer, RewriteOptions{Images: images, ImageOptions: settings})
-}
-
 // lazyReplacementImage 保存延迟编码替换图像所需的元信息与像素源
 type lazyReplacementImage struct {
 	image       image.Image
 	baseDict    Dictionary
 	interpolate bool
 	options     ImageWriteOptions
-}
-
-// prepareImageReplacements 校验替换图像并准备延迟编码元信息，不提前压缩像素
-// 入参: ctx 取消上下文, images 替换图像, settings 编码参数
-// 返回: map[Reference]*lazyReplacementImage 延迟替换图像, error 参数错误
-func (r *Reader) prepareImageReplacements(ctx context.Context, images map[Reference]image.Image, settings ImageWriteOptions) (map[Reference]*lazyReplacementImage, error) {
-	lazy := make(map[Reference]*lazyReplacementImage, len(images))
-	if len(images) == 0 {
-		return lazy, nil
-	}
-	maximum := int64(0)
-	for number := range r.xref {
-		maximum = max(maximum, number)
-	}
-	if maximum > math.MaxInt32-int64(len(images))-1024 {
-		return nil, fmt.Errorf("PDF object number exceeds output limit")
-	}
-	refs := slices.Collect(maps.Keys(images))
-	slices.SortFunc(refs, func(a, b Reference) int {
-		if a.Number != b.Number {
-			if a.Number < b.Number {
-				return -1
-			}
-			return 1
-		}
-		if a.Generation < b.Generation {
-			return -1
-		}
-		if a.Generation > b.Generation {
-			return 1
-		}
-		return 0
-	})
-	for _, ref := range refs {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if ref.Number <= 0 || ref.Generation < 0 || ref.Generation > 65535 {
-			return nil, fmt.Errorf("invalid image reference")
-		}
-		original, err := r.ReadImage(ref)
-		if err != nil {
-			return nil, err
-		}
-		if original.ImageMask {
-			return nil, fmt.Errorf("cannot replace a stencil image")
-		}
-		source := images[ref]
-		if source == nil {
-			return nil, fmt.Errorf("missing replacement image")
-		}
-		bounds := source.Bounds()
-		if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
-			return nil, fmt.Errorf("invalid replacement image dimensions")
-		}
-		dict := maps.Clone(original.Stream.Dictionary)
-		for _, key := range []Name{"Length", "Filter", "DecodeParms", "Decode", "Mask", "SMask", "SMaskInData", "ImageMask", "Matte", "F", "FFilter", "FDecodeParms", "Alternates"} {
-			delete(dict, key)
-		}
-		lazy[ref] = &lazyReplacementImage{image: source, baseDict: dict, interpolate: original.Interpolate, options: settings}
-	}
-	return lazy, nil
 }
 
 // encodeReplacementImage 按需编码单个延迟替换图像并与原字典属性合并
@@ -1068,4 +960,112 @@ func encodePDFImagePass(ctx context.Context, img image.Image, bounds image.Recta
 		}
 	}
 	return stream, mask, false, false, nil
+}
+
+// CreateImage 从像素创建独立PDF图像及软遮罩，不修改文档或分配间接对象编号
+// 入参: ctx 取消上下文, source 像素图像, options 可选编码参数，至多一项
+// 返回: *Image 图像描述及独立编码数据, error 参数、编码或关闭错误
+func (r *Reader) CreateImage(ctx context.Context, source image.Image, options ...ImageWriteOptions) (*Image, error) {
+	if ctx == nil || r == nil {
+		return nil, fmt.Errorf("invalid image creation context")
+	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(options) > 1 {
+		return nil, fmt.Errorf("too many image write options")
+	}
+	var settings ImageWriteOptions
+	if len(options) == 1 {
+		settings = options[0]
+	}
+	stream, mask, err := encodePDFImage(ctx, source, settings)
+	if err != nil {
+		return nil, err
+	}
+	if mask != nil {
+		stream.Dictionary["SMask"] = mask
+	}
+	return r.ReadImage(stream)
+}
+
+// ReplaceImagesTo 无损替换间接图像，保留页面布局、其他对象及原加密配置
+// 默认保留非预乘颜色和透明度的八位或十六位精度；不修改源对象，不替换遮罩图像或签名文档
+// 出错时应丢弃本次输出，Reader及图片须在调用期间保持可读
+// 入参: ctx 取消上下文, writer 输出流, images 图像引用与替换像素, options 可选替换参数，至多一项
+// 返回: OptimizeReport 写出结果, error 参数、编码或写入错误
+func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images map[Reference]image.Image, options ...ImageWriteOptions) (OptimizeReport, error) {
+	if len(options) > 1 {
+		return OptimizeReport{}, fmt.Errorf("too many image write options")
+	}
+	var settings ImageWriteOptions
+	if len(options) == 1 {
+		settings = options[0]
+	}
+	return r.RewriteTo(ctx, writer, RewriteOptions{Images: images, ImageOptions: settings})
+}
+
+// prepareImageReplacements 校验替换图像并准备延迟编码元信息，不提前压缩像素
+// 入参: ctx 取消上下文, images 替换图像, settings 编码参数
+// 返回: map[Reference]*lazyReplacementImage 延迟替换图像, error 参数错误
+func (r *Reader) prepareImageReplacements(ctx context.Context, images map[Reference]image.Image, settings ImageWriteOptions) (map[Reference]*lazyReplacementImage, error) {
+	lazy := make(map[Reference]*lazyReplacementImage, len(images))
+	if len(images) == 0 {
+		return lazy, nil
+	}
+	maximum := int64(0)
+	for number := range r.xref {
+		maximum = max(maximum, number)
+	}
+	if maximum > math.MaxInt32-int64(len(images))-1024 {
+		return nil, fmt.Errorf("PDF object number exceeds output limit")
+	}
+	refs := slices.Collect(maps.Keys(images))
+	slices.SortFunc(refs, func(a, b Reference) int {
+		if a.Number != b.Number {
+			if a.Number < b.Number {
+				return -1
+			}
+			return 1
+		}
+		if a.Generation < b.Generation {
+			return -1
+		}
+		if a.Generation > b.Generation {
+			return 1
+		}
+		return 0
+	})
+	for _, ref := range refs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if ref.Number <= 0 || ref.Generation < 0 || ref.Generation > 65535 {
+			return nil, fmt.Errorf("invalid image reference")
+		}
+		original, err := r.ReadImage(ref)
+		if err != nil {
+			return nil, err
+		}
+		if original.ImageMask {
+			return nil, fmt.Errorf("cannot replace a stencil image")
+		}
+		source := images[ref]
+		if source == nil {
+			return nil, fmt.Errorf("missing replacement image")
+		}
+		bounds := source.Bounds()
+		if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
+			return nil, fmt.Errorf("invalid replacement image dimensions")
+		}
+		dict := maps.Clone(original.Stream.Dictionary)
+		for _, key := range []Name{"Length", "Filter", "DecodeParms", "Decode", "Mask", "SMask", "SMaskInData", "ImageMask", "Matte", "F", "FFilter", "FDecodeParms", "Alternates"} {
+			delete(dict, key)
+		}
+		lazy[ref] = &lazyReplacementImage{image: source, baseDict: dict, interpolate: original.Interpolate, options: settings}
+	}
+	return lazy, nil
 }

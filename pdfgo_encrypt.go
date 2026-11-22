@@ -53,6 +53,16 @@ type standardSecurity struct {
 	authenticated   bool
 }
 
+// padPassword 截断或填充密码为32字节
+// 入参: password 密码字节
+// 返回: []byte 填充后的密码
+func padPassword(password []byte) []byte {
+	data := make([]byte, 32)
+	n := copy(data, password)
+	copy(data[n:], passwordPadding[:])
+	return data
+}
+
 // Encryption 返回加密信息副本，未加密文档返回nil
 // 返回: *EncryptionInfo 加密信息
 func (r *Reader) Encryption() *EncryptionInfo {
@@ -234,16 +244,6 @@ func (r *Reader) securityFilters(object Object) (Object, error) {
 		result[name] = copy
 	}
 	return result, nil
-}
-
-// padPassword 截断或填充密码为32字节
-// 入参: password 密码字节
-// 返回: []byte 填充后的密码
-func padPassword(password []byte) []byte {
-	data := make([]byte, 32)
-	n := copy(data, password)
-	copy(data[n:], passwordPadding[:])
-	return data
 }
 
 // authenticateUser 按标准安全处理器算法2、4、5验证用户密码并派生文件密钥

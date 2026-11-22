@@ -29,16 +29,6 @@ type gradientFunction struct {
 	colorant  func(float64, []float64) error
 }
 
-// evaluate 计算颜色函数并传递运行时算术错误
-// 入参: x 输入分量
-// 返回: [4]float64 输出分量, error 求值错误
-func (f *gradientFunction) evaluate(x float64) ([4]float64, error) {
-	if f.calculate != nil {
-		return f.calculate(x)
-	}
-	return f.value(x), nil
-}
-
 // constantGradientFunction 保存单点函数的确定结果及常量分段
 // 入参: values 函数结果
 // 返回: *gradientFunction 常量函数
@@ -187,6 +177,90 @@ func deviceNGradientFunction(source *gradientFunction, input, output []float64, 
 		}
 	}
 	return f
+}
+
+// gradientDomain 将函数定义域中的分段限制或反向映射到调用区间
+// 入参: stops 定义域分段, domain 定义域, interval 调用区间
+// 返回: []GradientStop 调用区间分段
+func gradientDomain(stops []GradientStop, domain []float64, interval [2]float64) []GradientStop {
+	return gradientInterval(stops, functionPosition(interval[0], domain[0], domain[1]), functionPosition(interval[1], domain[0], domain[1]))
+}
+
+// clipGradientValue 按函数范围限制各输出分量
+// 入参: values 原值, limits 分量上下界
+// 返回: [4]float64 截断值
+func clipGradientValue(values [4]float64, limits []float64) [4]float64 {
+	for c := 0; c < len(limits)/2; c++ {
+		values[c] = math.Max(limits[2*c], math.Min(limits[2*c+1], values[c]))
+	}
+	return values
+}
+
+// mergeGradientFunctions 合并独立分量的精确断点和跳变
+// 入参: functions 分量函数, interval 输入区间
+// 返回: []GradientStop 合并分段
+func mergeGradientFunctions(functions []*gradientFunction, interval [2]float64) []GradientStop {
+	parts := make([][]GradientStop, len(functions))
+	positions := []float64{0, 1}
+	for i, function := range functions {
+		parts[i] = function.linear(interval)
+		if len(parts[i]) == 0 {
+			return nil
+		}
+		for _, stop := range parts[i] {
+			positions = append(positions, stop.Position)
+		}
+	}
+	slices.Sort(positions)
+	var stops []GradientStop
+	for _, position := range slices.Compact(positions) {
+		for _, left := range []bool{true, false} {
+			stop := GradientStop{Position: position}
+			for c, part := range parts {
+				stop.Values[c] = gradientValueSide(part, position, left)[0]
+			}
+			stops = append(stops, stop)
+		}
+	}
+	return slices.Compact(stops)
+}
+
+// sampledGradientStops 展开采样函数的精确断点及范围截断
+// 入参: f 已解析采样函数
+// 返回: []GradientStop 定义域中的线性分段
+func sampledGradientStops(f *tintFunction) []GradientStop {
+	positions := []float64{f.domain[0], f.domain[1]}
+	if f.encoded[0] != f.encoded[1] {
+		for i := 0; i < f.size; i++ {
+			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
+			if x > f.domain[0] && x < f.domain[1] {
+				positions = append(positions, x)
+			}
+		}
+	}
+	slices.Sort(positions)
+	positions = slices.Compact(positions)
+	raw := *f
+	raw.values = make([]float64, 2*f.channels)
+	for i := 0; i < f.channels; i++ {
+		raw.values[2*i], raw.values[2*i+1] = math.Inf(-1), math.Inf(1)
+	}
+	stops := make([]GradientStop, len(positions))
+	for i, x := range positions {
+		stops[i].Position = functionPosition(x, f.domain[0], f.domain[1])
+		raw.colorInto(x, stops[i].Values[:f.channels])
+	}
+	return clipGradientValues(stops, f.values)
+}
+
+// evaluate 计算颜色函数并传递运行时算术错误
+// 入参: x 输入分量
+// 返回: [4]float64 输出分量, error 求值错误
+func (f *gradientFunction) evaluate(x float64) ([4]float64, error) {
+	if f.calculate != nil {
+		return f.calculate(x)
+	}
+	return f.value(x), nil
 }
 
 // readGradientFunction 解析采样、指数、拼接及计算器函数，不近似非线性函数
@@ -448,78 +522,4 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		}
 	}
 	return f, nil
-}
-
-// gradientDomain 将函数定义域中的分段限制或反向映射到调用区间
-// 入参: stops 定义域分段, domain 定义域, interval 调用区间
-// 返回: []GradientStop 调用区间分段
-func gradientDomain(stops []GradientStop, domain []float64, interval [2]float64) []GradientStop {
-	return gradientInterval(stops, functionPosition(interval[0], domain[0], domain[1]), functionPosition(interval[1], domain[0], domain[1]))
-}
-
-// clipGradientValue 按函数范围限制各输出分量
-// 入参: values 原值, limits 分量上下界
-// 返回: [4]float64 截断值
-func clipGradientValue(values [4]float64, limits []float64) [4]float64 {
-	for c := 0; c < len(limits)/2; c++ {
-		values[c] = math.Max(limits[2*c], math.Min(limits[2*c+1], values[c]))
-	}
-	return values
-}
-
-// mergeGradientFunctions 合并独立分量的精确断点和跳变
-// 入参: functions 分量函数, interval 输入区间
-// 返回: []GradientStop 合并分段
-func mergeGradientFunctions(functions []*gradientFunction, interval [2]float64) []GradientStop {
-	parts := make([][]GradientStop, len(functions))
-	positions := []float64{0, 1}
-	for i, function := range functions {
-		parts[i] = function.linear(interval)
-		if len(parts[i]) == 0 {
-			return nil
-		}
-		for _, stop := range parts[i] {
-			positions = append(positions, stop.Position)
-		}
-	}
-	slices.Sort(positions)
-	var stops []GradientStop
-	for _, position := range slices.Compact(positions) {
-		for _, left := range []bool{true, false} {
-			stop := GradientStop{Position: position}
-			for c, part := range parts {
-				stop.Values[c] = gradientValueSide(part, position, left)[0]
-			}
-			stops = append(stops, stop)
-		}
-	}
-	return slices.Compact(stops)
-}
-
-// sampledGradientStops 展开采样函数的精确断点及范围截断
-// 入参: f 已解析采样函数
-// 返回: []GradientStop 定义域中的线性分段
-func sampledGradientStops(f *tintFunction) []GradientStop {
-	positions := []float64{f.domain[0], f.domain[1]}
-	if f.encoded[0] != f.encoded[1] {
-		for i := 0; i < f.size; i++ {
-			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
-			if x > f.domain[0] && x < f.domain[1] {
-				positions = append(positions, x)
-			}
-		}
-	}
-	slices.Sort(positions)
-	positions = slices.Compact(positions)
-	raw := *f
-	raw.values = make([]float64, 2*f.channels)
-	for i := 0; i < f.channels; i++ {
-		raw.values[2*i], raw.values[2*i+1] = math.Inf(-1), math.Inf(1)
-	}
-	stops := make([]GradientStop, len(positions))
-	for i, x := range positions {
-		stops[i].Position = functionPosition(x, f.domain[0], f.domain[1])
-		raw.colorInto(x, stops[i].Values[:f.channels])
-	}
-	return clipGradientValues(stops, f.values)
 }

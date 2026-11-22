@@ -44,48 +44,6 @@ type fontPostMapping struct {
 	err     error
 }
 
-// lookup 查询名称映射，空名称表返回未定义字形
-// 入参: name 字形名称
-// 返回: uint16 字形编号, error 实际使用的名称表错误
-func (p *fontPostMapping) lookup(name string) (uint16, error) {
-	return p.lookupContext(context.Background(), name)
-}
-
-// lookupContext 查询字形名称，取消的解析不进入共用缓存
-// 入参: ctx 取消上下文, name 字形名称
-// 返回: uint16 字形编号, error 名称表或取消错误
-func (p *fontPostMapping) lookupContext(ctx context.Context, name string) (uint16, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if p == nil {
-		return 0, nil
-	}
-	p.mu.RLock()
-	if p.ready {
-		glyph, err := p.glyphs[name], p.err
-		p.mu.RUnlock()
-		if cancelled := ctx.Err(); cancelled != nil {
-			return 0, cancelled
-		}
-		return glyph, err
-	}
-	p.mu.RUnlock()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if !p.ready {
-		glyphs, err := fontPostGlyphsContext(ctx, p.program)
-		if cancelled := ctx.Err(); cancelled != nil {
-			return 0, cancelled
-		}
-		p.glyphs, p.err, p.ready = glyphs, err, true
-	}
-	return p.glyphs[name], p.err
-}
-
 // fontPostGlyphsContext 解析字形名称表，检查数组及名称展开的取消
 // 入参: ctx 取消上下文, data SFNT字体数据
 // 返回: map[string]uint16 完整名称映射, error 解析或取消错误
@@ -217,4 +175,46 @@ func fontPostGlyphsContext(ctx context.Context, data []byte) (map[string]uint16,
 		return nil, err
 	}
 	return result, nil
+}
+
+// lookup 查询名称映射，空名称表返回未定义字形
+// 入参: name 字形名称
+// 返回: uint16 字形编号, error 实际使用的名称表错误
+func (p *fontPostMapping) lookup(name string) (uint16, error) {
+	return p.lookupContext(context.Background(), name)
+}
+
+// lookupContext 查询字形名称，取消的解析不进入共用缓存
+// 入参: ctx 取消上下文, name 字形名称
+// 返回: uint16 字形编号, error 名称表或取消错误
+func (p *fontPostMapping) lookupContext(ctx context.Context, name string) (uint16, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if p == nil {
+		return 0, nil
+	}
+	p.mu.RLock()
+	if p.ready {
+		glyph, err := p.glyphs[name], p.err
+		p.mu.RUnlock()
+		if cancelled := ctx.Err(); cancelled != nil {
+			return 0, cancelled
+		}
+		return glyph, err
+	}
+	p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if !p.ready {
+		glyphs, err := fontPostGlyphsContext(ctx, p.program)
+		if cancelled := ctx.Err(); cancelled != nil {
+			return 0, cancelled
+		}
+		p.glyphs, p.err, p.ready = glyphs, err, true
+	}
+	return p.glyphs[name], p.err
 }

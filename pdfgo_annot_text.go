@@ -43,6 +43,195 @@ type annotationCaptionText struct {
 	shaper  *annotationShaper
 }
 
+// annotationChoiceVisibleText 截取横排列表可见选项，避免隐藏项触发字体解析或整形
+// 入参: ctx 取消上下文, text 首个可见项起的文字, state 默认文字状态, height 可用高度
+// 返回: string 可见项文字, error 行距或取消错误
+func annotationChoiceVisibleText(ctx context.Context, text string, state graphicsState, height float64) (string, error) {
+	size := state.fontSize
+	if size == 0 {
+		size = min(12, height)
+	}
+	leading := state.leading
+	if leading <= 0 {
+		leading = size * 1.2
+	}
+	if leading <= 0 || math.IsNaN(leading) || math.IsInf(leading, 0) {
+		return "", fmt.Errorf("invalid choice field line spacing")
+	}
+	rows := math.Ceil(height / leading)
+	start := 0
+	for row := 1.0; ; row++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		end := strings.IndexByte(text[start:], '\n')
+		if end < 0 {
+			return text, nil
+		}
+		end += start
+		if row >= rows {
+			return text[:end], nil
+		}
+		start = end + 1
+	}
+}
+
+// annotationLetters 将Unicode文本映射回原字体字符码，不替换缺失字形
+// 入参: ctx 取消上下文, font 字体, text 文本
+// 返回: []annotationLetter 编码与度量, error 缺字或字体错误
+func annotationLetters(ctx context.Context, font *Font, text string) ([]annotationLetter, error) {
+	if annotationNeedsShaping(text) {
+		return nil, &UnsupportedError{Feature: "generated complex-script text"}
+	}
+	wanted := map[rune]bool{}
+	for _, c := range text {
+		wanted[c] = true
+	}
+	lookup, err := annotationLetterLookup(ctx, font, wanted)
+	if err != nil {
+		return nil, err
+	}
+	letters := make([]annotationLetter, 0, utf8.RuneCountInString(text))
+	for _, c := range text {
+		if c == '\n' {
+			letters = append(letters, annotationLetter{text: c})
+			continue
+		}
+		letter, ok := lookup[c]
+		if !ok {
+			return annotationEncodedLetters(ctx, font, text, lookup)
+		}
+		letters = append(letters, letter)
+	}
+	return letters, nil
+}
+
+// annotationLetterLookup 收集所需Unicode字符对应的原字体编码和度量
+// 入参: ctx 取消上下文, font 字体, wanted 所需字符
+// 返回: map[rune]annotationLetter 字符编码, error 取消错误
+func annotationLetterLookup(ctx context.Context, font *Font, wanted map[rune]bool) (map[rune]annotationLetter, error) {
+	entries, err := font.characterLookup(ctx, wanted)
+	if err != nil {
+		return nil, err
+	}
+	lookup := map[rune]annotationLetter{}
+	for ch, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		letter := annotationLetter{text: ch, code: entry.code, width: entry.glyph.Width, word: entry.glyph.WordSpace}
+		if font.Vertical {
+			letter.vertical = &entry.glyph.Vertical
+		}
+		lookup[ch] = letter
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return lookup, nil
+}
+
+// annotationLineWidth 计算文本行推进量，末字不计字符间距
+// 入参: letters 字符, state 文字状态, size 字号
+// 返回: float64 行宽
+func annotationLineWidth(letters []annotationLetter, state graphicsState, size float64) float64 {
+	width := 0.0
+	for i, letter := range letters {
+		width += letter.width / 1000 * size
+		if i+1 < len(letters) {
+			width += state.spacing
+			if letter.word {
+				width += state.wordSpacing
+			}
+		}
+	}
+	return width * state.hscale
+}
+
+// annotationLines 按显式换行和词边界折行，长词按字符拆分
+// 入参: letters 字符, state 文字状态, size 字号, width 可用宽度, multiline 是否多行
+// 返回: [][]annotationLetter 排版行
+func annotationLines(letters []annotationLetter, state graphicsState, size, width float64, multiline bool) [][]annotationLetter {
+	if !multiline {
+		return [][]annotationLetter{letters}
+	}
+	var lines [][]annotationLetter
+	start, lastBreak := 0, -1
+	advance := 0.0
+	for i := 0; i < len(letters); i++ {
+		letter := letters[i]
+		if letter.text == '\n' {
+			lines = append(lines, letters[start:i])
+			start, lastBreak, advance = i+1, -1, 0
+			continue
+		}
+		next := (letter.width / 1000 * size) * state.hscale
+		if i > start {
+			prev := letters[i-1]
+			next += state.spacing * state.hscale
+			if prev.word {
+				next += state.wordSpacing * state.hscale
+			}
+		}
+		if advance+next > width && i > start {
+			end := i
+			if lastBreak >= start {
+				end = lastBreak + 1
+			}
+			lines = append(lines, letters[start:end])
+			start, lastBreak, advance = end, -1, 0
+			i = end - 1
+			continue
+		}
+		advance += next
+		if unicode.IsSpace(letter.text) && letter.text != '\u00a0' && letter.text != '\u2007' && letter.text != '\u202f' {
+			lastBreak = i
+		}
+	}
+	return append(lines, letters[start:])
+}
+
+// escapeAnnotationName 将资源名编码为PDF名称，不改变原始字节
+// 入参: name 资源名称
+// 返回: string 可写入内容流的名称
+func escapeAnnotationName(name Name) string {
+	var out strings.Builder
+	for _, b := range []byte(name) {
+		if b <= 32 || b >= 127 || strings.ContainsRune("#%()/<>[]{}", rune(b)) {
+			fmt.Fprintf(&out, "#%02X", b)
+		} else {
+			out.WriteByte(b)
+		}
+	}
+	return out.String()
+}
+
+// writeAnnotationOperand 写入已验证的默认外观操作数
+// 入参: content 内容, value 操作数
+// 返回: error 不支持的操作数错误
+func writeAnnotationOperand(content *strings.Builder, value Object) error {
+	switch value := value.(type) {
+	case Name:
+		content.WriteString("/" + escapeAnnotationName(value))
+	case Integer:
+		fmt.Fprintf(content, "%d", value)
+	case Real:
+		content.WriteString(strconv.FormatFloat(float64(value), 'f', -1, 64))
+	case Array:
+		content.WriteByte('[')
+		for _, item := range value {
+			if err := writeAnnotationOperand(content, item); err != nil {
+				return err
+			}
+			content.WriteByte(' ')
+		}
+		content.WriteByte(']')
+	default:
+		return fmt.Errorf("invalid default appearance operand")
+	}
+	return nil
+}
+
 // ReadAnnotationText 读取注解文本字段，RC和RV允许文本流，其他字段要求文本字符串
 // 入参: annotation 注解, field 文本字段名, warning 异常字段警告，空值使用严格检查
 // 返回: string Unicode文本, error 引用、类型或编码错误
@@ -635,39 +824,6 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	return nil
 }
 
-// annotationChoiceVisibleText 截取横排列表可见选项，避免隐藏项触发字体解析或整形
-// 入参: ctx 取消上下文, text 首个可见项起的文字, state 默认文字状态, height 可用高度
-// 返回: string 可见项文字, error 行距或取消错误
-func annotationChoiceVisibleText(ctx context.Context, text string, state graphicsState, height float64) (string, error) {
-	size := state.fontSize
-	if size == 0 {
-		size = min(12, height)
-	}
-	leading := state.leading
-	if leading <= 0 {
-		leading = size * 1.2
-	}
-	if leading <= 0 || math.IsNaN(leading) || math.IsInf(leading, 0) {
-		return "", fmt.Errorf("invalid choice field line spacing")
-	}
-	rows := math.Ceil(height / leading)
-	start := 0
-	for row := 1.0; ; row++ {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-		end := strings.IndexByte(text[start:], '\n')
-		if end < 0 {
-			return text, nil
-		}
-		end += start
-		if row >= rows {
-			return text[:end], nil
-		}
-		start = end + 1
-	}
-}
-
 // annotationComb 读取文本字段有效的分格数量，忽略不适用的标志
 // 入参: dict 字段, flags 字段标志
 // 返回: int 分格数量, error 最大长度错误
@@ -760,61 +916,6 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 	return p, fontName, stateContent.String(), err
 }
 
-// annotationLetters 将Unicode文本映射回原字体字符码，不替换缺失字形
-// 入参: ctx 取消上下文, font 字体, text 文本
-// 返回: []annotationLetter 编码与度量, error 缺字或字体错误
-func annotationLetters(ctx context.Context, font *Font, text string) ([]annotationLetter, error) {
-	if annotationNeedsShaping(text) {
-		return nil, &UnsupportedError{Feature: "generated complex-script text"}
-	}
-	wanted := map[rune]bool{}
-	for _, c := range text {
-		wanted[c] = true
-	}
-	lookup, err := annotationLetterLookup(ctx, font, wanted)
-	if err != nil {
-		return nil, err
-	}
-	letters := make([]annotationLetter, 0, utf8.RuneCountInString(text))
-	for _, c := range text {
-		if c == '\n' {
-			letters = append(letters, annotationLetter{text: c})
-			continue
-		}
-		letter, ok := lookup[c]
-		if !ok {
-			return annotationEncodedLetters(ctx, font, text, lookup)
-		}
-		letters = append(letters, letter)
-	}
-	return letters, nil
-}
-
-// annotationLetterLookup 收集所需Unicode字符对应的原字体编码和度量
-// 入参: ctx 取消上下文, font 字体, wanted 所需字符
-// 返回: map[rune]annotationLetter 字符编码, error 取消错误
-func annotationLetterLookup(ctx context.Context, font *Font, wanted map[rune]bool) (map[rune]annotationLetter, error) {
-	entries, err := font.characterLookup(ctx, wanted)
-	if err != nil {
-		return nil, err
-	}
-	lookup := map[rune]annotationLetter{}
-	for ch, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		letter := annotationLetter{text: ch, code: entry.code, width: entry.glyph.Width, word: entry.glyph.WordSpace}
-		if font.Vertical {
-			letter.vertical = &entry.glyph.Vertical
-		}
-		lookup[ch] = letter
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return lookup, nil
-}
-
 // annotationDefaultColor 读取自由文本默认外观的边框颜色
 // 入参: ctx 取消上下文, object 默认外观字符串
 // 返回: Array 设备颜色, error 属性或颜色空间错误
@@ -842,105 +943,4 @@ func (r *Reader) annotationDefaultColor(ctx context.Context, object Object) (Arr
 		return nil
 	})
 	return color, err
-}
-
-// annotationLineWidth 计算文本行推进量，末字不计字符间距
-// 入参: letters 字符, state 文字状态, size 字号
-// 返回: float64 行宽
-func annotationLineWidth(letters []annotationLetter, state graphicsState, size float64) float64 {
-	width := 0.0
-	for i, letter := range letters {
-		width += letter.width / 1000 * size
-		if i+1 < len(letters) {
-			width += state.spacing
-			if letter.word {
-				width += state.wordSpacing
-			}
-		}
-	}
-	return width * state.hscale
-}
-
-// annotationLines 按显式换行和词边界折行，长词按字符拆分
-// 入参: letters 字符, state 文字状态, size 字号, width 可用宽度, multiline 是否多行
-// 返回: [][]annotationLetter 排版行
-func annotationLines(letters []annotationLetter, state graphicsState, size, width float64, multiline bool) [][]annotationLetter {
-	if !multiline {
-		return [][]annotationLetter{letters}
-	}
-	var lines [][]annotationLetter
-	start, lastBreak := 0, -1
-	advance := 0.0
-	for i := 0; i < len(letters); i++ {
-		letter := letters[i]
-		if letter.text == '\n' {
-			lines = append(lines, letters[start:i])
-			start, lastBreak, advance = i+1, -1, 0
-			continue
-		}
-		next := (letter.width / 1000 * size) * state.hscale
-		if i > start {
-			prev := letters[i-1]
-			next += state.spacing * state.hscale
-			if prev.word {
-				next += state.wordSpacing * state.hscale
-			}
-		}
-		if advance+next > width && i > start {
-			end := i
-			if lastBreak >= start {
-				end = lastBreak + 1
-			}
-			lines = append(lines, letters[start:end])
-			start, lastBreak, advance = end, -1, 0
-			i = end - 1
-			continue
-		}
-		advance += next
-		if unicode.IsSpace(letter.text) && letter.text != '\u00a0' && letter.text != '\u2007' && letter.text != '\u202f' {
-			lastBreak = i
-		}
-	}
-	return append(lines, letters[start:])
-}
-
-// escapeAnnotationName 将资源名编码为PDF名称，不改变原始字节
-// 入参: name 资源名称
-// 返回: string 可写入内容流的名称
-func escapeAnnotationName(name Name) string {
-	var out strings.Builder
-	for _, b := range []byte(name) {
-		if b <= 32 || b >= 127 || strings.ContainsRune("#%()/<>[]{}", rune(b)) {
-			fmt.Fprintf(&out, "#%02X", b)
-		} else {
-			out.WriteByte(b)
-		}
-	}
-	return out.String()
-}
-
-// writeAnnotationOperand 写入已验证的默认外观操作数
-// 入参: content 内容, value 操作数
-// 返回: error 不支持的操作数错误
-func writeAnnotationOperand(content *strings.Builder, value Object) error {
-	switch value := value.(type) {
-	case Name:
-		content.WriteString("/" + escapeAnnotationName(value))
-	case Integer:
-		fmt.Fprintf(content, "%d", value)
-	case Real:
-		content.WriteString(strconv.FormatFloat(float64(value), 'f', -1, 64))
-	case Array:
-		content.WriteByte('[')
-		for _, item := range value {
-			if err := writeAnnotationOperand(content, item); err != nil {
-				return err
-			}
-			content.WriteByte(' ')
-		}
-		content.WriteByte(']')
-	default:
-		return fmt.Errorf("invalid default appearance operand")
-	}
-	return nil
 }

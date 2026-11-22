@@ -20,6 +20,63 @@ import (
 	"sort"
 )
 
+// iccInverseMatrix 预计算RGB矩阵的逆向系数，不拒绝只能用于源绘制的配置
+// 入参: matrix 正向色度矩阵
+// 返回: [9]float64 逆向系数，不可逆时为零
+func iccInverseMatrix(matrix [9]float64) [9]float64 {
+	m := matrix
+	inverse := [9]float64{m[4]*m[8] - m[5]*m[7], m[5]*m[6] - m[3]*m[8], m[3]*m[7] - m[4]*m[6], m[2]*m[7] - m[1]*m[8], m[0]*m[8] - m[2]*m[6], m[1]*m[6] - m[0]*m[7], m[1]*m[5] - m[2]*m[4], m[2]*m[3] - m[0]*m[5], m[0]*m[4] - m[1]*m[3]}
+	determinant := m[0]*inverse[0] + m[1]*inverse[1] + m[2]*inverse[2]
+	if determinant == 0 || math.IsNaN(determinant) || math.IsInf(determinant, 0) {
+		return [9]float64{}
+	}
+	for i := range inverse {
+		inverse[i] /= determinant
+		if math.IsNaN(inverse[i]) || math.IsInf(inverse[i], 0) {
+			return [9]float64{}
+		}
+	}
+	return inverse
+}
+
+// iccProcessIntentIndex 选择浮点变换的渲染意图，绝对色度使用独立标签
+// 入参: intent 渲染意图
+// 返回: int 标签序号, error 未知意图
+func iccProcessIntentIndex(intent Name) (int, error) {
+	if intent == "AbsoluteColorimetric" {
+		return 3, nil
+	}
+	return iccIntentIndex(intent)
+}
+
+// iccFloatLabXYZ 将浮点Lab色度转换为D50的XYZ，不截断负值
+// 入参: lab Lab色度
+// 返回: [3]float64 XYZ色度
+func iccFloatLabXYZ(lab [3]float64) [3]float64 {
+	y := (lab[0] + 16) / 116
+	inverse := func(v float64) float64 {
+		if v > 6.0/29 {
+			return v * v * v
+		}
+		return 3 * (6.0 / 29) * (6.0 / 29) * (v - 4.0/29)
+	}
+	return [3]float64{.9642 * inverse(y+lab[1]/500), inverse(y), .8249 * inverse(y-lab[2]/200)}
+}
+
+// iccFloatXYZLab 将D50的XYZ转换为浮点Lab色度，不截断负值
+// 入参: xyz XYZ色度
+// 返回: [3]float64 Lab色度
+func iccFloatXYZLab(xyz [3]float64) [3]float64 {
+	f := func(v float64) float64 {
+		if v > (6.0/29)*(6.0/29)*(6.0/29) {
+			return math.Cbrt(v)
+		}
+		return v/(3*(6.0/29)*(6.0/29)) + 4.0/29
+	}
+	x, y, z := f(xyz[0]/.9642), f(xyz[1]), f(xyz[2]/.8249)
+	return [3]float64{116*y - 16, 500 * (x - y), 200 * (y - z)}
+}
+
 // xyz 将颜色分量转换到D50连接空间，避免通过sRGB中转截断色域
 // 入参: values 已校验的颜色分量, intent 渲染意图
 // 返回: [3]float64 D50色度, error 变换错误
@@ -211,35 +268,6 @@ func (s *iccColorSpace) fromDeviceXYZ(xyz [3]float64, intent Name) ([4]float64, 
 	return result, nil
 }
 
-// iccInverseMatrix 预计算RGB矩阵的逆向系数，不拒绝只能用于源绘制的配置
-// 入参: matrix 正向色度矩阵
-// 返回: [9]float64 逆向系数，不可逆时为零
-func iccInverseMatrix(matrix [9]float64) [9]float64 {
-	m := matrix
-	inverse := [9]float64{m[4]*m[8] - m[5]*m[7], m[5]*m[6] - m[3]*m[8], m[3]*m[7] - m[4]*m[6], m[2]*m[7] - m[1]*m[8], m[0]*m[8] - m[2]*m[6], m[1]*m[6] - m[0]*m[7], m[1]*m[5] - m[2]*m[4], m[2]*m[3] - m[0]*m[5], m[0]*m[4] - m[1]*m[3]}
-	determinant := m[0]*inverse[0] + m[1]*inverse[1] + m[2]*inverse[2]
-	if determinant == 0 || math.IsNaN(determinant) || math.IsInf(determinant, 0) {
-		return [9]float64{}
-	}
-	for i := range inverse {
-		inverse[i] /= determinant
-		if math.IsNaN(inverse[i]) || math.IsInf(inverse[i], 0) {
-			return [9]float64{}
-		}
-	}
-	return inverse
-}
-
-// iccProcessIntentIndex 选择浮点变换的渲染意图，绝对色度使用独立标签
-// 入参: intent 渲染意图
-// 返回: int 标签序号, error 未知意图
-func iccProcessIntentIndex(intent Name) (int, error) {
-	if intent == "AbsoluteColorimetric" {
-		return 3, nil
-	}
-	return iccIntentIndex(intent)
-}
-
 // processXYZ 按对应浮点标签取得连接空间色度，无标签时保留原变换
 // 入参: values 设备分量, intent 渲染意图
 // 返回: [3]float64 色度, bool 是否使用浮点标签, error 求值错误
@@ -269,34 +297,6 @@ func (s *iccColorSpace) processXYZ(values []float64, intent Name) ([3]float64, b
 		return xyz, true, err
 	}
 	return xyz, true, nil
-}
-
-// iccFloatLabXYZ 将浮点Lab色度转换为D50的XYZ，不截断负值
-// 入参: lab Lab色度
-// 返回: [3]float64 XYZ色度
-func iccFloatLabXYZ(lab [3]float64) [3]float64 {
-	y := (lab[0] + 16) / 116
-	inverse := func(v float64) float64 {
-		if v > 6.0/29 {
-			return v * v * v
-		}
-		return 3 * (6.0 / 29) * (6.0 / 29) * (v - 4.0/29)
-	}
-	return [3]float64{.9642 * inverse(y+lab[1]/500), inverse(y), .8249 * inverse(y-lab[2]/200)}
-}
-
-// iccFloatXYZLab 将D50的XYZ转换为浮点Lab色度，不截断负值
-// 入参: xyz XYZ色度
-// 返回: [3]float64 Lab色度
-func iccFloatXYZLab(xyz [3]float64) [3]float64 {
-	f := func(v float64) float64 {
-		if v > (6.0/29)*(6.0/29)*(6.0/29) {
-			return math.Cbrt(v)
-		}
-		return v/(3*(6.0/29)*(6.0/29)) + 4.0/29
-	}
-	x, y, z := f(xyz[0]/.9642), f(xyz[1]), f(xyz[2]/.8249)
-	return [3]float64{116*y - 16, 500 * (x - y), 200 * (y - z)}
 }
 
 // inverse 反求单调ICC曲线，对超出曲线范围的值使用端点

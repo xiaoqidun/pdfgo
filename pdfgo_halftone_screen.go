@@ -51,10 +51,43 @@ type HalftoneScreen struct {
 	transfer      []uint16
 }
 
+// halftonePhase 从坐标余数扣除原点相位，避免有符号坐标相减溢出
+// 入参: value 坐标余数, origin 原点余数, period 网格周期
+// 返回: uint64 平移后的非负余数
+func halftonePhase(value, origin, period uint64) uint64 {
+	if value < origin {
+		return value + period - origin
+	}
+	return value - origin
+}
+
+// halftoneModulo 计算有符号设备坐标的非负余数
+// 入参: value 设备坐标, modulus 网格周期
+// 返回: uint64 非负余数
+func halftoneModulo(value int, modulus uint64) uint64 {
+	v := value % int(modulus)
+	if v < 0 {
+		v += int(modulus)
+	}
+	return uint64(v)
+}
+
+// halftoneProduct 计算格点乘积的余数，不截断大坐标乘积
+// 入参: a 第一因子, b 第二因子, modulus 周期
+// 返回: uint64 乘积余数
+func halftoneProduct(a, b, modulus uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	_, remainder := bits.Div64(hi, lo, modulus)
+	return remainder
+}
+
 // CompileHalftone 编译类型1、5、6、10和16网屏，名称优先匹配设备定义
 // 入参: ctx 取消上下文, h 网屏定义, options 设备参数，默认单比特及百万像素网屏上限
 // 返回: *HalftoneScreen 设备网屏，默认网屏返回空值, error 参数或函数错误
 func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options HalftoneOptions) (*HalftoneScreen, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid halftone context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -300,36 +333,6 @@ func (s *HalftoneScreen) tileResidues(xm, ym uint64) [2]uint64 {
 	return [2]uint64{u, v}
 }
 
-// halftonePhase 从坐标余数扣除原点相位，避免有符号坐标相减溢出
-// 入参: value 坐标余数, origin 原点余数, period 网格周期
-// 返回: uint64 平移后的非负余数
-func halftonePhase(value, origin, period uint64) uint64 {
-	if value < origin {
-		return value + period - origin
-	}
-	return value - origin
-}
-
-// halftoneModulo 计算有符号设备坐标的非负余数
-// 入参: value 设备坐标, modulus 网格周期
-// 返回: uint64 非负余数
-func halftoneModulo(value int, modulus uint64) uint64 {
-	v := value % int(modulus)
-	if v < 0 {
-		v += int(modulus)
-	}
-	return uint64(v)
-}
-
-// halftoneProduct 计算格点乘积的余数，不截断大坐标乘积
-// 入参: a 第一因子, b 第二因子, modulus 周期
-// 返回: uint64 乘积余数
-func halftoneProduct(a, b, modulus uint64) uint64 {
-	hi, lo := bits.Mul64(a, b)
-	_, remainder := bits.Div64(hi, lo, modulus)
-	return remainder
-}
-
 // Quantize 将16位连续分量量化为设备等级，坐标始终处于设备空间
 // 入参: value 黑零白满的分量值, x 横向设备坐标, y 纵向设备坐标
 // 返回: uint16 归一化后的设备分量值
@@ -375,6 +378,9 @@ func (s *HalftoneScreen) quantize(value, threshold uint16) uint16 {
 // 入参: ctx 取消上下文, out 输出分量, values 源分量, x 起始设备横坐标, y 设备纵坐标
 // 返回: error 取消、尺寸或坐标错误，取消时输出可能已部分更新
 func (s *HalftoneScreen) QuantizeRow(ctx context.Context, out, values []uint16, x, y int) error {
+	if ctx == nil {
+		return fmt.Errorf("invalid halftone context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -429,6 +435,9 @@ func (s *HalftoneScreen) QuantizeRow(ctx context.Context, out, values []uint16, 
 // 入参: ctx 取消上下文, source 16位连续分量图像
 // 返回: *image.Gray16 网屏化图像, error 取消或空图像错误
 func (s *HalftoneScreen) Apply(ctx context.Context, source *image.Gray16) (*image.Gray16, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid halftone context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

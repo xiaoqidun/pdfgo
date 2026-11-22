@@ -144,6 +144,13 @@ func Open(path string) (*Reader, error) {
 // 入参: path 文件路径, password 用户或所有者密码，nil表示空密码
 // 返回: *Reader 阅读器, error 错误信息
 func OpenWithPassword(path string, password []byte) (*Reader, error) {
+	return OpenWithOptions(path, ReaderOptions{Password: password})
+}
+
+// OpenWithOptions 按读取选项打开PDF文件并读取交叉引用
+// 入参: path 文件路径, options 读取及外观选项
+// 返回: *Reader 阅读器, error 错误信息
+func OpenWithOptions(path string, options ReaderOptions) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -153,7 +160,7 @@ func OpenWithPassword(path string, password []byte) (*Reader, error) {
 		f.Close()
 		return nil, err
 	}
-	r, err := NewReaderWithPassword(f, info.Size(), password)
+	r, err := NewReaderWithOptions(f, info.Size(), options)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -189,6 +196,9 @@ func NewReaderWithUTF8Password(source io.ReaderAt, size int64, password []byte) 
 // 入参: source 随机读取器, size 文件字节数, options 读取及外观选项
 // 返回: *Reader 阅读器, error 错误信息
 func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions) (*Reader, error) {
+	if source == nil {
+		return nil, fmt.Errorf("nil source")
+	}
 	if size < 8 {
 		return nil, fmt.Errorf("invalid file size")
 	}
@@ -549,6 +559,9 @@ func (c *objectCache) evictLocked() {
 // 不关闭NewReader的外部数据源；关闭后不可继续读取，重复关闭不产生错误
 // 返回: error 关闭错误
 func (r *Reader) Close() error {
+	if r == nil {
+		return nil
+	}
 	closer := r.closer
 	if r.security != nil {
 		clear(r.security.key)

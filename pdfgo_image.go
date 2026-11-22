@@ -112,6 +112,293 @@ type emptySampleImage struct {
 	rect image.Rectangle
 }
 
+// newJBIG2GlobalsCache 创建JBIG2全局字典共享缓存
+// 返回: *jbig2GlobalsCache 缓存实例
+func newJBIG2GlobalsCache() *jbig2GlobalsCache {
+	return &jbig2GlobalsCache{raw: make(map[Reference][]byte), parsed: make(map[Reference]*jbig2.Globals)}
+}
+
+// jbig2SinglePageContext 仅解析段头验证完整单页边界，不为后续页面分配像素
+// 入参: ctx 取消上下文, data 顺序组织的文件或嵌入段数据
+// 返回: error 不完整段、多页、未知段长度或取消错误
+func jbig2SinglePageContext(ctx context.Context, data []byte) error {
+	if bytes.HasPrefix(data, jbig2FileHeader[:8]) {
+		if len(data) < 9 || data[8]&1 == 0 {
+			return fmt.Errorf("JBIG2 dimension recovery requires sequential segments")
+		}
+		offset := 9
+		if data[8]&2 == 0 {
+			offset = 13
+		}
+		if len(data) < offset {
+			return io.ErrUnexpectedEOF
+		}
+		data = data[offset:]
+	}
+	pages := 0
+	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		segment := jbig2.NewSegment()
+		parser := jbig2.NewDocument(data, nil, false, false)
+		if parser.ParseSegmentHeader(segment) != jbig2.ResultSuccess || segment.DataLength == ^uint32(0) {
+			return fmt.Errorf("JBIG2 dimension recovery requires complete explicit segment lengths")
+		}
+		end := uint64(segment.DataOffset) + uint64(segment.DataLength)
+		if end == 0 || end > uint64(len(data)) {
+			return io.ErrUnexpectedEOF
+		}
+		if segment.Flags.Type == 48 {
+			pages++
+			if pages > 1 {
+				return fmt.Errorf("JBIG2 dimension recovery requires a complete single page")
+			}
+		}
+		if segment.Flags.Type == 51 && end != uint64(len(data)) {
+			return fmt.Errorf("JBIG2 has data after the end-of-file segment")
+		}
+		data = data[int(end):]
+	}
+	if pages != 1 {
+		return fmt.Errorf("JBIG2 dimension recovery requires one coded page")
+	}
+	return ctx.Err()
+}
+
+// imageMaskOpaque 判断图像遮罩是否全部不透明，避免全白高分辨率遮罩放大原图采样
+// 入参: ctx 取消上下文, source 遮罩图像, inverted 是否反相遮罩
+// 返回: bool 是否全不透明, error 取消错误
+func imageMaskOpaque(ctx context.Context, source image.Image, inverted bool) (bool, error) {
+	bounds := source.Bounds()
+	var pix []byte
+	var stride, rowBytes int
+	switch src := source.(type) {
+	case *image.Gray:
+		pix, stride, rowBytes = src.Pix[src.PixOffset(bounds.Min.X, bounds.Min.Y):], src.Stride, bounds.Dx()
+	case *image.Gray16:
+		pix, stride, rowBytes = src.Pix[src.PixOffset(bounds.Min.X, bounds.Min.Y):], src.Stride, bounds.Dx()*2
+	}
+	if pix != nil {
+		want := uint8(255)
+		if inverted {
+			want = 0
+		}
+		for y := 0; y < bounds.Dy(); y++ {
+			if y&63 == 0 {
+				if err := ctx.Err(); err != nil {
+					return false, err
+				}
+			}
+			for _, v := range pix[y*stride : y*stride+rowBytes] {
+				if v != want {
+					return false, nil
+				}
+			}
+		}
+		return true, nil
+	}
+	want := uint16(65535)
+	if inverted {
+		want = 0
+	}
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if y&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+		}
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if imageRGBA64At(source, x, y).R != want {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+// imageByteExact 判断样本及重采样结果是否可由八位分量无损表达
+// 入参: source 样本图像
+// 返回: bool 是否可无损表达
+func imageByteExact(source image.Image) bool {
+	switch s := source.(type) {
+	case *image.NRGBA:
+		return s.Opaque()
+	case *image.RGBA, *image.Gray, *image.YCbCr:
+		return true
+	case *packedGrayImage:
+		return s.depth <= 8
+	case *mappedGrayImage:
+		return s.byteExact
+	case *rowGrayImage:
+		return s.byteExact
+	case *deviceSampleImage:
+		return s.byteExact
+	case *jpxSampleImage:
+		if s.ycc {
+			return false
+		}
+		for _, n := range s.channels {
+			bits := s.precision(n)
+			if bits != 1 && bits != 2 && bits != 4 && bits != 8 {
+				return false
+			}
+		}
+		if s.alpha >= 0 {
+			bits := s.precision(s.alpha)
+			return bits == 1 || bits == 2 || bits == 4 || bits == 8
+		}
+		return true
+	case *imageResample:
+		return (!s.interpolate || s.source.Bounds() == s.bounds) && imageByteExact(s.source)
+	default:
+		return false
+	}
+}
+
+// ccittImageReader 按图像尺寸和过滤器参数建立CCITT解码器
+// 入参: source 编码数据, width 图像宽度, height 图像高度, params 解码参数
+// 返回: io.Reader 样本读取器, bool 是否需要块结束标记, error 参数错误
+func ccittImageReader(source io.Reader, width, height int, params Dictionary) (io.Reader, bool, error) {
+	k, err := integerDefault(params, "K", 0)
+	if err != nil {
+		return nil, false, err
+	}
+	columns, err := integerDefault(params, "Columns", 1728)
+	if err != nil {
+		return nil, false, err
+	}
+	if columns != int64(width) || columns <= 0 || height <= 0 {
+		return nil, false, fmt.Errorf("CCITT dimensions differ from image dictionary")
+	}
+	rows, err := integerDefault(params, "Rows", 0)
+	if err != nil || rows < 0 {
+		return nil, false, fmt.Errorf("invalid CCITT Rows")
+	}
+	endOfBlock, align, invert, endOfLine := true, false, false, false
+	for _, flag := range []struct {
+		name  Name
+		value *bool
+	}{{"EndOfBlock", &endOfBlock}, {"EncodedByteAlign", &align}, {"BlackIs1", &invert}, {"EndOfLine", &endOfLine}} {
+		if value := params[flag.name]; value != nil {
+			boolean, ok := value.(Boolean)
+			if !ok {
+				return nil, false, fmt.Errorf("invalid CCITT %s", flag.name)
+			}
+			*flag.value = bool(boolean)
+		}
+	}
+	if endOfLine && k < 0 {
+		return nil, false, &UnsupportedError{Feature: "CCITT Group 4 end-of-line markers"}
+	}
+	damage := int64(0)
+	if k >= 0 && endOfLine {
+		damage, err = integerDefault(params, "DamagedRowsBeforeError", 0)
+		if err != nil || damage < 0 || uint64(damage) > uint64(^uint(0)>>1) {
+			return nil, false, fmt.Errorf("invalid CCITT DamagedRowsBeforeError")
+		}
+	}
+	if !endOfBlock && rows != 0 {
+		if uint64(rows) > uint64(^uint(0)>>1) {
+			return nil, false, fmt.Errorf("invalid CCITT Rows")
+		}
+		height = int(rows)
+	}
+	row := make([]byte, width/8+min(1, width%8))
+	var previous []byte
+	if damage != 0 {
+		previous = make([]byte, len(row))
+	}
+	return &faxReader{source: source, width: width, height: height, row: row, previous: previous, offset: len(row), changes: []int{width}, mixed: k > 0, group4: k < 0, eol: endOfLine, align: align, invert: invert, eob: endOfBlock, allowDamage: int(damage)}, endOfBlock, nil
+}
+
+// imageNRGBASample 取得非预乘颜色，保留透明像素中仍有效的原始颜色分量
+// 入参: pixel 样本颜色
+// 返回: color.NRGBA64 非预乘颜色
+func imageNRGBASample(pixel color.Color) color.NRGBA64 {
+	switch c := pixel.(type) {
+	case color.CMYK:
+		sample := cmykSample{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}
+		r, g, b, a := sample.RGBA()
+		return color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(a)}
+	case jpxSample:
+		if !c.cmyk {
+			return color.NRGBA64{R: c.values[0], G: c.values[1], B: c.values[2], A: c.alpha}
+		}
+	case color.NRGBA:
+		return color.NRGBA64{R: uint16(c.R) * 257, G: uint16(c.G) * 257, B: uint16(c.B) * 257, A: uint16(c.A) * 257}
+	case color.NRGBA64:
+		return c
+	}
+	return color.NRGBA64Model.Convert(pixel).(color.NRGBA64)
+}
+
+// imageCMYKSample 统一取得八位或十六位四色样本，保留黑色分量
+// 入参: pixel 样本颜色
+// 返回: cmykSample 四色分量, bool 是否为四色样本
+func imageCMYKSample(pixel color.Color) (cmykSample, bool) {
+	if sample, ok := pixel.(jpxSample); ok && sample.cmyk {
+		return sample.values, true
+	}
+	switch c := pixel.(type) {
+	case color.CMYK:
+		return cmykSample{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}, true
+	case cmykSample:
+		return c, true
+	}
+	return cmykSample{}, false
+}
+
+// imageCMYKAt 直接读取四色及重采样分量，保留原有最近邻和双线性舍入
+// 入参: source 样本图像, x 横向坐标, y 纵向坐标
+// 返回: cmykSample 四色分量, bool 是否为四色样本
+func imageCMYKAt(source image.Image, x, y int) (cmykSample, bool) {
+	switch s := source.(type) {
+	case *image.CMYK:
+		pixel := s.CMYKAt(x, y)
+		return cmykSample{uint16(pixel.C) * 257, uint16(pixel.M) * 257, uint16(pixel.Y) * 257, uint16(pixel.K) * 257}, true
+	case *packedCMYKImage:
+		if !image.Pt(x, y).In(s.rect) {
+			return cmykSample{}, false
+		}
+		return s.sample(x, y), true
+	case *imageResample:
+		b := s.source.Bounds()
+		if b == s.bounds {
+			return imageCMYKAt(s.source, x, y)
+		}
+		sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
+		sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
+		if !s.interpolate {
+			return imageCMYKAt(s.source, b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
+		}
+		x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
+		fx, fy := sx-float64(x0), sy-float64(y0)
+		var values [4]float64
+		for dy := 0; dy < 2; dy++ {
+			for dx := 0; dx < 2; dx++ {
+				pixel, ok := imageCMYKAt(s.source, b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy)))
+				if !ok {
+					return cmykSample{}, false
+				}
+				wx, wy := 1-fx, 1-fy
+				if dx == 1 {
+					wx = fx
+				}
+				if dy == 1 {
+					wy = fy
+				}
+				for c, value := range pixel {
+					values[c] += float64(value) * wx * wy
+				}
+			}
+		}
+		return cmykSample{uint16(math.Round(values[0])), uint16(math.Round(values[1])), uint16(math.Round(values[2])), uint16(math.Round(values[3]))}, true
+	default:
+		return imageCMYKSample(source.At(x, y))
+	}
+}
+
 // HasMask 判断模板、显式、色键及JPEG2000内嵌遮罩，空引用不构成遮罩
 // 不解码像素，也不判断遮罩是否全不透明
 // 返回: bool 是否具有生效遮罩, error 引用或遮罩参数错误
@@ -166,6 +453,9 @@ func (i *Image) JBIG2File() ([]byte, error) {
 // 入参: ctx 取消上下文
 // 返回: []byte 完整JBIG2文件或空值, error 参数、编码或取消错误
 func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -433,6 +723,9 @@ func (i *Image) DecodeImage() (image.Image, error) {
 // 入参: ctx 取消上下文
 // 返回: image.Image 解码图像, error 解码或取消错误
 func (i *Image) DecodeImageContext(ctx context.Context) (image.Image, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	result, err := i.decodeImage(ctx, nil, false)
 	if canceled := ctx.Err(); canceled != nil {
 		return nil, canceled
@@ -650,6 +943,9 @@ func (i *Image) decodeSamplesSizeContext(ctx context.Context, size image.Point) 
 // 入参: ctx 取消上下文, size 像素需求, rows 可选行解码资源
 // 返回: image.Image 原始样本, error 解码或取消错误
 func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, rows *imageRowContext) (image.Image, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -855,12 +1151,6 @@ func (i *Image) recoverArrayPredictorSamplesContext(ctx context.Context, filters
 	return samples, nil
 }
 
-// newJBIG2GlobalsCache 创建JBIG2全局字典共享缓存
-// 返回: *jbig2GlobalsCache 缓存实例
-func newJBIG2GlobalsCache() *jbig2GlobalsCache {
-	return &jbig2GlobalsCache{raw: make(map[Reference][]byte), parsed: make(map[Reference]*jbig2.Globals)}
-}
-
 // jbig2GlobalsRaw 读取并按对象引用缓存JBIG2全局字典流字节
 // 入参: ctx 取消上下文, obj JBIG2Globals对象
 // 返回: []byte 全局字典字节, error 解析或解码错误
@@ -955,54 +1245,6 @@ func (i *Image) jbig2DecodeOptions(ctx context.Context) *jbig2.DecodeOptions {
 	}
 }
 
-// jbig2SinglePageContext 仅解析段头验证完整单页边界，不为后续页面分配像素
-// 入参: ctx 取消上下文, data 顺序组织的文件或嵌入段数据
-// 返回: error 不完整段、多页、未知段长度或取消错误
-func jbig2SinglePageContext(ctx context.Context, data []byte) error {
-	if bytes.HasPrefix(data, jbig2FileHeader[:8]) {
-		if len(data) < 9 || data[8]&1 == 0 {
-			return fmt.Errorf("JBIG2 dimension recovery requires sequential segments")
-		}
-		offset := 9
-		if data[8]&2 == 0 {
-			offset = 13
-		}
-		if len(data) < offset {
-			return io.ErrUnexpectedEOF
-		}
-		data = data[offset:]
-	}
-	pages := 0
-	for len(data) > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		segment := jbig2.NewSegment()
-		parser := jbig2.NewDocument(data, nil, false, false)
-		if parser.ParseSegmentHeader(segment) != jbig2.ResultSuccess || segment.DataLength == ^uint32(0) {
-			return fmt.Errorf("JBIG2 dimension recovery requires complete explicit segment lengths")
-		}
-		end := uint64(segment.DataOffset) + uint64(segment.DataLength)
-		if end == 0 || end > uint64(len(data)) {
-			return io.ErrUnexpectedEOF
-		}
-		if segment.Flags.Type == 48 {
-			pages++
-			if pages > 1 {
-				return fmt.Errorf("JBIG2 dimension recovery requires a complete single page")
-			}
-		}
-		if segment.Flags.Type == 51 && end != uint64(len(data)) {
-			return fmt.Errorf("JBIG2 has data after the end-of-file segment")
-		}
-		data = data[int(end):]
-	}
-	if pages != 1 {
-		return fmt.Errorf("JBIG2 dimension recovery requires one coded page")
-	}
-	return ctx.Err()
-}
-
 // RGBA 返回不透明的设备色预览，原始分量由图像解码流程解释
 // 返回: uint32 红、绿、蓝及透明度
 func (c cmykSample) RGBA() (uint32, uint32, uint32, uint32) {
@@ -1052,57 +1294,6 @@ func (s *packedCMYKImage) sample(x, y int) cmykSample {
 		sample[c] = uint16(value * 65535 / ((uint32(1) << s.depth) - 1))
 	}
 	return sample
-}
-
-// imageMaskOpaque 判断图像遮罩是否全部不透明，避免全白高分辨率遮罩放大原图采样
-// 入参: ctx 取消上下文, source 遮罩图像, inverted 是否反相遮罩
-// 返回: bool 是否全不透明, error 取消错误
-func imageMaskOpaque(ctx context.Context, source image.Image, inverted bool) (bool, error) {
-	bounds := source.Bounds()
-	var pix []byte
-	var stride, rowBytes int
-	switch src := source.(type) {
-	case *image.Gray:
-		pix, stride, rowBytes = src.Pix[src.PixOffset(bounds.Min.X, bounds.Min.Y):], src.Stride, bounds.Dx()
-	case *image.Gray16:
-		pix, stride, rowBytes = src.Pix[src.PixOffset(bounds.Min.X, bounds.Min.Y):], src.Stride, bounds.Dx()*2
-	}
-	if pix != nil {
-		want := uint8(255)
-		if inverted {
-			want = 0
-		}
-		for y := 0; y < bounds.Dy(); y++ {
-			if y&63 == 0 {
-				if err := ctx.Err(); err != nil {
-					return false, err
-				}
-			}
-			for _, v := range pix[y*stride : y*stride+rowBytes] {
-				if v != want {
-					return false, nil
-				}
-			}
-		}
-		return true, nil
-	}
-	want := uint16(65535)
-	if inverted {
-		want = 0
-	}
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		if y&63 == 0 {
-			if err := ctx.Err(); err != nil {
-				return false, err
-			}
-		}
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			if imageRGBA64At(source, x, y).R != want {
-				return false, nil
-			}
-		}
-	}
-	return true, nil
 }
 
 // ColorModel 返回十六位灰度模型
@@ -1762,45 +1953,6 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	return out, nil
 }
 
-// imageByteExact 判断样本及重采样结果是否可由八位分量无损表达
-// 入参: source 样本图像
-// 返回: bool 是否可无损表达
-func imageByteExact(source image.Image) bool {
-	switch s := source.(type) {
-	case *image.NRGBA:
-		return s.Opaque()
-	case *image.RGBA, *image.Gray, *image.YCbCr:
-		return true
-	case *packedGrayImage:
-		return s.depth <= 8
-	case *mappedGrayImage:
-		return s.byteExact
-	case *rowGrayImage:
-		return s.byteExact
-	case *deviceSampleImage:
-		return s.byteExact
-	case *jpxSampleImage:
-		if s.ycc {
-			return false
-		}
-		for _, n := range s.channels {
-			bits := s.precision(n)
-			if bits != 1 && bits != 2 && bits != 4 && bits != 8 {
-				return false
-			}
-		}
-		if s.alpha >= 0 {
-			bits := s.precision(s.alpha)
-			return bits == 1 || bits == 2 || bits == 4 || bits == 8
-		}
-		return true
-	case *imageResample:
-		return (!s.interpolate || s.source.Bounds() == s.bounds) && imageByteExact(s.source)
-	default:
-		return false
-	}
-}
-
 // palette 解析索引色查找表，保留原始索引样本供Decode和色键遮罩使用
 // 返回: *imagePalette 调色板，非索引色时为空, error 错误信息
 func (i *Image) palette() (*imagePalette, error) {
@@ -2178,62 +2330,6 @@ func (i *Image) ccittSamplesContext(ctx context.Context, data []byte, params Dic
 	return i.rawSamples(ctx, samples)
 }
 
-// ccittImageReader 按图像尺寸和过滤器参数建立CCITT解码器
-// 入参: source 编码数据, width 图像宽度, height 图像高度, params 解码参数
-// 返回: io.Reader 样本读取器, bool 是否需要块结束标记, error 参数错误
-func ccittImageReader(source io.Reader, width, height int, params Dictionary) (io.Reader, bool, error) {
-	k, err := integerDefault(params, "K", 0)
-	if err != nil {
-		return nil, false, err
-	}
-	columns, err := integerDefault(params, "Columns", 1728)
-	if err != nil {
-		return nil, false, err
-	}
-	if columns != int64(width) || columns <= 0 || height <= 0 {
-		return nil, false, fmt.Errorf("CCITT dimensions differ from image dictionary")
-	}
-	rows, err := integerDefault(params, "Rows", 0)
-	if err != nil || rows < 0 {
-		return nil, false, fmt.Errorf("invalid CCITT Rows")
-	}
-	endOfBlock, align, invert, endOfLine := true, false, false, false
-	for _, flag := range []struct {
-		name  Name
-		value *bool
-	}{{"EndOfBlock", &endOfBlock}, {"EncodedByteAlign", &align}, {"BlackIs1", &invert}, {"EndOfLine", &endOfLine}} {
-		if value := params[flag.name]; value != nil {
-			boolean, ok := value.(Boolean)
-			if !ok {
-				return nil, false, fmt.Errorf("invalid CCITT %s", flag.name)
-			}
-			*flag.value = bool(boolean)
-		}
-	}
-	if endOfLine && k < 0 {
-		return nil, false, &UnsupportedError{Feature: "CCITT Group 4 end-of-line markers"}
-	}
-	damage := int64(0)
-	if k >= 0 && endOfLine {
-		damage, err = integerDefault(params, "DamagedRowsBeforeError", 0)
-		if err != nil || damage < 0 || uint64(damage) > uint64(^uint(0)>>1) {
-			return nil, false, fmt.Errorf("invalid CCITT DamagedRowsBeforeError")
-		}
-	}
-	if !endOfBlock && rows != 0 {
-		if uint64(rows) > uint64(^uint(0)>>1) {
-			return nil, false, fmt.Errorf("invalid CCITT Rows")
-		}
-		height = int(rows)
-	}
-	row := make([]byte, width/8+min(1, width%8))
-	var previous []byte
-	if damage != 0 {
-		previous = make([]byte, len(row))
-	}
-	return &faxReader{source: source, width: width, height: height, row: row, previous: previous, offset: len(row), changes: []int{width}, mixed: k > 0, group4: k < 0, eol: endOfLine, align: align, invert: invert, eob: endOfBlock, allowDamage: int(damage)}, endOfBlock, nil
-}
-
 // rawSamples 接管独立解压缓冲，将设备色彩样本或颜色索引解释为图像
 // 入参: ctx 取消上下文, data 独立原始样本字节
 // 返回: image.Image 样本图像, error 错误信息
@@ -2366,91 +2462,4 @@ func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error
 		return &image.Gray16{Pix: data, Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 	}
 	return &image.Gray{Pix: data, Stride: stride, Rect: image.Rect(0, 0, i.Width, i.Height)}, nil
-}
-
-// imageNRGBASample 取得非预乘颜色，保留透明像素中仍有效的原始颜色分量
-// 入参: pixel 样本颜色
-// 返回: color.NRGBA64 非预乘颜色
-func imageNRGBASample(pixel color.Color) color.NRGBA64 {
-	switch c := pixel.(type) {
-	case color.CMYK:
-		sample := cmykSample{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}
-		r, g, b, a := sample.RGBA()
-		return color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(a)}
-	case jpxSample:
-		if !c.cmyk {
-			return color.NRGBA64{R: c.values[0], G: c.values[1], B: c.values[2], A: c.alpha}
-		}
-	case color.NRGBA:
-		return color.NRGBA64{R: uint16(c.R) * 257, G: uint16(c.G) * 257, B: uint16(c.B) * 257, A: uint16(c.A) * 257}
-	case color.NRGBA64:
-		return c
-	}
-	return color.NRGBA64Model.Convert(pixel).(color.NRGBA64)
-}
-
-// imageCMYKSample 统一取得八位或十六位四色样本，保留黑色分量
-// 入参: pixel 样本颜色
-// 返回: cmykSample 四色分量, bool 是否为四色样本
-func imageCMYKSample(pixel color.Color) (cmykSample, bool) {
-	if sample, ok := pixel.(jpxSample); ok && sample.cmyk {
-		return sample.values, true
-	}
-	switch c := pixel.(type) {
-	case color.CMYK:
-		return cmykSample{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}, true
-	case cmykSample:
-		return c, true
-	}
-	return cmykSample{}, false
-}
-
-// imageCMYKAt 直接读取四色及重采样分量，保留原有最近邻和双线性舍入
-// 入参: source 样本图像, x 横向坐标, y 纵向坐标
-// 返回: cmykSample 四色分量, bool 是否为四色样本
-func imageCMYKAt(source image.Image, x, y int) (cmykSample, bool) {
-	switch s := source.(type) {
-	case *image.CMYK:
-		pixel := s.CMYKAt(x, y)
-		return cmykSample{uint16(pixel.C) * 257, uint16(pixel.M) * 257, uint16(pixel.Y) * 257, uint16(pixel.K) * 257}, true
-	case *packedCMYKImage:
-		if !image.Pt(x, y).In(s.rect) {
-			return cmykSample{}, false
-		}
-		return s.sample(x, y), true
-	case *imageResample:
-		b := s.source.Bounds()
-		if b == s.bounds {
-			return imageCMYKAt(s.source, x, y)
-		}
-		sx := (float64(x-s.bounds.Min.X)+.5)*float64(b.Dx())/float64(s.bounds.Dx()) - .5
-		sy := (float64(y-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
-		if !s.interpolate {
-			return imageCMYKAt(s.source, b.Min.X+min(b.Dx()-1, max(0, int(math.Floor(sx+.5)))), b.Min.Y+min(b.Dy()-1, max(0, int(math.Floor(sy+.5)))))
-		}
-		x0, y0 := int(math.Floor(sx)), int(math.Floor(sy))
-		fx, fy := sx-float64(x0), sy-float64(y0)
-		var values [4]float64
-		for dy := 0; dy < 2; dy++ {
-			for dx := 0; dx < 2; dx++ {
-				pixel, ok := imageCMYKAt(s.source, b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy)))
-				if !ok {
-					return cmykSample{}, false
-				}
-				wx, wy := 1-fx, 1-fy
-				if dx == 1 {
-					wx = fx
-				}
-				if dy == 1 {
-					wy = fy
-				}
-				for c, value := range pixel {
-					values[c] += float64(value) * wx * wy
-				}
-			}
-		}
-		return cmykSample{uint16(math.Round(values[0])), uint16(math.Round(values[1])), uint16(math.Round(values[2])), uint16(math.Round(values[3]))}, true
-	default:
-		return imageCMYKSample(source.At(x, y))
-	}
 }

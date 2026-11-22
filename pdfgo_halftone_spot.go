@@ -27,6 +27,82 @@ type SpotFunction struct {
 	value func(float64, float64) (float64, error)
 }
 
+// predefinedSpot 按ISO32000-1表128定义预置网点，不引入资源文件
+// 入参: name 标准网点名称
+// 返回: func(float64, float64) float64 网点函数, error 未知名称
+func predefinedSpot(name Name) (func(float64, float64) float64, error) {
+	switch name {
+	case "SimpleDot":
+		return func(x, y float64) float64 { return 1 - x*x - y*y }, nil
+	case "InvertedSimpleDot":
+		return func(x, y float64) float64 { return x*x + y*y - 1 }, nil
+	case "DoubleDot":
+		return func(x, y float64) float64 { return (math.Sin(2*math.Pi*x) + math.Sin(2*math.Pi*y)) / 2 }, nil
+	case "InvertedDoubleDot":
+		return func(x, y float64) float64 { return -(math.Sin(2*math.Pi*x) + math.Sin(2*math.Pi*y)) / 2 }, nil
+	case "CosineDot":
+		return func(x, y float64) float64 { return (math.Cos(math.Pi*x) + math.Cos(math.Pi*y)) / 2 }, nil
+	case "Double":
+		return func(x, y float64) float64 { return (math.Sin(math.Pi*x) + math.Sin(2*math.Pi*y)) / 2 }, nil
+	case "InvertedDouble":
+		return func(x, y float64) float64 { return -(math.Sin(math.Pi*x) + math.Sin(2*math.Pi*y)) / 2 }, nil
+	case "Line":
+		return func(x, y float64) float64 { return -math.Abs(y) }, nil
+	case "LineX":
+		return func(x, y float64) float64 { return x }, nil
+	case "LineY":
+		return func(x, y float64) float64 { return y }, nil
+	case "Round":
+		return func(x, y float64) float64 {
+			x, y = math.Abs(x), math.Abs(y)
+			if x+y <= 1 {
+				return 1 - x*x - y*y
+			}
+			return (x-1)*(x-1) + (y-1)*(y-1) - 1
+		}, nil
+	case "Ellipse":
+		return func(x, y float64) float64 {
+			x, y = math.Abs(x), math.Abs(y)
+			w := 3*x + 4*y - 3
+			if w < 0 {
+				return 1 - (x*x+y*y/(0.75*0.75))/4
+			}
+			if w > 1 {
+				return ((1-x)*(1-x)+(1-y)*(1-y)/(0.75*0.75))/4 - 1
+			}
+			return 0.5 - w
+		}, nil
+	case "EllipseA":
+		return func(x, y float64) float64 { return 1 - x*x - 0.9*y*y }, nil
+	case "InvertedEllipseA":
+		return func(x, y float64) float64 { return x*x + 0.9*y*y - 1 }, nil
+	case "EllipseB":
+		return func(x, y float64) float64 { return 1 - math.Sqrt(x*x+5*y*y/8) }, nil
+	case "EllipseC":
+		return func(x, y float64) float64 { return 1 - 0.9*x*x - y*y }, nil
+	case "InvertedEllipseC":
+		return func(x, y float64) float64 { return 0.9*x*x + y*y - 1 }, nil
+	case "Square":
+		return func(x, y float64) float64 { return -math.Max(math.Abs(x), math.Abs(y)) }, nil
+	case "Cross":
+		return func(x, y float64) float64 { return -math.Min(math.Abs(x), math.Abs(y)) }, nil
+	case "Rhomboid":
+		return func(x, y float64) float64 { return (0.9*math.Abs(x) + math.Abs(y)) / 2 }, nil
+	case "Diamond":
+		return func(x, y float64) float64 {
+			x, y = math.Abs(x), math.Abs(y)
+			if x+y <= 0.75 {
+				return 1 - x*x - y*y
+			}
+			if x+y <= 1.23 {
+				return 1 - 0.85*x - y
+			}
+			return (x-1)*(x-1) + (y-1)*(y-1) - 1
+		}, nil
+	}
+	return nil, &UnsupportedError{Feature: "spot function " + string(name)}
+}
+
 // ReadSpotFunction 读取标准预定义名称、类型0采样或类型4计算器网点函数
 // 入参: object 网点函数名称、数据流或间接引用
 // 返回: *SpotFunction 网点函数, error 定义错误
@@ -111,82 +187,6 @@ func (f *SpotFunction) Evaluate(x, y float64) (float64, error) {
 		return 0, fmt.Errorf("nonfinite spot result")
 	}
 	return math.Max(-1, math.Min(1, value)), nil
-}
-
-// predefinedSpot 按ISO32000-1表128定义预置网点，不引入资源文件
-// 入参: name 标准网点名称
-// 返回: func(float64, float64) float64 网点函数, error 未知名称
-func predefinedSpot(name Name) (func(float64, float64) float64, error) {
-	switch name {
-	case "SimpleDot":
-		return func(x, y float64) float64 { return 1 - x*x - y*y }, nil
-	case "InvertedSimpleDot":
-		return func(x, y float64) float64 { return x*x + y*y - 1 }, nil
-	case "DoubleDot":
-		return func(x, y float64) float64 { return (math.Sin(2*math.Pi*x) + math.Sin(2*math.Pi*y)) / 2 }, nil
-	case "InvertedDoubleDot":
-		return func(x, y float64) float64 { return -(math.Sin(2*math.Pi*x) + math.Sin(2*math.Pi*y)) / 2 }, nil
-	case "CosineDot":
-		return func(x, y float64) float64 { return (math.Cos(math.Pi*x) + math.Cos(math.Pi*y)) / 2 }, nil
-	case "Double":
-		return func(x, y float64) float64 { return (math.Sin(math.Pi*x) + math.Sin(2*math.Pi*y)) / 2 }, nil
-	case "InvertedDouble":
-		return func(x, y float64) float64 { return -(math.Sin(math.Pi*x) + math.Sin(2*math.Pi*y)) / 2 }, nil
-	case "Line":
-		return func(x, y float64) float64 { return -math.Abs(y) }, nil
-	case "LineX":
-		return func(x, y float64) float64 { return x }, nil
-	case "LineY":
-		return func(x, y float64) float64 { return y }, nil
-	case "Round":
-		return func(x, y float64) float64 {
-			x, y = math.Abs(x), math.Abs(y)
-			if x+y <= 1 {
-				return 1 - x*x - y*y
-			}
-			return (x-1)*(x-1) + (y-1)*(y-1) - 1
-		}, nil
-	case "Ellipse":
-		return func(x, y float64) float64 {
-			x, y = math.Abs(x), math.Abs(y)
-			w := 3*x + 4*y - 3
-			if w < 0 {
-				return 1 - (x*x+y*y/(0.75*0.75))/4
-			}
-			if w > 1 {
-				return ((1-x)*(1-x)+(1-y)*(1-y)/(0.75*0.75))/4 - 1
-			}
-			return 0.5 - w
-		}, nil
-	case "EllipseA":
-		return func(x, y float64) float64 { return 1 - x*x - 0.9*y*y }, nil
-	case "InvertedEllipseA":
-		return func(x, y float64) float64 { return x*x + 0.9*y*y - 1 }, nil
-	case "EllipseB":
-		return func(x, y float64) float64 { return 1 - math.Sqrt(x*x+5*y*y/8) }, nil
-	case "EllipseC":
-		return func(x, y float64) float64 { return 1 - 0.9*x*x - y*y }, nil
-	case "InvertedEllipseC":
-		return func(x, y float64) float64 { return 0.9*x*x + y*y - 1 }, nil
-	case "Square":
-		return func(x, y float64) float64 { return -math.Max(math.Abs(x), math.Abs(y)) }, nil
-	case "Cross":
-		return func(x, y float64) float64 { return -math.Min(math.Abs(x), math.Abs(y)) }, nil
-	case "Rhomboid":
-		return func(x, y float64) float64 { return (0.9*math.Abs(x) + math.Abs(y)) / 2 }, nil
-	case "Diamond":
-		return func(x, y float64) float64 {
-			x, y = math.Abs(x), math.Abs(y)
-			if x+y <= 0.75 {
-				return 1 - x*x - y*y
-			}
-			if x+y <= 1.23 {
-				return 1 - 0.85*x - y
-			}
-			return (x-1)*(x-1) + (y-1)*(y-1) - 1
-		}, nil
-	}
-	return nil, &UnsupportedError{Feature: "spot function " + string(name)}
 }
 
 // spotThresholds 按网点函数排序设备像素，精确模式使用16倍边长的超网格

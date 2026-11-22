@@ -43,6 +43,37 @@ type DestinationViewport struct {
 	ContentBounds *Rectangle
 }
 
+// destinationParameterCount 返回标准显式目标的参数数量
+// 入参: mode 目标模式
+// 返回: int 参数数量, bool 是否为标准模式
+func destinationParameterCount(mode Name) (int, bool) {
+	switch mode {
+	case "Fit", "FitB":
+		return 0, true
+	case "FitH", "FitV", "FitBH", "FitBV":
+		return 1, true
+	case "XYZ":
+		return 3, true
+	case "FitR":
+		return 4, true
+	}
+	return 0, false
+}
+
+// destinationRectangle 检查目标矩形的有限坐标和正面积
+// 入参: box 目标矩形
+// 返回: bool 范围是否有效
+func destinationRectangle(box Rectangle) bool {
+	return destinationFinite(box.XMin) && destinationFinite(box.YMin) && destinationFinite(box.XMax) && destinationFinite(box.YMax) && box.XMax > box.XMin && box.YMax > box.YMin && destinationFinite(box.XMax-box.XMin) && destinationFinite(box.YMax-box.YMin)
+}
+
+// destinationFinite 检查目标计算数值是否有限
+// 入参: value 数值
+// 返回: bool 是否为有限值
+func destinationFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
 // Transform 变换已解析的目标坐标，保留空坐标和缩放语义
 // 入参: matrix 到新页面坐标的轴对齐可逆变换
 // 返回: DestinationTarget 新目标, error 目标或变换错误
@@ -240,35 +271,4 @@ func (d DestinationTarget) View(viewport DestinationViewport) (DestinationView, 
 		return DestinationView{}, fmt.Errorf("%w: viewport calculation overflow", ErrInvalidDestination)
 	}
 	return result, nil
-}
-
-// destinationParameterCount 返回标准显式目标的参数数量
-// 入参: mode 目标模式
-// 返回: int 参数数量, bool 是否为标准模式
-func destinationParameterCount(mode Name) (int, bool) {
-	switch mode {
-	case "Fit", "FitB":
-		return 0, true
-	case "FitH", "FitV", "FitBH", "FitBV":
-		return 1, true
-	case "XYZ":
-		return 3, true
-	case "FitR":
-		return 4, true
-	}
-	return 0, false
-}
-
-// destinationRectangle 检查目标矩形的有限坐标和正面积
-// 入参: box 目标矩形
-// 返回: bool 范围是否有效
-func destinationRectangle(box Rectangle) bool {
-	return destinationFinite(box.XMin) && destinationFinite(box.YMin) && destinationFinite(box.XMax) && destinationFinite(box.YMax) && box.XMax > box.XMin && box.YMax > box.YMin && destinationFinite(box.XMax-box.XMin) && destinationFinite(box.YMax-box.YMin)
-}
-
-// destinationFinite 检查目标计算数值是否有限
-// 入参: value 数值
-// 返回: bool 是否为有限值
-func destinationFinite(value float64) bool {
-	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }

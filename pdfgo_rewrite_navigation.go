@@ -48,6 +48,37 @@ type linkNavigation struct {
 	replaceActions bool
 }
 
+// navigationURI 校验URI并将非ASCII字节及非法URI字符转换为百分号编码
+// 入参: value UTF-8地址
+// 返回: String ASCII地址, error 编码或地址错误
+func navigationURI(value string) (String, error) {
+	if !utf8.ValidString(value) {
+		return nil, fmt.Errorf("invalid PDF URI encoding")
+	}
+	if _, err := url.PathUnescape(value); err != nil {
+		return nil, fmt.Errorf("invalid PDF URI: %w", err)
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid PDF URI: %w", err)
+	}
+	value = parsed.String()
+	var result strings.Builder
+	result.Grow(len(value))
+	const hex = "0123456789ABCDEF"
+	for i := range len(value) {
+		c := value[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-._~:/?#[]@!$&'()*+,;=%", rune(c)) {
+			result.WriteByte(c)
+		} else {
+			result.WriteByte('%')
+			result.WriteByte(hex[c>>4])
+			result.WriteByte(hex[c&15])
+		}
+	}
+	return String(result.String()), nil
+}
+
 // navigationReplacements 校验导航修改并按实际层级更新大纲节点
 // 入参: ctx 取消上下文, options 替换配置, result 已有替换对象, resources 动作资源
 // 返回: map[AnnotationLocation]linkNavigation 链接导航修改, error 页面、目标或大纲错误
@@ -278,37 +309,6 @@ func (r *Reader) navigationAction(ctx context.Context, actions []NavigationActio
 		first["Next"] = list[1:]
 	}
 	return first, nil
-}
-
-// navigationURI 校验URI并将非ASCII字节及非法URI字符转换为百分号编码
-// 入参: value UTF-8地址
-// 返回: String ASCII地址, error 编码或地址错误
-func navigationURI(value string) (String, error) {
-	if !utf8.ValidString(value) {
-		return nil, fmt.Errorf("invalid PDF URI encoding")
-	}
-	if _, err := url.PathUnescape(value); err != nil {
-		return nil, fmt.Errorf("invalid PDF URI: %w", err)
-	}
-	parsed, err := url.Parse(value)
-	if err != nil {
-		return nil, fmt.Errorf("invalid PDF URI: %w", err)
-	}
-	value = parsed.String()
-	var result strings.Builder
-	result.Grow(len(value))
-	const hex = "0123456789ABCDEF"
-	for i := range len(value) {
-		c := value[i]
-		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-._~:/?#[]@!$&'()*+,;=%", rune(c)) {
-			result.WriteByte(c)
-		} else {
-			result.WriteByte('%')
-			result.WriteByte(hex[c>>4])
-			result.WriteByte(hex[c&15])
-		}
-	}
-	return String(result.String()), nil
 }
 
 // rewriteDestination 校验目标页和显示参数，保留空坐标及零缩放的原有语义

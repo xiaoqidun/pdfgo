@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"context"
+	"fmt"
 	"image"
 	"math"
 )
@@ -44,6 +45,9 @@ func (i *Image) DecodeComponentsView() (*ImageComponents, error) {
 // 入参: ctx 解码取消上下文
 // 返回: *ImageComponents 只读颜色分量及透明度, error 解码或取消错误
 func (i *Image) DecodeComponentsViewContext(ctx context.Context) (*ImageComponents, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
 	result := &ImageComponents{}
 	if _, err := i.decodeImage(ctx, result, true); err != nil {
 		return nil, err

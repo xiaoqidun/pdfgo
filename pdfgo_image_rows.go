@@ -51,18 +51,6 @@ type rowGrayImage struct {
 	byteExact bool
 }
 
-// close 释放解码器及保留的行样本，可重复调用
-func (s *imageRowContext) close() {
-	for _, source := range s.sources {
-		source.rows.decoder.Close()
-		source.rows.decoder = nil
-		source.rows.planes = nil
-		clear(source.planes)
-		source.planes = nil
-	}
-	s.sources = nil
-}
-
 // newJPXRowReader 按分量宽度估算条带高度，保留原始网格与采样邻域
 // 入参: decoder 区域解码器
 // 返回: *jpxRowReader 行读取器
@@ -79,6 +67,53 @@ func newJPXRowReader(decoder *j2kgo.Decoder) *jpxRowReader {
 	}
 	s.height = max(1, int(min(256, jpxRowMemoryLimit/max(memory, 1)))-2*s.margin)
 	return s
+}
+
+// prepareImageRows 在颜色取样前加载原始行及重采样邻域
+// 入参: ctx 取消上下文, source 图像, first 起始行, last 结束行，不包含该行
+// 返回: error 解码或取消错误
+func prepareImageRows(ctx context.Context, source image.Image, first, last int) error {
+	switch s := source.(type) {
+	case *jpxSampleImage:
+		return s.prepareRows(ctx, first, last)
+	case *rowGrayImage:
+		return prepareImageRows(ctx, s.source, first, last)
+	case *deviceSampleImage:
+		if err := prepareImageRows(ctx, s.source, first, last); err != nil {
+			return err
+		}
+		if s.mask != nil {
+			return prepareImageRows(ctx, s.mask, first, last)
+		}
+	case *imageResample:
+		b := s.source.Bounds()
+		if b == s.bounds {
+			return prepareImageRows(ctx, s.source, first, last)
+		}
+		low := (float64(first-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
+		high := (float64(last-1-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
+		var start, end int
+		if s.interpolate {
+			start, end = int(math.Floor(low)), int(math.Floor(high))+1
+		} else {
+			start, end = int(math.Floor(low+.5)), int(math.Floor(high+.5))
+		}
+		start, end = max(0, min(b.Dy()-1, start)), max(0, min(b.Dy()-1, end))
+		return prepareImageRows(ctx, s.source, b.Min.Y+start, b.Min.Y+end+1)
+	}
+	return ctx.Err()
+}
+
+// close 释放解码器及保留的行样本，可重复调用
+func (s *imageRowContext) close() {
+	for _, source := range s.sources {
+		source.rows.decoder.Close()
+		source.rows.decoder = nil
+		source.rows.planes = nil
+		clear(source.planes)
+		source.planes = nil
+	}
+	s.sources = nil
 }
 
 // read 解码覆盖指定行及采样邻域的横向条带，预算不足时缩小预读范围
@@ -142,41 +177,6 @@ func (s *jpxSampleImage) planeBounds(index int) image.Rectangle {
 		return s.planes[index].Bounds()
 	}
 	return s.rows.planes[index]
-}
-
-// prepareImageRows 在颜色取样前加载原始行及重采样邻域
-// 入参: ctx 取消上下文, source 图像, first 起始行, last 结束行，不包含该行
-// 返回: error 解码或取消错误
-func prepareImageRows(ctx context.Context, source image.Image, first, last int) error {
-	switch s := source.(type) {
-	case *jpxSampleImage:
-		return s.prepareRows(ctx, first, last)
-	case *rowGrayImage:
-		return prepareImageRows(ctx, s.source, first, last)
-	case *deviceSampleImage:
-		if err := prepareImageRows(ctx, s.source, first, last); err != nil {
-			return err
-		}
-		if s.mask != nil {
-			return prepareImageRows(ctx, s.mask, first, last)
-		}
-	case *imageResample:
-		b := s.source.Bounds()
-		if b == s.bounds {
-			return prepareImageRows(ctx, s.source, first, last)
-		}
-		low := (float64(first-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
-		high := (float64(last-1-s.bounds.Min.Y)+.5)*float64(b.Dy())/float64(s.bounds.Dy()) - .5
-		var start, end int
-		if s.interpolate {
-			start, end = int(math.Floor(low)), int(math.Floor(high))+1
-		} else {
-			start, end = int(math.Floor(low+.5)), int(math.Floor(high+.5))
-		}
-		start, end = max(0, min(b.Dy()-1, start)), max(0, min(b.Dy()-1, end))
-		return prepareImageRows(ctx, s.source, b.Min.Y+start, b.Min.Y+end+1)
-	}
-	return ctx.Err()
 }
 
 // ColorModel 返回可无损表达映射灰度的颜色模型

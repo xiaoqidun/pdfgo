@@ -37,6 +37,9 @@ type OutlineItem struct {
 // 入参: ctx 取消上下文, visit 零基层级和目录项的访问函数
 // 返回: error 目录结构、文本、循环或访问错误
 func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) error) error {
+	if r == nil || ctx == nil {
+		return fmt.Errorf("invalid outline context")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
