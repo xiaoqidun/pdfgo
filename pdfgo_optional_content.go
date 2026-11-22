@@ -69,7 +69,11 @@ func (r *Reader) optionalContentVisible(object Object, config Dictionary, depth 
 		if len(expression) < 2 {
 			return false, fmt.Errorf("invalid optional content expression")
 		}
-		op, ok := expression[0].(Name)
+		opVal, err := r.Resolve(expression[0])
+		if err != nil {
+			return false, err
+		}
+		op, ok := opVal.(Name)
 		if !ok || op != "And" && op != "Or" && op != "Not" || op == "Not" && len(expression) != 2 {
 			return false, fmt.Errorf("invalid optional content expression operator")
 		}
@@ -126,7 +130,10 @@ func (r *Reader) optionalContentVisible(object Object, config Dictionary, depth 
 		if len(list) == 0 {
 			return true, nil
 		}
-		policy := dict["P"]
+		policy, err := r.Resolve(dict["P"])
+		if err != nil {
+			return false, err
+		}
 		if policy == nil {
 			policy = Name("AnyOn")
 		}
@@ -135,7 +142,16 @@ func (r *Reader) optionalContentVisible(object Object, config Dictionary, depth 
 		}
 		all := policy == Name("AllOn") || policy == Name("AllOff")
 		result := all
+		count := 0
 		for _, group := range list {
+			resolved, err := r.Resolve(group)
+			if err != nil {
+				return false, err
+			}
+			if resolved == nil {
+				continue
+			}
+			count++
 			state, err := r.optionalContentVisible(group, config, depth+1)
 			if err != nil {
 				return false, err
@@ -148,6 +164,9 @@ func (r *Reader) optionalContentVisible(object Object, config Dictionary, depth 
 			} else {
 				result = result || state
 			}
+		}
+		if count == 0 {
+			return true, nil
 		}
 		return result, nil
 	default:
@@ -174,12 +193,18 @@ func (r *Reader) optionalGroupState(object Object, group, config Dictionary) (bo
 		if !ok {
 			return nil, fmt.Errorf("invalid optional content intent")
 		}
-		for _, item := range array {
+		resolved := make(Array, len(array))
+		for i, item := range array {
+			item, err := r.Resolve(item)
+			if err != nil {
+				return nil, err
+			}
 			if _, ok := item.(Name); !ok {
 				return nil, fmt.Errorf("invalid optional content intent")
 			}
+			resolved[i] = item
 		}
-		return array, nil
+		return resolved, nil
 	}
 	a, err := intents(group["Intent"])
 	if err != nil {
@@ -198,8 +223,12 @@ func (r *Reader) optionalGroupState(object Object, group, config Dictionary) (bo
 	if !match {
 		return true, nil
 	}
+	baseState, err := r.Resolve(config["BaseState"])
+	if err != nil {
+		return false, err
+	}
 	state := true
-	switch config["BaseState"] {
+	switch baseState {
 	case nil, Name("ON"), Name("Unchanged"):
 	case Name("OFF"):
 		state = false

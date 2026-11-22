@@ -73,7 +73,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 				return paint, err
 			}, false, nil}, nil
 		case Name("Indexed"):
-			image := &Image{reader: r, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{}}, effectiveColorSpace: effective}
+			image := &Image{reader: r, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{}}, Warning: r.warning, effectiveColorSpace: effective}
 			palette, err := image.palette()
 			if err != nil {
 				return nil, err

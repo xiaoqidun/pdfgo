@@ -40,6 +40,7 @@ type Halftone struct {
 	Thresholds                     []uint16
 	Components                     map[Name]*Halftone
 	reader                         *Reader
+	cache                          *objectCache
 }
 
 // ReadHalftone 读取类型1、5、6、10和16的网屏定义，Default返回空值
@@ -104,42 +105,54 @@ func (h *Halftone) namedOverride(named map[string]*Halftone) bool {
 	return false
 }
 
-// displayHalftone 在连续色调解释中恢复缺失阈值流，不丢弃有效的传递函数
+// displayHalftone 在连续色调解释中容忍无效或不支持的网屏定义并记录诊断
 // 入参: object 网屏定义
-// 返回: *Halftone 网屏或连续色调缺省, error 严格校验、函数或取消错误
+// 返回: *Halftone 网屏或连续色调缺省, error 严格校验、读取、解密、认证、关闭或取消错误
 func (p *pageInterpreter) displayHalftone(object Object) (*Halftone, error) {
 	h, cause := p.reader.ReadHalftoneForDevice(object, p.visitor.Halftones)
-	if cause == nil || p.visitor.Warning == nil || !errors.Is(cause, errMissingHalftoneThreshold) {
+	if cause == nil || p.visitor.Warning == nil {
 		return h, cause
 	}
 	if err := p.ctx.Err(); err != nil {
 		return nil, err
 	}
-	value, err := p.reader.Resolve(object)
-	if err != nil {
-		return nil, err
-	}
-	dict, ok := value.(Dictionary)
-	if !ok {
+	if isFatalReaderError(cause) {
 		return nil, cause
 	}
-	kind, err := p.reader.Resolve(dict["HalftoneType"])
-	if err != nil {
-		return nil, err
+	if errors.Is(cause, errMissingHalftoneThreshold) {
+		value, err := p.reader.Resolve(object)
+		if err != nil {
+			if isFatalReaderError(err) {
+				return nil, err
+			}
+		} else if dict, ok := value.(Dictionary); ok {
+			kind, err := p.reader.Resolve(dict["HalftoneType"])
+			if err != nil {
+				if isFatalReaderError(err) {
+					return nil, err
+				}
+			} else if kind == Integer(6) || kind == Integer(10) || kind == Integer(16) {
+				transfer, err := p.reader.Resolve(dict["TransferFunction"])
+				if err != nil {
+					if isFatalReaderError(err) {
+						return nil, err
+					}
+				} else {
+					candidate := &Halftone{Type: int(kind.(Integer)), Dictionary: dict, TransferFunction: transfer, reader: p.reader, cache: p.reader.cache}
+					identity, err := candidate.IdentityTransfer(p.reader)
+					if err != nil {
+						if isFatalReaderError(err) {
+							return nil, err
+						}
+					} else if identity {
+						p.visitor.Warning(Diagnostic{Message: "missing halftone threshold stream unused by continuous-tone display; identity transfer retained"})
+						return nil, p.ctx.Err()
+					}
+				}
+			}
+		}
 	}
-	if kind != Integer(6) && kind != Integer(10) && kind != Integer(16) {
-		return nil, cause
-	}
-	transfer, err := p.reader.Resolve(dict["TransferFunction"])
-	if err != nil {
-		return nil, err
-	}
-	h = &Halftone{Type: int(kind.(Integer)), Dictionary: dict, TransferFunction: transfer, reader: p.reader}
-	identity, err := h.IdentityTransfer(p.reader)
-	if err != nil || !identity {
-		return nil, cause
-	}
-	p.visitor.Warning(Diagnostic{Message: "missing halftone threshold stream unused by continuous-tone display; identity transfer retained"})
+	p.visitor.Warning(Diagnostic{Message: "invalid or unsupported halftone ignored: " + cause.Error()})
 	return nil, p.ctx.Err()
 }
 
@@ -181,7 +194,7 @@ func (r *Reader) readHalftone(object Object, component bool, named map[string]*H
 		}
 		name = append([]byte{}, raw...)
 	}
-	h := &Halftone{Dictionary: dict, Name: name, reader: r}
+	h := &Halftone{Dictionary: dict, Name: name, reader: r, cache: r.cache}
 	value, err = r.Resolve(dict["HalftoneType"])
 	if err != nil {
 		return nil, err
@@ -295,7 +308,7 @@ func (r *Reader) readHalftone(object Object, component bool, named map[string]*H
 		}
 		*field.target = int(n)
 	}
-	data, err := stream.Decode()
+	data, err := r.decodeStream(stream)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +357,7 @@ func (h *Halftone) identityTransfer(reader *Reader, depth int) (bool, error) {
 	if depth >= 32 {
 		return false, fmt.Errorf("halftone recursion limit exceeded")
 	}
-	if h.reader != nil {
+	if !reader.ownsObject(h.reader, h.cache) {
 		reader = h.reader
 	}
 	if reader == nil {

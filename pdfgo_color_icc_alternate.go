@@ -73,7 +73,7 @@ func (r *Reader) remapICCAlternate(object Array, resources Dictionary, remap boo
 		}
 		return nil, err
 	}
-	data, cause := stream.Decode()
+	data, cause := r.decodeStream(stream)
 	if cause == nil {
 		var profile *iccColorSpace
 		profile, cause = r.readICCProfileData(data, int(count))

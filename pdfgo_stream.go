@@ -26,6 +26,7 @@ import (
 	"hash/adler32"
 	"io"
 	"math/bits"
+	"os"
 	"strings"
 	"sync"
 )
@@ -47,13 +48,22 @@ var flateReaderPool sync.Pool
 // emptyZlibStream 保存空数据的合法zlib流，用于在归还解码器时解除原输入引用
 var emptyZlibStream = []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}
 
+// filterRefEntry 保存过滤器间接引用的只读解析结果或原始解析错误
+type filterRefEntry struct {
+	value Object
+	err   error
+}
+
 // Stream 保存流字典、未经解码的数据及间接对象引用
-// 阅读器返回的流解码需与所属Reader串行调用，并保持数据源可读
+// 多工作视图并发场景应通过Reader.DecodeStreamContext解码共享流
 type Stream struct {
 	Dictionary Dictionary
 	Data       []byte
 	Reference  Reference
 	reader     *Reader
+	cache      *objectCache
+	filterRefs map[Reference]filterRefEntry
+	hasWarning bool
 	decrypted  bool
 	compressed bool
 }
@@ -251,10 +261,10 @@ func decodeLZWBytesLimitContext(ctx context.Context, data []byte, early int64, l
 }
 
 // decodeASCII85Context 按校验后的长度解码ASCII85，不复制编码数据
-// 入参: ctx 取消上下文, data 带结束标记的编码数据
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: []byte 独立解码数据, error 编码、溢出或取消错误
-func decodeASCII85Context(ctx context.Context, data []byte) ([]byte, error) {
-	end, size, err := ascii85Size(ctx, data)
+func decodeASCII85Context(ctx context.Context, data []byte, warning func(Diagnostic)) ([]byte, error) {
+	end, size, err := ascii85Size(ctx, data, warning)
 	if err != nil {
 		return nil, err
 	}
@@ -294,14 +304,14 @@ func decodeASCII85Context(ctx context.Context, data []byte) ([]byte, error) {
 }
 
 // ascii85Size 校验ASCII85分组和结束标记，计算解码长度
-// 入参: ctx 取消上下文, data 编码数据
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: int 结束标记位置, int 解码字节数, error 编码、溢出或取消错误
-func ascii85Size(ctx context.Context, data []byte) (int, int, error) {
+func ascii85Size(ctx context.Context, data []byte, warning func(Diagnostic)) (int, int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
 	var value uint64
-	digits, size := 0, 0
+	digits, size, end := 0, 0, -1
 	for n, b := range data {
 		if n&4095 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -312,22 +322,8 @@ func ascii85Size(ctx context.Context, data []byte) (int, int, error) {
 			continue
 		}
 		if b == '~' && n+1 < len(data) && data[n+1] == '>' {
-			if digits == 1 {
-				return 0, 0, fmt.Errorf("incomplete ASCII85 group")
-			}
-			if digits > 1 {
-				for j := digits; j < 5; j++ {
-					value = value*85 + 84
-				}
-				if value > 1<<32-1 {
-					return 0, 0, fmt.Errorf("ASCII85 group overflow")
-				}
-				if digits-1 > int(^uint(0)>>1)-size {
-					return 0, 0, fmt.Errorf("ASCII85 decoded length overflow")
-				}
-				size += digits - 1
-			}
-			return n, size, ctx.Err()
+			end = n
+			break
 		}
 		if b == 'z' {
 			if digits != 0 {
@@ -352,14 +348,36 @@ func ascii85Size(ctx context.Context, data []byte) (int, int, error) {
 		}
 		size += 4
 	}
-	return 0, 0, fmt.Errorf("missing ASCII85 terminator")
+	if end < 0 && warning == nil {
+		return 0, 0, fmt.Errorf("missing ASCII85 terminator")
+	}
+	if digits == 1 {
+		return 0, 0, fmt.Errorf("incomplete ASCII85 group")
+	}
+	if digits > 1 {
+		for j := digits; j < 5; j++ {
+			value = value*85 + 84
+		}
+		if value > 1<<32-1 {
+			return 0, 0, fmt.Errorf("ASCII85 group overflow")
+		}
+		if digits-1 > int(^uint(0)>>1)-size {
+			return 0, 0, fmt.Errorf("ASCII85 decoded length overflow")
+		}
+		size += digits - 1
+	}
+	if end < 0 {
+		end = len(data)
+		warning(Diagnostic{Offset: int64(end), Message: "ASCII85 terminator missing; encoded stream boundary retained"})
+	}
+	return end, size, ctx.Err()
 }
 
 // decodeRunLength 按校验后的长度一次分配解码缓冲，分段检查取消
-// 入参: ctx 取消上下文, data 编码数据
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: []byte 解码数据, error 编码或取消错误
-func decodeRunLength(ctx context.Context, data []byte) ([]byte, error) {
-	size, err := runLengthSize(ctx, data)
+func decodeRunLength(ctx context.Context, data []byte, warning func(Diagnostic)) ([]byte, error) {
+	size, err := runLengthSize(ctx, data, warning)
 	if err != nil || size == 0 {
 		return nil, err
 	}
@@ -390,13 +408,16 @@ func decodeRunLength(ctx context.Context, data []byte) ([]byte, error) {
 		}
 		position += count
 	}
+	if warning != nil {
+		return out, ctx.Err()
+	}
 	return nil, fmt.Errorf("missing RunLength terminator")
 }
 
 // runLengthSize 校验游程边界、结束标记及解码长度，不分配展开样本
-// 入参: ctx 取消上下文, data 编码数据
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: int 解码字节数, error 编码、溢出或取消错误
-func runLengthSize(ctx context.Context, data []byte) (int, error) {
+func runLengthSize(ctx context.Context, data []byte, warning func(Diagnostic)) (int, error) {
 	size := 0
 	checkpoint := 0
 	for i := 0; i < len(data); {
@@ -430,6 +451,10 @@ func runLengthSize(ctx context.Context, data []byte) (int, error) {
 			return 0, fmt.Errorf("RunLength decoded length overflow")
 		}
 		size += count
+	}
+	if warning != nil {
+		warning(Diagnostic{Offset: int64(len(data)), Message: "RunLength terminator missing; encoded stream boundary retained"})
+		return size, ctx.Err()
 	}
 	return 0, fmt.Errorf("missing RunLength terminator")
 }
@@ -703,6 +728,38 @@ func readAllEstimated(input io.Reader, hint int) ([]byte, error) {
 	return buf.Bytes(), err
 }
 
+// DecodeStreamContext 使用当前阅读器及诊断配置解码通用流过滤器，支持多工作视图并发解码共享流
+// 入参: ctx 取消上下文, stream 数据流
+// 返回: []byte 独立解码数据, error 解码、关闭或取消错误
+func (r *Reader) DecodeStreamContext(ctx context.Context, stream *Stream) ([]byte, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid stream context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r == nil {
+		return nil, fmt.Errorf("invalid stream reader")
+	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
+	if stream == nil {
+		return nil, fmt.Errorf("missing stream")
+	}
+	if !r.ownsObject(stream.reader, stream.cache) {
+		return nil, fmt.Errorf("stream belongs to another reader")
+	}
+	return stream.decodeWith(ctx, r, r.warning, 0)
+}
+
+// decodeStream 使用当前阅读器及默认背景上下文解码通用流过滤器
+// 入参: stream 数据流
+// 返回: []byte 独立解码数据, error 解码错误
+func (r *Reader) decodeStream(stream *Stream) ([]byte, error) {
+	return r.DecodeStreamContext(context.Background(), stream)
+}
+
 // Decode 解码通用流过滤器，图像专用过滤器由图像接口处理
 // 阅读器返回的流按需解析参数引用，手工构造的流需提供直接参数
 // 返回: []byte 解码数据, error 错误信息
@@ -711,35 +768,35 @@ func (s *Stream) Decode() ([]byte, error) {
 }
 
 // DecodeContext 解码通用流过滤器，在读取及样本处理间检查取消
-// 阅读器返回的流需与所属Reader串行调用，并保持数据源可读
+// 多工作视图并发场景应通过当前工作视图的Reader.DecodeStreamContext调用
 // 入参: ctx 取消上下文
 // 返回: []byte 独立解码数据, error 解码或取消错误
 func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
-	var warning func(Diagnostic)
-	if s.reader != nil {
-		warning = s.reader.warning
+	if s == nil {
+		return nil, fmt.Errorf("missing stream")
 	}
-	return s.decodeContext(ctx, warning)
+	shared := s.cache != nil && s.cache.shared.Load()
+	if s.reader != nil && !shared {
+		return s.decodeWith(ctx, s.reader, s.reader.warning, 0)
+	}
+	var warning func(Diagnostic)
+	if shared && s.hasWarning {
+		warning = func(Diagnostic) {}
+	}
+	return s.decodeWith(ctx, nil, warning, 0)
 }
 
-// decodeContext 按调用方诊断策略解码流，图像使用自身的宽容读取配置
-// 入参: ctx 取消上下文, warning 恢复诊断，空值表示严格解码
-// 返回: []byte 独立解码数据, error 解码或取消错误
-func (s *Stream) decodeContext(ctx context.Context, warning func(Diagnostic)) ([]byte, error) {
-	return s.decodeContextLimit(ctx, warning, 0)
-}
-
-// decodeContextLimit 为对象流索引重建限制原始及解码数据，仅允许无预测的Flate过滤器
-// 入参: ctx 取消上下文, warning 恢复诊断, limit 数据上限，零值沿用通用解码
+// decodeWith 按调用方阅读器、诊断策略及可选字节上限解码通用流
+// 入参: ctx 取消上下文, reader 解析间接过滤器用的阅读器, warning 恢复诊断, limit 数据上限，零值沿用通用解码
 // 返回: []byte 独立解码数据, error 解码、超限或取消错误
-func (s *Stream) decodeContextLimit(ctx context.Context, warning func(Diagnostic), limit int64) ([]byte, error) {
+func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Diagnostic), limit int64) ([]byte, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("invalid stream context")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	filters, params, err := s.filterChain(s.reader)
+	filters, params, err := s.filterChainWith(reader, warning)
 	if err != nil {
 		return nil, err
 	}
@@ -801,9 +858,9 @@ func (s *Stream) decodeContextLimit(ctx context.Context, warning func(Diagnostic
 		case "ASCIIHexDecode":
 			data, err = decodeASCIIHexContext(ctx, data, warning)
 		case "ASCII85Decode":
-			data, err = decodeASCII85Context(ctx, data)
+			data, err = decodeASCII85Context(ctx, data, warning)
 		case "RunLengthDecode":
-			data, err = decodeRunLength(ctx, data)
+			data, err = decodeRunLength(ctx, data, warning)
 		default:
 			return nil, &UnsupportedError{Feature: "stream filter " + string(name)}
 		}
@@ -835,13 +892,105 @@ func (s *Stream) decodeContextLimit(ctx context.Context, warning func(Diagnostic
 // pdfObject 将流标记为PDF对象
 func (*Stream) pdfObject() {}
 
+// cacheFilterRefs 在流进入共享缓存前记录过滤器与解码参数中的间接引用快照，不修改源字典
+// 入参: reader 所属阅读器
+func (s *Stream) cacheFilterRefs(reader *Reader) {
+	if s.Dictionary == nil {
+		return
+	}
+	filter, parms := s.Dictionary["Filter"], s.Dictionary["DecodeParms"]
+	if !objectContainsReference(filter) && !objectContainsReference(parms) {
+		return
+	}
+	refs := make(map[Reference]filterRefEntry)
+	var capture func(Object, int)
+	capture = func(value Object, depth int) {
+		if depth > 4 || value == nil {
+			return
+		}
+		if ref, ok := value.(Reference); ok {
+			if _, exists := refs[ref]; exists {
+				return
+			}
+			resolved, err := reader.Resolve(ref)
+			refs[ref] = filterRefEntry{value: resolved, err: err}
+			if err != nil {
+				return
+			}
+			value = resolved
+		}
+		switch v := value.(type) {
+		case Array:
+			for _, item := range v {
+				capture(item, depth+1)
+			}
+		case Dictionary:
+			for key, item := range v {
+				if key == "JBIG2Globals" {
+					continue
+				}
+				capture(item, depth+1)
+			}
+		}
+	}
+	capture(filter, 0)
+	capture(parms, 0)
+	if len(refs) != 0 {
+		s.filterRefs = refs
+	}
+}
+
+// objectContainsReference 检查过滤器和解码参数值树是否包含间接引用
+// 入参: value 待检查对象
+// 返回: bool 是否含间接引用
+func objectContainsReference(value Object) bool {
+	switch v := value.(type) {
+	case Reference:
+		return true
+	case Array:
+		for _, item := range v {
+			if objectContainsReference(item) {
+				return true
+			}
+		}
+	case Dictionary:
+		for key, item := range v {
+			if key == "JBIG2Globals" {
+				continue
+			}
+			if _, ok := item.(Reference); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // filterChain 解析过滤器及解码参数的间接引用，不修改源字典
-// 入参: reader 关联阅读器，nil表示不解析间接引用
+// 入参: reader 关联阅读器，nil时优先使用只读快照且不访问阅读器
 // 返回: Array 过滤器, Array 对应参数, error 错误信息
 func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
+	var warning func(Diagnostic)
+	if reader != nil {
+		warning = reader.warning
+	}
+	return s.filterChainWith(reader, warning)
+}
+
+// filterChainWith 按指定阅读器与诊断回调解析过滤器及解码参数，不修改源字典
+// 入参: reader 关联阅读器，nil时优先使用只读快照, warning 恢复诊断回调
+// 返回: Array 过滤器, Array 对应参数, error 错误信息
+func (s *Stream) filterChainWith(reader *Reader, warning func(Diagnostic)) (Array, Array, error) {
 	resolve := func(value Object) (Object, error) {
 		if reader != nil {
 			return reader.Resolve(value)
+		}
+		if s.filterRefs != nil {
+			if ref, ok := value.(Reference); ok {
+				if entry, exists := s.filterRefs[ref]; exists {
+					return entry.value, entry.err
+				}
+			}
 		}
 		return value, nil
 	}
@@ -876,10 +1025,10 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 		params[0] = v
 	case Array:
 		if len(v) != len(filters) {
-			if reader == nil || reader.warning == nil {
+			if warning == nil {
 				return nil, nil, fmt.Errorf("filter parameter count mismatch")
 			}
-			reader.warning(Diagnostic{Message: "filter parameter count mismatch; positional parameters and missing defaults retained"})
+			warning(Diagnostic{Message: "filter parameter count mismatch; positional parameters and missing defaults retained"})
 		}
 		copy(params, v)
 	default:
@@ -893,14 +1042,14 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 		if _, ok := filters[i].(Name); !ok {
 			return nil, nil, fmt.Errorf("filter is not a name")
 		}
-		if reader != nil && reader.warning != nil {
+		if warning != nil {
 			if name, ok := streamFilterAliases[filters[i].(Name)]; ok {
-				reader.warning(Diagnostic{Message: "abbreviated stream filter expanded: " + string(filters[i].(Name))})
+				warning(Diagnostic{Message: "abbreviated stream filter expanded: " + string(filters[i].(Name))})
 				filters[i] = name
 			}
 			for _, name := range []Name{"FlateDecode", "LZWDecode", "ASCIIHexDecode", "ASCII85Decode", "RunLengthDecode", "CCITTFaxDecode", "DCTDecode", "JPXDecode", "JBIG2Decode", "Crypt"} {
 				if filters[i] != name && strings.EqualFold(string(filters[i].(Name)), string(name)) {
-					reader.warning(Diagnostic{Message: "stream filter name case normalized: " + string(filters[i].(Name))})
+					warning(Diagnostic{Message: "stream filter name case normalized: " + string(filters[i].(Name))})
 					filters[i] = name
 					break
 				}
@@ -915,7 +1064,7 @@ func (s *Stream) filterChain(reader *Reader) (Array, Array, error) {
 			if !ok {
 				return nil, nil, fmt.Errorf("invalid decode parameters")
 			}
-			if reader != nil {
+			if reader != nil || s.filterRefs != nil {
 				resolved := make(Dictionary, len(dict))
 				for key, value := range dict {
 					resolved[key], err = resolve(value)

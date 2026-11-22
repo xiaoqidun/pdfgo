@@ -333,7 +333,8 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 }
 
 // LookupNumberTree 按整数键在数字树中二分查找对应条目，值不预先解析
-// 遵循ISO 32000升序Nums与Limits剪枝，兼容邻接重叠Limits及命中无Limits子节点回退，配置Warning时跳过重复节点
+// 遵循ISO 32000升序Nums与Limits剪枝，兼容邻接重叠Limits及命中无Limits子节点回退
+// 配置Warning时跳过重复节点，并在探测到键序或Limits违序、无效键或损坏子树时记录诊断并回退顺序查找
 // 入参: ctx 取消上下文, root 数字树根, key 目标整数键
 // 返回: Object 命中值, bool 是否命中, error 结构、循环或取消错误
 func (r *Reader) LookupNumberTree(ctx context.Context, root Object, key int64) (Object, bool, error) {
@@ -388,10 +389,15 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 		return nil, false, nil
 	}
 	seenDicts[identity] = dict
+	var nodeLo, nodeHi int64
+	nodeHasLimits := false
 	if depth > 0 {
-		if lo, hi, hasLimits, err := r.numberTreeLimits(dict["Limits"]); err != nil {
+		var err error
+		nodeLo, nodeHi, nodeHasLimits, err = r.numberTreeLimits(dict["Limits"])
+		if err != nil {
 			return nil, false, err
-		} else if hasLimits && (key < lo || key > hi) {
+		}
+		if nodeHasLimits && (key < nodeLo || key > nodeHi) {
 			return nil, false, nil
 		}
 	}
@@ -407,7 +413,9 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 			}
 			if pairs := len(nums) / 2; pairs > 0 {
 				low, high := 0, pairs-1
-				ordered := true
+				var lowerKey, upperKey int64
+				hasLower, hasUpper := false, false
+				ordered, orderViolation := true, false
 				for low <= high {
 					if err := ctx.Err(); err != nil {
 						return nil, false, err
@@ -415,7 +423,11 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 					mid := (low + high) / 2
 					keyVal, err := r.Resolve(nums[mid*2])
 					if err != nil {
-						return nil, false, err
+						if !r.recoverAuxiliary(err) {
+							return nil, false, err
+						}
+						ordered = false
+						break
 					}
 					keyInt, ok := keyVal.(Integer)
 					if !ok {
@@ -425,32 +437,87 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 						ordered = false
 						break
 					}
-					if int64(keyInt) == key {
+					current := int64(keyInt)
+					if r.warning != nil && (hasLower && current <= lowerKey || hasUpper && current >= upperKey || nodeHasLimits && (current < nodeLo || current > nodeHi)) {
+						ordered, orderViolation = false, true
+						break
+					}
+					if current == key {
 						return nums[mid*2+1], true, nil
 					}
-					if int64(keyInt) < key {
+					if current < key {
+						lowerKey, hasLower = current, true
 						low = mid + 1
 					} else {
+						upperKey, hasUpper = current, true
 						high = mid - 1
 					}
 				}
+				if ordered && r.warning != nil && pairs > 1 {
+					probes := [8]int{0, 1, high - 1, high, low, low + 1, pairs - 2, pairs - 1}
+					var prev int64
+					hasPrev, lastIdx := false, -1
+					for _, idx := range probes {
+						if idx < 0 || idx >= pairs || idx <= lastIdx {
+							continue
+						}
+						lastIdx = idx
+						if err := ctx.Err(); err != nil {
+							return nil, false, err
+						}
+						keyVal, err := r.Resolve(nums[idx*2])
+						if err != nil {
+							if isFatalReaderError(err) {
+								return nil, false, err
+							}
+							continue
+						}
+						keyInt, ok := keyVal.(Integer)
+						if !ok {
+							r.recoverAuxiliary(fmt.Errorf("invalid number tree key"))
+							ordered = false
+							break
+						}
+						current := int64(keyInt)
+						if hasPrev && current <= prev || nodeHasLimits && (current < nodeLo || current > nodeHi) {
+							ordered, orderViolation = false, true
+							break
+						}
+						prev, hasPrev = current, true
+						if current == key {
+							r.recoverAuxiliary(fmt.Errorf("invalid number tree key order"))
+							return nums[idx*2+1], true, nil
+						}
+					}
+				}
 				if !ordered {
+					var previous int64
+					hasPrevious, reportedOrder := false, orderViolation
+					if reportedOrder {
+						r.recoverAuxiliary(fmt.Errorf("invalid number tree key order"))
+					}
 					for i := 0; i+1 < len(nums); i += 2 {
 						if err := ctx.Err(); err != nil {
 							return nil, false, err
 						}
 						keyVal, err := r.Resolve(nums[i])
 						if err != nil {
-							return nil, false, err
-						}
-						keyInt, ok := keyVal.(Integer)
-						if !ok {
-							if err := fmt.Errorf("invalid number tree key"); !r.recoverAuxiliary(err) {
+							if isFatalReaderError(err) {
 								return nil, false, err
 							}
 							continue
 						}
-						if int64(keyInt) == key {
+						keyInt, ok := keyVal.(Integer)
+						if !ok {
+							continue
+						}
+						current := int64(keyInt)
+						if hasPrevious && current <= previous && !reportedOrder {
+							r.recoverAuxiliary(fmt.Errorf("invalid number tree key order"))
+							reportedOrder = true
+						}
+						previous, hasPrevious = current, true
+						if current == key {
 							return nums[i+1], true, nil
 						}
 					}
@@ -470,7 +537,9 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 			}
 			if len(kids) != 0 {
 				low, high := 0, len(kids)-1
-				ordered := true
+				var lowerLo, lowerHi, upperLo, upperHi, probedLo, probedHi int64
+				hasLower, hasUpper := false, false
+				ordered, orderViolation := true, false
 				probed := -1
 				var tried map[int]bool
 				markTried := func(idx int) {
@@ -486,7 +555,11 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 					mid := (low + high) / 2
 					kidVal, err := r.Resolve(kids[mid])
 					if err != nil {
-						return nil, false, err
+						if !r.recoverAuxiliary(err) {
+							return nil, false, err
+						}
+						ordered = false
+						break
 					}
 					kidDict, ok := kidVal.(Dictionary)
 					if !ok {
@@ -495,30 +568,48 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 					}
 					lo, hi, hasLimits, err := r.numberTreeLimits(kidDict["Limits"])
 					if err != nil {
-						return nil, false, err
+						if !r.recoverAuxiliary(err) {
+							return nil, false, err
+						}
+						ordered = false
+						break
 					}
 					if !hasLimits {
 						ordered = false
 						break
 					}
+					if r.warning != nil && (hasLower && (lo < lowerLo || hi < lowerHi) || hasUpper && (lo > upperLo || hi > upperHi) || nodeHasLimits && (lo < nodeLo || hi > nodeHi)) {
+						ordered, orderViolation = false, true
+						break
+					}
 					if key < lo {
+						upperLo, upperHi, hasUpper = lo, hi, true
 						high = mid - 1
 					} else if key > hi {
+						lowerLo, lowerHi, hasLower = lo, hi, true
 						low = mid + 1
 					} else {
-						probed = mid
+						probed, probedLo, probedHi = mid, lo, hi
 						markTried(mid)
 						val, found, err := r.lookupNumberTreeNode(ctx, kids[mid], key, depth+1, seenRefs, seenDicts)
-						if err != nil || found {
-							return val, found, err
+						if found {
+							return val, true, nil
+						}
+						if err != nil {
+							if !r.recoverAuxiliary(err) {
+								return nil, false, err
+							}
+							ordered = false
 						}
 						break
 					}
 				}
 				if ordered {
 					leftEnd := high
+					refLo, refHi, hasRef := upperLo, upperHi, hasUpper
 					if probed >= 0 {
 						leftEnd = probed - 1
+						refLo, refHi, hasRef = probedLo, probedHi, true
 					}
 					for i := leftEnd; i >= 0; i-- {
 						if err := ctx.Err(); err != nil {
@@ -526,7 +617,11 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 						}
 						sibVal, err := r.Resolve(kids[i])
 						if err != nil {
-							return nil, false, err
+							if !r.recoverAuxiliary(err) {
+								return nil, false, err
+							}
+							ordered = false
+							break
 						}
 						sibDict, ok := sibVal.(Dictionary)
 						if !ok {
@@ -535,32 +630,53 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 						}
 						slo, shi, has, err := r.numberTreeLimits(sibDict["Limits"])
 						if err != nil {
-							return nil, false, err
+							if !r.recoverAuxiliary(err) {
+								return nil, false, err
+							}
+							ordered = false
+							break
 						}
 						if !has {
 							ordered = false
 							break
 						}
+						if r.warning != nil && (hasRef && (slo > refLo || shi > refHi) || nodeHasLimits && (slo < nodeLo || shi > nodeHi)) {
+							ordered, orderViolation = false, true
+							break
+						}
+						refLo, refHi, hasRef = slo, shi, true
 						if key > shi {
 							break
 						}
 						if key >= slo {
 							markTried(i)
 							val, found, err := r.lookupNumberTreeNode(ctx, kids[i], key, depth+1, seenRefs, seenDicts)
-							if err != nil || found {
-								return val, found, err
+							if found {
+								return val, true, nil
+							}
+							if err != nil {
+								if !r.recoverAuxiliary(err) {
+									return nil, false, err
+								}
+								ordered = false
+								break
 							}
 						}
 					}
 				}
 				if ordered && probed >= 0 {
+					refLo, refHi := probedLo, probedHi
 					for i := probed + 1; i < len(kids); i++ {
 						if err := ctx.Err(); err != nil {
 							return nil, false, err
 						}
 						sibVal, err := r.Resolve(kids[i])
 						if err != nil {
-							return nil, false, err
+							if !r.recoverAuxiliary(err) {
+								return nil, false, err
+							}
+							ordered = false
+							break
 						}
 						sibDict, ok := sibVal.(Dictionary)
 						if !ok {
@@ -569,32 +685,147 @@ func (r *Reader) lookupNumberTreeNode(ctx context.Context, node Object, key int6
 						}
 						slo, shi, has, err := r.numberTreeLimits(sibDict["Limits"])
 						if err != nil {
-							return nil, false, err
+							if !r.recoverAuxiliary(err) {
+								return nil, false, err
+							}
+							ordered = false
+							break
 						}
 						if !has {
 							ordered = false
 							break
 						}
+						if r.warning != nil && (slo < refLo || shi < refHi || nodeHasLimits && (slo < nodeLo || shi > nodeHi)) {
+							ordered, orderViolation = false, true
+							break
+						}
+						refLo, refHi = slo, shi
 						if key < slo {
 							break
 						}
 						if key <= shi {
 							markTried(i)
 							val, found, err := r.lookupNumberTreeNode(ctx, kids[i], key, depth+1, seenRefs, seenDicts)
-							if err != nil || found {
-								return val, found, err
+							if found {
+								return val, true, nil
+							}
+							if err != nil {
+								if !r.recoverAuxiliary(err) {
+									return nil, false, err
+								}
+								ordered = false
+								break
 							}
 						}
 					}
 				}
-				if !ordered {
-					for i, kid := range kids {
-						if tried[i] {
+				if ordered && r.warning != nil && len(kids) > 1 {
+					anchor := high
+					if probed >= 0 {
+						anchor = probed
+					}
+					probes := [8]int{0, 1, anchor - 1, anchor, anchor + 1, anchor + 2, len(kids) - 2, len(kids) - 1}
+					var prevLo, prevHi int64
+					hasPrev, lastIdx := false, -1
+					for _, idx := range probes {
+						if idx < 0 || idx >= len(kids) || idx <= lastIdx {
 							continue
 						}
-						val, found, err := r.lookupNumberTreeNode(ctx, kid, key, depth+1, seenRefs, seenDicts)
-						if err != nil || found {
-							return val, found, err
+						lastIdx = idx
+						if err := ctx.Err(); err != nil {
+							return nil, false, err
+						}
+						kidVal, err := r.Resolve(kids[idx])
+						if err != nil {
+							if isFatalReaderError(err) {
+								return nil, false, err
+							}
+							continue
+						}
+						kidDict, ok := kidVal.(Dictionary)
+						if !ok {
+							continue
+						}
+						lo, hi, has, err := r.numberTreeLimits(kidDict["Limits"])
+						if err != nil {
+							if isFatalReaderError(err) {
+								return nil, false, err
+							}
+							continue
+						}
+						if !has {
+							ordered = false
+							break
+						}
+						if hasPrev && (lo < prevLo || hi < prevHi) || nodeHasLimits && (lo < nodeLo || hi > nodeHi) || !tried[idx] && key >= lo && key <= hi {
+							ordered, orderViolation = false, true
+							break
+						}
+						prevLo, prevHi, hasPrev = lo, hi, true
+					}
+				}
+				if !ordered {
+					if r.warning == nil {
+						for i, kid := range kids {
+							if tried[i] {
+								continue
+							}
+							val, found, err := r.lookupNumberTreeNode(ctx, kid, key, depth+1, seenRefs, seenDicts)
+							if err != nil || found {
+								return val, found, err
+							}
+						}
+					} else {
+						var prevLo, prevHi int64
+						hasPrev, reportedOrder := false, orderViolation
+						if reportedOrder {
+							r.recoverAuxiliary(fmt.Errorf("invalid number tree key order"))
+						}
+						for i, kid := range kids {
+							if err := ctx.Err(); err != nil {
+								return nil, false, err
+							}
+							kidVal, err := r.Resolve(kid)
+							if err != nil {
+								if isFatalReaderError(err) {
+									return nil, false, err
+								}
+								continue
+							}
+							kidDict, ok := kidVal.(Dictionary)
+							if !ok {
+								continue
+							}
+							lo, hi, has, err := r.numberTreeLimits(kidDict["Limits"])
+							if err != nil {
+								if isFatalReaderError(err) {
+									return nil, false, err
+								}
+								continue
+							}
+							if has {
+								if hasPrev && (lo < prevLo || hi < prevHi) && !reportedOrder {
+									r.recoverAuxiliary(fmt.Errorf("invalid number tree key order"))
+									reportedOrder = true
+								}
+								prevLo, prevHi, hasPrev = lo, hi, true
+								if key < lo || key > hi {
+									continue
+								}
+							}
+							if tried[i] {
+								continue
+							}
+							val, found, err := r.lookupNumberTreeNode(ctx, kid, key, depth+1, seenRefs, seenDicts)
+							if err != nil {
+								if isFatalReaderError(err) {
+									return nil, false, err
+								}
+								continue
+							}
+							if found {
+								return val, true, nil
+							}
 						}
 					}
 				}

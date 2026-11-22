@@ -23,6 +23,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 )
 
 // objectStreamCacheLimit 限制多个对象流的解码缓存，单个超限流仅保留最近一次
@@ -114,6 +115,8 @@ type objectCacheEntry struct {
 // objectCache 管理PDF对象缓存，对流对象按字节预算执行LRU淘汰并保持并发安全
 type objectCache struct {
 	mu      sync.Mutex
+	shared  atomic.Bool
+	origin  *objectCache
 	objects map[Reference]Object
 	pinned  map[Reference]Object
 	streams map[Reference]*objectCacheEntry
@@ -130,7 +133,29 @@ func newObjectCache(budget int64) *objectCache {
 	if budget <= 0 {
 		budget = streamCacheBudget
 	}
-	return &objectCache{objects: make(map[Reference]Object), streams: make(map[Reference]*objectCacheEntry), budget: budget}
+	cache := &objectCache{objects: make(map[Reference]Object), streams: make(map[Reference]*objectCacheEntry), budget: budget}
+	cache.origin = cache
+	return cache
+}
+
+// sameObjectCache 判断两个对象缓存是否同源，兼容共享视图与写回视图副本
+// 入参: a 首个对象缓存, b 对比对象缓存
+// 返回: bool 是否同源
+func sameObjectCache(a, b *objectCache) bool {
+	return a != nil && b != nil && a.origin == b.origin
+}
+
+// ownsObject 判断已归属阅读器的对象是否属于当前阅读器或同源视图，不访问对象原阅读器字段
+// 入参: objReader 对象原阅读器, objCache 对象构造时缓存
+// 返回: bool 是否属于当前阅读器
+func (r *Reader) ownsObject(objReader *Reader, objCache *objectCache) bool {
+	if objReader == nil {
+		return true
+	}
+	if r == nil {
+		return false
+	}
+	return objReader == r || sameObjectCache(objCache, r.cache)
 }
 
 // Open 打开PDF文件并读取交叉引用
@@ -486,6 +511,7 @@ func (c *objectCache) cloneWithPinned(pinned map[Reference]Object) *objectCache 
 	if c == nil {
 		return clone
 	}
+	clone.origin = c.origin
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.pinned) > 0 {
@@ -694,6 +720,9 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if stream, ok := value.(*Stream); ok && stream != nil {
+		stream.cacheFilterRefs(r)
 	}
 	r.cache.set(ref, value)
 	return value, nil
@@ -1393,7 +1422,7 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 		if err != nil {
 			return ref, nil, err
 		}
-		value = &Stream{Dictionary: dict, Data: data, Reference: ref, reader: r}
+		value = &Stream{Dictionary: dict, Data: data, Reference: ref, reader: r, cache: r.cache, hasWarning: r.warning != nil}
 		err = r.parseAt(start+actualLength, func(tail *objectParser) error {
 			token := tail.token()
 			if token != "endstream" && (r.warning == nil || !streamEndTypo(token)) {
@@ -1939,9 +1968,7 @@ func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, 
 			return nil, nil, fmt.Errorf("invalid cross-reference index")
 		}
 	}
-	direct := *stream
-	direct.reader = nil
-	data, err := direct.decodeContext(context.Background(), r.warning)
+	data, err := stream.decodeWith(context.Background(), nil, r.warning, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2092,7 +2119,7 @@ func (r *Reader) readObjectStreamLimit(ref Reference, limit int64) (*objectStrea
 	if e1 != nil || e2 != nil || count <= 0 || first < 0 {
 		return nil, fmt.Errorf("invalid object stream header")
 	}
-	data, err := stream.decodeContextLimit(context.Background(), r.warning, limit)
+	data, err := stream.decodeWith(context.Background(), r, r.warning, limit)
 	if err != nil {
 		return nil, err
 	}

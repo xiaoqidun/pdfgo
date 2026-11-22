@@ -1178,26 +1178,26 @@ func (r *Reader) optimizationContentData(ctx context.Context, stream *Stream, li
 				return nil, err
 			}
 		case "ASCII85Decode":
-			_, size, err := ascii85Size(ctx, data)
+			_, size, err := ascii85Size(ctx, data, nil)
 			if err != nil {
 				return nil, err
 			}
 			if size > limit {
 				return nil, io.ErrShortBuffer
 			}
-			data, err = decodeASCII85Context(ctx, data)
+			data, err = decodeASCII85Context(ctx, data, nil)
 			if err != nil {
 				return nil, err
 			}
 		case "RunLengthDecode":
-			size, err := runLengthSize(ctx, data)
+			size, err := runLengthSize(ctx, data, nil)
 			if err != nil {
 				return nil, err
 			}
 			if size > limit {
 				return nil, io.ErrShortBuffer
 			}
-			data, err = decodeRunLength(ctx, data)
+			data, err = decodeRunLength(ctx, data, nil)
 			if err != nil {
 				return nil, err
 			}

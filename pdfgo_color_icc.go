@@ -471,7 +471,7 @@ func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpac
 	if err != nil {
 		return nil, err
 	}
-	data, err := stream.Decode()
+	data, err := r.decodeStream(stream)
 	if err != nil {
 		return r.recoverICCAlternate(stream, int(count), ranges, effective, err)
 	}

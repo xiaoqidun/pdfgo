@@ -279,7 +279,7 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 			}
 		}
 	}
-	data, err := stream.Decode()
+	data, err := r.decodeStream(stream)
 	if err != nil {
 		return nil, err
 	}

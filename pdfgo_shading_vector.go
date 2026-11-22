@@ -161,7 +161,7 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 		if !streamOK {
 			return nil, fmt.Errorf("missing calculator function stream")
 		}
-		data, err := stream.Decode()
+		data, err := r.decodeStream(stream)
 		if err != nil {
 			return nil, err
 		}

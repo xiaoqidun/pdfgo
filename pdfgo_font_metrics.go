@@ -736,3 +736,61 @@ func (m *cffFontMetrics) type2Width(ctx context.Context, data []byte, args *[]fl
 	}
 	return 0, false, fmt.Errorf("incomplete CFF glyph metrics")
 }
+
+// ttfFontMetrics 保存内嵌TrueType的unitsPerEm与hmtx水平字宽表
+type ttfFontMetrics struct {
+	unitsPerEm  uint16
+	numHMetrics int
+	hmtx        []byte
+}
+
+// readTTFFontMetrics 读取TrueType的head、hhea与hmtx表用于缺失Widths时的字宽回退
+// 入参: ctx 取消上下文, data 内嵌TrueType程序
+// 返回: *ttfFontMetrics 水平度量表, error 表缺失、截断或取消错误
+func readTTFFontMetrics(ctx context.Context, data []byte) (*ttfFontMetrics, error) {
+	head, err := fontTableContext(ctx, data, "head")
+	if err != nil {
+		return nil, err
+	}
+	if len(head) < 54 {
+		return nil, fmt.Errorf("missing or truncated TrueType head table")
+	}
+	unitsPerEm := binary.BigEndian.Uint16(head[18:20])
+	if unitsPerEm == 0 {
+		return nil, fmt.Errorf("invalid TrueType unitsPerEm")
+	}
+	hhea, err := fontTableContext(ctx, data, "hhea")
+	if err != nil {
+		return nil, err
+	}
+	if len(hhea) < 36 {
+		return nil, fmt.Errorf("missing or truncated TrueType hhea table")
+	}
+	numHMetrics := int(binary.BigEndian.Uint16(hhea[34:36]))
+	if numHMetrics == 0 {
+		return nil, fmt.Errorf("invalid TrueType numberOfHMetrics")
+	}
+	hmtx, err := fontTableContext(ctx, data, "hmtx")
+	if err != nil {
+		return nil, err
+	}
+	if len(hmtx) < numHMetrics*4 {
+		return nil, fmt.Errorf("missing or truncated TrueType hmtx table")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return &ttfFontMetrics{unitsPerEm: unitsPerEm, numHMetrics: numHMetrics, hmtx: hmtx}, nil
+}
+
+// glyphWidth 按字形编号从hmtx换算千分之一横向字宽
+// 入参: id 字形编号
+// 返回: float64 千分之一文字空间字宽
+func (m *ttfFontMetrics) glyphWidth(id uint16) float64 {
+	index := int(id)
+	if index >= m.numHMetrics {
+		index = m.numHMetrics - 1
+	}
+	advance := binary.BigEndian.Uint16(m.hmtx[index*4 : index*4+2])
+	return float64(advance) * 1000 / float64(m.unitsPerEm)
+}

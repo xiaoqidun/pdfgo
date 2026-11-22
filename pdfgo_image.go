@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"errors"
 	"fmt"
 	"hash/maphash"
 	"image"
@@ -526,8 +527,12 @@ func (i *Image) encodedFileContext(ctx context.Context, terminal Name) ([]byte, 
 	}
 	data := i.Stream.Data
 	if len(filters) > 1 {
-		prefix := Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": params[:len(params)-1]}, Data: data, reader: i.reader}
-		data, err = prefix.DecodeContext(ctx)
+		warning := i.Warning
+		if warning == nil && i.reader != nil {
+			warning = i.reader.warning
+		}
+		prefix := Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": params[:len(params)-1]}, Data: data}
+		data, err = prefix.decodeWith(ctx, nil, warning, 0)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -975,7 +980,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	}
 	data := i.Stream.Data
 	if terminal == "" || len(filters) != 0 {
-		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data}).decodeContext(ctx, i.Warning)
+		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data}).decodeWith(ctx, nil, i.Warning, 0)
 		if err != nil {
 			if terminal == "" {
 				return i.recoverArrayPredictorSamplesContext(ctx, filters, parameters, err)
@@ -1173,7 +1178,7 @@ func (i *Image) jbig2GlobalsRaw(ctx context.Context, obj Object) ([]byte, error)
 	if !ok || stream == nil {
 		return nil, fmt.Errorf("invalid JBIG2 globals")
 	}
-	data, err := stream.DecodeContext(ctx)
+	data, err := i.reader.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
@@ -2045,15 +2050,23 @@ func (i *Image) palette() (*imagePalette, error) {
 	case String:
 		data = value
 	case *Stream:
-		data, err = value.Decode()
+		data, err = i.reader.decodeStream(value)
 		if err != nil {
 			return nil, err
 		}
 	default:
 		return nil, fmt.Errorf("invalid Indexed lookup")
 	}
-	if len(data) != int(n+1)*components {
+	expected := int(n+1) * components
+	if len(data) < expected {
 		return nil, fmt.Errorf("invalid Indexed lookup length")
+	}
+	if len(data) > expected {
+		if i.Warning == nil {
+			return nil, fmt.Errorf("invalid Indexed lookup length")
+		}
+		i.Warning(Diagnostic{Message: fmt.Sprintf("Indexed color space lookup table has %d excess bytes; using declared %d entries", len(data)-expected, int(n+1))})
+		data = data[:expected]
 	}
 	palette := make([]color.NRGBA64, int(n+1))
 	result := &imagePalette{colors: palette, values: make([][4]float64, len(palette))}
@@ -2234,7 +2247,15 @@ func (i *Image) decodeMaskRows(ctx context.Context, components int, rows *imageR
 		return nil, nil, false, nil, err
 	}
 	mask.Warning = i.Warning
-	if mask.Mask != nil || mask.SoftMask != nil || soft && (mask.ImageMask || mask.ColorSpace != Name("DeviceGray")) || !soft && !mask.ImageMask {
+	nestedMask, err := i.reader.Resolve(mask.Mask)
+	if err != nil {
+		return nil, nil, false, nil, err
+	}
+	nestedSoftMask, err := i.reader.Resolve(mask.SoftMask)
+	if err != nil {
+		return nil, nil, false, nil, err
+	}
+	if nestedMask != nil || (nestedSoftMask != nil && nestedSoftMask != Name("None")) || soft && (mask.ImageMask || mask.ColorSpace != Name("DeviceGray")) || !soft && !mask.ImageMask {
 		return nil, nil, false, nil, fmt.Errorf("invalid image mask dictionary")
 	}
 	var matte []float64
@@ -2324,7 +2345,11 @@ func (i *Image) ccittSamplesContext(ctx context.Context, data []byte, params Dic
 			return nil, fmt.Errorf("CCITT dimensions differ from image dictionary")
 		}
 		if err != io.EOF {
-			return nil, err
+			if i.Warning != nil && ctx.Err() == nil && errors.Is(err, io.ErrUnexpectedEOF) {
+				i.Warning(Diagnostic{Message: "CCITT end-of-block marker missing; complete declared image samples retained"})
+			} else {
+				return nil, err
+			}
 		}
 	}
 	return i.rawSamples(ctx, samples)

@@ -41,7 +41,7 @@ func (p *pageInterpreter) postscript(stream *Stream) error {
 	if p.visitor.PostScript == nil {
 		return nil
 	}
-	data, err := stream.DecodeContext(p.ctx)
+	data, err := p.reader.DecodeStreamContext(p.ctx, stream)
 	if err != nil {
 		return err
 	}
@@ -55,7 +55,7 @@ func (p *pageInterpreter) postscript(stream *Stream) error {
 		if !ok || level1 == nil {
 			return fmt.Errorf("invalid PostScript Level1 stream")
 		}
-		mark.Level1, err = level1.DecodeContext(p.ctx)
+		mark.Level1, err = p.reader.DecodeStreamContext(p.ctx, level1)
 		if err != nil {
 			return err
 		}

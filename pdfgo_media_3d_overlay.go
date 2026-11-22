@@ -103,7 +103,7 @@ func (r *Reader) WalkThreeDOverlay(ctx context.Context, page *Page, source Three
 	if stream == nil {
 		return nil
 	}
-	if stream.reader != nil && stream.reader != r {
+	if !r.ownsObject(stream.reader, stream.cache) {
 		return fmt.Errorf("3D overlay belongs to another reader")
 	}
 	if source.Camera.Source != "M" && source.Camera.Source != "U3D" || source.Projection == nil {

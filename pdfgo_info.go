@@ -154,7 +154,7 @@ func (r *Reader) readOutputIntent(object Object) (OutputIntent, error) {
 	if !ok {
 		return result, fmt.Errorf("invalid DestOutputProfile stream")
 	}
-	data, err := stream.Decode()
+	data, err := r.decodeStream(stream)
 	if err != nil {
 		return result, fmt.Errorf("DestOutputProfile: %w", err)
 	}
@@ -258,12 +258,20 @@ func (r *Reader) Info() (DocumentInfo, error) {
 	return result, nil
 }
 
-// recoverAuxiliary 报告辅助信息错误，输入读取、关闭及取消错误继续传递
+// isFatalReaderError 判断错误是否为不可恢复的读取、解密、认证、关闭或取消错误
+// 入参: err 待判定错误
+// 返回: bool 是否必须向上传递
+func isFatalReaderError(err error) bool {
+	var read *ReadError
+	var security *objectSecurityError
+	return errors.As(err, &read) || errors.As(err, &security) || errors.Is(err, ErrPassword) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed)
+}
+
+// recoverAuxiliary 报告辅助信息错误，输入读取、解密、认证、关闭及取消错误继续传递
 // 入参: err 辅助信息错误
 // 返回: bool 是否已记录并允许继续
 func (r *Reader) recoverAuxiliary(err error) bool {
-	var read *ReadError
-	if err == nil || r.warning == nil || errors.As(err, &read) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed) {
+	if err == nil || r.warning == nil || isFatalReaderError(err) {
 		return false
 	}
 	r.warning(Diagnostic{Message: err.Error()})

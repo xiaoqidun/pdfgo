@@ -151,7 +151,7 @@ func (r *Reader) ReadSpotFunction(object Object) (*SpotFunction, error) {
 	if domain[0] > domain[1] || domain[2] > domain[3] || rangeValues[0] > rangeValues[1] {
 		return nil, fmt.Errorf("invalid spot function bounds")
 	}
-	data, err := stream.Decode()
+	data, err := r.decodeStream(stream)
 	if err != nil {
 		return nil, err
 	}

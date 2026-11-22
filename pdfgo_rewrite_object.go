@@ -126,7 +126,7 @@ func (c *rewriteObjectCopy) copyStream(stream *Stream, depth int) (*Stream, erro
 	}
 	dict := make(Dictionary, len(stream.Dictionary))
 	nested := *c
-	if stream.reader != nil {
+	if !c.source.ownsObject(stream.reader, stream.cache) {
 		nested.source = stream.reader
 	}
 	filters, parameters, err := stream.filterChain(nested.source)

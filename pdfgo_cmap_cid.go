@@ -513,7 +513,7 @@ func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, active m
 	}
 	active[stream] = true
 	defer delete(active, stream)
-	data, err := stream.DecodeContext(ctx)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +586,7 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 	}
 	active[stream] = true
 	defer delete(active, stream)
-	data, err := stream.DecodeContext(ctx)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
 	}

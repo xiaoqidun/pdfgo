@@ -511,6 +511,9 @@ func (r *Reader) Fork(source io.ReaderAt, warning func(Diagnostic), shapeText Te
 		copied.key = bytes.Clone(r.security.key)
 		security = &copied
 	}
+	if r.cache != nil {
+		r.cache.shared.Store(true)
+	}
 	return &Reader{
 		Version:        r.Version,
 		Trailer:        r.Trailer,
@@ -606,23 +609,53 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 				}
 				knockout = bool(flag)
 			default:
-				return &UnsupportedError{Feature: fmt.Sprintf("page group field %q", key)}
+				if visitor.Warning == nil {
+					return &UnsupportedError{Feature: fmt.Sprintf("page group field %q", key)}
+				}
+				visitor.Warning(Diagnostic{Message: fmt.Sprintf("unsupported page group field %q ignored", key)})
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	if value, err := r.Resolve(page.Dictionary["Trans"]); err != nil {
-		return err
+		if visitor.Warning == nil || isFatalReaderError(err) {
+			return err
+		}
+		visitor.Warning(Diagnostic{Message: fmt.Sprintf("invalid page transition ignored: %v", err)})
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	} else if value != nil {
 		transition, ok := value.(Dictionary)
 		if !ok {
-			return fmt.Errorf("invalid page transition")
-		}
-		style, err := r.Resolve(transition["S"])
-		if err != nil {
-			return err
-		}
-		if style != nil && style != Name("R") {
-			return &UnsupportedError{Feature: "page transition " + fmt.Sprint(style)}
+			if visitor.Warning == nil {
+				return fmt.Errorf("invalid page transition")
+			}
+			visitor.Warning(Diagnostic{Message: "invalid page transition ignored"})
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		} else {
+			style, err := r.Resolve(transition["S"])
+			if err != nil {
+				if visitor.Warning == nil || isFatalReaderError(err) {
+					return err
+				}
+				visitor.Warning(Diagnostic{Message: fmt.Sprintf("invalid page transition ignored: %v", err)})
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			} else if style != nil && style != Name("R") {
+				if visitor.Warning == nil {
+					return &UnsupportedError{Feature: "page transition " + fmt.Sprint(style)}
+				}
+				visitor.Warning(Diagnostic{Message: "unsupported page transition " + fmt.Sprint(style) + " ignored"})
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	var data bytes.Buffer
@@ -677,7 +710,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if font == nil || font.Subtype != Name("Type3") || index < 0 || index >= len(mark.Glyphs) || index >= len(mark.Positions) {
 		return fmt.Errorf("invalid Type3 glyph")
 	}
-	if font.reader != nil {
+	if !r.ownsObject(font.reader, font.cache) {
 		r = font.reader
 	}
 	if mark.Mode == 3 {
@@ -719,7 +752,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 		visitor.Warning(Diagnostic{Message: message})
 		return nil
 	}
-	data, err := stream.DecodeContext(ctx)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return err
 	}
@@ -777,7 +810,11 @@ func (p *pageInterpreter) run(data []byte) error {
 		}
 	}
 	if p.compatibility != 0 {
-		return fmt.Errorf("unbalanced compatibility section")
+		if p.visitor.Warning == nil {
+			return fmt.Errorf("unbalanced compatibility section")
+		}
+		p.visitor.Warning(Diagnostic{Offset: int64(len(data)), Message: "unbalanced compatibility section"})
+		p.compatibility = 0
 	}
 	if err := p.ctx.Err(); err != nil {
 		return err
@@ -955,7 +992,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.compatibility++
 	case "EX":
 		if p.compatibility == 0 {
-			return fmt.Errorf("unmatched operator %q", "EX")
+			return p.operationWarning(op, `unmatched operator "EX"`)
 		}
 		p.compatibility--
 	case "d0", "d1":
@@ -1008,29 +1045,53 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.state.style.MiterLimit = v[0]
 	case "d":
 		if len(a) != 2 {
-			return fmt.Errorf("invalid dash operands")
+			if p.visitor.Warning == nil {
+				return fmt.Errorf("invalid dash operands")
+			}
+			p.state.style.Dash, p.state.style.DashPhase = nil, 0
+			return p.operationWarning(op, "invalid dash operands; solid line default used")
 		}
 		values, ok := a[0].(Array)
 		if !ok {
-			return fmt.Errorf("invalid dash pattern")
+			if p.visitor.Warning == nil {
+				return fmt.Errorf("invalid dash pattern")
+			}
+			p.state.style.Dash, p.state.style.DashPhase = nil, 0
+			return p.operationWarning(op, "invalid dash pattern; solid line default used")
 		}
 		dash, err := numbers(values, len(values))
 		if err != nil {
-			return err
+			if p.visitor.Warning == nil {
+				return err
+			}
+			p.state.style.Dash, p.state.style.DashPhase = nil, 0
+			return p.operationWarning(op, "invalid dash pattern; solid line default used")
 		}
 		sum := 0.0
 		for _, n := range dash {
 			if n < 0 {
-				return fmt.Errorf("negative dash")
+				if p.visitor.Warning == nil {
+					return fmt.Errorf("negative dash")
+				}
+				p.state.style.Dash, p.state.style.DashPhase = nil, 0
+				return p.operationWarning(op, "negative dash; solid line default used")
 			}
 			sum += n
 		}
 		if len(dash) > 0 && sum == 0 {
-			return fmt.Errorf("empty dash cycle")
+			if p.visitor.Warning == nil {
+				return fmt.Errorf("empty dash cycle")
+			}
+			p.state.style.Dash, p.state.style.DashPhase = nil, 0
+			return p.operationWarning(op, "empty dash cycle; solid line default used")
 		}
 		phase, err := numbers(a[1:], 1)
 		if err != nil {
-			return err
+			if p.visitor.Warning == nil {
+				return err
+			}
+			p.state.style.Dash, p.state.style.DashPhase = nil, 0
+			return p.operationWarning(op, "invalid dash phase; solid line default used")
 		}
 		p.state.style.Dash = dash
 		p.state.style.DashPhase = phase[0]
@@ -1041,13 +1102,13 @@ func (p *pageInterpreter) operation(op Operation) error {
 		add("M", p.current)
 	case "l":
 		if !p.hasPoint {
-			return fmt.Errorf("line without current point")
+			return p.operationWarning(op, "line without current point")
 		}
 		p.current = point(v[0], v[1])
 		add("L", p.current)
 	case "c", "v", "y":
 		if !p.hasPoint {
-			return fmt.Errorf("curve without current point")
+			return p.operationWarning(op, "curve without current point")
 		}
 		var c1, c2, end Point
 		if op.Operator == "c" {
@@ -1115,7 +1176,15 @@ func (p *pageInterpreter) operation(op Operation) error {
 				if math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy) {
 					strokeMatrix = Matrix{m[0], m[1], m[2], m[3], 0, 0}
 					if _, ok := strokeMatrix.Inverse(); !ok {
-						return &UnsupportedError{Feature: "singular path stroke"}
+						if p.visitor.Warning == nil {
+							return &UnsupportedError{Feature: "singular path stroke"}
+						}
+						p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: "singular path stroke ignored"})
+						if err := p.ctx.Err(); err != nil {
+							return err
+						}
+						stroke = false
+						strokeMatrix = Matrix{}
 					}
 				} else {
 					style.LineWidth *= sx
@@ -1126,11 +1195,13 @@ func (p *pageInterpreter) operation(op Operation) error {
 					style.DashPhase *= sx
 				}
 			}
-			if p.visitor.Path == nil {
-				return fmt.Errorf("path visitor missing")
-			}
-			if err := p.visitor.Path(PathMark{Sequence: p.sequence, Path: p.path, Style: style, Fill: fill, Stroke: stroke, StrokeMatrix: strokeMatrix}); err != nil {
-				return err
+			if fill || stroke {
+				if p.visitor.Path == nil {
+					return fmt.Errorf("path visitor missing")
+				}
+				if err := p.visitor.Path(PathMark{Sequence: p.sequence, Path: p.path, Style: style, Fill: fill, Stroke: stroke, StrokeMatrix: strokeMatrix}); err != nil {
+					return err
+				}
 			}
 		}
 		if p.pendingClip {
@@ -1423,7 +1494,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.state.leading = v[0]
 	case "Tr":
 		if v[0] < 0 || v[0] > 7 || v[0] != math.Trunc(v[0]) {
-			return fmt.Errorf("invalid text rendering mode")
+			return p.operationWarning(op, "invalid text rendering mode")
 		}
 		p.state.mode = int(v[0])
 	case "Ts":
@@ -1523,10 +1594,16 @@ func (p *pageInterpreter) operation(op Operation) error {
 	case "i":
 		n, err := numbers(a, 1)
 		if err != nil {
-			return err
+			if p.visitor.Warning == nil {
+				return err
+			}
+			return p.operationWarning(op, "invalid flatness ignored")
 		}
 		if n[0] < 0 || n[0] > 100 {
-			return fmt.Errorf("invalid flatness")
+			if p.visitor.Warning == nil {
+				return fmt.Errorf("invalid flatness")
+			}
+			return p.operationWarning(op, "flatness out of range clamped")
 		}
 	case "BMC", "BDC", "EMC", "MP", "DP":
 		return p.markedContent(op)
@@ -2269,7 +2346,14 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 		case "D":
 			values, ok := value.(Array)
 			if !ok || len(values) != 2 {
-				return fmt.Errorf("invalid graphics state dash pattern")
+				if p.visitor.Warning == nil {
+					return fmt.Errorf("invalid graphics state dash pattern")
+				}
+				p.state.style.Dash, p.state.style.DashPhase = nil, 0
+				if err := p.operationWarning(Operation{Operator: "gs"}, "invalid graphics state dash pattern; solid line default used"); err != nil {
+					return err
+				}
+				continue
 			}
 			values = append(Array(nil), values...)
 			for i := range values {
@@ -2277,6 +2361,16 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				if err != nil {
 					return err
 				}
+			}
+			if arr, ok := values[0].(Array); ok {
+				resolved := make(Array, len(arr))
+				for i := range arr {
+					resolved[i], err = p.reader.Resolve(arr[i])
+					if err != nil {
+						return err
+					}
+				}
+				values[0] = resolved
 			}
 			if err := p.operation(Operation{Operator: "d", Operands: values}); err != nil {
 				return err
@@ -2391,14 +2485,37 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 			p.state.style.OverprintMode = int(value.(Integer))
 		case "SM":
 			n, err := numbers([]Object{value}, 1)
-			if err != nil || n[0] < 0 || n[0] > 1 {
-				return fmt.Errorf("invalid smoothness tolerance")
+			if err != nil {
+				if p.visitor.Warning == nil {
+					return fmt.Errorf("invalid smoothness tolerance")
+				}
+				if err := p.operationWarning(Operation{Operator: "gs"}, "invalid smoothness tolerance ignored"); err != nil {
+					return err
+				}
+				continue
+			}
+			if n[0] < 0 || n[0] > 1 {
+				if p.visitor.Warning == nil {
+					return fmt.Errorf("invalid smoothness tolerance")
+				}
+				if err := p.operationWarning(Operation{Operator: "gs"}, "smoothness tolerance out of range clamped"); err != nil {
+					return err
+				}
+				clamped := math.Max(0, math.Min(1, n[0]))
+				p.state.style.Smoothness = &clamped
+				continue
 			}
 			p.state.style.Smoothness = &n[0]
 		case "AAPL:AA":
 			flag, ok := value.(Boolean)
 			if !ok {
-				return fmt.Errorf("invalid antialias flag")
+				if p.visitor.Warning == nil {
+					return fmt.Errorf("invalid antialias flag")
+				}
+				if err := p.operationWarning(Operation{Operator: "gs"}, "invalid antialias flag ignored"); err != nil {
+					return err
+				}
+				continue
 			}
 			v := bool(flag)
 			p.state.style.Antialias = &v

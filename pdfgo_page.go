@@ -217,7 +217,7 @@ func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error
 		if !ok {
 			return written, fmt.Errorf("page content is not a stream")
 		}
-		data, err := stream.DecodeContext(ctx)
+		data, err := p.reader.DecodeStreamContext(ctx, stream)
 		if err != nil {
 			return written, err
 		}

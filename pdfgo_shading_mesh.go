@@ -234,7 +234,11 @@ func (b *meshBits) read(count int) (uint32, error) {
 // 返回: Paint 曲面画刷, error 格式或能力错误
 func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error) {
 	d := stream.Dictionary
-	kind, ok := d["ShadingType"].(Integer)
+	kindValue, err := p.reader.Resolve(d["ShadingType"])
+	if err != nil {
+		return Paint{}, err
+	}
+	kind, ok := kindValue.(Integer)
 	if !ok || kind < 4 || kind > 7 {
 		return Paint{}, &UnsupportedError{Feature: "mesh shading type"}
 	}
@@ -286,7 +290,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	if err != nil {
 		return Paint{}, err
 	}
-	data, err := stream.Decode()
+	data, err := p.reader.DecodeStreamContext(p.ctx, stream)
 	if err != nil {
 		return Paint{}, err
 	}

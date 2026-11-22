@@ -180,7 +180,7 @@ func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Objec
 		f.sampled, err = r.readSampledFunctionContext(ctx, stream, 2, outputs)
 	case Integer(4):
 		var data []byte
-		data, err = stream.DecodeContext(ctx)
+		data, err = r.DecodeStreamContext(ctx, stream)
 		if err == nil {
 			f.program, err = newCalculatorFunction(data, r.warning)
 		}
@@ -227,7 +227,11 @@ func (p *pageInterpreter) functionShading(shading Dictionary, matrix Matrix) (Pa
 		g.Matrix = matrix.Mul(Matrix(v))
 	}
 	if _, ok := g.Matrix.Inverse(); !ok {
-		return Paint{}, fmt.Errorf("singular function shading transform")
+		if p.visitor.Warning == nil {
+			return Paint{}, fmt.Errorf("singular function shading transform")
+		}
+		p.visitor.Warning(Diagnostic{Message: "singular function shading transform ignored"})
+		return Paint{None: true}, p.ctx.Err()
 	}
 	object, err := p.shadingColorSpace(shading["ColorSpace"])
 	if err != nil {

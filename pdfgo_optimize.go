@@ -1736,12 +1736,12 @@ func (r *Reader) optimizeDataStream(ctx context.Context, s *Stream) (*Stream, er
 				}
 				var decodeErr error
 				if filter == Name("ASCII85Decode") {
-					_, size, e := ascii85Size(ctx, data)
+					_, size, e := ascii85Size(ctx, data, nil)
 					if e != nil || size > optimizationBufferLimit {
 						decodeOK = false
 						break
 					}
-					data, decodeErr = decodeASCII85Context(ctx, data)
+					data, decodeErr = decodeASCII85Context(ctx, data, nil)
 				} else {
 					_, size, e := asciiHexSize(ctx, data, nil)
 					if e != nil || size > optimizationBufferLimit {
@@ -1800,7 +1800,7 @@ func (r *Reader) optimizeDataStream(ctx context.Context, s *Stream) (*Stream, er
 		}
 		decodedLimit *= factor
 	}
-	data, e := s.DecodeContext(ctx)
+	data, e := r.DecodeStreamContext(ctx, s)
 	if e != nil {
 		return s, ctx.Err()
 	}

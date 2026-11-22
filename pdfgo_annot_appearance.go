@@ -295,7 +295,7 @@ func (r *Reader) linkAppearance(annotation Annotation) (*Stream, error) {
 			}
 		}
 	}
-	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Real(w), Real(h)}}, Data: []byte(content.String()), reader: r}, nil
+	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Real(w), Real(h)}}, Data: []byte(content.String()), reader: r, cache: r.cache, hasWarning: r.warning != nil}, nil
 }
 
 // inkAppearance 按原始手写坐标生成线段外观，保留公共笔画和不透明度
@@ -357,7 +357,7 @@ func (r *Reader) inkAppearance(annotation Annotation) (*Stream, error) {
 	content.WriteString("S\n")
 	box := annotation.Rect
 	resources := Dictionary{"ExtGState": Dictionary{"Opacity": Dictionary{"CA": Real(alpha), "ca": Real(alpha)}}}
-	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}, "Resources": resources}, Data: []byte(content.String()), reader: r}, nil
+	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}, "Resources": resources}, Data: []byte(content.String()), reader: r, cache: r.cache, hasWarning: r.warning != nil}, nil
 }
 
 // textMarkupAppearance 按文字四边形生成高亮、下划线、删除线或波浪线外观
@@ -730,7 +730,7 @@ func (r *Reader) annotationContentBounds(annotation Annotation) (Rectangle, erro
 func (r *Reader) annotationAppearance(annotation Annotation, content string, resources Dictionary) (*Stream, error) {
 	box := annotation.Rect
 	bbox := Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}
-	body := &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox}, Data: []byte(content), reader: r}
+	body := &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox}, Data: []byte(content), reader: r, cache: r.cache, hasWarning: r.warning != nil}
 	if resources != nil {
 		body.Dictionary["Resources"] = resources
 	}
@@ -754,5 +754,5 @@ func (r *Reader) annotationAppearance(annotation Annotation, content string, res
 		state["BM"] = Name("Multiply")
 	}
 	resources = Dictionary{"XObject": Dictionary{"Shape": body}, "ExtGState": Dictionary{"Opacity": state}}
-	return &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox, "Resources": resources}, Data: []byte("/Opacity gs /Shape Do"), reader: r}, nil
+	return &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": bbox, "Resources": resources}, Data: []byte("/Opacity gs /Shape Do"), reader: r, cache: r.cache, hasWarning: r.warning != nil}, nil
 }

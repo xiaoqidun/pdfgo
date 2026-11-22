@@ -89,7 +89,7 @@ func (p *pageInterpreter) formData(stream *Stream) ([]byte, *formContent, error)
 	if content := p.forms.entries[stream]; content != nil {
 		return content.data, content, nil
 	}
-	data, err := stream.DecodeContext(p.ctx)
+	data, err := p.reader.DecodeStreamContext(p.ctx, stream)
 	if err != nil {
 		return nil, nil, err
 	}

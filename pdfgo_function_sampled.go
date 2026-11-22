@@ -109,7 +109,7 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 	if order == Integer(3) {
 		f.order = 3
 	}
-	data, err := stream.DecodeContext(ctx)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
 	}

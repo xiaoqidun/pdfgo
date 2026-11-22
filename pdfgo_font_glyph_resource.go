@@ -156,7 +156,7 @@ func (f *Font) GlyphFontContext(ctx context.Context, glyphs []GlyphWidth) (*Font
 	for _, key := range []Name{"FontFile", "FontFile2", "FontFile3", "CIDSet", "CharSet"} {
 		delete(descriptor, key)
 	}
-	program := &Stream{Data: f.Program, Dictionary: Dictionary{}, reader: f.reader}
+	program := &Stream{Data: f.Program, Dictionary: Dictionary{}, reader: f.reader, cache: f.cache}
 	if subtype == "CIDFontType2" && f.ProgramType != "OpenType" {
 		program.Dictionary["Length1"] = Integer(len(f.Program))
 		descriptor["FontFile2"] = program

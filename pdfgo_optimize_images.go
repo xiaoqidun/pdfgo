@@ -605,17 +605,17 @@ func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters,
 			}
 			data, err = decodeASCIIHexContext(ctx, data, nil)
 		case Name("ASCII85Decode"):
-			_, size, e := ascii85Size(ctx, data)
+			_, size, e := ascii85Size(ctx, data, nil)
 			if e != nil || size > optimizationBufferLimit {
 				return nil, ctx.Err()
 			}
-			data, err = decodeASCII85Context(ctx, data)
+			data, err = decodeASCII85Context(ctx, data, nil)
 		case Name("RunLengthDecode"):
-			size, e := runLengthSize(ctx, data)
+			size, e := runLengthSize(ctx, data, nil)
 			if e != nil || size > optimizationBufferLimit {
 				return nil, ctx.Err()
 			}
-			data, err = decodeRunLength(ctx, data)
+			data, err = decodeRunLength(ctx, data, nil)
 		default:
 			return nil, nil
 		}
@@ -868,7 +868,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				if !ok {
 					continue
 				}
-				data, err := procStream.DecodeContext(ctx)
+				data, err := r.DecodeStreamContext(ctx, procStream)
 				if err != nil {
 					markResourcesUnsafe(res, target, map[Reference]bool{ref: true}, 0)
 					break
@@ -1008,7 +1008,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			if ref.Number > 0 {
 				patternActive[ref] = true
 			}
-			content, decodeErr := patStream.DecodeContext(ctx)
+			content, decodeErr := r.DecodeStreamContext(ctx, patStream)
 			walkErr := decodeErr
 			if walkErr == nil {
 				walkErr = walk(content, patRes, initialMatrix.Mul(patMatrix), depth+1, budget, collector, localUnsafe)
@@ -1135,7 +1135,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 						formBudget := 100000
 						subCollector := make(map[imagePlacementKey]struct{})
 						subUnsafe := make(map[Reference]bool)
-						content, decodeErr := stream.DecodeContext(ctx)
+						content, decodeErr := r.DecodeStreamContext(ctx, stream)
 						walkErr := decodeErr
 						if walkErr == nil {
 							walkErr = walk(content, childResources, formMatrix, depth+1, &formBudget, subCollector, subUnsafe)
@@ -1173,7 +1173,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 						childResources = dict
 					}
 					child := matrix.Mul(formMatrix)
-					content, err := stream.DecodeContext(ctx)
+					content, err := r.DecodeStreamContext(ctx, stream)
 					if err != nil {
 						return err
 					}
@@ -1248,7 +1248,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		scaleX := (rect.XMax - rect.XMin) / (maxX - minX)
 		scaleY := (rect.YMax - rect.YMin) / (maxY - minY)
 		apMatrix := Matrix{unit * scaleX, 0, 0, unit * scaleY, 0, 0}.Mul(formMatrix)
-		content, err := apStream.DecodeContext(ctx)
+		content, err := r.DecodeStreamContext(ctx, apStream)
 		if err != nil {
 			return failSafe()
 		}

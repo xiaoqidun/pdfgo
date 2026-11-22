@@ -604,10 +604,19 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	if !visible {
 		return Paint{None: true}, nil
 	}
-	if _, ok := m.Inverse(); !ok {
-		return Paint{}, fmt.Errorf("singular shading transform")
+	inverse, ok := m.Inverse()
+	if !ok {
+		if p.visitor.Warning == nil {
+			return Paint{}, fmt.Errorf("singular shading transform")
+		}
+		p.visitor.Warning(Diagnostic{Message: "singular shading transform ignored"})
+		return Paint{None: true}, p.ctx.Err()
 	}
-	if shading["ShadingType"] == Integer(1) {
+	kind, err := p.reader.Resolve(shading["ShadingType"])
+	if err != nil {
+		return Paint{}, err
+	}
+	if kind == Integer(1) {
 		return p.functionShading(shading, m)
 	}
 	domain := [2]float64{0, 1}
@@ -622,9 +631,9 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		domain = [2]float64(d)
 	}
 	count := 4
-	if shading["ShadingType"] == Integer(3) {
+	if kind == Integer(3) {
 		count = 6
-	} else if shading["ShadingType"] != Integer(2) {
+	} else if kind != Integer(2) {
 		return Paint{}, &UnsupportedError{Feature: "shading type"}
 	}
 	coords, err := p.reader.numberArray(shading["Coords"], count)
@@ -641,11 +650,11 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	if count == 4 {
 		end := Point{coords[2], coords[3]}
 		if start == end {
-			return Paint{}, fmt.Errorf("degenerate shading axis")
-		}
-		inverse, ok := m.Inverse()
-		if !ok {
-			return Paint{}, fmt.Errorf("singular shading transform")
+			if p.visitor.Warning == nil {
+				return Paint{}, fmt.Errorf("degenerate shading axis")
+			}
+			p.visitor.Warning(Diagnostic{Message: "degenerate axial shading ignored"})
+			return Paint{None: true}, p.ctx.Err()
 		}
 		dx, dy := end.X-start.X, end.Y-start.Y
 		gx, gy := inverse[0]*dx+inverse[1]*dy, inverse[2]*dx+inverse[3]*dy
@@ -666,6 +675,10 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 			return Paint{}, fmt.Errorf("invalid shading extension")
 		}
 		for i, v := range a {
+			v, err = p.reader.Resolve(v)
+			if err != nil {
+				return Paint{}, err
+			}
 			b, ok := v.(Boolean)
 			if !ok {
 				return Paint{}, fmt.Errorf("invalid shading extension")

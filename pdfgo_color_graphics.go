@@ -53,7 +53,7 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 			calibrated.gray = true
 			calibrated.calRGB, err = p.reader.readCalGray(array)
 		case "Indexed":
-			image := &Image{reader: p.reader, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{"Intent": p.state.style.RenderingIntent}}, effectiveColorSpace: true}
+			image := &Image{reader: p.reader, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{"Intent": p.state.style.RenderingIntent}}, Warning: p.visitor.Warning, effectiveColorSpace: true}
 			calibrated.palette, err = image.palette()
 		}
 	case "DeviceN":

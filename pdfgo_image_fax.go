@@ -419,7 +419,7 @@ func (r *faxReader) rowMode() (bool, error) {
 		for count := uint(1); count < 12; count++ {
 			value, err := r.peek(count)
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return false, nil
+				return false, io.ErrUnexpectedEOF
 			}
 			if err != nil || value != 0 {
 				return false, err
@@ -438,6 +438,20 @@ func (r *faxReader) rowMode() (bool, error) {
 	marked, err := r.marker(r.eol || r.mixed)
 	if err != nil {
 		return false, err
+	}
+	if !marked && !r.eol && !r.mixed {
+		for count := uint(1); count < 12; count++ {
+			value, err := r.peek(count)
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return false, io.ErrUnexpectedEOF
+			}
+			if err != nil {
+				return false, err
+			}
+			if value != 0 {
+				break
+			}
+		}
 	}
 	oneD := true
 	if r.mixed {

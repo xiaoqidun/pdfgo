@@ -19,7 +19,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"unicode/utf8"
@@ -46,7 +45,9 @@ type Font struct {
 	widths               map[uint32]float64
 	defaultWidth         float64
 	defaultWidthDeclared bool
+	allowMissingWidth    bool
 	programMetrics       *fontProgramMetrics
+	ttfMetrics           *ttfFontMetrics
 	coreName             string
 	cidWidths            cidMetrics[float64]
 	verticals            cidMetrics[VerticalMetrics]
@@ -70,6 +71,7 @@ type Font struct {
 	type3Procs           Dictionary
 	type3Resources       Dictionary
 	reader               *Reader
+	cache                *objectCache
 }
 
 // Glyph 保存原始字符码、Unicode文本、字形名称、编号和千分之一字宽
@@ -153,7 +155,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	if !ok {
 		return nil, fmt.Errorf("missing font subtype")
 	}
-	font := &Font{Dictionary: dict, Subtype: subtype, widths: map[uint32]float64{}, reader: r}
+	font := &Font{Dictionary: dict, Subtype: subtype, widths: map[uint32]float64{}, reader: r, cache: r.cache}
 	value, err = r.Resolve(dict["BaseFont"])
 	if err != nil {
 		return nil, err
@@ -324,7 +326,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			if !ok || stream == nil {
 				return nil, fmt.Errorf("invalid CIDToGIDMap")
 			}
-			font.glyphMap, err = stream.DecodeContext(ctx)
+			font.glyphMap, err = r.DecodeStreamContext(ctx, stream)
 			if err != nil {
 				return nil, err
 			}
@@ -405,8 +407,16 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			if err != nil {
 				return nil, err
 			}
-			if first < 0 || first > 255 || first != float64(int(first)) || int(first)+len(array) > 256 {
+			if first < 0 || first > 255 || first != float64(int(first)) {
 				return nil, fmt.Errorf("invalid simple font width range")
+			}
+			if int(first)+len(array) > 256 {
+				if r.warning == nil {
+					return nil, fmt.Errorf("invalid simple font width range")
+				}
+				array = array[:256-int(first)]
+				font.Recovered = true
+				r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q Widths exceeds 256 entries; truncated to 256", font.Name)})
 			}
 			for n, value := range array {
 				width, err := r.number(value)
@@ -434,9 +444,14 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			if dict["FontBBox"] != nil {
 				box, err := r.rectangle(dict["FontBBox"])
 				if err != nil {
-					return nil, err
+					if r.warning == nil || isFatalReaderError(err) {
+						return nil, err
+					}
+					font.Recovered = true
+					r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid FontBBox ignored: %v", font.Name, err)})
+				} else {
+					font.type3Bounds = &box
 				}
-				font.type3Bounds = &box
 			}
 			procs, err := r.Resolve(dict["CharProcs"])
 			if err != nil {
@@ -466,7 +481,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			if cause := ctx.Err(); cause != nil {
 				return nil, cause
 			}
-			if r.warning == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if r.warning == nil || isFatalReaderError(err) {
 				return nil, err
 			}
 			font.Unicode = nil
@@ -498,24 +513,42 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		}
 		value, err := r.Resolve(boxObject)
 		if err != nil {
-			return nil, err
+			if r.warning == nil || isFatalReaderError(err) {
+				return nil, err
+			}
+			font.Recovered = true
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid FontBBox ignored: %v", font.Name, err)})
 		}
 		if subtype != "Type3" && value != nil {
-			boundsDeclared = true
 			array, ok := value.(Array)
 			if !ok || len(array) != 4 {
-				return nil, fmt.Errorf("invalid font bounding box")
-			}
-			var values [4]float64
-			for i, value := range array {
-				values[i], err = r.number(value)
-				if err != nil {
-					return nil, fmt.Errorf("font bounding box: %w", err)
+				if r.warning == nil {
+					return nil, fmt.Errorf("invalid font bounding box")
 				}
-			}
-			bounds := Rectangle{min(values[0], values[2]), min(values[1], values[3]), max(values[0], values[2]), max(values[1], values[3])}
-			if bounds.XMin < bounds.XMax && bounds.YMin < bounds.YMax {
-				font.BoundingBox = &bounds
+				font.Recovered = true
+				r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid FontBBox ignored", font.Name)})
+			} else {
+				var values [4]float64
+				var boxErr error
+				for i, value := range array {
+					values[i], boxErr = r.number(value)
+					if boxErr != nil {
+						break
+					}
+				}
+				if boxErr != nil {
+					if r.warning == nil || isFatalReaderError(boxErr) {
+						return nil, fmt.Errorf("font bounding box: %w", boxErr)
+					}
+					font.Recovered = true
+					r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid FontBBox ignored: %v", font.Name, boxErr)})
+				} else {
+					boundsDeclared = true
+					bounds := Rectangle{min(values[0], values[2]), min(values[1], values[3]), max(values[0], values[2]), max(values[1], values[3])}
+					if bounds.XMin < bounds.XMax && bounds.YMin < bounds.YMax {
+						font.BoundingBox = &bounds
+					}
+				}
 			}
 		}
 		missingWidth := d["MissingWidth"]
@@ -556,7 +589,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 					return nil, fmt.Errorf("invalid font program subtype")
 				}
 			}
-			font.Program, err = stream.DecodeContext(ctx)
+			font.Program, err = r.DecodeStreamContext(ctx, stream)
 			if err != nil {
 				return nil, err
 			}
@@ -676,6 +709,17 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			}
 		}
 	}
+	if !font.composite && len(font.Program) != 0 && cffProgram == nil && font.ProgramType != "FontFile" && (font.simpleCmap != nil || font.post != nil) && len(font.widths) == 0 && !font.defaultWidthDeclared && r.warning != nil {
+		metrics, err := readTTFFontMetrics(ctx, font.Program)
+		if cause := ctx.Err(); cause != nil {
+			return nil, cause
+		}
+		if err == nil {
+			font.ttfMetrics = metrics
+			font.Recovered = true
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q missing Widths; using embedded TrueType hmtx metrics", font.Name)})
+		}
+	}
 	if font.composite && len(font.Program) != 0 && cidSubtype == Name("CIDFontType0") && font.cffGlyphs == nil {
 		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without CFF program"}
 	}
@@ -684,53 +728,98 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid non-stream CIDToGIDMap; default Identity mapping retained", font.Name)})
 	}
 	if font.composite && metrics["CIDSystemInfo"] != nil {
+		hasEmbeddedCID := len(font.Program) != 0 && (font.cffGlyphs != nil || font.glyphCount != 0)
 		value, err := r.Resolve(metrics["CIDSystemInfo"])
 		if err != nil {
-			return nil, err
-		}
-		info, ok := value.(Dictionary)
-		if !ok {
-			return nil, fmt.Errorf("invalid CID system information")
-		}
-		registry, err := r.Resolve(info["Registry"])
-		if err != nil {
-			return nil, err
-		}
-		ordering, err := r.Resolve(info["Ordering"])
-		if err != nil {
-			return nil, err
-		}
-		reg, regOK := registry.(String)
-		ord, ordOK := ordering.(String)
-		if !regOK || !ordOK {
-			return nil, fmt.Errorf("invalid CID character collection")
-		}
-		mismatch := font.cidMap.ordering != "" && font.cidMap.ordering != "Identity" && (font.cidMap.ordering != string(ord) || font.cidMap.registry != string(reg))
-		if mismatch {
-			if r.warning == nil || len(font.Program) == 0 || font.cffGlyphs == nil && font.glyphCount == 0 {
-				return nil, fmt.Errorf("CMap and font character collections differ")
-			}
-			font.Recovered = true
-			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q CMap and font character collections differ; embedded CID glyph mapping retained without collection Unicode inference", font.Name)})
-		}
-		if !mismatch && string(reg) == "Adobe" {
-			index, err := cmapResourceIndex()
-			if err != nil {
+			if r.warning == nil || !hasEmbeddedCID || isFatalReaderError(err) {
 				return nil, err
 			}
-			name := Name("Adobe-" + string(ord) + "-UCS2")
-			if _, exists := index[name]; exists {
-				font.cidUnicode, err = loadUnicodeCMapContext(ctx, name, nil)
-				if err != nil {
-					return nil, err
+			font.Recovered = true
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid CIDSystemInfo ignored: %v; embedded CID glyph mapping retained", font.Name, err)})
+		}
+		if value != nil {
+			info, ok := value.(Dictionary)
+			if !ok {
+				if r.warning == nil || !hasEmbeddedCID {
+					return nil, fmt.Errorf("invalid CID system information")
+				}
+				font.Recovered = true
+				r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid CIDSystemInfo ignored; embedded CID glyph mapping retained", font.Name)})
+			} else {
+				registry, regErr := r.Resolve(info["Registry"])
+				if regErr != nil && (r.warning == nil || !hasEmbeddedCID || isFatalReaderError(regErr)) {
+					return nil, regErr
+				}
+				ordering, ordErr := r.Resolve(info["Ordering"])
+				if ordErr != nil && (r.warning == nil || !hasEmbeddedCID || isFatalReaderError(ordErr)) {
+					return nil, ordErr
+				}
+				if regErr != nil || ordErr != nil {
+					font.Recovered = true
+					r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid CIDSystemInfo ignored; embedded CID glyph mapping retained", font.Name)})
+				} else {
+					reg, regOK := registry.(String)
+					ord, ordOK := ordering.(String)
+					if !regOK || !ordOK {
+						if r.warning == nil || !hasEmbeddedCID {
+							return nil, fmt.Errorf("invalid CID character collection")
+						}
+						font.Recovered = true
+						r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid CID character collection ignored; embedded CID glyph mapping retained", font.Name)})
+					} else {
+						mismatch := font.cidMap.ordering != "" && font.cidMap.ordering != "Identity" && (font.cidMap.ordering != string(ord) || font.cidMap.registry != string(reg))
+						if mismatch {
+							if r.warning == nil || !hasEmbeddedCID {
+								return nil, fmt.Errorf("CMap and font character collections differ")
+							}
+							font.Recovered = true
+							r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q CMap and font character collections differ; embedded CID glyph mapping retained without collection Unicode inference", font.Name)})
+						}
+						if !mismatch && string(reg) == "Adobe" {
+							index, err := cmapResourceIndex()
+							if err != nil {
+								return nil, err
+							}
+							name := Name("Adobe-" + string(ord) + "-UCS2")
+							if _, exists := index[name]; exists {
+								font.cidUnicode, err = loadUnicodeCMapContext(ctx, name, nil)
+								if err != nil {
+									return nil, err
+								}
+							}
+						}
+					}
 				}
 			}
+		} else if err == nil {
+			if r.warning == nil || !hasEmbeddedCID {
+				return nil, fmt.Errorf("invalid CID system information")
+			}
+			font.Recovered = true
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid CIDSystemInfo ignored; embedded CID glyph mapping retained", font.Name)})
 		}
 	}
 	if !font.composite && len(font.Program) == 0 && len(font.widths) == 0 && !font.defaultWidthDeclared && r.warning != nil {
 		if name := coreFontAlias(font.Name); name != "" {
 			font.coreName, font.Recovered = name, true
 			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q missing widths recovered from existing Base14 %s metrics; source font name retained", font.Name, name)})
+		}
+		isCore := false
+		if font.Subtype == "Type1" || font.coreName != "" {
+			fonts, err := coreFonts()
+			if err != nil {
+				return nil, err
+			}
+			name := font.Name
+			if font.coreName != "" {
+				name = font.coreName
+			}
+			isCore = fonts[name] != nil
+		}
+		if !isCore {
+			font.allowMissingWidth = true
+			font.Recovered = true
+			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q missing Widths without embedded program; standard MissingWidth=0 used", font.Name)})
 		}
 	}
 	if (font.Subtype == "Type1" || font.coreName != "") && len(font.Program) == 0 && !boundsDeclared {
@@ -938,6 +1027,14 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 				return nil, &UnsupportedError{Feature: "unmapped simple font character"}
 			}
 		}
+		var glyphID uint16
+		if f.ttfMetrics != nil {
+			var err error
+			glyphID, err = f.resolvedSimpleGlyphContext(ctx, code, name)
+			if err != nil {
+				return nil, err
+			}
+		}
 		width, ok := f.widths[cid]
 		if f.composite {
 			width, ok = f.cidWidths.get(cid)
@@ -958,6 +1055,9 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 				}
 				width, ok = embeddedWidth, true
 			}
+			if f.ttfMetrics != nil {
+				width, ok = f.ttfMetrics.glyphWidth(glyphID), true
+			}
 			if len(f.widths) == 0 && core != nil {
 				if standardWidth, found := core.widths[name]; found {
 					width = standardWidth
@@ -968,7 +1068,7 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		if f.Subtype == Name("Type3") {
 			width *= f.type3Matrix[0] * 1000
 		}
-		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && (core == nil || name != ".notdef") {
+		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && !f.allowMissingWidth && (core == nil || name != ".notdef") {
 			if len(f.Program) != 0 {
 				return nil, &UnsupportedError{Feature: "embedded font metrics"}
 			}
@@ -991,23 +1091,14 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		if f.Subtype == Name("Type3") {
 			glyph.Name = name
 		}
-		if f.simpleCmap != nil || f.post != nil {
-			id, err := f.simpleGlyphContext(ctx, code, name)
+		if f.ttfMetrics != nil {
+			glyph.ID, glyph.HasID = glyphID, true
+		} else if f.simpleCmap != nil || f.post != nil {
+			id, err := f.resolvedSimpleGlyphContext(ctx, code, name)
 			if err != nil {
 				return nil, err
 			}
-			if f.cmapRecovered {
-				undefined := !f.symbolic && (name == "" || name == ".notdef")
-				blank := !f.symbolic && (name == "space" || name == "nonbreakingspace")
-				if id == 0 && !undefined && !blank || f.glyphCount != 0 && uint32(id) >= f.glyphCount {
-					return nil, fmt.Errorf("font %q %w for character code %#x (%q)", f.Name, errRecoveredCmapGlyphUnavailable, code, name)
-				}
-			}
-			if f.glyphCount != 0 && uint32(id) >= f.glyphCount {
-				id = 0
-			}
-			glyph.ID = id
-			glyph.HasID = true
+			glyph.ID, glyph.HasID = id, true
 		}
 		if f.composite && len(f.Program) != 0 {
 			glyph.HasID = true
@@ -1037,6 +1128,27 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		return nil, err
 	}
 	return glyphs, nil
+}
+
+// resolvedSimpleGlyphContext 查找并校验简单TrueType字体的字形编号，越界编号归一为.notdef
+// 入参: ctx 取消上下文, code 字符码, name 字形名称
+// 返回: uint16 有效字形编号, error 映射、恢复校验或取消错误
+func (f *Font) resolvedSimpleGlyphContext(ctx context.Context, code uint32, name string) (uint16, error) {
+	id, err := f.simpleGlyphContext(ctx, code, name)
+	if err != nil {
+		return 0, err
+	}
+	if f.cmapRecovered {
+		undefined := !f.symbolic && (name == "" || name == ".notdef")
+		blank := !f.symbolic && (name == "space" || name == "nonbreakingspace")
+		if id == 0 && !undefined && !blank || f.glyphCount != 0 && uint32(id) >= f.glyphCount {
+			return 0, fmt.Errorf("font %q %w for character code %#x (%q)", f.Name, errRecoveredCmapGlyphUnavailable, code, name)
+		}
+	}
+	if f.glyphCount != 0 && uint32(id) >= f.glyphCount {
+		return 0, nil
+	}
+	return id, nil
 }
 
 // hasCIDGlyph 检查内嵌字体是否提供指定CID的有效字形

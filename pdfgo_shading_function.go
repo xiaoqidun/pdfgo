@@ -375,7 +375,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		if !ok {
 			return nil, fmt.Errorf("missing calculator function stream")
 		}
-		data, err := stream.Decode()
+		data, err := r.decodeStream(stream)
 		if err != nil {
 			return nil, err
 		}

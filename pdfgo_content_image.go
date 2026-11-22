@@ -290,7 +290,7 @@ func (p *pageInterpreter) recoverLZWImage(image *Image) error {
 	if err != nil || predictor != 1 {
 		return err
 	}
-	data, decodeErr := source.decodeContext(p.ctx, nil)
+	data, _, decodeErr := decodeLZWBytesContext(p.ctx, source.Data, early)
 	if err := p.ctx.Err(); err != nil {
 		return err
 	}
@@ -325,6 +325,7 @@ func (p *pageInterpreter) recoverLZWImage(image *Image) error {
 	delete(stream.Dictionary, "DecodeParms")
 	stream.Dictionary["Length"] = Integer(len(data))
 	stream.Data = data
+	stream.filterRefs = nil
 	image.Stream = &stream
 	if p.forms == nil {
 		p.forms = &formCache{}

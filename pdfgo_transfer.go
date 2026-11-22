@@ -254,7 +254,7 @@ func (r *Reader) halftoneTransfer(h *Halftone) (*TransferFunction, bool, error) 
 	if h == nil || h.Type == 0 || h.TransferFunction == nil {
 		return nil, false, nil
 	}
-	if h.reader != nil {
+	if !r.ownsObject(h.reader, h.cache) {
 		r = h.reader
 	}
 	value, err := r.Resolve(h.TransferFunction)

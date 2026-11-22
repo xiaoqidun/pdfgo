@@ -353,99 +353,67 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if value == nil && !annotation.IsStandard() {
 		return ctx.Err()
 	}
-	if value == nil && annotation.Subtype == "Stamp" {
-		stream, err := r.stampAppearance(annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && annotation.Subtype == "Widget" {
-		stream, err := r.widgetAppearance(ctx, page, annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && annotation.Subtype == "FreeText" {
-		text, err := r.ReadAnnotationTextContext(ctx, annotation, "Contents", visitor.Warning)
-		if err != nil {
-			return err
-		}
-		annotation.Dictionary = maps.Clone(annotation.Dictionary)
-		annotation.Dictionary["Contents"] = String("\xef\xbb\xbf" + text)
-		stream, err := r.variableTextAppearance(ctx, page, annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && annotation.Subtype == "Link" {
-		stream, err := r.linkAppearance(annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && (annotation.Subtype == "Text" || annotation.Subtype == "FileAttachment" || annotation.Subtype == "Sound" || annotation.Subtype == "Caret") {
-		stream, err := r.iconAppearance(annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && annotation.Subtype == "Ink" {
-		stream, err := r.inkAppearance(annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && annotation.Subtype == "Line" {
-		stream, err := r.lineAppearance(ctx, page, annotation, visitor.Warning)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && annotation.Subtype == "Redact" {
-		stream, err := r.redactionAppearance(ctx, annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && (annotation.Subtype == "Highlight" || annotation.Subtype == "Underline" || annotation.Subtype == "StrikeOut" || annotation.Subtype == "Squiggly") {
-		stream, err := r.textMarkupAppearance(annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && (annotation.Subtype == "Square" || annotation.Subtype == "Circle" || annotation.Subtype == "Polygon" || annotation.Subtype == "PolyLine") {
-		stream, err := r.shapeAppearance(annotation)
-		if err != nil {
-			return err
-		}
-		value = Dictionary{"N": stream}
-	}
-	if value == nil && annotation.Subtype == "Screen" {
-		return nil
-	}
-	if value == nil && annotation.Subtype == "Movie" {
-		movie, err := r.ReadMovie(annotation.Dictionary["Movie"])
-		if err != nil {
-			return err
-		}
-		if movie.Poster == Boolean(true) {
-			return &UnsupportedError{Feature: "poster extraction from movie"}
-		}
-		poster, ok := movie.Poster.(*Stream)
-		if !ok {
+	if value == nil {
+		var stream *Stream
+		var synthErr error
+		synthesized := true
+		switch annotation.Subtype {
+		case "Stamp":
+			stream, synthErr = r.stampAppearance(annotation)
+		case "Widget":
+			stream, synthErr = r.widgetAppearance(ctx, page, annotation)
+		case "FreeText":
+			var text string
+			text, synthErr = r.ReadAnnotationTextContext(ctx, annotation, "Contents", visitor.Warning)
+			if synthErr == nil {
+				annotation.Dictionary = maps.Clone(annotation.Dictionary)
+				annotation.Dictionary["Contents"] = String("\xef\xbb\xbf" + text)
+				stream, synthErr = r.variableTextAppearance(ctx, page, annotation)
+			}
+		case "Link":
+			stream, synthErr = r.linkAppearance(annotation)
+		case "Text", "FileAttachment", "Sound", "Caret":
+			stream, synthErr = r.iconAppearance(annotation)
+		case "Ink":
+			stream, synthErr = r.inkAppearance(annotation)
+		case "Line":
+			stream, synthErr = r.lineAppearance(ctx, page, annotation, visitor.Warning)
+		case "Redact":
+			stream, synthErr = r.redactionAppearance(ctx, annotation)
+		case "Highlight", "Underline", "StrikeOut", "Squiggly":
+			stream, synthErr = r.textMarkupAppearance(annotation)
+		case "Square", "Circle", "Polygon", "PolyLine":
+			stream, synthErr = r.shapeAppearance(annotation)
+		case "Screen":
 			return nil
+		case "Movie":
+			var movie Movie
+			movie, synthErr = r.ReadMovie(annotation.Dictionary["Movie"])
+			if synthErr == nil {
+				if movie.Poster == Boolean(true) {
+					synthErr = &UnsupportedError{Feature: "poster extraction from movie"}
+				} else if poster, ok := movie.Poster.(*Stream); !ok {
+					return nil
+				} else {
+					stream = &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Integer(1), Integer(1)}, "Resources": Dictionary{"XObject": Dictionary{"Poster": poster}}}, Data: []byte("/Poster Do"), reader: r, cache: r.cache, hasWarning: r.warning != nil}
+				}
+			}
+		default:
+			synthesized = false
 		}
-		stream := &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Integer(1), Integer(1)}, "Resources": Dictionary{"XObject": Dictionary{"Poster": poster}}}, Data: []byte("/Poster Do"), reader: r}
-		value = Dictionary{"N": stream}
+		if synthErr != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if visitor.Warning == nil || isFatalReaderError(synthErr) {
+				return synthErr
+			}
+			visitor.Warning(Diagnostic{Message: fmt.Sprintf("PDF %s annotation appearance synthesis failed: %v; omitted", annotation.Subtype, synthErr)})
+			return ctx.Err()
+		}
+		if synthesized {
+			value = Dictionary{"N": stream}
+		}
 	}
 	appearance, ok := value.(Dictionary)
 	if !ok {
@@ -469,6 +437,9 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		stream, err = r.widgetAppearance(ctx, page, annotation)
 		if err == nil {
 			visitor.Warning(Diagnostic{Message: "invalid PDF widget appearance replaced from field properties"})
+		} else if ctx.Err() == nil && !isFatalReaderError(err) {
+			visitor.Warning(Diagnostic{Message: "PDF Widget annotation appearance synthesis failed: " + err.Error() + "; omitted"})
+			return ctx.Err()
 		}
 	}
 	if errors.Is(err, ErrInvalidAnnotationAppearance) && visitor.Warning != nil {

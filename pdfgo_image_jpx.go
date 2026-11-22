@@ -618,7 +618,7 @@ func (r *Reader) jpxDefaults(stream *Stream) (int, Object, error) {
 	}
 	data := stream.Data
 	if len(filters) > 1 {
-		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": parameters[:len(parameters)-1]}, Data: data}).Decode()
+		data, err = r.decodeStream(&Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": parameters[:len(parameters)-1]}, Data: data})
 		if err != nil {
 			return 0, nil, err
 		}
@@ -716,13 +716,16 @@ func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object,
 		case 2, 3:
 			profile := specification[3:]
 			if len(profile) < 128 {
-				return nil, false, fmt.Errorf("invalid JPEG2000 ICC profile")
+				if r.warning == nil {
+					return nil, false, fmt.Errorf("invalid JPEG2000 ICC profile")
+				}
+				continue
 			}
 			components := map[string]Integer{"GRAY": 1, "RGB ": 3, "CMYK": 4}[string(profile[16:20])]
 			if components == 0 {
 				continue
 			}
-			space := Array{Name("ICCBased"), &Stream{Dictionary: Dictionary{"N": components}, Data: profile, reader: r}}
+			space := Array{Name("ICCBased"), &Stream{Dictionary: Dictionary{"N": components}, Data: profile, reader: r, cache: r.cache, hasWarning: r.warning != nil}}
 			if _, err := r.readICCColorSpace(space); err == nil {
 				return space, false, nil
 			}

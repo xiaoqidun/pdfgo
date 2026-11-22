@@ -270,7 +270,7 @@ func (r *Reader) ReadAnnotationTextContext(ctx context.Context, annotation Annot
 			break
 		}
 		var decoded []byte
-		decoded, err = value.DecodeContext(ctx)
+		decoded, err = r.DecodeStreamContext(ctx, value)
 		data = String(decoded)
 	default:
 		err = fmt.Errorf("invalid annotation %s: expected text string", field)
@@ -335,7 +335,7 @@ func (r *Reader) annotationTextString(ctx context.Context, object Object) (strin
 		if value == nil {
 			return "", fmt.Errorf("missing annotation text stream")
 		}
-		data, err = value.DecodeContext(ctx)
+		data, err = r.DecodeStreamContext(ctx, value)
 		if err != nil {
 			return "", err
 		}
@@ -474,7 +474,7 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 		}
 	}
 	resources = maps.Clone(resources)
-	stream := &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Real(w), Real(h)}, "Matrix": Array{Real(matrix[0]), Real(matrix[1]), Real(matrix[2]), Real(matrix[3]), Real(matrix[4]), Real(matrix[5])}, "Resources": resources}, reader: r}
+	stream := &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Real(w), Real(h)}, "Matrix": Array{Real(matrix[0]), Real(matrix[1]), Real(matrix[2]), Real(matrix[3]), Real(matrix[4]), Real(matrix[5])}, "Resources": resources}, reader: r, cache: r.cache, hasWarning: r.warning != nil}
 	if dict["FT"] == Name("Btn") && flags&(1<<16) == 0 {
 		if err := r.writeAnnotationToggleButton(ctx, annotation, mk, flags, frame, border, resources, &content, stroke); err != nil {
 			return nil, err

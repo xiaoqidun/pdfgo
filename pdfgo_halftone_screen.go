@@ -125,7 +125,7 @@ func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options Halft
 		return nil, fmt.Errorf("missing nonprimary halftone transfer function")
 	}
 	transferReader := r
-	if h.reader != nil {
+	if !r.ownsObject(h.reader, h.cache) {
 		r = h.reader
 	}
 	if r.closed {

@@ -34,8 +34,9 @@ type OutlineItem struct {
 }
 
 // WalkOutlines 按先序访问文档目录，包括折叠节点的子项，不限制层级
+// 配置Warning时跳过损坏、循环或格式异常的目录根及目录项，保留可访问条目并记录诊断
 // 入参: ctx 取消上下文, visit 零基层级和目录项的访问函数
-// 返回: error 目录结构、文本、循环或访问错误
+// 返回: error 目录结构、文本、循环、读取、解密、认证或访问错误
 func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) error) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("invalid outline context")
@@ -48,12 +49,22 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 		return err
 	}
 	value, err := r.Resolve(catalog["Outlines"])
-	if err != nil || value == nil {
-		return err
+	if err != nil {
+		if !r.recoverAuxiliary(err) {
+			return err
+		}
+		return ctx.Err()
+	}
+	if value == nil {
+		return nil
 	}
 	outlines, ok := value.(Dictionary)
 	if !ok {
-		return fmt.Errorf("invalid outlines dictionary")
+		err := fmt.Errorf("invalid outlines dictionary")
+		if !r.recoverAuxiliary(err) {
+			return err
+		}
+		return ctx.Err()
 	}
 	type entry struct {
 		object Object
@@ -72,72 +83,127 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 		}
 		ref, ok := next.object.(Reference)
 		if !ok {
-			return fmt.Errorf("outline item is not indirect")
+			err := fmt.Errorf("outline item is not indirect")
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			continue
 		}
 		if seen[ref] {
-			return fmt.Errorf("repeated outline item")
+			err := fmt.Errorf("repeated outline item")
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			continue
 		}
 		seen[ref] = true
 		value, err := r.Resolve(ref)
 		if err != nil {
-			return err
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			continue
 		}
 		if value == nil {
 			continue
 		}
 		dict, ok := value.(Dictionary)
 		if !ok {
-			return fmt.Errorf("invalid outline item")
+			err := fmt.Errorf("invalid outline item")
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			continue
 		}
 		title, err := r.Resolve(dict["Title"])
 		if err != nil {
-			return err
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			stack = append(stack, entry{dict["Next"], next.level})
+			continue
 		}
 		text, ok := title.(String)
 		if !ok {
-			return fmt.Errorf("invalid outline title")
+			err := fmt.Errorf("invalid outline title")
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			stack = append(stack, entry{dict["Next"], next.level})
+			continue
 		}
 		item := OutlineItem{Reference: ref, Dictionary: dict, Destination: dict["Dest"], Action: dict["A"]}
 		item.Title, err = DecodeTextString(text)
 		if err != nil {
-			return err
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			stack = append(stack, entry{dict["Next"], next.level})
+			continue
 		}
 		count, err := r.Resolve(dict["Count"])
 		if err != nil {
-			return err
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
 		}
 		if count != nil {
 			n, ok := count.(Integer)
 			if !ok {
-				return fmt.Errorf("invalid outline count")
+				err := fmt.Errorf("invalid outline count")
+				if !r.recoverAuxiliary(err) {
+					return err
+				}
+			} else {
+				item.Expanded = n > 0
 			}
-			item.Expanded = n > 0
 		}
 		flags, err := r.Resolve(dict["F"])
 		if err != nil {
-			return err
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
 		}
 		if flags != nil {
 			n, ok := flags.(Integer)
 			if !ok || n < 0 {
-				return fmt.Errorf("invalid outline flags")
+				err := fmt.Errorf("invalid outline flags")
+				if !r.recoverAuxiliary(err) {
+					return err
+				}
+			} else {
+				item.Italic, item.Bold = n&1 != 0, n&2 != 0
 			}
-			item.Italic, item.Bold = n&1 != 0, n&2 != 0
 		}
 		color, err := r.Resolve(dict["C"])
 		if err != nil {
-			return err
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
 		}
 		if color != nil {
 			values, err := r.numberArray(color, 3)
 			if err != nil {
-				return err
-			}
-			for i, v := range values {
-				if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
-					return fmt.Errorf("invalid outline color")
+				if !r.recoverAuxiliary(err) {
+					return err
 				}
-				item.Color[i] = v
+			} else {
+				var rgb [3]float64
+				valid := true
+				for i, v := range values {
+					if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
+						err := fmt.Errorf("invalid outline color")
+						if !r.recoverAuxiliary(err) {
+							return err
+						}
+						valid = false
+						break
+					}
+					rgb[i] = v
+				}
+				if valid {
+					item.Color = rgb
+				}
 			}
 		}
 		if err := visit(next.level, item); err != nil {

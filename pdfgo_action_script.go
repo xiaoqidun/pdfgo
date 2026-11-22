@@ -45,7 +45,7 @@ func (r *Reader) ReadJavaScriptAction(ctx context.Context, object Object) (JavaS
 		if value == nil {
 			return result, fmt.Errorf("invalid JavaScript text stream")
 		}
-		data, err := value.DecodeContext(ctx)
+		data, err := r.DecodeStreamContext(ctx, value)
 		if err != nil {
 			return result, err
 		}
