@@ -165,11 +165,11 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 		if err != nil {
 			return nil, err
 		}
-		program, err := compileCalculator(data)
+		program, err := newCalculatorFunction(data, r.warning)
 		if err != nil {
 			return nil, err
 		}
-		evaluate = func(x float64, out []float64) error { return evaluateCalculator(program, []float64{x}, out) }
+		evaluate = func(x float64, out []float64) error { return program.evaluate([]float64{x}, out) }
 		if expressions, err := affineCalculator(data, 1, channels); err == nil {
 			for c, expression := range expressions {
 				stops := []GradientStop{{Position: 0, Values: [4]float64{expression[0] + expression[1]*domain[0]}}, {Position: 1, Values: [4]float64{expression[0] + expression[1]*domain[1]}}}

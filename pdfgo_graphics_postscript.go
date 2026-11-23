@@ -27,10 +27,13 @@ type PostScriptMark struct {
 	Resources Dictionary
 }
 
-// postscript 仅向显式输出访问器交付原始程序，其他设备不绘制
+// postscript 仅向显式输出访问器交付原始程序，缺省在非严格模式下警告并跳过
 // 入参: stream PostScript数据流
 // 返回: error 解码、访问或取消错误
 func (p *pageInterpreter) postscript(stream *Stream) error {
+	if p.hidden {
+		return nil
+	}
 	if err := p.ctx.Err(); err != nil {
 		return err
 	}
@@ -39,6 +42,10 @@ func (p *pageInterpreter) postscript(stream *Stream) error {
 		return err
 	}
 	if p.visitor.PostScript == nil {
+		if p.visitor.Warning == nil {
+			return &UnsupportedError{Feature: "PostScript visitor missing"}
+		}
+		p.visitor.Warning(Diagnostic{Message: "PostScript XObject skipped because PostScript visitor is not set"})
 		return nil
 	}
 	data, err := p.reader.DecodeStreamContext(p.ctx, stream)

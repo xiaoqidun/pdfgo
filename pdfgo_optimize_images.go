@@ -1808,7 +1808,7 @@ func (r *Reader) optimizePDFPixelImage(ctx context.Context, orig *Stream, dict D
 	}
 	for _, filter := range filters {
 		switch filter {
-		case Name("FlateDecode"), Name("LZWDecode"), Name("ASCII85Decode"), Name("ASCIIHexDecode"), Name("RunLengthDecode"):
+		case Name("FlateDecode"), Name("BrotliDecode"), Name("LZWDecode"), Name("ASCII85Decode"), Name("ASCIIHexDecode"), Name("RunLengthDecode"):
 		default:
 			return nil, ctx.Err()
 		}

@@ -450,6 +450,23 @@ func (i *Image) JBIG2File() ([]byte, error) {
 	return i.JBIG2FileContext(context.Background())
 }
 
+// validateJBIG2FileHeader 校验PDF内JBIG2流是否含完整文件头，统一处理全局段冲突及严格模式拒收
+// 入参: data JBIG2编码数据, hasGlobals 是否配置JBIG2Globals
+// 返回: bool 是否含完整文件头, error 冲突或严格模式错误
+func (i *Image) validateJBIG2FileHeader(data []byte, hasGlobals bool) (bool, error) {
+	if !bytes.HasPrefix(data, jbig2FileHeader[:8]) {
+		return false, nil
+	}
+	if hasGlobals {
+		return false, fmt.Errorf("JBIG2 stream with file header cannot use JBIG2Globals")
+	}
+	if i.Warning == nil {
+		return false, fmt.Errorf("JBIG2 stream cannot contain file header")
+	}
+	i.Warning(Diagnostic{Message: "JBIG2 image contains a complete file header; retaining original file"})
+	return true, nil
+}
+
 // JBIG2FileContext 无损封装单页JBIG2，前置过滤器与全局段解码期间检查取消
 // 入参: ctx 取消上下文
 // 返回: []byte 完整JBIG2文件或空值, error 参数、编码或取消错误
@@ -474,6 +491,10 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 	if encoded == nil {
 		return nil, nil
 	}
+	hasHeader, err := i.validateJBIG2FileHeader(encoded, params["JBIG2Globals"] != nil)
+	if err != nil {
+		return nil, err
+	}
 	var globals []byte
 	if params["JBIG2Globals"] != nil {
 		globals, err = i.jbig2GlobalsRaw(ctx, params["JBIG2Globals"])
@@ -485,14 +506,7 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	data := encoded
-	if bytes.HasPrefix(encoded, jbig2FileHeader[:8]) {
-		if len(globals) != 0 {
-			return nil, nil
-		}
-		if i.Warning != nil {
-			i.Warning(Diagnostic{Message: "JBIG2 image already has a complete file header; preserving original file without a second header"})
-		}
-	} else {
+	if !hasHeader {
 		data = make([]byte, 0, len(jbig2FileHeader)+len(globals)+len(encoded))
 		data = append(data, jbig2FileHeader...)
 		data = append(data, globals...)
@@ -934,14 +948,7 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 // 入参: ctx 取消上下文
 // 返回: image.Image 独立原始样本, error 解码或取消错误
 func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
-	return i.decodeSamplesSizeContext(ctx, image.Point{})
-}
-
-// decodeSamplesSizeContext 解码原始样本，仅对显式尺寸需求启用JPEG2000分辨率裁减
-// 入参: ctx 取消上下文, size 像素需求
-// 返回: image.Image 原始样本, error 解码或取消错误
-func (i *Image) decodeSamplesSizeContext(ctx context.Context, size image.Point) (image.Image, error) {
-	return i.decodeSamplesRowsContext(ctx, size, nil)
+	return i.decodeSamplesRowsContext(ctx, image.Point{}, nil)
 }
 
 // decodeSamplesRowsContext 解码原始样本，行输出时为JPEG2000保留有界解码窗口
@@ -978,31 +985,56 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 			parameters = parameters[:len(parameters)-1]
 		}
 	}
+	target := image.Point{}
+	if size.X > 0 && size.Y > 0 {
+		bounded := boundedSampleSize(i.Width, i.Height, size)
+		if bounded.X < i.Width || bounded.Y < i.Height {
+			target = bounded
+		}
+	}
+	if terminal == "" && target != (image.Point{}) {
+		result, handled, err := i.downsampleRawStreamContext(ctx, filters, parameters, target)
+		if handled {
+			return result, err
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 	data := i.Stream.Data
 	if terminal == "" || len(filters) != 0 {
 		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data}).decodeWith(ctx, nil, i.Warning, 0)
 		if err != nil {
 			if terminal == "" {
-				return i.recoverArrayPredictorSamplesContext(ctx, filters, parameters, err)
+				recovered, recErr := i.recoverArrayPredictorSamplesContext(ctx, filters, parameters, err)
+				if recErr != nil || target == (image.Point{}) {
+					return recovered, recErr
+				}
+				return downsampleDecodedImage(ctx, recovered, target)
 			}
 			return nil, err
 		}
 	}
 	var result image.Image
 	dimensionsRecovered := false
+	downsampled := false
 	switch terminal {
 	case "CCITTFaxDecode":
 		result, err = i.ccittSamplesContext(ctx, data, terminalParams)
 	case "DCTDecode":
-		result, err = i.jpegSamplesContext(ctx, data, terminalParams)
+		result, err = i.jpegSamplesSizeContext(ctx, data, terminalParams, target)
 		if err != nil {
 			return nil, err
 		}
+		downsampled = target != (image.Point{})
 	case "JBIG2Decode":
 		if i.BitsPerComponent != 1 {
 			return nil, fmt.Errorf("invalid JBIG2 component depth")
 		}
 		if _, _, err := imageBufferSize(i.Width, i.Height, 1); err != nil {
+			return nil, err
+		}
+		if _, err := i.validateJBIG2FileHeader(data, terminalParams["JBIG2Globals"] != nil); err != nil {
 			return nil, err
 		}
 		opts := i.jbig2DecodeOptions(ctx)
@@ -1042,8 +1074,10 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	case "JPXDecode":
 		cmyk := i.ColorSpace == Name("DeviceCMYK")
 		result, err = i.jpxSamplesRowsContext(ctx, data, cmyk, size, rows)
+		downsampled = size.X > 0 && size.Y > 0
 	default:
-		result, err = i.rawSamples(ctx, data)
+		result, err = i.rawSamplesSize(ctx, data, target)
+		downsampled = target != (image.Point{})
 	}
 	if canceled := ctx.Err(); canceled != nil {
 		return nil, canceled
@@ -1051,8 +1085,17 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	if err != nil {
 		return nil, err
 	}
-	if !dimensionsRecovered && (terminal != "JPXDecode" || size.X <= 0 || size.Y <= 0) && (result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height) && (i.Warning == nil || terminal != "DCTDecode" && terminal != "JPXDecode") {
+	if !dimensionsRecovered && !downsampled && (result.Bounds().Dx() != i.Width || result.Bounds().Dy() != i.Height) && (i.Warning == nil || terminal != "DCTDecode" && terminal != "JPXDecode") {
 		return nil, fmt.Errorf("decoded image dimensions differ from dictionary")
+	}
+	if !downsampled && target != (image.Point{}) {
+		dst := boundedSampleSize(result.Bounds().Dx(), result.Bounds().Dy(), target)
+		if dst.X < result.Bounds().Dx() || dst.Y < result.Bounds().Dy() {
+			result, err = downsampleDecodedImage(ctx, result, dst)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	return result, nil
 }
@@ -1328,7 +1371,7 @@ func (i *Image) decodeImage(ctx context.Context, target *ImageComponents, sample
 	return i.decodeImageSize(ctx, target, sampled, image.Point{})
 }
 
-// decodeImageSize 共用颜色和遮罩解释，有外部遮罩或索引色时保留完整原始样本
+// decodeImageSize 共用颜色和遮罩解释，按显式像素需求对主图、遮罩及索引色分级降采样
 // 入参: ctx 取消上下文, target 可选分量输出, sampled 延迟分量采样, size 显式像素需求
 // 返回: image.Image 显示图像，分量模式下为空, error 解码错误
 func (i *Image) decodeImageSize(ctx context.Context, target *ImageComponents, sampled bool, size image.Point) (image.Image, error) {
@@ -1505,29 +1548,66 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			ranges[n] = v
 		}
 	}
-	if target != nil || i.ImageMask || palette != nil || deviceN != nil || separation != nil {
+	if target != nil || writer != nil {
 		size = image.Point{}
-	} else if size.X > 0 && size.Y > 0 && embeddedMask == 0 {
-		mask, _, err := i.maskObject()
-		if err != nil {
-			return nil, err
-		}
-		if mask != nil {
-			size = image.Point{}
-		}
 	}
-	samples, err := i.decodeSamplesRowsContext(ctx, size, rows)
-	if err != nil {
-		return nil, err
-	}
-	var mask *imageResample
+	var maskImage *Image
 	var keys, matte []float64
 	var inverted bool
 	if embeddedMask == 0 {
-		mask, keys, inverted, matte, err = i.decodeMaskRows(ctx, components, rows)
+		var soft bool
+		maskImage, keys, soft, matte, err = i.prepareMask(ctx, components)
 		if err != nil {
 			return nil, err
 		}
+		inverted = !soft
+	}
+	fullW, fullH := i.Width, i.Height
+	if maskImage != nil {
+		fullW, fullH = max(fullW, maskImage.Width), max(fullH, maskImage.Height)
+	}
+	outSize := image.Point{}
+	if size.X > 0 && size.Y > 0 {
+		candidate := scaledImageSize(fullW, fullH, size)
+		if candidate.X < fullW || candidate.Y < fullH {
+			outSize = candidate
+		}
+	}
+	var mask *imageResample
+	if maskImage != nil {
+		maskSize := image.Point{}
+		if outSize != (image.Point{}) {
+			maskSize = boundedSampleSize(maskImage.Width, maskImage.Height, outSize)
+		}
+		decoded, err := maskImage.decodeImageRows(ctx, nil, false, maskSize, nil, rows)
+		if err != nil {
+			return nil, err
+		}
+		opaque, err := imageMaskOpaque(ctx, decoded, inverted)
+		if err != nil {
+			return nil, err
+		}
+		if opaque {
+			matte = nil
+			if size.X > 0 && size.Y > 0 {
+				candidate := scaledImageSize(i.Width, i.Height, size)
+				if candidate.X < i.Width || candidate.Y < i.Height {
+					outSize = candidate
+				} else {
+					outSize = image.Point{}
+				}
+			}
+		} else {
+			mask = &imageResample{source: decoded, bounds: decoded.Bounds(), interpolate: maskImage.Interpolate}
+		}
+	}
+	sampleSize := outSize
+	if palette != nil || len(keys) != 0 {
+		sampleSize = image.Point{}
+	}
+	samples, err := i.decodeSamplesRowsContext(ctx, sampleSize, rows)
+	if err != nil {
+		return nil, err
 	}
 	if embeddedMask != 0 {
 		if embeddedMask == 2 {
@@ -1540,17 +1620,51 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			}
 		}
 	}
-	if mask != nil {
-		opaque, err := imageMaskOpaque(ctx, mask.source, inverted)
-		if err != nil {
-			return nil, err
-		}
-		if opaque {
-			mask, matte = nil, nil
+	sampleHasAlpha := false
+	if outSize != (image.Point{}) && palette != nil && len(keys) == 0 && embeddedMask == 0 && len(matte) == 0 {
+		sb := samples.Bounds()
+		if sb.Dx() > outSize.X || sb.Dy() > outSize.Y {
+			dst := boundedSampleSize(sb.Dx(), sb.Dy(), outSize)
+			var expanded image.Image
+			expanded, sampleHasAlpha, err = downsampleIndexedImage(ctx, samples, palette, ranges[0], ranges[1], dst)
+			if err != nil {
+				return nil, err
+			}
+			samples = expanded
+			palette = nil
+			components = 3
+			defaultDecode = true
+			calibrated, lab, profile, separation, deviceN = nil, nil, nil, nil, nil
+			ranges = []float64{0, 1, 0, 1, 0, 1}
+			limits = []float64{0, 1, 0, 1, 0, 1}
+			displaySpace = &ColorSpace{Model: "DeviceRGB"}
 		}
 	}
 	bounds := samples.Bounds()
-	if mask != nil {
+	if outSize != (image.Point{}) {
+		if mask == nil {
+			targetSize := boundedSampleSize(bounds.Dx(), bounds.Dy(), outSize)
+			bounds = image.Rect(0, 0, targetSize.X, targetSize.Y)
+		} else {
+			bounds = image.Rect(0, 0, outSize.X, outSize.Y)
+		}
+		if palette == nil && len(keys) == 0 && (samples.Bounds().Dx() > bounds.Dx() || samples.Bounds().Dy() > bounds.Dy()) {
+			dst := boundedSampleSize(samples.Bounds().Dx(), samples.Bounds().Dy(), bounds.Size())
+			samples, err = downsampleDecodedImage(ctx, samples, dst)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if mask != nil && (mask.source.Bounds().Dx() > bounds.Dx() || mask.source.Bounds().Dy() > bounds.Dy()) {
+			dst := boundedSampleSize(mask.source.Bounds().Dx(), mask.source.Bounds().Dy(), bounds.Size())
+			scaledMask, err := downsampleDecodedImage(ctx, mask.source, dst)
+			if err != nil {
+				return nil, err
+			}
+			mask.source = scaledMask
+			mask.bounds = scaledMask.Bounds()
+		}
+	} else if mask != nil {
 		bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
 	}
 	if target == nil && (i.ColorSpace == Name("DeviceGray") && !i.ImageMask || rows != nil && i.ImageMask) && embeddedMask == 0 && mask == nil && len(keys) == 0 && len(matte) == 0 {
@@ -1565,9 +1679,9 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	if samples.Bounds() != bounds {
 		switch samples.(type) {
 		case *image.NRGBA, *image.NRGBA64:
-			samples = &deviceSampleImage{source: samples, byteExact: imageByteExact(samples)}
+			samples = &deviceSampleImage{source: samples, byteExact: imageByteExact(samples), embedded: sampleHasAlpha}
 		}
-		samples = &imageResample{source: samples, bounds: bounds, interpolate: i.Interpolate && palette == nil}
+		samples = &imageResample{source: samples, bounds: bounds, interpolate: i.Interpolate && palette == nil && len(keys) == 0}
 	}
 	if mask != nil {
 		mask.bounds = bounds
@@ -1585,7 +1699,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				}
 			}
 		}
-		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: float64((uint32(1) << i.BitsPerComponent) - 1), byteExact: byteExact, embedded: embeddedMask != 0}, nil
+		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: float64((uint32(1) << i.BitsPerComponent) - 1), byteExact: byteExact, embedded: embeddedMask != 0 || sampleHasAlpha}, nil
 	}
 	var out *image.NRGBA64
 	var encoder *pngImageEncoder
@@ -2189,10 +2303,10 @@ func (i *Image) palette() (*imagePalette, error) {
 	return result, nil
 }
 
-// decodeMaskRows 解析有效遮罩，行输出时复用JPEG2000解码窗口
-// 入参: ctx 取消上下文, components 原始图像分量数, rows 可选行解码资源
-// 返回: *imageResample 遮罩图像, []float64 色键范围, bool 是否反转灰度, []float64 预混合底色, error 错误信息
-func (i *Image) decodeMaskRows(ctx context.Context, components int, rows *imageRowContext) (*imageResample, []float64, bool, []float64, error) {
+// prepareMask 解析有效外部遮罩描述、色键和预混合底色，不提前解码遮罩像素
+// 入参: ctx 取消上下文, components 原始图像分量数
+// 返回: *Image 遮罩图像描述, []float64 色键范围, bool 是否软遮罩, []float64 预混合底色, error 错误信息
+func (i *Image) prepareMask(ctx context.Context, components int) (*Image, []float64, bool, []float64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -2247,6 +2361,7 @@ func (i *Image) decodeMaskRows(ctx context.Context, components int, rows *imageR
 		return nil, nil, false, nil, err
 	}
 	mask.Warning = i.Warning
+	mask.Workers = i.Workers
 	nestedMask, err := i.reader.Resolve(mask.Mask)
 	if err != nil {
 		return nil, nil, false, nil, err
@@ -2279,11 +2394,7 @@ func (i *Image) decodeMaskRows(ctx context.Context, components int, rows *imageR
 			}
 		}
 	}
-	decoded, err := mask.decodeImageRows(ctx, nil, false, image.Point{}, nil, rows)
-	if err != nil {
-		return nil, nil, false, nil, err
-	}
-	return &imageResample{source: decoded, bounds: decoded.Bounds(), interpolate: mask.Interpolate}, nil, !soft, matte, nil
+	return mask, nil, soft, matte, nil
 }
 
 // maskObject 解析生效的外部遮罩，软遮罩优先，空引用不构成遮罩
@@ -2355,18 +2466,14 @@ func (i *Image) ccittSamplesContext(ctx context.Context, data []byte, params Dic
 	return i.rawSamples(ctx, samples)
 }
 
-// rawSamples 接管独立解压缓冲，将设备色彩样本或颜色索引解释为图像
-// 入参: ctx 取消上下文, data 独立原始样本字节
-// 返回: image.Image 样本图像, error 错误信息
-func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+// rawSampleComponents 解析原始图像流对应的颜色分量数
+// 返回: int 分量数, error 颜色空间错误
+func (i *Image) rawSampleComponents() (int, error) {
 	components := 0
 	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
 		deviceN, err := i.reader.readDeviceNSpace(space, i.effectiveColorSpace, 0)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		components = deviceN.components
 	}
@@ -2396,21 +2503,42 @@ func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
 		profile, err := i.reader.Resolve(space[1])
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 		stream, ok := profile.(*Stream)
 		if !ok {
-			return nil, fmt.Errorf("invalid ICC profile stream")
+			return 0, fmt.Errorf("invalid ICC profile stream")
 		}
 		switch stream.Dictionary["N"] {
 		case Integer(1), Integer(3), Integer(4):
 			components = int(stream.Dictionary["N"].(Integer))
 		default:
-			return nil, &UnsupportedError{Feature: "image ICC component count"}
+			return 0, &UnsupportedError{Feature: "image ICC component count"}
 		}
 	}
 	if components == 0 {
-		return nil, &UnsupportedError{Feature: "raw image color space"}
+		return 0, &UnsupportedError{Feature: "raw image color space"}
+	}
+	return components, nil
+}
+
+// rawSamples 接管独立解压缓冲，将设备色彩样本或颜色索引解释为图像
+// 入参: ctx 取消上下文, data 独立原始样本字节
+// 返回: image.Image 样本图像, error 错误信息
+func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error) {
+	return i.rawSamplesSize(ctx, data, image.Point{})
+}
+
+// rawSamplesSize 将独立原始样本解释为图像，有目标尺寸时直接按行盒式降采样
+// 入参: ctx 取消上下文, data 独立原始样本字节, target 目标尺寸限制
+// 返回: image.Image 样本图像, error 错误信息
+func (i *Image) rawSamplesSize(ctx context.Context, data []byte, target image.Point) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	components, err := i.rawSampleComponents()
+	if err != nil {
+		return nil, err
 	}
 	stride, expected, err := imageSampleSize(i.Width, i.Height, components, i.BitsPerComponent)
 	if err != nil {
@@ -2435,6 +2563,13 @@ func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error
 			}
 		}
 		data = bytes.Clone(data[:expected])
+	}
+	if target.X > 0 && target.Y > 0 {
+		dst := boundedSampleSize(i.Width, i.Height, target)
+		if dst.X < i.Width || dst.Y < i.Height {
+			result, _, err := i.downsampleRawReaderContext(ctx, bytes.NewReader(data), components, stride, dst, false)
+			return result, err
+		}
 	}
 	if components > 4 {
 		return &packedDeviceNImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent, channels: components}, nil

@@ -413,7 +413,7 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	if config.Width != i.Width || config.Height != i.Height {
-		if i.Warning == nil {
+		if i.Warning == nil || !jpegDimensionRecoveryAllowed(i.Width, i.Height, config.Width, config.Height) {
 			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
 		}
 		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using complete image data dimensions %dx%d", config.Width, config.Height)})
@@ -492,6 +492,13 @@ func (i *Image) jpegTransformContext(ctx context.Context, data []byte, params Di
 // 入参: ctx 取消上下文, data JPEG数据, params DCT解码参数
 // 返回: image.Image 原始颜色样本, error 参数、解码或取消错误
 func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dictionary) (image.Image, error) {
+	return i.jpegSamplesSizeContext(ctx, data, params, image.Point{})
+}
+
+// jpegSamplesSizeContext 按PDF的DCT颜色规则解码，并在存在显式缩小需求时直接盒式降采样
+// 入参: ctx 取消上下文, data JPEG数据, params DCT解码参数, size 目标尺寸限制
+// 返回: image.Image 原始或降采样后的颜色样本, error 参数、解码或取消错误
+func (i *Image) jpegSamplesSizeContext(ctx context.Context, data []byte, params Dictionary, size image.Point) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -512,7 +519,7 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 		return nil, err
 	}
 	if config.Width != i.Width || config.Height != i.Height {
-		if i.Warning == nil {
+		if i.Warning == nil || !jpegDimensionRecoveryAllowed(i.Width, i.Height, config.Width, config.Height) {
 			return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
 		}
 		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using image data dimensions %dx%d", config.Width, config.Height)})
@@ -520,7 +527,9 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 	if err := frame.sampleSize(); err != nil {
 		return nil, err
 	}
-	if components == 4 || components == 3 && (config.ColorModel != color.YCbCrModel || !transform) {
+	dst := boundedSampleSize(config.Width, config.Height, size)
+	downscale := size.X > 0 && size.Y > 0 && (dst.X < config.Width || dst.Y < config.Height)
+	if !downscale && (components == 4 || components == 3 && (config.ColorModel != color.YCbCrModel || !transform)) {
 		if _, _, err := imageBufferSize(config.Width, config.Height, 4); err != nil {
 			return nil, err
 		}
@@ -530,22 +539,45 @@ func (i *Image) jpegSamplesContext(ctx context.Context, data []byte, params Dict
 		return nil, err
 	}
 	if cmyk, ok := result.(*image.CMYK); ok {
-		for n := range cmyk.Pix {
+		out := &packedCMYKImage{data: cmyk.Pix, rect: cmyk.Rect, stride: cmyk.Stride, depth: 8}
+		if downscale {
+			scaled, err := downsampleDecodedImage(ctx, out, dst)
+			if err != nil {
+				return nil, err
+			}
+			out = scaled.(*packedCMYKImage)
+		}
+		for n := range out.data {
 			if n&4095 == 0 {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
 			}
-			cmyk.Pix[n] = 255 - cmyk.Pix[n]
+			out.data[n] = 255 - out.data[n]
 		}
-		return &packedCMYKImage{data: cmyk.Pix, rect: cmyk.Rect, stride: cmyk.Stride, depth: 8}, nil
+		return out, nil
 	}
 	if components != 3 {
+		if downscale {
+			return downsampleDecodedImage(ctx, result, dst)
+		}
 		return result, nil
 	}
 	ycbcr, rawYCbCr := result.(*image.YCbCr)
+	if downscale && rawYCbCr {
+		return downsampleYCbCr(ctx, ycbcr, dst, transform)
+	}
 	if transform == rawYCbCr {
+		if downscale {
+			return downsampleDecodedImage(ctx, result, dst)
+		}
 		return result, nil
+	}
+	if downscale {
+		result, err = downsampleDecodedImage(ctx, result, dst)
+		if err != nil {
+			return nil, err
+		}
 	}
 	out := image.NewRGBA(result.Bounds())
 	for y := out.Rect.Min.Y; y < out.Rect.Max.Y; y++ {
@@ -635,10 +667,23 @@ func (i *Image) jpegReadTransformContext(ctx context.Context, data []byte, param
 	return candidate, frame, transform, tagged, ctx.Err()
 }
 
+// jpegDimensionRecoveryAllowed 判断宽松模式下JPEG与字典的尺寸差异是否属于可恢复的单向偏差
+// 入参: dictWidth 字典宽度, dictHeight 字典高度, frameWidth 编码宽度, frameHeight 编码高度
+// 返回: bool 是否允许按编码尺寸恢复
+func jpegDimensionRecoveryAllowed(dictWidth, dictHeight, frameWidth, frameHeight int) bool {
+	if frameWidth <= 0 || frameHeight <= 0 {
+		return false
+	}
+	return frameWidth == dictWidth || frameHeight == dictHeight
+}
+
 // jpegDimensionFileContext 用完整扫描验证字典高度候选，禁止截去额外MCU行或按损坏高度分配巨幅图像
 // 入参: ctx 取消上下文, data JPEG数据, frame 原编码布局, params DCT参数
 // 返回: []byte 已验证的编码副本或原编码, error 不完整扫描、预算或取消错误
 func (i *Image) jpegDimensionFileContext(ctx context.Context, data []byte, frame jpegFrame, params Dictionary) ([]byte, error) {
+	if !jpegDimensionRecoveryAllowed(i.Width, i.Height, frame.width, frame.height) {
+		return nil, fmt.Errorf("JPEG dimensions differ from image dictionary")
+	}
 	validate := func(encoded []byte, width, height int) error {
 		if width <= 0 || height <= 0 || width > jpegRecoveryPixelLimit/height {
 			return fmt.Errorf("JPEG dimension recovery exceeds sample budget")

@@ -29,7 +29,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/andybalholm/brotli"
 )
+
+// brotliDecodeLimit 限制BrotliDecode单流最大解压字节数，防止压缩炸弹耗尽内存
+const brotliDecodeLimit = 256 << 20
 
 // streamFilterAliases 保存内联图像的标准过滤器缩写
 var streamFilterAliases = map[Name]Name{
@@ -44,6 +49,9 @@ var streamFilterAliases = map[Name]Name{
 
 // flateReaderPool 复用zlib解码器，降低高频Flate流解压的堆分配
 var flateReaderPool sync.Pool
+
+// brotliReaderPool 复用Brotli解码器，降低高频Brotli流解压的堆分配
+var brotliReaderPool sync.Pool
 
 // emptyZlibStream 保存空数据的合法zlib流，用于在归还解码器时解除原输入引用
 var emptyZlibStream = []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}
@@ -75,9 +83,9 @@ type contextInput struct {
 }
 
 // completeFlatePayload 验证完整压缩块及截断校验尾部，不恢复截断压缩数据
-// 入参: ctx 取消上下文, encoded 压缩数据, decoded 已解码数据
+// 入参: ctx 取消上下文, encoded 压缩数据, decodedLen 已解码字节长度
 // 返回: bool 是否仅存在校验尾部问题
-func completeFlatePayload(ctx context.Context, encoded, decoded []byte) bool {
+func completeFlatePayload(ctx context.Context, encoded []byte, decodedLen int64) bool {
 	if len(encoded) < 2 || encoded[1]&0x20 != 0 {
 		return false
 	}
@@ -86,7 +94,7 @@ func completeFlatePayload(ctx context.Context, encoded, decoded []byte) bool {
 	checksum := adler32.New()
 	count, err := io.Copy(checksum, &contextInput{ctx: ctx, reader: reader})
 	closeErr := reader.Close()
-	if err != nil || closeErr != nil || ctx.Err() != nil || count != int64(len(decoded)) || source.Len() > 4 {
+	if err != nil || closeErr != nil || ctx.Err() != nil || count != decodedLen || source.Len() > 4 {
 		return false
 	}
 	var expected [4]byte
@@ -695,6 +703,28 @@ func releaseZlibReader(reader io.ReadCloser) {
 	}
 }
 
+// acquireBrotliReader 从池中获取并重置Brotli解码器，启用RFC 9841大窗口以支持PDF 2.0扩展流
+// 入参: input 压缩数据输入流
+// 返回: *brotli.Reader 可用解码器
+func acquireBrotliReader(input io.Reader) *brotli.Reader {
+	if cached, ok := brotliReaderPool.Get().(*brotli.Reader); ok {
+		_ = cached.Reset(input)
+		return cached
+	}
+	return brotli.NewReaderOptions(input, brotli.ReaderOptions{LargeWindow: true})
+}
+
+// releaseBrotliReader 清除输入引用后按规模决定是否归还Brotli解码器，避免大窗口长期驻留内存
+// 入参: reader 待归还的解码器, decodedBytes 已解码字节数, failed 是否发生异常或超限
+func releaseBrotliReader(reader *brotli.Reader, decodedBytes int64, failed bool) {
+	if failed || decodedBytes > 1<<20 {
+		return
+	}
+	if reader.Reset(bytes.NewReader(nil)) == nil {
+		brotliReaderPool.Put(reader)
+	}
+}
+
 // estimateFlateCapacity 根据流字典Length及压缩长度预估解压输出缓冲容量
 // 入参: dict 流字典, encodedLen 压缩数据长度, limit 解码字节上限
 // 返回: int 建议初始容量
@@ -812,7 +842,7 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 		dict, _ := params[i].(Dictionary)
 		if limit > 0 {
 			predictor, err := integerDefault(dict, "Predictor", 1)
-			if name != "FlateDecode" || err != nil || predictor != 1 {
+			if name != "FlateDecode" && name != "BrotliDecode" || err != nil || predictor != 1 {
 				return nil, fmt.Errorf("unsupported bounded object stream filter")
 			}
 		}
@@ -840,7 +870,7 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 				if err == nil {
 					err = closeErr
 				}
-				if warning != nil && ctx.Err() == nil && (errors.Is(err, zlib.ErrChecksum) || err == io.ErrUnexpectedEOF && completeFlatePayload(ctx, encoded, data)) {
+				if warning != nil && ctx.Err() == nil && (errors.Is(err, zlib.ErrChecksum) || err == io.ErrUnexpectedEOF && completeFlatePayload(ctx, encoded, int64(len(data)))) {
 					message := "Flate checksum truncated; complete compressed data retained"
 					if errors.Is(err, zlib.ErrChecksum) {
 						message = "Flate checksum mismatch; complete compressed data retained"
@@ -848,6 +878,27 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 					warning(Diagnostic{Message: message})
 					err = nil
 				}
+			}
+		case "BrotliDecode":
+			encoded := data
+			maxBytes := int64(brotliDecodeLimit)
+			if limit > 0 && limit < maxBytes {
+				maxBytes = limit
+			}
+			reader := acquireBrotliReader(&contextInput{ctx: ctx, reader: bytes.NewReader(encoded)})
+			input := io.LimitReader(&contextInput{ctx: ctx, reader: reader}, maxBytes+1)
+			data, err = readAllEstimated(input, estimateFlateCapacity(s.Dictionary, len(encoded), maxBytes))
+			exceeded := int64(len(data)) > maxBytes
+			releaseBrotliReader(reader, int64(len(data)), exceeded || err != nil)
+			if exceeded {
+				if limit > 0 {
+					return nil, fmt.Errorf("stream recovery decode limit exceeded")
+				}
+				return nil, fmt.Errorf("Brotli decode limit exceeded")
+			}
+			if warning != nil && ctx.Err() == nil && err != nil && err.Error() == "brotli: excessive input" {
+				warning(Diagnostic{Message: "Brotli stream has trailing bytes; complete compressed data retained"})
+				err = nil
 			}
 		case "LZWDecode":
 			var early int64
@@ -870,7 +921,7 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 		if err != nil {
 			return nil, err
 		}
-		if name == "FlateDecode" || name == "LZWDecode" {
+		if name == "FlateDecode" || name == "LZWDecode" || name == "BrotliDecode" {
 			data, err = restorePredictorContext(ctx, data, dict)
 			if err != nil {
 				return nil, err
@@ -1047,7 +1098,7 @@ func (s *Stream) filterChainWith(reader *Reader, warning func(Diagnostic)) (Arra
 				warning(Diagnostic{Message: "abbreviated stream filter expanded: " + string(filters[i].(Name))})
 				filters[i] = name
 			}
-			for _, name := range []Name{"FlateDecode", "LZWDecode", "ASCIIHexDecode", "ASCII85Decode", "RunLengthDecode", "CCITTFaxDecode", "DCTDecode", "JPXDecode", "JBIG2Decode", "Crypt"} {
+			for _, name := range []Name{"FlateDecode", "BrotliDecode", "LZWDecode", "ASCIIHexDecode", "ASCII85Decode", "RunLengthDecode", "CCITTFaxDecode", "DCTDecode", "JPXDecode", "JBIG2Decode", "Crypt"} {
 				if filters[i] != name && strings.EqualFold(string(filters[i].(Name)), string(name)) {
 					warning(Diagnostic{Message: "stream filter name case normalized: " + string(filters[i].(Name))})
 					filters[i] = name

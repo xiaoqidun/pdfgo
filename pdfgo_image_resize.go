@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"math"
 
 	"golang.org/x/image/draw"
 )
@@ -42,12 +41,11 @@ func ResizeImage(ctx context.Context, src image.Image, size image.Point) (image.
 	if size.X <= 0 || size.Y <= 0 || bounds.Empty() {
 		return src, nil
 	}
-	scale := math.Max(float64(size.X)/float64(bounds.Dx()), float64(size.Y)/float64(bounds.Dy()))
-	if scale >= 1 {
+	scaled := scaledImageSize(bounds.Dx(), bounds.Dy(), size)
+	width, height := scaled.X, scaled.Y
+	if width >= bounds.Dx() && height >= bounds.Dy() {
 		return src, nil
 	}
-	width := max(1, int(math.Ceil(float64(bounds.Dx())*scale)))
-	height := max(1, int(math.Ceil(float64(bounds.Dy())*scale)))
 	if int64(width) > optimizationBufferLimit/4/int64(height) {
 		return src, nil
 	}
@@ -94,7 +92,7 @@ func (i *Image) DecodeImageSize(size image.Point) (image.Image, error) {
 }
 
 // DecodeImageSizeContext 按显式像素需求解码并等比缩小，不改变原始图像描述
-// JPEG2000设备色及校准色可提前裁减高分辨率层；外部遮罩及索引色先按完整样本解释
+// 支持对JPEG、JPEG2000、通用流、外部遮罩及调色板、专色图像分级降采样
 // 零值或非正需求保持完整尺寸，缩小结果不用于无损输出
 // 入参: ctx 取消上下文, size 两轴像素需求
 // 返回: image.Image 显示图像, error 参数、解码或取消错误

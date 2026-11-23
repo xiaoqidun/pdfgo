@@ -232,7 +232,8 @@ type ReplacementText struct {
 // Halftones提供只读设备命名网屏，优先于文件中的同名备用定义
 // Form可保留普通表单边界，缺省直接展开；透明表单仍由Group接收
 // Form的子访问器接收已变换并裁剪的图元，不应再次应用表单矩阵
-// Form及Group的子访问器未指定内容标记、可选内容及警告回调时沿用上层回调
+// Form及Group的子访问器未指定内容标记、可选内容、PostScript及警告回调时沿用上层回调
+// PostScript接收PostScript XObject原始程序，缺省在Warning非空时发出诊断并跳过，Warning为空时返回错误
 // Warning非空时诊断无效内容指令及可恢复外观，保留有效绘制和已有文字定位
 type Visitor struct {
 	Path            func(PathMark) error
@@ -685,6 +686,9 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			}
 			if v.Halftones == nil {
 				v.Halftones = visitor.Halftones
+			}
+			if v.PostScript == nil {
+				v.PostScript = visitor.PostScript
 			}
 			child.visitor = v
 			return child.run(data.Bytes())
@@ -2062,12 +2066,12 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 			}
 			*flag.target = bool(boolean)
 		}
-		var space Object
-		if groupMark.Isolated || p.maskGroup == stream {
-			space, err = groupReader.Resolve(group["CS"])
-			if err != nil {
-				return err
-			}
+		if p.maskGroup == stream {
+			groupMark.Isolated = true
+		}
+		space, err := groupReader.Resolve(group["CS"])
+		if err != nil {
+			return err
 		}
 		if space != nil {
 			space, err = groupReader.resourceColorSpace(space, groupResources)
@@ -2187,6 +2191,9 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 			if visitor.Halftones == nil {
 				visitor.Halftones = child.visitor.Halftones
 			}
+			if visitor.PostScript == nil {
+				visitor.PostScript = child.visitor.PostScript
+			}
 			group.visitor = visitor
 			return walk(&group)
 		})
@@ -2216,6 +2223,9 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 			}
 			if visitor.Halftones == nil {
 				visitor.Halftones = child.visitor.Halftones
+			}
+			if visitor.PostScript == nil {
+				visitor.PostScript = child.visitor.PostScript
 			}
 			form.visitor = visitor
 			return walk(&form)

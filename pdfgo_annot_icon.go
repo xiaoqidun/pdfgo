@@ -94,8 +94,14 @@ func (r *Reader) iconAppearance(annotation Annotation) (*Stream, error) {
 			return nil, err
 		}
 	}
+	x, y := box.XMin, box.YMin
+	width, height := box.XMax-box.XMin, box.YMax-box.YMin
+	if annotation.Subtype == "Text" {
+		width, height = min(width, 20), min(height, 20)
+		y = box.YMax - height
+	}
 	var content strings.Builder
-	fmt.Fprintf(&content, "%g 0 0 %g %g %g cm 1 w 1 J 1 j 0 G\n", (box.XMax-box.XMin)/16, (box.YMax-box.YMin)/16, box.XMin, box.YMin)
+	fmt.Fprintf(&content, "%g 0 0 %g %g %g cm 1 w 1 J 1 j 0 G\n", width/16, height/16, x, y)
 	if annotation.Subtype == "Text" && annotation.Dictionary["C"] == nil {
 		border.color = Array{Integer(1), Integer(1), Integer(0)}
 	}

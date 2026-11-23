@@ -27,7 +27,7 @@ import (
 )
 
 // objectStreamCacheLimit 限制多个对象流的解码缓存，单个超限流仅保留最近一次
-const objectStreamCacheLimit = 16 << 20
+const objectStreamCacheLimit = 64 << 20
 
 // streamCacheBudget 限制Reader缓存的流对象总字节上限
 const streamCacheBudget = 32 << 20
@@ -57,7 +57,7 @@ type Reader struct {
 	colorProfiles      map[[32]byte]*iccColorSpace
 	deviceProfile      *Stream
 	colorProfileDepth  int
-	objectStreams      [4]*objectStream
+	objectStreams      [8]*objectStream
 	security           *standardSecurity
 	warning            func(Diagnostic)
 	textShaper         TextShaper
@@ -1216,7 +1216,7 @@ func (r *Reader) rebuildCompressedEntries(index map[int64]xrefEntry, trailer Dic
 	local.xref, local.Trailer = index, trailer
 	local.cache, local.loading = newObjectCache(streamCacheBudget), map[Reference]bool{}
 	local.recoveryIndex, local.recoveryTried = index, true
-	local.objectStreams = [4]*objectStream{}
+	clear(local.objectStreams[:])
 	candidates := map[int64]xrefEntry{}
 	remaining := int64(readerRecoveryLimit)
 	seen := map[Reference]bool{}
@@ -1459,7 +1459,7 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 }
 
 // streamExtent 校验声明的流长度，恢复时只接受有完整结束封装的唯一候选
-// 入参: start 流数据起点, length 声明长度，负值表示缺失
+// 入参: start 流数据起点, length 声明长度，负值表示缺失, ref 对象引用
 // 返回: int64 实际长度, int64 封装末尾, error 读取或边界错误
 func (r *Reader) streamExtent(start, length int64, ref Reference) (int64, int64, error) {
 	var end int64
@@ -2051,16 +2051,18 @@ func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error
 		copy(r.objectStreams[1:], r.objectStreams[:len(r.objectStreams)-1])
 		r.objectStreams[0] = stream
 		used := stream.bytes
-		for i, cached := range r.objectStreams[1:] {
+		kept := 1
+		for _, cached := range r.objectStreams[1:] {
 			if cached == nil {
 				break
 			}
-			used += cached.bytes
-			if used > objectStreamCacheLimit {
-				clear(r.objectStreams[i+1:])
-				break
+			if used+cached.bytes <= objectStreamCacheLimit {
+				r.objectStreams[kept] = cached
+				kept++
+				used += cached.bytes
 			}
 		}
+		clear(r.objectStreams[kept:])
 	}
 	index := entry.generation
 	if index < 0 || index >= int64(len(stream.ids)) || stream.ids[index] != ref.Number {

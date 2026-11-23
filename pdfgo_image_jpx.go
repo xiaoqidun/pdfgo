@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -843,6 +844,27 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 		raster, err = rowReader.read(ctx, 0, 1)
 	} else {
 		raster, err = decoder.DecodeSize(ctx, size)
+	}
+	if err != nil && size != (image.Point{}) {
+		full := decoder.Info().Bounds
+		var limitErr *j2kgo.LimitError
+		for errors.As(err, &limitErr) {
+			shift := uint(reduce + 1)
+			if shift >= 31 {
+				break
+			}
+			nextSize := image.Point{X: max(1, full.Dx()>>shift), Y: max(1, full.Dy()>>shift)}
+			nextReduce, reduceErr := decoder.Reduction(nextSize)
+			if reduceErr != nil || nextReduce <= reduce {
+				break
+			}
+			reduce = nextReduce
+			raster, err = decoder.DecodeSize(ctx, nextSize)
+			if err == nil && i.Warning != nil {
+				b := raster.Info().Bounds
+				i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG2000 target size reduced to %dx%d to stay within wavelet memory budget", b.Dx(), b.Dy())})
+			}
+		}
 	}
 	if err != nil {
 		return nil, err
