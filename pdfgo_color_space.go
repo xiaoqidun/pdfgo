@@ -15,6 +15,8 @@
 package pdfgo
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"reflect"
@@ -89,6 +91,72 @@ func (s *ColorSpace) Equal(other *ColorSpace) bool {
 		return *s.profile.signature == *other.profile.signature && reflect.DeepEqual(s.profile.ranges, other.profile.ranges)
 	}
 	return reflect.DeepEqual(s.profile, other.profile)
+}
+
+// Digest 返回颜色空间配置的内容摘要，不支持确定性摘要的复合空间返回false
+// 返回: [32]byte 内容摘要, bool 是否生成确定性摘要
+func (s *ColorSpace) Digest() ([32]byte, bool) {
+	var zero [32]byte
+	if s == nil {
+		return zero, true
+	}
+	h := sha256.New()
+	var buf [8]byte
+	writeU64 := func(v uint64) {
+		binary.LittleEndian.PutUint64(buf[:], v)
+		h.Write(buf[:])
+	}
+	writeFloat := func(v float64) {
+		if v == 0 {
+			v = 0
+		}
+		writeU64(math.Float64bits(v))
+	}
+	writeU64(uint64(len(s.Model)))
+	h.Write([]byte(s.Model))
+	if s.mapped {
+		h.Write([]byte{1})
+	} else {
+		h.Write([]byte{0})
+	}
+	if s.profile == nil {
+		h.Write([]byte{0})
+		var sum [32]byte
+		h.Sum(sum[:0])
+		return sum, true
+	}
+	if s.profile.alternate != nil || s.profile.alternateBlending != nil {
+		return zero, false
+	}
+	h.Write([]byte{1})
+	if s.profile.signature != nil {
+		h.Write([]byte{1})
+		h.Write(s.profile.signature[:])
+	} else if len(s.profile.data) != 0 {
+		h.Write([]byte{2})
+		writeU64(uint64(len(s.profile.data)))
+		h.Write(s.profile.data)
+	} else {
+		return zero, false
+	}
+	if s.profile.lab {
+		h.Write([]byte{1})
+	} else {
+		h.Write([]byte{0})
+	}
+	writeU64(uint64(len(s.profile.intent)))
+	h.Write([]byte(s.profile.intent))
+	if s.profile.ranges != nil {
+		h.Write([]byte{1})
+		for _, v := range *s.profile.ranges {
+			writeFloat(v)
+		}
+	} else {
+		h.Write([]byte{0})
+	}
+	var sum [32]byte
+	h.Sum(sum[:0])
+	return sum, true
 }
 
 // SRGBEquivalent 检查混合空间与sRGB的偏差是否在8位量化精度内

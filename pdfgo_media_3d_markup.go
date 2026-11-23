@@ -42,6 +42,35 @@ func ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16]byte, error
 	if err != nil {
 		return result, err
 	}
+	return threeDArtworkMD5(ctx, data)
+}
+
+// ThreeDArtworkChecksum 在当前阅读器视图下计算三维模型数据的MD5，保留诊断回调与间接过滤器解析能力
+// 入参: ctx 取消上下文, stream 三维模型流
+// 返回: [16]byte 校验和, error 解码或取消错误
+func (r *Reader) ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16]byte, error) {
+	var result [16]byte
+	if ctx == nil || stream == nil {
+		return result, fmt.Errorf("invalid 3D artwork checksum source")
+	}
+	var data []byte
+	var err error
+	if r != nil && !r.closed && r.ownsObject(stream.reader, stream.cache) {
+		data, err = r.DecodeStreamContext(ctx, stream)
+	} else {
+		data, err = stream.DecodeContext(ctx)
+	}
+	if err != nil {
+		return result, err
+	}
+	return threeDArtworkMD5(ctx, data)
+}
+
+// threeDArtworkMD5 分块计算三维模型解码数据的MD5摘要并响应取消
+// 入参: ctx 取消上下文, data 解码后的模型字节
+// 返回: [16]byte 校验和, error 哈希或取消错误
+func threeDArtworkMD5(ctx context.Context, data []byte) ([16]byte, error) {
+	var result [16]byte
 	hash := md5.New()
 	for len(data) != 0 {
 		if err := ctx.Err(); err != nil {

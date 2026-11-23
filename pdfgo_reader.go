@@ -63,6 +63,7 @@ type Reader struct {
 	textShaper         TextShaper
 	decodeWorkers      int
 	jbig2Globals       *jbig2GlobalsCache
+	owner              *Reader
 	closed             bool
 	recoveryIndex      map[int64]xrefEntry
 	recoveryTried      bool
@@ -723,6 +724,10 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 	}
 	if stream, ok := value.(*Stream); ok && stream != nil {
 		stream.cacheFilterRefs(r)
+		if r.owner != nil {
+			stream.reader = r.owner
+			stream.hasWarning = r.owner.warning != nil
+		}
 	}
 	r.cache.set(ref, value)
 	return value, nil

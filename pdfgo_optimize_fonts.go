@@ -275,6 +275,7 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 		close(jobs)
 		count := min(workers, len(fontRefs))
 		sharedWarning := syncWarning(r.warning)
+		wasShared := r.cache != nil && r.cache.shared.Swap(true)
 		var wg sync.WaitGroup
 		wg.Add(count)
 		for range count {
@@ -308,6 +309,9 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 			}()
 		}
 		wg.Wait()
+		if r.cache != nil && !wasShared {
+			r.cache.shared.Store(false)
+		}
 		for _, res := range results {
 			if res.err != nil {
 				return nil, nil, res.err

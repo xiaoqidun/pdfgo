@@ -14,6 +14,15 @@
 
 package pdfgo
 
+import (
+	"bytes"
+	"encoding/binary"
+	"hash"
+	"maps"
+	"math"
+	"slices"
+)
+
 // Object 表示PDF对象，空对象使用nil表示
 type Object interface{ pdfObject() }
 
@@ -67,3 +76,177 @@ func (Dictionary) pdfObject() {}
 
 // pdfObject 将间接引用标记为PDF对象
 func (Reference) pdfObject() {}
+
+// EqualObject 按PDF值语义深度比较两个对象，流对象仅比较引用、字典与字节内容而不访问内部阅读器状态
+// 入参: a 左侧对象, b 右侧对象
+// 返回: bool 是否值等价
+func EqualObject(a, b Object) bool {
+	return equalObject(a, b, 0)
+}
+
+// equalObject 递归比较PDF对象值，限制嵌套深度以防循环结构栈溢出
+// 入参: a 左侧对象, b 右侧对象, depth 当前递归深度
+// 返回: bool 是否值等价
+func equalObject(a, b Object, depth int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if depth > 64 {
+		return false
+	}
+	switch x := a.(type) {
+	case Boolean:
+		y, ok := b.(Boolean)
+		return ok && x == y
+	case Integer:
+		y, ok := b.(Integer)
+		return ok && x == y
+	case Real:
+		y, ok := b.(Real)
+		return ok && (x == y || math.IsNaN(float64(x)) && math.IsNaN(float64(y)))
+	case Name:
+		y, ok := b.(Name)
+		return ok && x == y
+	case String:
+		y, ok := b.(String)
+		return ok && bytes.Equal(x, y)
+	case Reference:
+		y, ok := b.(Reference)
+		return ok && x == y
+	case Array:
+		y, ok := b.(Array)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if !equalObject(x[i], y[i], depth+1) {
+				return false
+			}
+		}
+		return true
+	case Dictionary:
+		y, ok := b.(Dictionary)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for k, xv := range x {
+			yv, exists := y[k]
+			if !exists || !equalObject(xv, yv, depth+1) {
+				return false
+			}
+		}
+		return true
+	case *Stream:
+		y, ok := b.(*Stream)
+		if !ok {
+			return false
+		}
+		if x == y {
+			return true
+		}
+		if x == nil || y == nil {
+			return false
+		}
+		return x.Reference == y.Reference && bytes.Equal(x.Data, y.Data) && equalObject(x.Dictionary, y.Dictionary, depth+1)
+	default:
+		return false
+	}
+}
+
+// HashObject 按PDF值语义将对象写入哈希器，流对象仅写入引用、字典与字节内容而不访问内部阅读器状态
+// 入参: h 目标哈希器, value 待摘要对象
+// 返回: bool 是否完成确定性摘要
+func HashObject(h hash.Hash, value Object) bool {
+	return hashObject(h, value, 0)
+}
+
+// hashObject 递归按规范顺序写入对象内容，限制嵌套深度防止循环结构溢出
+// 入参: h 目标哈希器, value 待摘要对象, depth 当前递归深度
+// 返回: bool 是否完成确定性摘要
+func hashObject(h hash.Hash, value Object, depth int) bool {
+	if depth > 64 {
+		return false
+	}
+	var buf [8]byte
+	writeU64 := func(v uint64) {
+		binary.LittleEndian.PutUint64(buf[:], v)
+		h.Write(buf[:])
+	}
+	if value == nil {
+		h.Write([]byte{'0'})
+		return true
+	}
+	switch v := value.(type) {
+	case Boolean:
+		if v {
+			h.Write([]byte{'B', 1})
+		} else {
+			h.Write([]byte{'B', 0})
+		}
+		return true
+	case Integer:
+		h.Write([]byte{'I'})
+		writeU64(uint64(v))
+		return true
+	case Real:
+		h.Write([]byte{'R'})
+		f := float64(v)
+		if math.IsNaN(f) {
+			writeU64(0x7ff8000000000001)
+		} else {
+			if f == 0 {
+				f = 0
+			}
+			writeU64(math.Float64bits(f))
+		}
+		return true
+	case Name:
+		h.Write([]byte{'N'})
+		writeU64(uint64(len(v)))
+		h.Write([]byte(v))
+		return true
+	case String:
+		h.Write([]byte{'S'})
+		writeU64(uint64(len(v)))
+		h.Write(v)
+		return true
+	case Reference:
+		h.Write([]byte{'X'})
+		writeU64(uint64(v.Number))
+		writeU64(uint64(v.Generation))
+		return true
+	case Array:
+		h.Write([]byte{'A'})
+		writeU64(uint64(len(v)))
+		for _, item := range v {
+			if !hashObject(h, item, depth+1) {
+				return false
+			}
+		}
+		return true
+	case Dictionary:
+		h.Write([]byte{'D'})
+		writeU64(uint64(len(v)))
+		for _, key := range slices.Sorted(maps.Keys(v)) {
+			writeU64(uint64(len(key)))
+			h.Write([]byte(key))
+			if !hashObject(h, v[key], depth+1) {
+				return false
+			}
+		}
+		return true
+	case *Stream:
+		if v == nil {
+			h.Write([]byte{'m'})
+			return true
+		}
+		h.Write([]byte{'M'})
+		writeU64(uint64(v.Reference.Number))
+		writeU64(uint64(v.Reference.Generation))
+		writeU64(uint64(len(v.Data)))
+		h.Write(v.Data)
+		return hashObject(h, v.Dictionary, depth+1)
+	default:
+		return false
+	}
+}

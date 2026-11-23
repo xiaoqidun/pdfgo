@@ -960,6 +960,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		origWarning := r.warning
 		sharedWarning := syncWarning(origWarning)
 		r.warning = sharedWarning
+		wasShared := r.cache != nil && r.cache.shared.Swap(true)
 		workCtx, workCancel = context.WithCancel(ctx)
 		taskCh = make(chan *streamOptJob, windowLimit)
 		pendingJobs = make(map[int]*streamOptJob, windowLimit)
@@ -981,6 +982,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			workCancel()
 			close(taskCh)
 			wg.Wait()
+			if r.cache != nil && !wasShared {
+				r.cache.shared.Store(false)
+			}
 			r.warning = origWarning
 			r.cache.pruneObjectsIfOver(originalCache, 0)
 		}()
@@ -1442,6 +1446,16 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 // 入参: warning 并发安全的警告回调
 // 返回: *Reader 独立工作阅读器
 func (r *Reader) workerReader(warning func(Diagnostic)) *Reader {
+	owner := r.owner
+	if owner == nil {
+		owner = r
+	}
+	var security *standardSecurity
+	if r.security != nil {
+		copied := *r.security
+		copied.key = bytes.Clone(r.security.key)
+		security = &copied
+	}
 	return &Reader{
 		Version:        r.Version,
 		Trailer:        r.Trailer,
@@ -1453,10 +1467,11 @@ func (r *Reader) workerReader(warning func(Diagnostic)) *Reader {
 		cache:          r.cache,
 		loading:        make(map[Reference]bool),
 		deviceProfile:  r.deviceProfile,
-		security:       r.security,
+		security:       security,
 		warning:        warning,
 		decodeWorkers:  1,
 		jbig2Globals:   r.jbig2Globals,
+		owner:          owner,
 	}
 }
 

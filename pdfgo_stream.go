@@ -958,7 +958,7 @@ func objectContainsReference(value Object) bool {
 			if key == "JBIG2Globals" {
 				continue
 			}
-			if _, ok := item.(Reference); ok {
+			if objectContainsReference(item) {
 				return true
 			}
 		}

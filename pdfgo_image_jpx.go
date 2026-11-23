@@ -431,15 +431,19 @@ func (i *Image) JPXLosslessContext(ctx context.Context) (bool, int, error) {
 	if err != nil {
 		return false, 0, err
 	}
+	defer decoder.Close()
 	info := decoder.Info()
-	_ = decoder.Close()
 	maxBitDepth := 0
 	for _, component := range info.Components {
 		if int(component.Precision) > maxBitDepth {
 			maxBitDepth = int(component.Precision)
 		}
 	}
-	return info.Lossless, maxBitDepth, ctx.Err()
+	lossless, err := decoder.Lossless(ctx)
+	if err != nil {
+		return false, 0, err
+	}
+	return lossless, maxBitDepth, ctx.Err()
 }
 
 // jpxMaskMode 读取JPEG2000内嵌软遮罩模式

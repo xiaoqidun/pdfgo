@@ -449,9 +449,6 @@ func encodePDFPaletted(ctx context.Context, img *image.Paletted, options ImageWr
 			},
 			Data: alpha.Bytes(),
 		}
-		if preblend {
-			mask.Dictionary["Matte"] = Array{Integer(1), Integer(1), Integer(1)}
-		}
 	}
 	return stream, mask, nil
 }
