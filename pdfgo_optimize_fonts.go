@@ -867,6 +867,61 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 				} else {
 					state = fontState{}
 				}
+			case "gs":
+				if len(op.Operands) != 1 || resources == nil {
+					state = fontState{unknown: true}
+					return nil
+				}
+				name, ok := op.Operands[0].(Name)
+				if !ok {
+					state = fontState{unknown: true}
+					return nil
+				}
+				gsVal, err := resolveMeta(resources["ExtGState"])
+				if err != nil {
+					return err
+				}
+				gsDict, ok := gsVal.(Dictionary)
+				if !ok {
+					state = fontState{unknown: true}
+					return nil
+				}
+				entry, exists := gsDict[name]
+				if !exists {
+					state = fontState{unknown: true}
+					return nil
+				}
+				stateVal, err := resolveMeta(entry)
+				if err != nil {
+					return err
+				}
+				stateDict, ok := stateVal.(Dictionary)
+				if !ok {
+					state = fontState{unknown: true}
+					return nil
+				}
+				if stateDict["Font"] == nil {
+					return nil
+				}
+				fontArrVal, err := resolveMeta(stateDict["Font"])
+				if err != nil {
+					return err
+				}
+				fontArr, ok := fontArrVal.(Array)
+				if !ok || len(fontArr) < 1 {
+					state = fontState{unknown: true}
+					return nil
+				}
+				ref, isTarget, valid := resolveFontTarget(fontArr[0])
+				if !valid {
+					state = fontState{unknown: true}
+					return nil
+				}
+				if isTarget {
+					state = fontState{ref: ref}
+				} else {
+					state = fontState{}
+				}
 			case "Tj", "'":
 				if len(op.Operands) < 1 {
 					return nil
@@ -1168,7 +1223,7 @@ func (r *Reader) optimizationContentData(ctx context.Context, stream *Stream, li
 			if err != nil {
 				return nil, err
 			}
-			data, _, err = decodeLZWBytesLimitContext(ctx, data, early, limit)
+			data, _, err = decodeLZWBytesLimitContext(ctx, data, early, int64(limit))
 			if err != nil {
 				return nil, err
 			}

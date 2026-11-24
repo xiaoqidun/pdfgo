@@ -73,11 +73,22 @@ func aes256PasswordHash(password, salt, user []byte, revision int) []byte {
 }
 
 // openAES256Security 认证R5/R6密码并校验AES-256文件密钥和权限
-// 入参: dict 加密字典, password 已编码密码, revision 安全处理器版本
+// 入参: dict 加密字典, password 已编码密码, revision 安全处理器版本, unencrypted 豁免加密引用集合
 // 返回: error 认证或参数错误
-func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision int) error {
-	length, err := integerDefault(dict, "Length", 256)
-	if err != nil || length != 256 {
+func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision int, unencrypted map[Reference]bool) error {
+	lengthObj, err := r.Resolve(dict["Length"])
+	if err != nil {
+		return err
+	}
+	length := int64(256)
+	if lengthObj != nil {
+		n, ok := lengthObj.(Integer)
+		if !ok {
+			return fmt.Errorf("invalid AES-256 key length")
+		}
+		length = int64(n)
+	}
+	if length != 256 {
 		return fmt.Errorf("invalid AES-256 key length")
 	}
 	values := make(map[Name][]byte, 5)
@@ -86,7 +97,11 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 		size int
 	}{{"U", 48}, {"UE", 32}, {"Perms", 16}, {"O", 48}, {"OE", 32}} {
 		name, size := field.name, field.size
-		value, ok := dict[name].(String)
+		resolved, err := r.Resolve(dict[name])
+		if err != nil {
+			return err
+		}
+		value, ok := resolved.(String)
 		if r.warning != nil && ok && (name == "O" || name == "U") && len(value) > size {
 			r.warning(Diagnostic{Message: fmt.Sprintf("AES-256 %s entry has trailing bytes; authenticating the first %d bytes", name, size)})
 			value = value[:size]
@@ -100,13 +115,21 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 		}
 		values[name] = value
 	}
-	permissions, ok := dict["P"].(Integer)
+	permObj, err := r.Resolve(dict["P"])
+	if err != nil {
+		return err
+	}
+	permissions, ok := permObj.(Integer)
 	if !ok || permissions < -1<<31 || permissions > 1<<32-1 {
 		return fmt.Errorf("invalid AES-256 permissions")
 	}
-	s := &standardSecurity{info: EncryptionInfo{Revision: revision, Permissions: uint32(permissions)}, encryptMetadata: true, streamFilter: "Identity", stringFilter: "Identity", embeddedFilter: "Identity"}
-	if value := dict["EncryptMetadata"]; value != nil {
-		flag, ok := value.(Boolean)
+	s := &standardSecurity{info: EncryptionInfo{Revision: revision, Permissions: uint32(permissions)}, encryptMetadata: true, streamFilter: "Identity", stringFilter: "Identity", embeddedFilter: "Identity", unencrypted: unencrypted}
+	metaObj, err := r.Resolve(dict["EncryptMetadata"])
+	if err != nil {
+		return err
+	}
+	if metaObj != nil {
+		flag, ok := metaObj.(Boolean)
 		if !ok {
 			return fmt.Errorf("invalid EncryptMetadata")
 		}
@@ -124,7 +147,11 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 		name   Name
 		target *Name
 	}{{"StmF", &s.streamFilter}, {"StrF", &s.stringFilter}} {
-		if value := dict[entry.name]; value != nil {
+		value, err := r.Resolve(dict[entry.name])
+		if err != nil {
+			return err
+		}
+		if value != nil {
 			*entry.target, ok = value.(Name)
 			if !ok {
 				return fmt.Errorf("invalid %s crypt filter", entry.name)
@@ -132,8 +159,12 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 		}
 	}
 	s.embeddedFilter = s.streamFilter
-	if value := dict["EFF"]; value != nil {
-		s.embeddedFilter, ok = value.(Name)
+	effObj, err := r.Resolve(dict["EFF"])
+	if err != nil {
+		return err
+	}
+	if effObj != nil {
+		s.embeddedFilter, ok = effObj.(Name)
 		if !ok {
 			return fmt.Errorf("invalid embedded file crypt filter")
 		}

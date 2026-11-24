@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"reflect"
 )
 
@@ -53,19 +54,29 @@ type ExternalGoToAction struct {
 // 入参: ctx 取消上下文, object 动作字典或间接引用
 // 返回: ExternalGoToAction 目标信息, error 类型、必填项目或路径错误
 func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (ExternalGoToAction, error) {
-	if ctx == nil {
+	if r == nil || ctx == nil {
 		return ExternalGoToAction{}, fmt.Errorf("invalid action context")
 	}
 	if err := ctx.Err(); err != nil {
 		return ExternalGoToAction{}, err
+	}
+	if r.closed {
+		return ExternalGoToAction{}, os.ErrClosed
 	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return ExternalGoToAction{}, err
 	}
 	dict, ok := value.(Dictionary)
-	if !ok {
-		return ExternalGoToAction{}, fmt.Errorf("invalid external go-to action")
+	if !ok || dict == nil {
+		return ExternalGoToAction{}, fmt.Errorf("%w: invalid external go-to action", ErrInvalidAction)
+	}
+	dictType, err := r.Resolve(dict["Type"])
+	if err != nil {
+		return ExternalGoToAction{}, err
+	}
+	if dictType != nil && dictType != Name("Action") {
+		return ExternalGoToAction{}, fmt.Errorf("%w: dictionary type", ErrInvalidAction)
 	}
 	value, err = r.Resolve(dict["S"])
 	if err != nil {
@@ -73,7 +84,7 @@ func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (Ext
 	}
 	kind, ok := value.(Name)
 	if !ok || kind != "GoToR" && kind != "GoToE" {
-		return ExternalGoToAction{}, fmt.Errorf("invalid external go-to action type")
+		return ExternalGoToAction{}, fmt.Errorf("%w: invalid external go-to action type", ErrInvalidAction)
 	}
 	result := ExternalGoToAction{Type: kind}
 	value, err = r.Resolve(dict["F"])
@@ -83,18 +94,18 @@ func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (Ext
 	if value != nil {
 		file, err := r.ReadFileSpecification(value)
 		if err != nil {
-			return result, err
+			return result, wrapActionError(err)
 		}
 		if file.Embedded != nil {
-			return result, fmt.Errorf("external go-to root file is embedded")
+			return result, fmt.Errorf("%w: external go-to root file is embedded", ErrInvalidAction)
 		}
 		result.File = &file
 	} else if kind == "GoToR" {
-		return result, fmt.Errorf("missing remote go-to file")
+		return result, fmt.Errorf("%w: missing remote go-to file", ErrInvalidAction)
 	}
 	result.Destination, err = r.ReadRemoteDestination(dict["D"])
 	if err != nil {
-		return result, err
+		return result, wrapActionError(err)
 	}
 	value, err = r.Resolve(dict["NewWindow"])
 	if err != nil {
@@ -103,7 +114,7 @@ func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (Ext
 	if value != nil {
 		window, ok := value.(Boolean)
 		if !ok {
-			return result, fmt.Errorf("invalid external go-to window flag")
+			return result, fmt.Errorf("%w: invalid external go-to window flag", ErrInvalidAction)
 		}
 		flag := bool(window)
 		result.NewWindow = &flag
@@ -111,33 +122,45 @@ func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (Ext
 	if kind == "GoToR" {
 		return result, ctx.Err()
 	}
-	value, err = r.Resolve(dict["T"])
+	rawTarget := dict["T"]
+	value, err = r.Resolve(rawTarget)
 	if err != nil {
 		return result, err
 	}
 	if value == nil && result.File == nil {
-		return result, fmt.Errorf("missing embedded go-to target")
+		return result, fmt.Errorf("%w: missing embedded go-to target", ErrInvalidAction)
 	}
 	seen := map[uintptr]bool{}
+	seenRefs := map[Reference]bool{}
 	for value != nil {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
+		if len(result.Target) >= maxActionWalkSteps {
+			return result, fmt.Errorf("%w: embedded target path limit exceeded", ErrInvalidAction)
+		}
+		if ref, ok := rawTarget.(Reference); ok {
+			if seenRefs[ref] {
+				return result, fmt.Errorf("%w: cyclic embedded target path", ErrInvalidAction)
+			}
+			seenRefs[ref] = true
+		}
 		dict, ok := value.(Dictionary)
 		if !ok || dict == nil {
-			return result, fmt.Errorf("invalid embedded target dictionary")
+			return result, fmt.Errorf("%w: invalid embedded target dictionary", ErrInvalidAction)
 		}
 		id := reflect.ValueOf(dict).Pointer()
 		if seen[id] {
-			return result, fmt.Errorf("cyclic embedded target path")
+			return result, fmt.Errorf("%w: cyclic embedded target path", ErrInvalidAction)
 		}
 		seen[id] = true
 		target, err := r.readEmbeddedTarget(dict)
 		if err != nil {
-			return result, err
+			return result, wrapActionError(err)
 		}
 		result.Target = append(result.Target, target)
-		value, err = r.Resolve(dict["T"])
+		rawTarget = dict["T"]
+		value, err = r.Resolve(rawTarget)
 		if err != nil {
 			return result, err
 		}

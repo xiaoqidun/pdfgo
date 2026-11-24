@@ -47,12 +47,23 @@ func walkOperationsBorrowed(ctx context.Context, data []byte, visit func(Operati
 // 入参: ctx 取消上下文, data 内容流, visit 操作访问函数, resolve 颜色空间解析器, warning 可恢复诊断, borrowed 是否允许复用操作数切片
 // 返回: error 解析或访问错误
 func walkOperations(ctx context.Context, data []byte, visit func(Operation) error, resolve func(Object) (Object, error), warning func(Diagnostic), borrowed bool) error {
+	return walkOperationsReader(ctx, data, visit, resolve, warning, borrowed, nil)
+}
+
+// walkOperationsReader 按阅读器流预算配置解析内容流，在内联图像处应用上下文取消与解码上限
+// 入参: ctx 取消上下文, data 内容流, visit 操作访问函数, resolve 颜色空间解析器, warning 可恢复诊断, borrowed 是否允许复用操作数切片, reader 关联阅读器
+// 返回: error 解析或访问错误
+func walkOperationsReader(ctx context.Context, data []byte, visit func(Operation) error, resolve func(Object) (Object, error), warning func(Diagnostic), borrowed bool, reader *Reader) error {
 	if ctx == nil {
 		return fmt.Errorf("invalid content context")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if visit == nil {
+		return fmt.Errorf("missing operation visitor")
+	}
+	maxStreamBytes, maxFilterChain := effectiveStreamLimits(reader, nil)
 	p := objectParser{data: data, warning: warning, content: true}
 	var operands []Object
 	compatibility := 0
@@ -134,7 +145,7 @@ func walkOperations(ctx context.Context, data []byte, visit func(Operation) erro
 			if len(operands) != 0 {
 				return p.fail("inline image has operands")
 			}
-			stream, err := p.inlineImage(resolve)
+			stream, err := p.inlineImage(ctx, resolve, maxStreamBytes, maxFilterChain)
 			if err != nil {
 				return err
 			}

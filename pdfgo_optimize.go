@@ -60,13 +60,13 @@ type OptimizeReport struct {
 
 // pdfOutput 写出间接对象并累计文件偏移
 type pdfOutput struct {
-	ctx      context.Context
-	writer   io.Writer
-	reader   *Reader
-	security *standardSecurity
-	encrypt  Reference
-	aliases  map[Reference]Reference
-	count    int64
+	ctx         context.Context
+	writer      io.Writer
+	reader      *Reader
+	security    *standardSecurity
+	unencrypted map[Reference]bool
+	aliases     map[Reference]Reference
+	count       int64
 }
 
 // smaskOptInfo 缓存共享软遮罩的不透明与预混合检测结果
@@ -263,7 +263,6 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		return report, fmt.Errorf("missing output writer")
 	}
 	out := &pdfOutput{ctx: ctx, writer: writer, reader: r, security: r.security}
-	out.encrypt, _ = r.Trailer["Encrypt"].(Reference)
 	defer func() { report.Bytes = out.count }()
 	progress := func(stage string, done, total int) error {
 		if err := ctx.Err(); err != nil {
@@ -551,6 +550,23 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			protectedAliases[ref] = true
 		}
 	}
+	if r.security != nil || trailer["Encrypt"] != nil {
+		out.unencrypted, err = collectUnencryptedRefs(trailer, func(ref Reference) (Object, error) {
+			if value, ok := metadata[ref]; ok {
+				if isStream[ref] {
+					return &Stream{Dictionary: value.(Dictionary)}, nil
+				}
+				return value, nil
+			}
+			return object(ref)
+		})
+		if err != nil {
+			return report, err
+		}
+		for ref := range out.unencrypted {
+			protectedAliases[ref] = true
+		}
+	}
 	if options.Compression.Mode != CompressionUnchanged {
 		if err := progress("compress", 0, 0); err != nil {
 			return report, err
@@ -701,7 +717,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		return report, fmt.Errorf("PDF object number exceeds output limit")
 	}
 	var pageTreeOverrides map[Reference]Object
-	if balanced, treeErr := buildBalancedPageTree(ctx, trailer, refs, isStream, metadata, &maxID); treeErr != nil {
+	if balanced, treeErr := buildBalancedPageTree(ctx, trailer, refs, isStream, metadata, out.aliases, &maxID); treeErr != nil {
 		return report, treeErr
 	} else if balanced != nil {
 		pageTreeOverrides = balanced.overrides
@@ -792,11 +808,31 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			if stream.Dictionary["BitsPerComponent"] == Integer(16) && version < "1.5" {
 				version = "1.5"
 			}
+			version = max(version, r.streamFilterVersion(stream.Dictionary))
 		}
+	}
+	for ref := range isStream {
+		if dict, ok := metadata[ref].(Dictionary); ok {
+			version = max(version, r.streamFilterVersion(dict))
+		}
+	}
+	for _, stream := range fontUpdates {
+		if stream != nil {
+			version = max(version, r.streamFilterVersion(stream.Dictionary))
+		}
+	}
+	if len(lazyImages) > 0 && version < "1.2" {
+		version = "1.2"
+	}
+	if options.Compression.Mode != CompressionUnchanged && len(isStream) > 0 && version < "1.2" {
+		version = "1.2"
 	}
 	version, err = replacementImageVersion(ctx, version, lazyImages)
 	if err != nil {
 		return report, err
+	}
+	if !validPDFVersion(version) {
+		return report, fmt.Errorf("invalid PDF output version %q", version)
 	}
 	if _, err := fmt.Fprintf(out, "%%PDF-%s\n%%\xE2\xE3\xCF\xD3\n", version); err != nil {
 		return report, err
@@ -1155,7 +1191,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			}
 		}
 		value = r.optimizedFontNames(value, fontTags, out.aliases, 0)
-		if _, stream := value.(*Stream); packed && !stream && ref.Generation == 0 && ref != out.encrypt {
+		if _, stream := value.(*Stream); packed && !stream && ref.Generation == 0 && !out.unencrypted[ref] {
 			var buffer bytes.Buffer
 			plain := *out
 			plain.writer = &buffer
@@ -1331,7 +1367,7 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 	if depth > 256 {
 		return fmt.Errorf("excessive PDF object nesting")
 	}
-	if ref == w.encrypt {
+	if w.unencrypted[ref] {
 		encrypt = false
 	}
 	var text string
@@ -1470,6 +1506,8 @@ func (r *Reader) workerReader(warning func(Diagnostic)) *Reader {
 		security:       security,
 		warning:        warning,
 		decodeWorkers:  1,
+		maxStreamBytes: r.maxStreamBytes,
+		maxFilterChain: r.maxFilterChain,
 		jbig2Globals:   r.jbig2Globals,
 		owner:          owner,
 	}
@@ -1829,7 +1867,52 @@ func (r *Reader) optimizeDataStream(ctx context.Context, s *Stream) (*Stream, er
 	return s, nil
 }
 
-// applyExplicitCryptFilter 在V4及以上且原流显式声明Crypt时为目标流前置加密过滤器
+// streamFilterVersion 根据流类型与过滤器链返回所需的最低PDF版本
+// 入参: dict 流字典
+// 返回: string 最低PDF版本号，无额外要求时为空字符串
+func (r *Reader) streamFilterVersion(dict Dictionary) string {
+	if dict == nil {
+		return ""
+	}
+	required := ""
+	if kind, err := r.Resolve(dict["Type"]); err == nil && (kind == Name("ObjStm") || kind == Name("XRef")) {
+		required = max(required, "1.5")
+	}
+	filterObj, err := r.Resolve(dict["Filter"])
+	if err != nil || filterObj == nil {
+		return required
+	}
+	check := func(item Object) {
+		resolved, err := r.Resolve(item)
+		if err != nil {
+			return
+		}
+		name, ok := resolved.(Name)
+		if !ok {
+			return
+		}
+		switch name {
+		case "FlateDecode":
+			required = max(required, "1.2")
+		case "JBIG2Decode":
+			required = max(required, "1.4")
+		case "JPXDecode":
+			required = max(required, "1.5")
+		case "BrotliDecode":
+			required = max(required, "2.0")
+		}
+	}
+	if array, ok := filterObj.(Array); ok {
+		for _, item := range array {
+			check(item)
+		}
+	} else {
+		check(filterObj)
+	}
+	return required
+}
+
+// applyExplicitCryptFilter 在V4及以上且原流显式声明Crypt时为目标流前置加密过滤器，保持数组扁平
 // 入参: source 原始流, dst 目标流
 // 返回: error 加密过滤器解析错误
 func (r *Reader) applyExplicitCryptFilter(source, dst *Stream) error {
@@ -1841,8 +1924,31 @@ func (r *Reader) applyExplicitCryptFilter(source, dst *Stream) error {
 		return err
 	}
 	if explicit {
-		dst.Dictionary["Filter"] = Array{Name("Crypt"), dst.Dictionary["Filter"]}
-		dst.Dictionary["DecodeParms"] = Array{Dictionary{"Name": name}, dst.Dictionary["DecodeParms"]}
+		cryptParms := Dictionary{"Name": name}
+		switch existing := dst.Dictionary["Filter"].(type) {
+		case nil:
+			dst.Dictionary["Filter"] = Name("Crypt")
+			dst.Dictionary["DecodeParms"] = cryptParms
+		case Array:
+			filters := make(Array, 0, len(existing)+1)
+			filters = append(filters, Name("Crypt"))
+			filters = append(filters, existing...)
+			dst.Dictionary["Filter"] = filters
+			parms := make(Array, len(filters))
+			parms[0] = cryptParms
+			switch existingParms := dst.Dictionary["DecodeParms"].(type) {
+			case Array:
+				copy(parms[1:], existingParms)
+			case Dictionary:
+				if len(existing) == 1 {
+					parms[1] = existingParms
+				}
+			}
+			dst.Dictionary["DecodeParms"] = parms
+		default:
+			dst.Dictionary["Filter"] = Array{Name("Crypt"), existing}
+			dst.Dictionary["DecodeParms"] = Array{cryptParms, dst.Dictionary["DecodeParms"]}
+		}
 	}
 	return nil
 }

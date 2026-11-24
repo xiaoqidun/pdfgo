@@ -21,6 +21,12 @@ import (
 	"sort"
 )
 
+// maxICCProcessElements 限制ICC多阶段处理变换的最大元素数
+const maxICCProcessElements = 64
+
+// maxICCProcessBudget 限制单次ICC多阶段处理变换求值的最大运算预算，防止高维CLUT或重复阶段耗尽CPU
+const maxICCProcessBudget = 4096
+
 // iccProcessElements 保存ICC浮点多阶段变换
 type iccProcessElements struct {
 	input, output, channels int
@@ -47,13 +53,18 @@ func parseICCProcessElements(data []byte) (*iccProcessElements, error) {
 	if s.input == 0 || s.output == 0 {
 		return nil, fmt.Errorf("invalid ICC process channels")
 	}
-	blocks, err := iccProcessBlocks(data, 16, uint64(binary.BigEndian.Uint32(data[12:])))
+	count := uint64(binary.BigEndian.Uint32(data[12:]))
+	if count > maxICCProcessElements {
+		return nil, fmt.Errorf("ICC process element count exceeds limit")
+	}
+	blocks, err := iccProcessBlocks(data, 16, count)
 	if err != nil {
 		return nil, err
 	}
 	channels := s.input
 	s.channels = max(s.input, s.output)
 	shared := make(map[*byte]iccProcessElement)
+	budget := 0
 	for _, block := range blocks {
 		e, found := shared[&block[0]]
 		if !found {
@@ -66,6 +77,11 @@ func parseICCProcessElements(data []byte) (*iccProcessElements, error) {
 		if e.input != channels {
 			return nil, fmt.Errorf("inconsistent ICC process channels")
 		}
+		cost := e.evalCost()
+		if cost <= 0 || cost > maxICCProcessBudget-budget {
+			return nil, fmt.Errorf("ICC process evaluation complexity exceeds limit")
+		}
+		budget += cost
 		channels = e.output
 		s.channels = max(s.channels, channels)
 		s.elements = append(s.elements, e)
@@ -74,6 +90,31 @@ func parseICCProcessElements(data []byte) (*iccProcessElements, error) {
 		return nil, fmt.Errorf("inconsistent ICC process output")
 	}
 	return s, nil
+}
+
+// evalCost 估算单个ICC浮点处理元素的单次求值运算代价
+// 返回: int 估算步数，超限时返回零
+func (e iccProcessElement) evalCost() int {
+	switch e.kind {
+	case "clut":
+		if len(e.grid) > 12 {
+			return 0
+		}
+		corners := 1 << len(e.grid)
+		if corners > maxICCProcessBudget/max(e.output, 1) {
+			return 0
+		}
+		return corners * max(e.output, 1)
+	case "matf":
+		if e.input > maxICCProcessBudget/max(e.output, 1) {
+			return 0
+		}
+		return e.input * e.output
+	case "cvst":
+		return e.input
+	default:
+		return max(e.input, 1)
+	}
 }
 
 // iccProcessBlocks 校验位置表和共享数据边界，拒绝部分重叠

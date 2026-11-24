@@ -85,7 +85,7 @@ func halftoneProduct(a, b, modulus uint64) uint64 {
 // 入参: ctx 取消上下文, h 网屏定义, options 设备参数，默认单比特及百万像素网屏上限
 // 返回: *HalftoneScreen 设备网屏，默认网屏返回空值, error 参数或函数错误
 func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options HalftoneOptions) (*HalftoneScreen, error) {
-	if ctx == nil {
+	if r == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid halftone context")
 	}
 	if err := ctx.Err(); err != nil {
@@ -333,10 +333,25 @@ func (s *HalftoneScreen) tileResidues(xm, ym uint64) [2]uint64 {
 	return [2]uint64{u, v}
 }
 
-// Quantize 将16位连续分量量化为设备等级，坐标始终处于设备空间
-// 入参: value 黑零白满的分量值, x 横向设备坐标, y 纵向设备坐标
-// 返回: uint16 归一化后的设备分量值
+// valid 判断网屏是否已完整编译且可用于安全量化
+// 返回: bool 是否有效
+func (s *HalftoneScreen) valid() bool {
+	if s == nil || s.levels == 0 {
+		return false
+	}
+	if s.tiled != nil {
+		return s.width*s.height+s.width2*s.height2 > 0
+	}
+	return s.width > 0 && s.height > 0 && len(s.thresholds) >= s.width*s.height
+}
+
+// Quantize 在设备像素坐标量化单个加色分量，零值或无效网屏原样返回输入分量
+// 入参: value 16位加色分量, x 设备横坐标, y 设备纵坐标
+// 返回: uint16 量化后的16位设备分量
 func (s *HalftoneScreen) Quantize(value uint16, x, y int) uint16 {
+	if !s.valid() {
+		return value
+	}
 	if s.xsign < 0 {
 		x = ^x
 	}
@@ -384,7 +399,7 @@ func (s *HalftoneScreen) QuantizeRow(ctx context.Context, out, values []uint16, 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if s == nil || s.levels == 0 {
+	if !s.valid() {
 		return fmt.Errorf("missing halftone screen")
 	}
 	if len(out) != len(values) {
@@ -444,7 +459,7 @@ func (s *HalftoneScreen) Apply(ctx context.Context, source *image.Gray16) (*imag
 	if source == nil {
 		return nil, fmt.Errorf("missing halftone source")
 	}
-	if s == nil || s.levels == 0 {
+	if !s.valid() {
 		return nil, fmt.Errorf("missing halftone screen")
 	}
 	width, height := source.Rect.Dx(), source.Rect.Dy()

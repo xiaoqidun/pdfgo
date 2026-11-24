@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 )
 
 // SoftMask 保存透明度或亮度蒙版及其传递函数
@@ -76,17 +77,35 @@ func (m *SoftMask) WalkContext(ctx context.Context, visitor Visitor) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if m == nil || m.stream == nil {
+	if m == nil || m.stream == nil || m.interpreter.reader == nil {
 		return fmt.Errorf("invalid soft mask group")
+	}
+	if m.interpreter.reader.closed {
+		return os.ErrClosed
 	}
 	p := m.interpreter
 	p.ctx = ctx
 	p.forms, p.content = nil, nil
+	if visitor.MarkedContent == nil {
+		visitor.MarkedContent = p.visitor.MarkedContent
+	}
+	if visitor.OptionalContent == nil {
+		visitor.OptionalContent = p.visitor.OptionalContent
+	}
 	if visitor.Reference == nil {
 		visitor.Reference = p.visitor.Reference
 	}
+	if visitor.ColorantDevice == nil {
+		visitor.ColorantDevice = p.visitor.ColorantDevice
+	}
 	if visitor.Halftones == nil {
 		visitor.Halftones = p.visitor.Halftones
+	}
+	if visitor.PostScript == nil {
+		visitor.PostScript = p.visitor.PostScript
+	}
+	if visitor.Warning == nil {
+		visitor.Warning = p.visitor.Warning
 	}
 	p.visitor = visitor
 	p.maskGroup = m.stream

@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"compress/lzw"
 	"compress/zlib"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -38,10 +39,13 @@ type inlineByteReader struct {
 }
 
 // inlineCCITTLength 按声明行数或块结束标记解码并确定内联数据边界
-// 入参: data 内容流余下数据, dict 图像字典, params 解码参数
-// 返回: int 编码字节数, error 图像或编码错误
-func inlineCCITTLength(data []byte, dict Dictionary, params Object) (int, error) {
-	length, err := inlineSampleLength(dict)
+// 入参: ctx 取消上下文, data 内容流余下数据, dict 图像字典, params 解码参数, maxBytes 最大解码字节上限
+// 返回: int 编码字节数, error 图像、超限、取消或编码错误
+func inlineCCITTLength(ctx context.Context, data []byte, dict Dictionary, params Object, maxBytes int64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	length, err := inlineSampleLength(dict, maxBytes)
 	if err != nil {
 		return 0, err
 	}
@@ -55,7 +59,7 @@ func inlineCCITTLength(data []byte, dict Dictionary, params Object) (int, error)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := io.CopyN(io.Discard, reader, int64(length)); err != nil {
+	if _, err := io.CopyN(io.Discard, &contextInput{ctx: ctx, reader: reader}, int64(length)); err != nil {
 		return 0, err
 	}
 	if endOfBlock {
@@ -68,13 +72,13 @@ func inlineCCITTLength(data []byte, dict Dictionary, params Object) (int, error)
 			return 0, err
 		}
 	}
-	return source.pos, nil
+	return source.pos, ctx.Err()
 }
 
 // inlineSampleLength 计算未压缩图像逐行字节对齐后的数据长度
-// 入参: dict 内联图像字典
-// 返回: int 字节数, error 无效尺寸、色空间或整数溢出
-func inlineSampleLength(dict Dictionary) (int, error) {
+// 入参: dict 内联图像字典, maxBytes 最大字节上限，非正数表示不限
+// 返回: int 字节数, error 无效尺寸、色空间、超限或整数溢出
+func inlineSampleLength(dict Dictionary, maxBytes int64) (int, error) {
 	w, wok := dict["Width"].(Integer)
 	h, hok := dict["Height"].(Integer)
 	b, bok := dict["BitsPerComponent"].(Integer)
@@ -89,6 +93,18 @@ func inlineSampleLength(dict Dictionary) (int, error) {
 	}
 	if array, ok := dict["ColorSpace"].(Array); ok && len(array) > 0 {
 		switch array[0] {
+		case Name("DeviceGray"):
+			if len(array) == 1 {
+				components = 1
+			}
+		case Name("DeviceRGB"):
+			if len(array) == 1 {
+				components = 3
+			}
+		case Name("DeviceCMYK"):
+			if len(array) == 1 {
+				components = 4
+			}
 		case Name("Indexed"), Name("Separation"), Name("CalGray"):
 			components = 1
 		case Name("CalRGB"), Name("Lab"):
@@ -129,22 +145,40 @@ func inlineSampleLength(dict Dictionary) (int, error) {
 	if uint64(h) > limit/row {
 		return 0, fmt.Errorf("inline image size overflow")
 	}
-	return int(row * uint64(h)), nil
+	total := row * uint64(h)
+	if maxBytes > 0 && total > uint64(maxBytes) {
+		return 0, fmt.Errorf("inline image decode limit exceeded")
+	}
+	return int(total), nil
 }
 
 // inlineFilterLength 根据首层过滤器的结束标记定位压缩数据末尾
-// 入参: data 内容流余下数据, filter 过滤器名称, params 解码参数, warning 可恢复诊断
-// 返回: int 压缩字节数, error 无效或未支持的编码
-func inlineFilterLength(data []byte, filter Name, params Object, warning func(Diagnostic)) (int, error) {
+// 入参: ctx 取消上下文, data 内容流余下数据, filter 过滤器名称, params 解码参数, warning 可恢复诊断, maxBytes 最大解码字节上限
+// 返回: int 压缩字节数, error 无效、超限、取消或未支持的编码
+func inlineFilterLength(ctx context.Context, data []byte, filter Name, params Object, warning func(Diagnostic), maxBytes int64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	switch filter {
 	case "FlateDecode":
 		r := bytes.NewReader(data)
-		z, err := zlib.NewReader(r)
+		z, err := acquireZlibReader(r)
 		if err != nil {
 			return 0, err
 		}
-		_, err = io.Copy(io.Discard, z)
+		var input io.Reader = &contextInput{ctx: ctx, reader: z}
+		if maxBytes > 0 {
+			input = io.LimitReader(input, maxBytes+1)
+		}
+		written, err := io.Copy(io.Discard, input)
 		closeErr := z.Close()
+		releaseZlibReader(z)
+		if canceled := ctx.Err(); canceled != nil {
+			return 0, canceled
+		}
+		if maxBytes > 0 && written > maxBytes {
+			return 0, fmt.Errorf("inline image decode limit exceeded")
+		}
 		if errors.Is(err, zlib.ErrChecksum) && warning != nil {
 			warning(Diagnostic{Message: "inline Flate checksum mismatch; complete compressed data retained"})
 			err = nil
@@ -162,47 +196,87 @@ func inlineFilterLength(data []byte, filter Name, params Object, warning func(Di
 			}
 			early = int64(n)
 		}
-		_, n, err := decodeLZWBytes(data, early)
+		_, n, err := decodeLZWBytesLimitContext(ctx, data, early, maxBytes)
+		if errors.Is(err, io.ErrShortBuffer) {
+			return 0, fmt.Errorf("inline image decode limit exceeded")
+		}
 		return n, err
 	case "ASCIIHexDecode":
 		if n := bytes.IndexByte(data, '>'); n >= 0 {
-			return n + 1, nil
+			if maxBytes > 0 && int64(n/2+1) > maxBytes {
+				_, size, err := asciiHexSize(ctx, data[:n+1], warning)
+				if err != nil {
+					return 0, err
+				}
+				if int64(size) > maxBytes {
+					return 0, fmt.Errorf("inline image decode limit exceeded")
+				}
+			}
+			return n + 1, ctx.Err()
 		}
 		return 0, io.ErrUnexpectedEOF
 	case "ASCII85Decode":
 		if n := bytes.Index(data, []byte("~>")); n >= 0 {
-			return n + 2, nil
+			if maxBytes > 0 && int64(n)*4 > maxBytes {
+				_, size, err := ascii85Size(ctx, data[:n+2], warning)
+				if err != nil {
+					return 0, err
+				}
+				if int64(size) > maxBytes {
+					return 0, fmt.Errorf("inline image decode limit exceeded")
+				}
+			}
+			return n + 2, ctx.Err()
 		}
 		return 0, io.ErrUnexpectedEOF
 	case "RunLengthDecode":
-		for n := 0; n < len(data); {
+		var decoded int64
+		for n, steps := 0, 0; n < len(data); steps++ {
+			if steps&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return 0, err
+				}
+			}
 			b := int(data[n])
 			n++
 			if b == 128 {
-				return n, nil
+				return n, ctx.Err()
 			}
 			if b < 128 {
+				decoded += int64(b + 1)
 				n += b + 1
 			} else {
+				decoded += int64(257 - b)
 				n++
+			}
+			if maxBytes > 0 && decoded > maxBytes {
+				return 0, fmt.Errorf("inline image decode limit exceeded")
 			}
 		}
 		return 0, io.ErrUnexpectedEOF
 	case "DCTDecode":
-		return inlineJPEGLength(data)
+		return inlineJPEGLength(ctx, data)
 	}
 	return 0, &UnsupportedError{Feature: "inline image filter " + string(filter)}
 }
 
 // inlineJPEGLength 沿JPEG段长度与熵编码转义定位EOI，不搜索任意二进制结束串
-// 入参: data JPEG及后续内容数据
-// 返回: int JPEG字节数, error 无效段或缺失结束标记
-func inlineJPEGLength(data []byte) (int, error) {
+// 入参: ctx 取消上下文, data JPEG及后续内容数据
+// 返回: int JPEG字节数, error 无效段、取消或缺失结束标记
+func inlineJPEGLength(ctx context.Context, data []byte) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if len(data) < 2 || data[0] != 0xff || data[1] != 0xd8 {
 		return 0, fmt.Errorf("invalid inline JPEG header")
 	}
 	position := 2
-	for position < len(data) {
+	for steps := 0; position < len(data); steps++ {
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
 		if data[position] != 0xff {
 			return 0, fmt.Errorf("invalid inline JPEG marker")
 		}
@@ -234,7 +308,12 @@ func inlineJPEGLength(data []byte) (int, error) {
 		if marker != 0xda {
 			continue
 		}
-		for position < len(data) {
+		for scanSteps := 0; position < len(data); scanSteps++ {
+			if scanSteps&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return 0, err
+				}
+			}
 			if data[position] != 0xff {
 				position++
 				continue
@@ -290,7 +369,11 @@ func (p *pageInterpreter) recoverLZWImage(image *Image) error {
 	if err != nil || predictor != 1 {
 		return err
 	}
-	data, _, decodeErr := decodeLZWBytesContext(p.ctx, source.Data, early)
+	maxBytes, _ := effectiveStreamLimits(p.reader, source)
+	data, _, decodeErr := decodeLZWBytesLimitContext(p.ctx, source.Data, early, maxBytes)
+	if errors.Is(decodeErr, io.ErrShortBuffer) {
+		return fmt.Errorf("LZW decode limit exceeded")
+	}
 	if err := p.ctx.Err(); err != nil {
 		return err
 	}
@@ -300,11 +383,18 @@ func (p *pageInterpreter) recoverLZWImage(image *Image) error {
 			return decodeErr
 		}
 		decoder := lzw.NewReader(bytes.NewReader(source.Data), lzw.MSB, 8)
+		var input io.Reader = &contextInput{ctx: p.ctx, reader: decoder}
+		if maxBytes > 0 {
+			input = io.LimitReader(input, maxBytes+1)
+		}
 		var err error
-		data, err = io.ReadAll(&contextInput{ctx: p.ctx, reader: decoder})
+		data, err = io.ReadAll(input)
 		closeErr := decoder.Close()
 		if err := p.ctx.Err(); err != nil {
 			return err
+		}
+		if maxBytes > 0 && int64(len(data)) > maxBytes {
+			return fmt.Errorf("LZW decode limit exceeded")
 		}
 		if !errors.Is(err, io.ErrUnexpectedEOF) || closeErr != nil {
 			return decodeErr
@@ -359,12 +449,18 @@ func (r *inlineByteReader) Read(p []byte) (int, error) {
 }
 
 // inlineImage 读取内联图像字典并按样本长度或过滤器结束标记定位数据
-// 入参: resolve 当前作用域颜色空间解析器
-// 返回: *Stream 展开缩写后的图像流, error 字典或数据边界错误
-func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Stream, error) {
+// 入参: ctx 取消上下文, resolve 当前作用域颜色空间解析器, maxBytes 最大解码字节上限, maxChain 最大过滤器链深度
+// 返回: *Stream 展开缩写后的图像流, error 字典、超限、取消或数据边界错误
+func (p *objectParser) inlineImage(ctx context.Context, resolve func(Object) (Object, error), maxBytes int64, maxChain int) (*Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dict := Dictionary{"Subtype": Name("Image")}
 	keys := map[Name]Name{"BPC": "BitsPerComponent", "CS": "ColorSpace", "D": "Decode", "DP": "DecodeParms", "F": "Filter", "H": "Height", "IM": "ImageMask", "I": "Interpolate", "W": "Width"}
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		p.skipSpace()
 		if p.pos == len(p.data) {
 			return nil, io.ErrUnexpectedEOF
@@ -396,23 +492,14 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 		p.pos++
 	}
 	p.pos++
-	aliases := map[Name]Name{"G": "DeviceGray", "RGB": "DeviceRGB", "CMYK": "DeviceCMYK", "I": "Indexed"}
-	expand := func(value Object) Object {
+	colorSpaceAliases := map[Name]Name{"G": "DeviceGray", "RGB": "DeviceRGB", "CMYK": "DeviceCMYK", "I": "Indexed"}
+	expandWith := func(value Object, table map[Name]Name) Object {
 		if name, ok := value.(Name); ok {
-			if full, ok := aliases[name]; ok {
-				return full
-			}
-			if full, ok := streamFilterAliases[name]; ok {
+			if full, ok := table[name]; ok {
 				return full
 			}
 			if p.warning != nil {
-				for alias, full := range aliases {
-					if strings.EqualFold(string(name), string(alias)) {
-						p.warning(Diagnostic{Offset: int64(p.pos), Message: "inline image abbreviation case normalized: " + string(name)})
-						return full
-					}
-				}
-				for alias, full := range streamFilterAliases {
+				for alias, full := range table {
 					if strings.EqualFold(string(name), string(alias)) {
 						p.warning(Diagnostic{Offset: int64(p.pos), Message: "inline image abbreviation case normalized: " + string(name)})
 						return full
@@ -422,13 +509,30 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 		}
 		return value
 	}
-	for _, key := range []Name{"ColorSpace", "Filter"} {
-		if array, ok := dict[key].(Array); ok {
+	var expandColorSpace func(Object, int) Object
+	expandColorSpace = func(value Object, depth int) Object {
+		if depth > 4 {
+			return value
+		}
+		if array, ok := value.(Array); ok && len(array) > 0 {
+			array[0] = expandWith(array[0], colorSpaceAliases)
+			if array[0] == Name("Indexed") && len(array) >= 2 {
+				array[1] = expandColorSpace(array[1], depth+1)
+			}
+			return array
+		}
+		return expandWith(value, colorSpaceAliases)
+	}
+	if dict["ColorSpace"] != nil {
+		dict["ColorSpace"] = expandColorSpace(dict["ColorSpace"], 0)
+	}
+	if dict["Filter"] != nil {
+		if array, ok := dict["Filter"].(Array); ok {
 			for i := range array {
-				array[i] = expand(array[i])
+				array[i] = expandWith(array[i], streamFilterAliases)
 			}
 		} else {
-			dict[key] = expand(dict[key])
+			dict["Filter"] = expandWith(dict["Filter"], streamFilterAliases)
 		}
 	}
 	if resolve != nil && dict["ColorSpace"] != nil {
@@ -445,19 +549,25 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 			dict["ColorSpace"] = Array{array[0], profile}
 		}
 	}
-	stream := &Stream{Dictionary: dict}
-	filters, params, err := stream.filterChain(nil)
+	stream := &Stream{Dictionary: dict, maxStreamBytes: maxBytes, maxFilterChain: maxChain}
+	if maxBytes == 0 {
+		stream.maxStreamBytes = -1
+	}
+	if maxChain == 0 {
+		stream.maxFilterChain = -1
+	}
+	filters, params, err := stream.filterChainWith(nil, p.warning)
 	if err != nil {
 		return nil, err
 	}
 	data := p.data[p.pos:]
 	length := 0
 	if len(filters) == 0 {
-		length, err = inlineSampleLength(dict)
+		length, err = inlineSampleLength(dict, maxBytes)
 	} else if filters[0] == Name("CCITTFaxDecode") {
-		length, err = inlineCCITTLength(data, dict, params[0])
+		length, err = inlineCCITTLength(ctx, data, dict, params[0], maxBytes)
 	} else {
-		length, err = inlineFilterLength(data, filters[0].(Name), params[0], p.warning)
+		length, err = inlineFilterLength(ctx, data, filters[0].(Name), params[0], p.warning, maxBytes)
 	}
 	if err != nil {
 		return nil, err
@@ -477,5 +587,5 @@ func (p *objectParser) inlineImage(resolve func(Object) (Object, error)) (*Strea
 	if p.token() != "EI" {
 		return nil, p.fail("missing inline image end")
 	}
-	return stream, nil
+	return stream, ctx.Err()
 }

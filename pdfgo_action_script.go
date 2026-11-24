@@ -43,7 +43,7 @@ func (r *Reader) ReadJavaScriptAction(ctx context.Context, object Object) (JavaS
 		encoded = value
 	case *Stream:
 		if value == nil {
-			return result, fmt.Errorf("invalid JavaScript text stream")
+			return result, fmt.Errorf("%w: invalid JavaScript text stream", ErrInvalidAction)
 		}
 		data, err := r.DecodeStreamContext(ctx, value)
 		if err != nil {
@@ -51,11 +51,11 @@ func (r *Reader) ReadJavaScriptAction(ctx context.Context, object Object) (JavaS
 		}
 		encoded = String(data)
 	default:
-		return result, fmt.Errorf("invalid JavaScript action source")
+		return result, fmt.Errorf("%w: invalid JavaScript action source", ErrInvalidAction)
 	}
 	result.Script, err = DecodeTextString(encoded)
 	if err != nil {
-		return JavaScriptAction{}, err
+		return JavaScriptAction{}, wrapActionError(err)
 	}
 	if err := ctx.Err(); err != nil {
 		return JavaScriptAction{}, err

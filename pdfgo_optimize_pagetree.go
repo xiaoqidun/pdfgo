@@ -31,22 +31,33 @@ type balancedPageTree struct {
 
 // buildBalancedPageTree 在页面数超阈值且原树过宽或过深时重建度为64的平衡Pages树
 // 复用原根Pages引用并下推被移除中间节点的可继承属性，存在外部引用或未知扩展键时保守跳过
-// 入参: ctx 取消上下文, trailer 尾字典, refs 当前可达对象, isStream 流对象标记, metadata 对象属性映射, maxID 当前最大对象号指针
+// 入参: ctx 取消上下文, trailer 尾字典, refs 当前可达对象, isStream 流对象标记, metadata 对象属性映射, aliases 对象别名映射, maxID 当前最大对象号指针
 // 返回: *balancedPageTree 重建结果，无需或不宜重建时为nil, error 取消错误
-func buildBalancedPageTree(ctx context.Context, trailer Dictionary, refs []Reference, isStream map[Reference]bool, metadata map[Reference]Object, maxID *int64) (*balancedPageTree, error) {
+func buildBalancedPageTree(ctx context.Context, trailer Dictionary, refs []Reference, isStream map[Reference]bool, metadata map[Reference]Object, aliases map[Reference]Reference, maxID *int64) (*balancedPageTree, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	resolveAlias := func(ref Reference) Reference {
+		if canonical, ok := aliases[ref]; ok {
+			return canonical
+		}
+		return ref
 	}
 	rootRef, ok := trailer["Root"].(Reference)
 	if !ok {
 		return nil, nil
 	}
+	rootRef = resolveAlias(rootRef)
 	catalog, ok := metadata[rootRef].(Dictionary)
 	if !ok || isStream[rootRef] {
 		return nil, nil
 	}
 	rootPagesRef, ok := catalog["Pages"].(Reference)
-	if !ok || isStream[rootPagesRef] {
+	if !ok {
+		return nil, nil
+	}
+	rootPagesRef = resolveAlias(rootPagesRef)
+	if isStream[rootPagesRef] {
 		return nil, nil
 	}
 	rootPagesDict, ok := metadata[rootPagesRef].(Dictionary)
@@ -118,7 +129,7 @@ func buildBalancedPageTree(ctx context.Context, trailer Dictionary, refs []Refer
 				if !ok {
 					return false
 				}
-				if !walk(kidRef, depth+1, attrs, false) {
+				if !walk(resolveAlias(kidRef), depth+1, attrs, false) {
 					return false
 				}
 			}
@@ -155,7 +166,7 @@ func buildBalancedPageTree(ctx context.Context, trailer Dictionary, refs []Refer
 			}
 			switch v := val.(type) {
 			case Reference:
-				return oldInternal[v]
+				return oldInternal[resolveAlias(v)]
 			case Array:
 				for _, item := range v {
 					if hasExternalRef(item, depth+1) {

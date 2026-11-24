@@ -338,6 +338,9 @@ func gradientValueSide(stops []GradientStop, position float64, left bool) [4]flo
 // 入参: position 归一化轴位置，范围外使用端点颜色
 // 返回: [3]float64 sRGB颜色, error 无效渐变或颜色变换错误
 func (g *AxialGradient) ColorAt(position float64) ([3]float64, error) {
+	if g == nil {
+		return [3]float64{}, fmt.Errorf("invalid gradient evaluation")
+	}
 	values, err := g.ValuesAt(position)
 	return gradientRGB(values, err, g.Space, g.Intent)
 }
@@ -346,6 +349,9 @@ func (g *AxialGradient) ColorAt(position float64) ([3]float64, error) {
 // 入参: position 归一化双圆插值位置，范围外使用端点颜色
 // 返回: [3]float64 sRGB颜色, error 无效渐变或颜色变换错误
 func (g *RadialGradient) ColorAt(position float64) ([3]float64, error) {
+	if g == nil {
+		return [3]float64{}, fmt.Errorf("invalid gradient evaluation")
+	}
 	values, err := g.ValuesAt(position)
 	return gradientRGB(values, err, g.Space, g.Intent)
 }
@@ -354,6 +360,9 @@ func (g *RadialGradient) ColorAt(position float64) ([3]float64, error) {
 // 入参: position 归一化轴位置，范围外使用端点
 // 返回: [4]float64 源空间分量, error 无效求值
 func (g *AxialGradient) ValuesAt(position float64) ([4]float64, error) {
+	if g == nil {
+		return [4]float64{}, fmt.Errorf("invalid gradient evaluation")
+	}
 	return gradientValues(g.Stops, g.function, g.domain, position)
 }
 
@@ -361,6 +370,9 @@ func (g *AxialGradient) ValuesAt(position float64) ([4]float64, error) {
 // 入参: position 归一化双圆插值位置，范围外使用端点
 // 返回: [4]float64 源空间分量, error 无效求值
 func (g *RadialGradient) ValuesAt(position float64) ([4]float64, error) {
+	if g == nil {
+		return [4]float64{}, fmt.Errorf("invalid gradient evaluation")
+	}
 	return gradientValues(g.Stops, g.function, g.domain, position)
 }
 

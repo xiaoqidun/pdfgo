@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 )
 
 // ThreeDMeasurement 保存三维测量及批注参数，不执行投影或重算声明的测量值
@@ -44,18 +45,21 @@ type ThreeDMeasurement struct {
 	ShowCircle      bool
 	Radius          bool
 	Comment         Reference
-	Dictionary      Dictionary `json:"-"`
+	Dictionary      Dictionary
 }
 
 // ReadThreeDMeasurements 读取视图的MA数组，取消或解析失败时不返回部分结果
 // 入参: ctx 取消上下文, object 测量数组或引用，可为空
-// 返回: []ThreeDMeasurement 测量数据, error 类型、参数或取消错误
+// 返回: []ThreeDMeasurement 测量数据, error 类型、参数、关闭或取消错误
 func (r *Reader) ReadThreeDMeasurements(ctx context.Context, object Object) ([]ThreeDMeasurement, error) {
-	if ctx == nil || r == nil || r.closed {
+	if ctx == nil || r == nil {
 		return nil, fmt.Errorf("invalid 3D measurement reader or context")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if r.closed {
+		return nil, os.ErrClosed
 	}
 	value, err := r.Resolve(object)
 	if err != nil || value == nil {
@@ -87,8 +91,11 @@ func (r *Reader) ReadThreeDMeasurements(ctx context.Context, object Object) ([]T
 // 返回: ThreeDMeasurement 测量参数, error 类型、参数或引用错误
 func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error) {
 	result := ThreeDMeasurement{TextSize: 12, Color: [3]float64{1, 1, 1}, Precision: 3, Degrees: true, ExtensionLength: 60, Radius: true}
-	if r == nil || r.closed {
+	if r == nil {
 		return result, fmt.Errorf("invalid 3D measurement reader")
+	}
+	if r.closed {
+		return result, os.ErrClosed
 	}
 	dict, err := r.mediaDictionary(object, false)
 	if err != nil {

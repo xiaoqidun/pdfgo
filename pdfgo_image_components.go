@@ -295,11 +295,16 @@ func (i *Image) colorantSpace() (Object, error) {
 // 入参: x 横坐标, y 纵坐标
 // 返回: []uint16 非预乘浓度，返回切片只读
 func (i *ImageComponents) TintsAt(x, y int) []uint16 {
-	if len(i.Colorants) == 0 || !(image.Point{X: x, Y: y}).In(i.Rect) {
+	if i == nil || len(i.Colorants) == 0 || !(image.Point{X: x, Y: y}).In(i.Rect) {
 		return nil
 	}
-	offset := ((y-i.Rect.Min.Y)*i.Rect.Dx() + x - i.Rect.Min.X) * len(i.Colorants)
-	return i.Tints[offset : offset+len(i.Colorants)]
+	width, count := i.Rect.Dx(), len(i.Colorants)
+	pixel := (y-i.Rect.Min.Y)*width + x - i.Rect.Min.X
+	if pixel < 0 || pixel > (len(i.Tints)-count)/count || len(i.Tints) < count {
+		return nil
+	}
+	offset := pixel * count
+	return i.Tints[offset : offset+count]
 }
 
 // ValuesAt 返回像素的单位颜色分量及透明度，区域外返回透明值
@@ -307,14 +312,22 @@ func (i *ImageComponents) TintsAt(x, y int) []uint16 {
 // 返回: [4]float64 非预乘颜色, float64 透明度
 func (i *ImageComponents) ValuesAt(x, y int) ([4]float64, float64) {
 	var values [4]float64
-	if !(image.Point{X: x, Y: y}).In(i.Rect) {
+	if i == nil || !(image.Point{X: x, Y: y}).In(i.Rect) {
 		return values, 0
 	}
 	if i.view != nil {
 		return i.view.valuesAt(x, y)
 	}
 	channels := i.Space.Components()
-	offset := ((y-i.Rect.Min.Y)*i.Rect.Dx() + x - i.Rect.Min.X) * (channels + 1)
+	if channels <= 0 {
+		return values, 0
+	}
+	stride := channels + 1
+	pixel := (y-i.Rect.Min.Y)*i.Rect.Dx() + x - i.Rect.Min.X
+	if pixel < 0 || len(i.Pix) < stride || pixel > (len(i.Pix)-stride)/stride {
+		return values, 0
+	}
+	offset := pixel * stride
 	for c := 0; c < channels; c++ {
 		values[c] = float64(i.Pix[offset+c]) / 65535
 	}

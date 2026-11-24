@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 )
 
 // OutlineItem 保存目录标题、显示样式及原始跳转声明，不执行动作
@@ -43,6 +44,12 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing outline visitor")
 	}
 	catalog, err := r.catalogDictionary()
 	if err != nil {

@@ -26,6 +26,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"os"
 	"sync"
 
 	"github.com/xiaoqidun/jbig2"
@@ -55,11 +56,27 @@ type Image struct {
 	effectiveColorSpace bool
 }
 
-// jbig2GlobalsCache 缓存按对象引用共享的JBIG2全局字典原文及已解析状态
+// jbig2GlobalsCacheBudget 限制JBIG2全局字典共享缓存的总字节上限
+const jbig2GlobalsCacheBudget int64 = 32 << 20
+
+// jbig2GlobalsEntry 保存单个JBIG2全局字典缓存项及其LRU链表节点
+type jbig2GlobalsEntry struct {
+	ref    Reference
+	raw    []byte
+	parsed *jbig2.Globals
+	size   int64
+	prev   *jbig2GlobalsEntry
+	next   *jbig2GlobalsEntry
+}
+
+// jbig2GlobalsCache 按字节预算LRU缓存按对象引用共享的JBIG2全局字典原文及已解析状态
 type jbig2GlobalsCache struct {
-	mu     sync.Mutex
-	raw    map[Reference][]byte
-	parsed map[Reference]*jbig2.Globals
+	mu      sync.Mutex
+	entries map[Reference]*jbig2GlobalsEntry
+	head    *jbig2GlobalsEntry
+	tail    *jbig2GlobalsEntry
+	used    int64
+	budget  int64
 }
 
 // deviceSampleImage 按需组合设备色或索引色样本与遮罩，不重复展开像素缓冲
@@ -113,10 +130,140 @@ type emptySampleImage struct {
 	rect image.Rectangle
 }
 
-// newJBIG2GlobalsCache 创建JBIG2全局字典共享缓存
+// newJBIG2GlobalsCache 创建带字节预算LRU的JBIG2全局字典共享缓存
 // 返回: *jbig2GlobalsCache 缓存实例
 func newJBIG2GlobalsCache() *jbig2GlobalsCache {
-	return &jbig2GlobalsCache{raw: make(map[Reference][]byte), parsed: make(map[Reference]*jbig2.Globals)}
+	return newJBIG2GlobalsCacheWithBudget(jbig2GlobalsCacheBudget)
+}
+
+// newJBIG2GlobalsCacheWithBudget 按指定字节预算创建JBIG2全局字典LRU缓存
+// 入参: budget 字节上限，非正数使用默认预算
+// 返回: *jbig2GlobalsCache 缓存实例
+func newJBIG2GlobalsCacheWithBudget(budget int64) *jbig2GlobalsCache {
+	if budget <= 0 {
+		budget = jbig2GlobalsCacheBudget
+	}
+	return &jbig2GlobalsCache{entries: make(map[Reference]*jbig2GlobalsEntry), budget: budget}
+}
+
+// moveToFront 将已存在缓存项移到LRU链头，调用方须持有互斥锁
+// 入参: entry 缓存项
+func (c *jbig2GlobalsCache) moveToFront(entry *jbig2GlobalsEntry) {
+	if c.head == entry {
+		return
+	}
+	if entry.prev != nil {
+		entry.prev.next = entry.next
+	}
+	if entry.next != nil {
+		entry.next.prev = entry.prev
+	}
+	if c.tail == entry {
+		c.tail = entry.prev
+	}
+	entry.prev = nil
+	entry.next = c.head
+	if c.head != nil {
+		c.head.prev = entry
+	}
+	c.head = entry
+	if c.tail == nil {
+		c.tail = entry
+	}
+}
+
+// evictOverBudget 淘汰最久未使用的JBIG2全局字典直至满足字节预算，调用方须持有互斥锁
+func (c *jbig2GlobalsCache) evictOverBudget() {
+	for c.used > c.budget && c.tail != nil {
+		victim := c.tail
+		c.tail = victim.prev
+		if c.tail != nil {
+			c.tail.next = nil
+		} else {
+			c.head = nil
+		}
+		victim.prev, victim.next = nil, nil
+		delete(c.entries, victim.ref)
+		c.used -= victim.size
+	}
+}
+
+// getRaw 查询已缓存的JBIG2全局字典原文并刷新LRU顺序
+// 入参: ref 全局字典对象引用
+// 返回: []byte 原文字节, bool 是否命中
+func (c *jbig2GlobalsCache) getRaw(ref Reference) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[ref]
+	if !ok || entry.raw == nil {
+		return nil, false
+	}
+	c.moveToFront(entry)
+	return entry.raw, true
+}
+
+// setRaw 写入JBIG2全局字典原文并按字节预算执行LRU淘汰
+// 入参: ref 全局字典对象引用, data 原文字节
+func (c *jbig2GlobalsCache) setRaw(ref Reference, data []byte) {
+	cost := max(int64(len(data)), 1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cost > c.budget {
+		return
+	}
+	if entry, ok := c.entries[ref]; ok {
+		c.used -= entry.size
+		entry.raw = data
+		entry.size = cost
+		c.used += entry.size
+		c.moveToFront(entry)
+		c.evictOverBudget()
+		return
+	}
+	entry := &jbig2GlobalsEntry{ref: ref, raw: data, size: cost}
+	c.entries[ref] = entry
+	c.used += entry.size
+	c.moveToFront(entry)
+	c.evictOverBudget()
+}
+
+// getParsed 查询已缓存的JBIG2全局符号字典并刷新LRU顺序
+// 入参: ref 全局字典对象引用
+// 返回: *jbig2.Globals 已解析字典, bool 是否命中
+func (c *jbig2GlobalsCache) getParsed(ref Reference) (*jbig2.Globals, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[ref]
+	if !ok || entry.parsed == nil {
+		return nil, false
+	}
+	c.moveToFront(entry)
+	return entry.parsed, true
+}
+
+// setParsed 写入已解析的JBIG2全局符号字典并按字节预算执行LRU淘汰
+// 入参: ref 全局字典对象引用, parsed 已解析字典, rawLen 原始字节长度
+func (c *jbig2GlobalsCache) setParsed(ref Reference, parsed *jbig2.Globals, rawLen int) {
+	cost := max(int64(rawLen)*2, 4096)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cost > c.budget {
+		return
+	}
+	if entry, ok := c.entries[ref]; ok {
+		c.used -= entry.size
+		entry.parsed = parsed
+		entry.size = max(entry.size, cost)
+		c.used += entry.size
+		c.moveToFront(entry)
+		c.evictOverBudget()
+		return
+	}
+	entry := &jbig2GlobalsEntry{ref: ref, parsed: parsed, size: cost}
+	c.entries[ref] = entry
+	c.used += entry.size
+	c.moveToFront(entry)
+	c.evictOverBudget()
 }
 
 // jbig2SinglePageContext 仅解析段头验证完整单页边界，不为后续页面分配像素
@@ -404,8 +551,17 @@ func imageCMYKAt(source image.Image, x, y int) (cmykSample, bool) {
 // 不解码像素，也不判断遮罩是否全不透明
 // 返回: bool 是否具有生效遮罩, error 引用或遮罩参数错误
 func (i *Image) HasMask() (bool, error) {
+	if i == nil {
+		return false, fmt.Errorf("missing image")
+	}
+	if i.reader != nil && i.reader.closed {
+		return false, os.ErrClosed
+	}
 	if i.ImageMask {
 		return true, nil
+	}
+	if i.Stream == nil {
+		return false, fmt.Errorf("missing image stream")
 	}
 	mode, err := i.jpxMaskMode()
 	if err != nil || mode != 0 {
@@ -418,9 +574,21 @@ func (i *Image) HasMask() (bool, error) {
 // HasSoftMask 判断显式及JPEG2000内嵌软遮罩，不将硬遮罩当作软遮罩
 // 返回: bool 是否具有软遮罩, error 引用或遮罩参数错误
 func (i *Image) HasSoftMask() (bool, error) {
+	if i == nil {
+		return false, fmt.Errorf("missing image")
+	}
+	if i.reader != nil && i.reader.closed {
+		return false, os.ErrClosed
+	}
+	if i.Stream == nil {
+		return false, fmt.Errorf("missing image stream")
+	}
 	mode, err := i.jpxMaskMode()
 	if err != nil || mode != 0 {
 		return mode != 0, err
+	}
+	if i.SoftMask == nil {
+		return false, nil
 	}
 	value, err := i.reader.Resolve(i.SoftMask)
 	return value != nil && value != Name("None"), err
@@ -471,11 +639,14 @@ func (i *Image) validateJBIG2FileHeader(data []byte, hasGlobals bool) (bool, err
 // 入参: ctx 取消上下文
 // 返回: []byte 完整JBIG2文件或空值, error 参数、编码或取消错误
 func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
-	if ctx == nil {
+	if ctx == nil || i == nil || i.Stream == nil {
 		return nil, fmt.Errorf("invalid image context")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if i.reader != nil && i.reader.closed {
+		return nil, os.ErrClosed
 	}
 	if i.ImageMask || i.BitsPerComponent != 1 || i.ColorSpace != Name("DeviceGray") || len(i.Decode) != 0 || i.Stream.Dictionary["Matte"] != nil {
 		return nil, nil
@@ -546,7 +717,7 @@ func (i *Image) encodedFileContext(ctx context.Context, terminal Name) ([]byte, 
 			warning = i.reader.warning
 		}
 		prefix := Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": params[:len(params)-1]}, Data: data}
-		data, err = prefix.decodeWith(ctx, nil, warning, 0)
+		data, err = prefix.decodeWith(ctx, i.reader, warning, 0)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -955,11 +1126,14 @@ func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
 // 入参: ctx 取消上下文, size 像素需求, rows 可选行解码资源
 // 返回: image.Image 原始样本, error 解码或取消错误
 func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, rows *imageRowContext) (image.Image, error) {
-	if ctx == nil {
+	if ctx == nil || i == nil || i.Stream == nil {
 		return nil, fmt.Errorf("invalid image context")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if i.reader != nil && i.reader.closed {
+		return nil, os.ErrClosed
 	}
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
@@ -1206,10 +1380,7 @@ func (i *Image) jbig2GlobalsRaw(ctx context.Context, obj Object) ([]byte, error)
 	ref, isRef := obj.(Reference)
 	cache := i.reader.jbig2Globals
 	if isRef && cache != nil {
-		cache.mu.Lock()
-		cached, ok := cache.raw[ref]
-		cache.mu.Unlock()
-		if ok {
+		if cached, ok := cache.getRaw(ref); ok {
 			return cached, nil
 		}
 	}
@@ -1226,9 +1397,7 @@ func (i *Image) jbig2GlobalsRaw(ctx context.Context, obj Object) ([]byte, error)
 		return nil, err
 	}
 	if isRef && cache != nil {
-		cache.mu.Lock()
-		cache.raw[ref] = data
-		cache.mu.Unlock()
+		cache.setRaw(ref, data)
 	}
 	return data, nil
 }
@@ -1240,10 +1409,7 @@ func (i *Image) jbig2GlobalsParsed(ctx context.Context, obj Object, opts *jbig2.
 	ref, isRef := obj.(Reference)
 	cache := i.reader.jbig2Globals
 	if isRef && cache != nil {
-		cache.mu.Lock()
-		cached, ok := cache.parsed[ref]
-		cache.mu.Unlock()
-		if ok {
+		if cached, ok := cache.getParsed(ref); ok {
 			return cached, nil
 		}
 	}
@@ -1259,9 +1425,7 @@ func (i *Image) jbig2GlobalsParsed(ctx context.Context, obj Object, opts *jbig2.
 		return nil, err
 	}
 	if isRef && cache != nil {
-		cache.mu.Lock()
-		cache.parsed[ref] = parsed
-		cache.mu.Unlock()
+		cache.setParsed(ref, parsed, len(raw))
 	}
 	return parsed, nil
 }
@@ -1398,8 +1562,14 @@ func (i *Image) decodeImageOutput(ctx context.Context, target *ImageComponents, 
 // 入参: ctx 取消上下文, target 可选分量输出, sampled 延迟分量采样, size 像素需求, writer 可选PNG输出流, rows 可选行解码资源
 // 返回: image.Image 显示图像，直接输出时为空, error 解码或写入错误
 func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sampled bool, size image.Point, writer io.Writer, rows *imageRowContext) (image.Image, error) {
+	if i == nil || i.Stream == nil {
+		return nil, fmt.Errorf("missing image source")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if i.reader != nil && i.reader.closed {
+		return nil, os.ErrClosed
 	}
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
@@ -2488,6 +2658,16 @@ func (i *Image) rawSampleComponents() (int, error) {
 	if i.ImageMask {
 		components = 1
 	}
+	if space, ok := i.ColorSpace.(Array); ok && len(space) == 1 {
+		switch space[0] {
+		case Name("DeviceGray"):
+			components = 1
+		case Name("DeviceRGB"):
+			components = 3
+		case Name("DeviceCMYK"):
+			components = 4
+		}
+	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Indexed") {
 		components = 1
 	}
@@ -2509,9 +2689,13 @@ func (i *Image) rawSampleComponents() (int, error) {
 		if !ok {
 			return 0, fmt.Errorf("invalid ICC profile stream")
 		}
-		switch stream.Dictionary["N"] {
+		nVal, err := i.reader.Resolve(stream.Dictionary["N"])
+		if err != nil {
+			return 0, err
+		}
+		switch nVal {
 		case Integer(1), Integer(3), Integer(4):
-			components = int(stream.Dictionary["N"].(Integer))
+			components = int(nVal.(Integer))
 		default:
 			return 0, &UnsupportedError{Feature: "image ICC component count"}
 		}

@@ -94,7 +94,7 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 			return nil, err
 		}
 		if fill && cloud == 0 {
-			fmt.Fprintf(&content, "%g %g %g %g re f\n", frame.XMin, frame.YMin, fw, fh)
+			writeAnnotationOperation(&content, "re f", frame.XMin, frame.YMin, fw, fh)
 		}
 	}
 	if cloud > 0 {
@@ -120,9 +120,10 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 		inset := math.Min(border.width/2, math.Min(fw, fh)/2)
 		switch border.style {
 		case "S", "D":
-			fmt.Fprintf(&content, "%g %g %g %g re S\n", frame.XMin+inset, frame.YMin+inset, fw-2*inset, fh-2*inset)
+			writeAnnotationOperation(&content, "re S", frame.XMin+inset, frame.YMin+inset, fw-2*inset, fh-2*inset)
 		case "U":
-			fmt.Fprintf(&content, "%g %g m %g %g l S\n", frame.XMin, frame.YMin+inset, frame.XMax, frame.YMin+inset)
+			writeAnnotationOperation(&content, "m", frame.XMin, frame.YMin+inset)
+			writeAnnotationOperation(&content, "l S", frame.XMax, frame.YMin+inset)
 		case "B", "I":
 			if err := r.writeAnnotationRelief(&content, border, frame); err != nil {
 				return nil, err
@@ -170,9 +171,9 @@ func (r *Reader) writeFreeTextCallout(content *strings.Builder, annotation Annot
 		}
 	}
 	if stroke {
-		fmt.Fprintf(content, "%g %g m\n", points[0], points[1])
+		writeAnnotationOperation(content, "m", points[0], points[1])
 		for i := 2; i < len(points); i += 2 {
-			fmt.Fprintf(content, "%g %g l\n", points[i], points[i+1])
+			writeAnnotationOperation(content, "l", points[i], points[i+1])
 		}
 		content.WriteString("S\n")
 	}

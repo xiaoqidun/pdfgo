@@ -87,7 +87,10 @@ func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (ann
 			}
 		case "font-size", "vertical-align":
 			n, err := annotationRichPoint(value)
-			if err != nil || name == "font-size" && n < 0 {
+			if err != nil {
+				return style, err
+			}
+			if name == "font-size" && n < 0 {
 				return style, fmt.Errorf("invalid rich text %s", name)
 			}
 			if name == "font-size" {
@@ -152,7 +155,10 @@ func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (ann
 					}
 				}
 			}
-			if err != nil || !found {
+			if err != nil {
+				return style, err
+			}
+			if !found {
 				return style, fmt.Errorf("invalid rich text font shorthand")
 			}
 		case "color":

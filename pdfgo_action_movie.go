@@ -67,30 +67,30 @@ func (r *Reader) ReadMovieAction(ctx context.Context, object Object) (MovieActio
 		return result, err
 	}
 	if (annotation == nil) == (title == nil) {
-		return result, fmt.Errorf("invalid movie action target")
+		return result, fmt.Errorf("%w: invalid movie action target", ErrInvalidAction)
 	}
 	if annotation != nil {
 		ref, indirect := dict["Annotation"].(Reference)
 		target, valid := annotation.(Dictionary)
 		if !indirect || ref.Number <= 0 || !valid || target == nil {
-			return result, fmt.Errorf("invalid movie annotation reference")
+			return result, fmt.Errorf("%w: invalid movie annotation reference", ErrInvalidAction)
 		}
 		kind, err := r.Resolve(target["Subtype"])
 		if err != nil {
 			return result, err
 		}
 		if kind != Name("Movie") {
-			return result, fmt.Errorf("invalid movie annotation type")
+			return result, fmt.Errorf("%w: invalid movie annotation type", ErrInvalidAction)
 		}
 		result.Annotation = ref
 	} else {
 		text, ok := title.(String)
 		if !ok {
-			return result, fmt.Errorf("invalid movie action title")
+			return result, fmt.Errorf("%w: invalid movie action title", ErrInvalidAction)
 		}
 		result.Title, err = DecodeTextString(text)
 		if err != nil {
-			return result, err
+			return result, wrapActionError(err)
 		}
 	}
 	value, err := r.Resolve(dict["Operation"])
@@ -100,7 +100,7 @@ func (r *Reader) ReadMovieAction(ctx context.Context, object Object) (MovieActio
 	if value != nil {
 		operation, ok := value.(Name)
 		if !ok || operation != "Play" && operation != "Stop" && operation != "Pause" && operation != "Resume" {
-			return result, fmt.Errorf("invalid movie action operation")
+			return result, fmt.Errorf("%w: invalid movie action operation", ErrInvalidAction)
 		}
 		result.Operation = operation
 	}
@@ -114,7 +114,7 @@ func (r *Reader) ReadMovieAction(ctx context.Context, object Object) (MovieActio
 		}
 	}
 	_, err = r.ReadMovieActivation(ctx, result.Activation)
-	return result, err
+	return result, wrapActionError(err)
 }
 
 // ReadMovieActivation 按PDF标准表296解析播放区间、时间单位及窗口参数

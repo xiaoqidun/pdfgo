@@ -117,7 +117,13 @@ func (f *Font) glyphLookup(ctx context.Context, wanted map[uint16]int) (map[uint
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		glyph, ok, _ := f.encodingGlyph(ctx, code)
+		glyph, ok, err := f.encodingGlyph(ctx, code)
+		if err != nil {
+			if ignorableEncodingGlyphError(err) {
+				continue
+			}
+			return nil, err
+		}
 		if !ok || !glyph.HasID || wanted[glyph.ID] == 0 {
 			continue
 		}

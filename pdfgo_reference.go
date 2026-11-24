@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -112,6 +113,12 @@ func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRa
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing page label visitor")
 	}
 	catalog, err := r.catalogDictionary()
 	if err != nil {
@@ -244,6 +251,12 @@ func (r *Reader) ResolveReferencePage(ctx context.Context, reference ReferenceXO
 // 入参: reference 引用目标
 // 返回: bool 文件标识相同或引用未声明标识, error 标识结构错误
 func (r *Reader) ReferenceIDMatches(reference ReferenceXObject) (bool, error) {
+	if r == nil {
+		return false, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return false, os.ErrClosed
+	}
 	if len(reference.ID) == 0 {
 		return true, nil
 	}

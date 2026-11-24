@@ -107,6 +107,14 @@ func (r *Reader) compileSeparationSpace(space Array, effective bool, depth int) 
 	var icc *iccColorSpace
 	if !ok {
 		array, arrayOK := object.(Array)
+		if arrayOK && len(array) == 1 {
+			if name, nameOK := array[0].(Name); nameOK && (name == "DeviceGray" || name == "DeviceRGB" || name == "DeviceCMYK") {
+				alternate, ok = name, true
+			}
+		}
+	}
+	if !ok {
+		array, arrayOK := object.(Array)
 		if !arrayOK || len(array) != 2 {
 			return nil, &UnsupportedError{Feature: "Separation alternate color space"}
 		}

@@ -170,8 +170,7 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 }
 
 // cffFontMappingWithGlyphMap 读取CFF字形选择，非CID程序优先使用明确的CIDToGIDMap
-// 入参: data CFF数据, composite 复合字体, encoding 基础编码, differences 编码差异
-// 入参: identity 非CID程序是否允许编号映射, programType 容器类型, glyphMap 原始CID到GID表
+// 入参: data CFF数据, composite 复合字体, encoding 基础编码, differences 编码差异, identity 非CID程序是否允许编号映射, programType 容器类型, glyphMap 原始CID到GID表
 // 返回: map[uint32]uint16 字形映射, map[uint32]string 字形名称, error 结构错误
 func cffFontMappingWithGlyphMap(data []byte, composite bool, encoding Name, differences map[uint32]string, identity bool, programType Name, glyphMap []byte) (map[uint32]uint16, map[uint32]string, error) {
 	dict, stringsIndex, chars, err := cffFontData(data)

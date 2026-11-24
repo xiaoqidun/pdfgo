@@ -38,7 +38,6 @@ type FunctionGradient struct {
 
 // coordinateFunction 保存二维采样或计算器函数及各分量的独立函数
 type coordinateFunction struct {
-	ctx     context.Context
 	domain  [4]float64
 	bounds  []float64
 	outputs int
@@ -51,7 +50,7 @@ type coordinateFunction struct {
 // 入参: point 定义域坐标，不含Matrix变换
 // 返回: [4]float64 源颜色或备用空间分量, error 坐标或求值错误
 func (g *FunctionGradient) ValuesAt(point Point) ([4]float64, error) {
-	if g.function == nil || math.IsNaN(point.X) || math.IsNaN(point.Y) || math.IsInf(point.X, 0) || math.IsInf(point.Y, 0) {
+	if g == nil || g.function == nil || math.IsNaN(point.X) || math.IsNaN(point.Y) || math.IsInf(point.X, 0) || math.IsInf(point.Y, 0) {
 		return [4]float64{}, fmt.Errorf("invalid function shading evaluation")
 	}
 	point.X = math.Max(g.Domain.XMin, math.Min(g.Domain.XMax, point.X))
@@ -71,6 +70,9 @@ func (g *FunctionGradient) ValuesAt(point Point) ([4]float64, error) {
 // 入参: point 定义域坐标，不含Matrix变换
 // 返回: [3]float64 sRGB颜色, error 坐标或颜色变换错误
 func (g *FunctionGradient) ColorAt(point Point) ([3]float64, error) {
+	if g == nil {
+		return [3]float64{}, fmt.Errorf("invalid function shading evaluation")
+	}
 	values, err := g.ValuesAt(point)
 	return gradientRGB(values, err, g.Space, g.Intent)
 }
@@ -79,11 +81,6 @@ func (g *FunctionGradient) ColorAt(point Point) ([3]float64, error) {
 // 入参: point 二维输入, out 输出分量缓冲区
 // 返回: error 计算器或非有限结果错误
 func (f *coordinateFunction) evaluate(point [2]float64, out []float64) error {
-	if f.ctx != nil {
-		if err := f.ctx.Err(); err != nil {
-			return err
-		}
-	}
 	if f.parts != nil {
 		for i, part := range f.parts {
 			if err := part.evaluate(point, out[i:i+1]); err != nil {
@@ -99,11 +96,6 @@ func (f *coordinateFunction) evaluate(point [2]float64, out []float64) error {
 		f.sampled.evaluate(point[:], out)
 	} else if err := f.program.evaluate(point[:], out); err != nil {
 		return err
-	}
-	if f.ctx != nil {
-		if err := f.ctx.Err(); err != nil {
-			return err
-		}
 	}
 	for i, value := range out {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
@@ -128,7 +120,7 @@ func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Objec
 	if err != nil {
 		return nil, err
 	}
-	f := &coordinateFunction{outputs: outputs, ctx: ctx}
+	f := &coordinateFunction{outputs: outputs}
 	if array, ok := value.(Array); ok {
 		if len(array) != outputs {
 			return nil, fmt.Errorf("invalid coordinate function count")

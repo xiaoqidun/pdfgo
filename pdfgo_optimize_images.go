@@ -25,8 +25,27 @@ import (
 	"io"
 	"maps"
 	"math"
+	"os"
 	"slices"
 )
+
+// isFatalOptimizationReadError 判断错误是否属于必须向上传播的取消、关闭、认证、读取或安全错误
+// 入参: ctx 取消上下文, err 待检查错误
+// 返回: bool 是否为不可吞噬的致命读取错误
+func isFatalOptimizationReadError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed) || errors.Is(err, ErrPassword) {
+		return true
+	}
+	var readErr *ReadError
+	var security *objectSecurityError
+	return errors.As(err, &readErr) || errors.As(err, &security)
+}
 
 // imagePlacementKey 保存图片在局部坐标系中的线性变换分量
 type imagePlacementKey struct {
@@ -1008,7 +1027,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			if ref.Number > 0 {
 				patternActive[ref] = true
 			}
-			content, decodeErr := r.DecodeStreamContext(ctx, patStream)
+			content, decodeErr := r.optimizationContentData(ctx, patStream, optimizationBufferLimit)
 			walkErr := decodeErr
 			if walkErr == nil {
 				walkErr = walk(content, patRes, initialMatrix.Mul(patMatrix), depth+1, budget, collector, localUnsafe)
@@ -1016,8 +1035,8 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			if ref.Number > 0 {
 				delete(patternActive, ref)
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if isFatalOptimizationReadError(ctx, walkErr) {
+				return walkErr
 			}
 			if walkErr != nil {
 				if errors.Is(walkErr, errUnsafe) || !markResourcesUnsafe(patRes, localUnsafe, map[Reference]bool{ref: true}, 0) {
@@ -1135,14 +1154,14 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 						formBudget := 100000
 						subCollector := make(map[imagePlacementKey]struct{})
 						subUnsafe := make(map[Reference]bool)
-						content, decodeErr := r.DecodeStreamContext(ctx, stream)
+						content, decodeErr := r.optimizationContentData(ctx, stream, optimizationBufferLimit)
 						walkErr := decodeErr
 						if walkErr == nil {
 							walkErr = walk(content, childResources, formMatrix, depth+1, &formBudget, subCollector, subUnsafe)
 						}
 						delete(formActive, ref)
-						if ctx.Err() != nil {
-							return ctx.Err()
+						if isFatalOptimizationReadError(ctx, walkErr) {
+							return walkErr
 						}
 						var entry *cachedFormImages
 						if walkErr != nil || len(subCollector) > 10000 {
@@ -1173,7 +1192,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 						childResources = dict
 					}
 					child := matrix.Mul(formMatrix)
-					content, err := r.DecodeStreamContext(ctx, stream)
+					content, err := r.optimizationContentData(ctx, stream, optimizationBufferLimit)
 					if err != nil {
 						return err
 					}
@@ -1193,8 +1212,8 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		if apStream.Dictionary["Resources"] != nil {
 			resVal, err := r.Resolve(apStream.Dictionary["Resources"])
 			if err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
 				}
 				return errUnsafe
 			}
@@ -1206,9 +1225,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				apRes = dict
 			}
 		}
-		failSafe := func() error {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		failSafe := func(cause error) error {
+			if isFatalOptimizationReadError(ctx, cause) {
+				return cause
 			}
 			if !markResourcesUnsafe(apRes, unsafe, map[Reference]bool{}, 0) {
 				return errUnsafe
@@ -1216,22 +1235,22 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			return nil
 		}
 		if !rectValid || rect.XMin == rect.XMax || rect.YMin == rect.YMax {
-			return failSafe()
+			return failSafe(nil)
 		}
 		box, err := r.rectangle(apStream.Dictionary["BBox"])
 		if err != nil {
-			return failSafe()
+			return failSafe(err)
 		}
 		formMatrix := Identity()
 		if apStream.Dictionary["Matrix"] != nil {
 			mVal, err := r.Resolve(apStream.Dictionary["Matrix"])
 			if err != nil {
-				return failSafe()
+				return failSafe(err)
 			}
 			if mVal != nil {
 				values, err := r.numberArray(mVal, 6)
 				if err != nil {
-					return failSafe()
+					return failSafe(err)
 				}
 				formMatrix = Matrix(values)
 			}
@@ -1243,24 +1262,24 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			maxX, maxY = math.Max(maxX, pt.X), math.Max(maxY, pt.Y)
 		}
 		if math.IsInf(minX, 0) || math.IsInf(minY, 0) || math.IsInf(maxX, 0) || math.IsInf(maxY, 0) || math.IsNaN(minX) || math.IsNaN(minY) || math.IsNaN(maxX) || math.IsNaN(maxY) || minX == maxX || minY == maxY {
-			return failSafe()
+			return failSafe(nil)
 		}
 		scaleX := (rect.XMax - rect.XMin) / (maxX - minX)
 		scaleY := (rect.YMax - rect.YMin) / (maxY - minY)
 		apMatrix := Matrix{unit * scaleX, 0, 0, unit * scaleY, 0, 0}.Mul(formMatrix)
-		content, err := r.DecodeStreamContext(ctx, apStream)
+		content, err := r.optimizationContentData(ctx, apStream, optimizationBufferLimit)
 		if err != nil {
-			return failSafe()
+			return failSafe(err)
 		}
 		apBudget := 100000
 		if err := walk(content, apRes, apMatrix, 0, &apBudget, nil, unsafe); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
 			}
 			if errors.Is(err, errUnsafe) {
 				return errUnsafe
 			}
-			return failSafe()
+			return failSafe(err)
 		}
 		return ctx.Err()
 	}
@@ -1270,6 +1289,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		}
 		val, err := r.Resolve(page.Dictionary["Annots"])
 		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
 			return ctx.Err()
 		}
 		annots, ok := val.(Array)
@@ -1282,6 +1304,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			}
 			annotObj, _, err := resolveObjectRef(item)
 			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
+				}
 				continue
 			}
 			annotDict, ok := annotObj.(Dictionary)
@@ -1290,6 +1315,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			}
 			apVal, err := r.Resolve(annotDict["AP"])
 			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
+				}
 				continue
 			}
 			apDict, ok := apVal.(Dictionary)
@@ -1297,10 +1325,19 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				continue
 			}
 			rect, rectErr := r.rectangle(annotDict["Rect"])
+			if isFatalOptimizationReadError(ctx, rectErr) {
+				return rectErr
+			}
 			rectValid := rectErr == nil
 			for _, apKey := range []Name{"N", "R", "D"} {
 				entryVal, err := r.Resolve(apDict[apKey])
-				if err != nil || entryVal == nil {
+				if err != nil {
+					if isFatalOptimizationReadError(ctx, err) {
+						return err
+					}
+					continue
+				}
+				if entryVal == nil {
 					continue
 				}
 				switch v := entryVal.(type) {
@@ -1312,6 +1349,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 					for _, stateEntry := range v {
 						stateObj, _, err := resolveObjectRef(stateEntry)
 						if err != nil {
+							if isFatalOptimizationReadError(ctx, err) {
+								return err
+							}
 							continue
 						}
 						if stateStream, ok := stateObj.(*Stream); ok {
@@ -1331,10 +1371,10 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		if err := walkPageAnnotations(page, unit); err != nil {
 			return err
 		}
-		content, err := page.Content()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		var content bytes.Buffer
+		if _, err := page.WriteContent(ctx, &optimizationBuffer{buffer: &content, limit: optimizationBufferLimit}); err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
 			}
 			if !markResourcesUnsafe(page.Resources, unsafe, map[Reference]bool{}, 0) {
 				return errUnsafe
@@ -1342,9 +1382,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			return nil
 		}
 		pageBudget := 100000
-		if err := walk(content, page.Resources, Matrix{unit, 0, 0, unit, 0, 0}, 0, &pageBudget, nil, unsafe); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		if err := walk(content.Bytes(), page.Resources, Matrix{unit, 0, 0, unit, 0, 0}, 0, &pageBudget, nil, unsafe); err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
 			}
 			if errors.Is(err, errUnsafe) || !markResourcesUnsafe(page.Resources, unsafe, map[Reference]bool{}, 0) {
 				return errUnsafe
@@ -1354,6 +1394,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		return nil
 	})
 	if err != nil {
+		if isFatalOptimizationReadError(ctx, err) {
+			return nil, err
+		}
 		return nil, ctx.Err()
 	}
 	for ref := range unsafe {

@@ -70,6 +70,8 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 	}
 	paint := Paint{SourceSpace: name}
 	switch {
+	case name == "DeviceGray", name == "DeviceRGB":
+		paint.Space = &ColorSpace{Model: name}
 	case name == "DeviceCMYK":
 		paint.CMYK = &[4]float64{0, 0, 0, 1}
 		paint.Space = &ColorSpace{Model: name}

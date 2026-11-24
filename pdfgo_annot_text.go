@@ -437,7 +437,7 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 			return nil, err
 		}
 		if fill {
-			fmt.Fprintf(&content, "%g %g %g %g re f\n", frame.XMin, frame.YMin, fw, fh)
+			writeAnnotationOperation(&content, "re f", frame.XMin, frame.YMin, fw, fh)
 		}
 	}
 	stroke, err := r.writeAnnotationStroke(&content, border)
@@ -448,9 +448,10 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 		inset := math.Min(border.width/2, math.Min(fw, fh)/2)
 		switch border.style {
 		case "S", "D":
-			fmt.Fprintf(&content, "%g %g %g %g re S\n", frame.XMin+inset, frame.YMin+inset, fw-2*inset, fh-2*inset)
+			writeAnnotationOperation(&content, "re S", frame.XMin+inset, frame.YMin+inset, fw-2*inset, fh-2*inset)
 		case "U":
-			fmt.Fprintf(&content, "%g %g m %g %g l S\n", frame.XMin, frame.YMin+inset, frame.XMax, frame.YMin+inset)
+			writeAnnotationOperation(&content, "m", frame.XMin, frame.YMin+inset)
+			writeAnnotationOperation(&content, "l S", frame.XMax, frame.YMin+inset)
 		case "B", "I":
 			if err := r.writeAnnotationRelief(&content, border, frame); err != nil {
 				return nil, err

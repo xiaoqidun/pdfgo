@@ -61,6 +61,8 @@ type iccColorSpace struct {
 	alternate          *patternColorSpace
 	alternateBlending  *ColorSpace
 	alternateCount     int
+	alternateDigest    [32]byte
+	hasAlternateDigest bool
 	intent             Name
 }
 

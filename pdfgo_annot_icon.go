@@ -101,7 +101,8 @@ func (r *Reader) iconAppearance(annotation Annotation) (*Stream, error) {
 		y = box.YMax - height
 	}
 	var content strings.Builder
-	fmt.Fprintf(&content, "%g 0 0 %g %g %g cm 1 w 1 J 1 j 0 G\n", width/16, height/16, x, y)
+	writeAnnotationOperation(&content, "cm", width/16, 0, 0, height/16, x, y)
+	content.WriteString("1 w 1 J 1 j 0 G\n")
 	if annotation.Subtype == "Text" && annotation.Dictionary["C"] == nil {
 		border.color = Array{Integer(1), Integer(1), Integer(0)}
 	}

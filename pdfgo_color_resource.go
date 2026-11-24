@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"bytes"
 	"fmt"
+	"os"
 )
 
 // cloneColorantDictionary 复制需重映射的属性字典，不改变共享资源
@@ -49,6 +50,12 @@ func colorSpaceFamily(value Object) Name {
 // 入参: profile 独立ICC数据，nil清除；调用后可修改输入切片
 // 返回: error 配置错误，失败保留原设置
 func (r *Reader) SetDeviceColorProfile(profile []byte) error {
+	if r == nil {
+		return fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
 	if profile == nil {
 		r.deviceProfile = nil
 		return nil

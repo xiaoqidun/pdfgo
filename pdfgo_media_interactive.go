@@ -17,34 +17,37 @@ package pdfgo
 import (
 	"context"
 	"fmt"
+	"os"
 )
 
 // ThreeD 保存3D数据、视图和激活参数，不解码模型或执行脚本
 // AnnotationBackground仅在面色要求宿主背景时读取，空值表示透明
 // AnnotationBox使用页面用户坐标，ViewBox以注解中心为原点
 type ThreeD struct {
-	Stream               *Stream
-	Format               Name
-	Views                []Dictionary
-	DefaultView          Object
-	SelectedView         Dictionary
-	Activation           Dictionary
-	ActivationPolicy     ThreeDActivation
-	AnimationStyle       ThreeDAnimation
-	Projection           *ThreeDProjection
-	Camera               ThreeDCamera
-	Background           ThreeDBackground
-	AnnotationBackground *[3]float64
-	Lighting             ThreeDLighting
-	Presentation         ThreeDPresentation
-	Measurements         []ThreeDMeasurement
-	AnnotationBox        Rectangle
-	ViewBox              Rectangle
-	Resources            Object
-	OnInstantiate        *Stream
-	Animation            Dictionary
-	Interactive          bool
-	Dictionary           Dictionary
+	Stream                *Stream
+	Format                Name
+	Views                 []Dictionary
+	ViewReferences        []Reference
+	DefaultView           Object
+	SelectedView          Dictionary
+	SelectedViewReference Reference
+	Activation            Dictionary
+	ActivationPolicy      ThreeDActivation
+	AnimationStyle        ThreeDAnimation
+	Projection            *ThreeDProjection
+	Camera                ThreeDCamera
+	Background            ThreeDBackground
+	AnnotationBackground  *[3]float64
+	Lighting              ThreeDLighting
+	Presentation          ThreeDPresentation
+	Measurements          []ThreeDMeasurement
+	AnnotationBox         Rectangle
+	ViewBox               Rectangle
+	Resources             Object
+	OnInstantiate         *Stream
+	Animation             Dictionary
+	Interactive           bool
+	Dictionary            Dictionary
 }
 
 // RichMedia 保存富媒体资源、配置、视图和播放设置，不执行脚本
@@ -120,6 +123,59 @@ func (r *Reader) mediaDictionaries(object Object) ([]Dictionary, error) {
 	return result, nil
 }
 
+// resolveIndirectReference 解析对象对应的最终间接引用，直接对象返回零值引用
+// 入参: object 原始对象或间接引用
+// 返回: Reference 最终间接引用, error 引用或循环错误
+func (r *Reader) resolveIndirectReference(object Object) (Reference, error) {
+	var ref Reference
+	seen := map[Reference]bool{}
+	for {
+		next, ok := object.(Reference)
+		if !ok {
+			return ref, nil
+		}
+		if seen[next] {
+			return Reference{}, fmt.Errorf("cyclic indirect reference %d %d", next.Number, next.Generation)
+		}
+		seen[next] = true
+		ref = next
+		resolved, err := r.Object(next)
+		if err != nil {
+			return Reference{}, err
+		}
+		object = resolved
+	}
+}
+
+// mediaDictionariesWithRefs 读取媒体字典数组及其间接引用，不预先解析字典内的脚本或数据流
+// 入参: object 数组或引用
+// 返回: []Dictionary 字典列表, []Reference 对应间接引用列表, error 数组、字典或引用错误
+func (r *Reader) mediaDictionariesWithRefs(object Object) ([]Dictionary, []Reference, error) {
+	value, err := r.Resolve(object)
+	if err != nil || value == nil {
+		return nil, nil, err
+	}
+	array, ok := value.(Array)
+	if !ok {
+		return nil, nil, fmt.Errorf("invalid media dictionary array")
+	}
+	result := make([]Dictionary, 0, len(array))
+	refs := make([]Reference, 0, len(array))
+	for _, item := range array {
+		ref, err := r.resolveIndirectReference(item)
+		if err != nil {
+			return nil, nil, err
+		}
+		dict, err := r.mediaDictionary(item, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		result = append(result, dict)
+		refs = append(refs, ref)
+	}
+	return result, refs, nil
+}
+
 // ReadThreeD 解析3D注解及共享数据引用，保留模型原始编码和视图选择
 // 入参: annotation 3D注解
 // 返回: ThreeD 模型信息, error 类型、引用或视图错误
@@ -129,14 +185,17 @@ func (r *Reader) ReadThreeD(annotation Annotation) (ThreeD, error) {
 
 // ReadThreeDContext 解析三维注解及默认视图，支持批量测量读取取消
 // 入参: ctx 取消上下文, annotation 三维注解
-// 返回: ThreeD 模型信息, error 类型、引用、视图或取消错误
+// 返回: ThreeD 模型信息, error 类型、引用、视图、关闭或取消错误
 func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (ThreeD, error) {
 	result := ThreeD{Interactive: true, Dictionary: annotation.Dictionary}
-	if ctx == nil || r == nil || r.closed {
+	if ctx == nil || r == nil {
 		return result, fmt.Errorf("invalid 3D reader or context")
 	}
 	if err := ctx.Err(); err != nil {
 		return result, err
+	}
+	if r.closed {
+		return result, os.ErrClosed
 	}
 	if annotation.Subtype != "3D" {
 		return result, fmt.Errorf("not a 3D annotation")
@@ -178,43 +237,52 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 	if !ok || result.Format == "" {
 		return result, fmt.Errorf("invalid 3D format")
 	}
-	result.Views, err = r.mediaDictionaries(stream.Dictionary["VA"])
+	result.Views, result.ViewReferences, err = r.mediaDictionariesWithRefs(stream.Dictionary["VA"])
 	if err != nil {
 		return result, err
 	}
-	result.DefaultView, err = r.Resolve(annotation.Dictionary["3DV"])
+	selectorRaw := annotation.Dictionary["3DV"]
+	result.DefaultView, err = r.Resolve(selectorRaw)
 	if err != nil {
 		return result, err
 	}
 	if result.DefaultView == nil {
-		result.DefaultView, err = r.Resolve(stream.Dictionary["DV"])
+		selectorRaw = stream.Dictionary["DV"]
+		result.DefaultView, err = r.Resolve(selectorRaw)
 		if err != nil {
 			return result, err
 		}
 		if result.DefaultView == nil && len(result.Views) != 0 {
 			result.DefaultView = Integer(0)
+			selectorRaw = Integer(0)
 		}
 	}
 	selector := result.DefaultView
 	if selector == Name("D") {
-		selector, err = r.Resolve(stream.Dictionary["DV"])
+		selectorRaw = stream.Dictionary["DV"]
+		selector, err = r.Resolve(selectorRaw)
 		if err != nil {
 			return result, err
 		}
 		if selector == nil && len(result.Views) != 0 {
 			selector = Integer(0)
+			selectorRaw = Integer(0)
 		}
 	}
 	switch v := selector.(type) {
 	case nil:
 	case Dictionary:
 		result.SelectedView = v
+		result.SelectedViewReference, err = r.resolveIndirectReference(selectorRaw)
+		if err != nil {
+			return result, err
+		}
 	case String:
 		name, err := DecodeTextString(v)
 		if err != nil {
 			return result, err
 		}
-		for _, view := range result.Views {
+		for i, view := range result.Views {
 			value, err := r.Resolve(view["IN"])
 			if err != nil {
 				return result, err
@@ -226,6 +294,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 				}
 				if internal == name {
 					result.SelectedView = view
+					result.SelectedViewReference = result.ViewReferences[i]
 					break
 				}
 			}
@@ -238,6 +307,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 			return result, fmt.Errorf("invalid 3D view index")
 		}
 		result.SelectedView = result.Views[v]
+		result.SelectedViewReference = result.ViewReferences[v]
 	case Name:
 		if (v != "F" && v != "L") || len(result.Views) == 0 {
 			return result, fmt.Errorf("invalid 3D view selector")
@@ -247,6 +317,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 			index = len(result.Views) - 1
 		}
 		result.SelectedView = result.Views[index]
+		result.SelectedViewReference = result.ViewReferences[index]
 	default:
 		return result, fmt.Errorf("invalid 3D default view")
 	}
@@ -338,11 +409,14 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 // 返回: RichMedia 媒体信息, error 资源、配置或引用错误
 func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (RichMedia, error) {
 	result := RichMedia{}
-	if ctx == nil {
-		return result, fmt.Errorf("invalid rich media context")
+	if ctx == nil || r == nil {
+		return result, fmt.Errorf("invalid rich media reader or context")
 	}
 	if err := ctx.Err(); err != nil {
 		return result, err
+	}
+	if r.closed {
+		return result, os.ErrClosed
 	}
 	if annotation.Subtype != "RichMedia" {
 		return result, fmt.Errorf("not a rich media annotation")

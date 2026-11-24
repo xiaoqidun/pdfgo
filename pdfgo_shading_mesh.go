@@ -65,7 +65,7 @@ func meshBernstein(t float64) [4]float64 {
 // UsesFunction 判断颜色分量是否需在插值后经过函数变换
 // 返回: bool 是否使用颜色函数
 func (g *MeshGradient) UsesFunction() bool {
-	return g.function != nil || g.tint != nil || g.lab != nil || g.Space != nil && g.Space.profile != nil && (g.Space.profile.ranges != nil || g.Space.profile.alternate != nil)
+	return g != nil && (g.function != nil || g.tint != nil || g.lab != nil || g.Space != nil && g.Space.profile != nil && (g.Space.profile.ranges != nil || g.Space.profile.alternate != nil))
 }
 
 // LinearColors 返回可直接用于线性插值的三角形顶点颜色，不改变源网格
@@ -163,6 +163,9 @@ func (p MeshPatch) PointAt(u, v float64) Point {
 // 入参: patch 网格序号, u 横向参数或第二顶点权重, v 纵向参数或第三顶点权重
 // 返回: [4]float64 Space颜色空间分量, error 参数或颜色错误
 func (g *MeshGradient) ValuesAt(patch int, u, v float64) ([4]float64, error) {
+	if g == nil {
+		return [4]float64{}, fmt.Errorf("invalid mesh gradient")
+	}
 	weights, colors, err := g.sourceColorsAt(patch, u, v)
 	if err != nil {
 		return [4]float64{}, err

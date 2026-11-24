@@ -221,6 +221,9 @@ func (g *MeshGradient) ColorantValuesAt(patch int, u, v float64, out []float64) 
 // 入参: position 归一化轴位置，范围外使用端点
 // 返回: *ColorantPaint 色料快照，非色料渐变为nil, error 参数或函数错误
 func (g *AxialGradient) ColorantAt(position float64) (*ColorantPaint, error) {
+	if g == nil {
+		return nil, nil
+	}
 	return gradientColorantAt(g.function, g.domain, position)
 }
 
@@ -228,6 +231,9 @@ func (g *AxialGradient) ColorantAt(position float64) (*ColorantPaint, error) {
 // 入参: position 归一化双圆插值位置，范围外使用端点
 // 返回: *ColorantPaint 色料快照，非色料渐变为nil, error 参数或函数错误
 func (g *RadialGradient) ColorantAt(position float64) (*ColorantPaint, error) {
+	if g == nil {
+		return nil, nil
+	}
 	return gradientColorantAt(g.function, g.domain, position)
 }
 
@@ -235,7 +241,7 @@ func (g *RadialGradient) ColorantAt(position float64) (*ColorantPaint, error) {
 // 入参: point 定义域坐标，不含Matrix变换
 // 返回: *ColorantPaint 色料快照，非色料渐变为nil, error 参数或函数错误
 func (g *FunctionGradient) ColorantAt(point Point) (*ColorantPaint, error) {
-	if g.tint == nil || g.tint.colorants == nil {
+	if g == nil || g.tint == nil || g.tint.colorants == nil {
 		return nil, nil
 	}
 	components := len(g.tint.colorants.Names)
@@ -254,7 +260,7 @@ func (g *FunctionGradient) ColorantAt(point Point) (*ColorantPaint, error) {
 // 入参: patch 网格序号, u 横向参数或第二顶点权重, v 纵向参数或第三顶点权重
 // 返回: *ColorantPaint 色料快照，非色料网格为nil, error 参数或函数错误
 func (g *MeshGradient) ColorantAt(patch int, u, v float64) (*ColorantPaint, error) {
-	if g.tint == nil || g.tint.colorants == nil {
+	if g == nil || g.tint == nil || g.tint.colorants == nil {
 		return nil, nil
 	}
 	components := len(g.tint.colorants.Names)

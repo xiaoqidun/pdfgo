@@ -976,6 +976,9 @@ func (r *Reader) encodePassword(password []byte) ([]byte, error) {
 	for _, c := range string(password) {
 		found := false
 		for code := 0; code < 256; code++ {
+			if code < 0x18 && code != '\t' && code != '\n' && code != '\r' {
+				continue
+			}
 			decoded := rune(code)
 			if mapped, ok := pdfDocCharacters[byte(code)]; ok {
 				if mapped == 0 {

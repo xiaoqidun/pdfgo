@@ -301,7 +301,7 @@ func validateFontCmap(ctx context.Context, table []byte) error {
 				}
 			}
 			end, start := int(u16(14+index*2)), int(u16(16+count*2+index*2))
-			if start > end || index != 0 && end <= int(u16(12+index*2)) {
+			if start > end || index != 0 && start <= int(u16(12+index*2)) {
 				return fmt.Errorf("invalid cmap segment order")
 			}
 			address := 16 + count*6 + index*2

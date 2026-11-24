@@ -90,8 +90,17 @@ func ParseCIDMapContext(ctx context.Context, data []byte) (CIDMap, error) {
 		}
 	}
 	result := CIDMap{}
+	var expanded uint64
 	for current := mapping; current != nil; current = current.base {
 		for _, entry := range current.ranges {
+			if entry.last < entry.first {
+				continue
+			}
+			span := entry.last - entry.first + 1
+			if span == 0 || span > maxCMapEntries-expanded {
+				return nil, fmt.Errorf("CMap mapping entries exceed limit")
+			}
+			expanded += span
 			for code := entry.first; code <= entry.last; code++ {
 				if (code-entry.first)&255 == 0 {
 					if err := ctx.Err(); err != nil {

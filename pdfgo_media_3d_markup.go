@@ -18,48 +18,36 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
+	"os"
 	"reflect"
 )
 
 // ThreeDMarkup 保存三维批注的宿主、视图及可选模型校验和，不决定激活状态
 type ThreeDMarkup struct {
-	Annotation Annotation
-	View       Dictionary
-	Checksum   *[16]byte
-	Dictionary Dictionary
-}
-
-// ThreeDArtworkChecksum 计算三维模型数据的MD5，不将PDF流过滤器编码计入模型内容
-// 校验仅用于检测模型变化，不用于安全认证
-// 入参: ctx 取消上下文, stream 三维模型流
-// 返回: [16]byte 校验和, error 解码或取消错误
-func ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16]byte, error) {
-	var result [16]byte
-	if ctx == nil || stream == nil {
-		return result, fmt.Errorf("invalid 3D artwork checksum source")
-	}
-	data, err := stream.DecodeContext(ctx)
-	if err != nil {
-		return result, err
-	}
-	return threeDArtworkMD5(ctx, data)
+	Annotation    Annotation
+	View          Dictionary
+	ViewReference Reference
+	Checksum      *[16]byte
+	Dictionary    Dictionary
+	reader        *Reader
 }
 
 // ThreeDArtworkChecksum 在当前阅读器视图下计算三维模型数据的MD5，保留诊断回调与间接过滤器解析能力
+// 校验仅用于检测模型变化，不用于安全认证
 // 入参: ctx 取消上下文, stream 三维模型流
-// 返回: [16]byte 校验和, error 解码或取消错误
+// 返回: [16]byte 校验和, error 解码、关闭或取消错误
 func (r *Reader) ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16]byte, error) {
 	var result [16]byte
-	if ctx == nil || stream == nil {
+	if r == nil || ctx == nil || stream == nil {
 		return result, fmt.Errorf("invalid 3D artwork checksum source")
 	}
-	var data []byte
-	var err error
-	if r != nil && !r.closed && r.ownsObject(stream.reader, stream.cache) {
-		data, err = r.DecodeStreamContext(ctx, stream)
-	} else {
-		data, err = stream.DecodeContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
+	if r.closed {
+		return result, os.ErrClosed
+	}
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return result, err
 	}
@@ -86,11 +74,32 @@ func threeDArtworkMD5(ctx context.Context, data []byte) ([16]byte, error) {
 	return result, ctx.Err()
 }
 
-// MatchesView 比较同一Reader内的视图对象身份，不将参数相同的不同视图合并
+// MatchesView 比较同一Reader内的视图对象身份，优先按引用核对缓存字典且不合并参数相同的不同视图
 // 入参: view 当前选定视图
 // 返回: bool 是否为绑定视图
 func (m ThreeDMarkup) MatchesView(view Dictionary) bool {
-	return m.View != nil && view != nil && reflect.ValueOf(m.View).Pointer() == reflect.ValueOf(view).Pointer()
+	if m.View == nil || view == nil {
+		return false
+	}
+	target := reflect.ValueOf(view).Pointer()
+	if reflect.ValueOf(m.View).Pointer() == target {
+		return true
+	}
+	if m.ViewReference != (Reference{}) && m.reader != nil && !m.reader.closed {
+		if resolved, err := m.reader.Object(m.ViewReference); err == nil {
+			if dict, ok := resolved.(Dictionary); ok && dict != nil {
+				return reflect.ValueOf(dict).Pointer() == target
+			}
+		}
+	}
+	return false
+}
+
+// MatchesViewReference 按间接对象引用比较三维批注是否绑定到指定视图，直接字典无引用时返回false
+// 入参: ref 目标视图间接引用
+// 返回: bool 是否为绑定视图引用
+func (m ThreeDMarkup) MatchesViewReference(ref Reference) bool {
+	return m.ViewReference != (Reference{}) && m.ViewReference == ref
 }
 
 // ReadThreeDMarkups 批量解析同页批注关联，按输入顺序返回，未关联项为空
@@ -98,8 +107,14 @@ func (m ThreeDMarkup) MatchesView(view Dictionary) bool {
 // 入参: ctx 取消上下文, annotations 同页注解
 // 返回: []*ThreeDMarkup 批注关联, error 类型、引用或取消错误
 func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation) ([]*ThreeDMarkup, error) {
-	if ctx == nil || r == nil || r.closed {
+	if ctx == nil || r == nil {
 		return nil, fmt.Errorf("invalid 3D markup reader or context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r.closed {
+		return nil, os.ErrClosed
 	}
 	var result []*ThreeDMarkup
 	var names map[string][]Annotation
@@ -127,6 +142,10 @@ func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation
 		}
 		if kind != nil && kind != Name("ExData") {
 			return nil, fmt.Errorf("invalid 3D markup external data type")
+		}
+		viewRef, err := r.resolveIndirectReference(dict["3DV"])
+		if err != nil {
+			return nil, err
 		}
 		view, err := r.mediaDictionary(dict["3DV"], false)
 		if err != nil || view == nil {
@@ -181,7 +200,7 @@ func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation
 		default:
 			return nil, fmt.Errorf("invalid 3D markup annotation")
 		}
-		markup := &ThreeDMarkup{Annotation: host, View: view, Dictionary: dict}
+		markup := &ThreeDMarkup{Annotation: host, View: view, ViewReference: viewRef, Dictionary: dict, reader: r}
 		checksum, err := r.Resolve(dict["MD5"])
 		if err != nil {
 			return nil, err

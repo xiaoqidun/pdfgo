@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"context"
 	"fmt"
+	"os"
 	"reflect"
 )
 
@@ -30,6 +31,12 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing name tree visitor")
 	}
 	value, err := r.Resolve(root)
 	if err != nil || value == nil {
@@ -144,6 +151,12 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing number tree visitor")
 	}
 	value, err := r.Resolve(root)
 	if err != nil || value == nil {
@@ -343,6 +356,9 @@ func (r *Reader) LookupNumberTree(ctx context.Context, root Object, key int64) (
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
+	}
+	if r.closed {
+		return nil, false, os.ErrClosed
 	}
 	seenRefs := make(map[Reference]bool)
 	seenDicts := make(map[uintptr]Dictionary)
@@ -876,6 +892,12 @@ func (r *Reader) WalkEmbeddedFiles(ctx context.Context, visit func(string, FileS
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing embedded files visitor")
+	}
 	catalog, err := r.catalogDictionary()
 	if err != nil {
 		return err
@@ -900,6 +922,12 @@ func (r *Reader) WalkEmbeddedFiles(ctx context.Context, visit func(string, FileS
 // catalogDictionary 读取目录字典，不执行目录中的动作
 // 返回: Dictionary 目录, error 结构错误
 func (r *Reader) catalogDictionary() (Dictionary, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	value, err := r.Resolve(r.Trailer["Root"])
 	if err != nil {
 		return nil, err

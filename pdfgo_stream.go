@@ -33,8 +33,63 @@ import (
 	"github.com/andybalholm/brotli"
 )
 
-// brotliDecodeLimit 限制BrotliDecode单流最大解压字节数，防止压缩炸弹耗尽内存
-const brotliDecodeLimit = 256 << 20
+// defaultMaxStreamBytes 限制单个流默认最大解压字节数，防止压缩炸弹耗尽内存
+const defaultMaxStreamBytes int64 = 256 << 20
+
+// defaultMaxFilterChain 限制单个流默认最大过滤器链深度
+const defaultMaxFilterChain = 16
+
+// normalizeMaxStreamBytes 规范化流解压字节上限，零值取默认值，负值表示不限制
+// 入参: limit 配置的字节上限
+// 返回: int64 规范化上限
+func normalizeMaxStreamBytes(limit int64) int64 {
+	if limit < 0 {
+		return -1
+	}
+	if limit == 0 {
+		return defaultMaxStreamBytes
+	}
+	return limit
+}
+
+// normalizeMaxFilterChain 规范化过滤器链深度上限，零值取默认值，负值表示不限制
+// 入参: limit 配置的链深度上限
+// 返回: int 规范化上限
+func normalizeMaxFilterChain(limit int) int {
+	if limit < 0 {
+		return -1
+	}
+	if limit == 0 {
+		return defaultMaxFilterChain
+	}
+	return limit
+}
+
+// effectiveStreamLimits 计算生效的流解压字节上限与过滤器链深度上限，零值表示不限制
+// 入参: reader 关联阅读器, stream 目标数据流
+// 返回: int64 生效字节上限, int 生效过滤器链深度上限
+func effectiveStreamLimits(reader *Reader, stream *Stream) (int64, int) {
+	var maxBytes int64
+	var maxChain int
+	if reader != nil {
+		maxBytes = reader.maxStreamBytes
+		maxChain = reader.maxFilterChain
+	} else if stream != nil {
+		maxBytes = stream.maxStreamBytes
+		maxChain = stream.maxFilterChain
+	}
+	if maxBytes == 0 {
+		maxBytes = defaultMaxStreamBytes
+	} else if maxBytes < 0 {
+		maxBytes = 0
+	}
+	if maxChain == 0 {
+		maxChain = defaultMaxFilterChain
+	} else if maxChain < 0 {
+		maxChain = 0
+	}
+	return maxBytes, maxChain
+}
 
 // streamFilterAliases 保存内联图像的标准过滤器缩写
 var streamFilterAliases = map[Name]Name{
@@ -65,15 +120,17 @@ type filterRefEntry struct {
 // Stream 保存流字典、未经解码的数据及间接对象引用
 // 多工作视图并发场景应通过Reader.DecodeStreamContext解码共享流
 type Stream struct {
-	Dictionary Dictionary
-	Data       []byte
-	Reference  Reference
-	reader     *Reader
-	cache      *objectCache
-	filterRefs map[Reference]filterRefEntry
-	hasWarning bool
-	decrypted  bool
-	compressed bool
+	Dictionary     Dictionary
+	Data           []byte
+	Reference      Reference
+	reader         *Reader
+	cache          *objectCache
+	filterRefs     map[Reference]filterRefEntry
+	maxStreamBytes int64
+	maxFilterChain int
+	hasWarning     bool
+	decrypted      bool
+	compressed     bool
 }
 
 // contextInput 在分块读取之间检查取消
@@ -86,13 +143,13 @@ type contextInput struct {
 // 入参: ctx 取消上下文, encoded 压缩数据, decodedLen 已解码字节长度
 // 返回: bool 是否仅存在校验尾部问题
 func completeFlatePayload(ctx context.Context, encoded []byte, decodedLen int64) bool {
-	if len(encoded) < 2 || encoded[1]&0x20 != 0 {
+	if len(encoded) < 2 || encoded[1]&0x20 != 0 || decodedLen < 0 {
 		return false
 	}
 	source := bytes.NewReader(encoded[2:])
 	reader := flate.NewReader(source)
 	checksum := adler32.New()
-	count, err := io.Copy(checksum, &contextInput{ctx: ctx, reader: reader})
+	count, err := io.Copy(checksum, io.LimitReader(&contextInput{ctx: ctx, reader: reader}, decodedLen+1))
 	closeErr := reader.Close()
 	if err != nil || closeErr != nil || ctx.Err() != nil || count != decodedLen || source.Len() > 4 {
 		return false
@@ -109,9 +166,19 @@ func completeFlatePayload(ctx context.Context, encoded []byte, decodedLen int64)
 // 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: []byte 解码数据, error 编码或取消错误
 func decodeASCIIHexContext(ctx context.Context, data []byte, warning func(Diagnostic)) ([]byte, error) {
+	return decodeASCIIHexLimitContext(ctx, data, warning, 0)
+}
+
+// decodeASCIIHexLimitContext 按上限校验长度后解码十六进制流，补齐末尾半字节
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断, limit 解码字节上限，非正数表示不限
+// 返回: []byte 解码数据, error 编码、超限或取消错误
+func decodeASCIIHexLimitContext(ctx context.Context, data []byte, warning func(Diagnostic), limit int64) ([]byte, error) {
 	end, size, err := asciiHexSize(ctx, data, warning)
 	if err != nil {
 		return nil, err
+	}
+	if limit > 0 && int64(size) > limit {
+		return nil, fmt.Errorf("ASCIIHex decode limit exceeded")
 	}
 	out := make([]byte, size)
 	index := 0
@@ -182,24 +249,10 @@ func asciiHexSize(ctx context.Context, data []byte, warning func(Diagnostic)) (i
 	return 0, 0, fmt.Errorf("missing ASCIIHex terminator")
 }
 
-// decodeLZWBytes 解码LZW并返回结束码占用的字节数，供内联图像界定数据边界
-// 入参: data 压缩数据, early 提前增长标志
-// 返回: []byte 解码数据, int 已消费字节数, error 编码错误
-func decodeLZWBytes(data []byte, early int64) ([]byte, int, error) {
-	return decodeLZWBytesContext(context.Background(), data, early)
-}
-
-// decodeLZWBytesContext 解码LZW并返回消费长度，分段检查取消
-// 入参: ctx 取消上下文, data 编码数据, early 提前增长标志
-// 返回: []byte 解码数据, int 消费字节数, error 编码或取消错误
-func decodeLZWBytesContext(ctx context.Context, data []byte, early int64) ([]byte, int, error) {
-	return decodeLZWBytesLimitContext(ctx, data, early, 0)
-}
-
 // decodeLZWBytesLimitContext 有界解码LZW并返回消费长度，超出上限立即中止
 // 入参: ctx 取消上下文, data 编码数据, early 提前增长标志, limit 解码字节上限，非正数表示不限
 // 返回: []byte 解码数据, int 消费字节数, error 编码、超限或取消错误
-func decodeLZWBytesLimitContext(ctx context.Context, data []byte, early int64, limit int) ([]byte, int, error) {
+func decodeLZWBytesLimitContext(ctx context.Context, data []byte, early int64, limit int64) ([]byte, int, error) {
 	if early != 0 && early != 1 {
 		return nil, 0, fmt.Errorf("invalid LZW EarlyChange")
 	}
@@ -250,7 +303,7 @@ func decodeLZWBytesLimitContext(ctx context.Context, data []byte, early int64, l
 		if code == next {
 			extra++
 		}
-		if limit > 0 && len(out)+extra > limit {
+		if limit > 0 && int64(len(out))+int64(extra) > limit {
 			return nil, 0, io.ErrShortBuffer
 		}
 		out = append(out, stack[start:]...)
@@ -272,9 +325,19 @@ func decodeLZWBytesLimitContext(ctx context.Context, data []byte, early int64, l
 // 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: []byte 独立解码数据, error 编码、溢出或取消错误
 func decodeASCII85Context(ctx context.Context, data []byte, warning func(Diagnostic)) ([]byte, error) {
+	return decodeASCII85LimitContext(ctx, data, warning, 0)
+}
+
+// decodeASCII85LimitContext 按上限校验长度后解码ASCII85，不复制编码数据
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断, limit 解码字节上限，非正数表示不限
+// 返回: []byte 独立解码数据, error 编码、溢出、超限或取消错误
+func decodeASCII85LimitContext(ctx context.Context, data []byte, warning func(Diagnostic), limit int64) ([]byte, error) {
 	end, size, err := ascii85Size(ctx, data, warning)
 	if err != nil {
 		return nil, err
+	}
+	if limit > 0 && int64(size) > limit {
+		return nil, fmt.Errorf("ASCII85 decode limit exceeded")
 	}
 	out := make([]byte, size)
 	var value uint32
@@ -385,7 +448,14 @@ func ascii85Size(ctx context.Context, data []byte, warning func(Diagnostic)) (in
 // 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: []byte 解码数据, error 编码或取消错误
 func decodeRunLength(ctx context.Context, data []byte, warning func(Diagnostic)) ([]byte, error) {
-	size, err := runLengthSize(ctx, data, warning)
+	return decodeRunLengthLimit(ctx, data, warning, 0)
+}
+
+// decodeRunLengthLimit 按上限校验游程长度后解码，超限立即拒绝且不分配展开缓冲
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断, limit 解码字节上限，非正数表示不限
+// 返回: []byte 解码数据, error 编码、超限或取消错误
+func decodeRunLengthLimit(ctx context.Context, data []byte, warning func(Diagnostic), limit int64) ([]byte, error) {
+	size, err := runLengthSizeLimit(ctx, data, warning, limit)
 	if err != nil || size == 0 {
 		return nil, err
 	}
@@ -426,6 +496,13 @@ func decodeRunLength(ctx context.Context, data []byte, warning func(Diagnostic))
 // 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断
 // 返回: int 解码字节数, error 编码、溢出或取消错误
 func runLengthSize(ctx context.Context, data []byte, warning func(Diagnostic)) (int, error) {
+	return runLengthSizeLimit(ctx, data, warning, 0)
+}
+
+// runLengthSizeLimit 按字节上限校验游程边界、结束标记及解码长度，不分配展开样本
+// 入参: ctx 取消上下文, data 编码数据, warning 可恢复诊断, limit 解码字节上限，非正数表示不限
+// 返回: int 解码字节数, error 编码、溢出、超限或取消错误
+func runLengthSizeLimit(ctx context.Context, data []byte, warning func(Diagnostic), limit int64) (int, error) {
 	size := 0
 	checkpoint := 0
 	for i := 0; i < len(data); {
@@ -457,6 +534,9 @@ func runLengthSize(ctx context.Context, data []byte, warning func(Diagnostic)) (
 		}
 		if count > int(^uint(0)>>1)-size {
 			return 0, fmt.Errorf("RunLength decoded length overflow")
+		}
+		if limit > 0 && int64(size)+int64(count) > limit {
+			return 0, fmt.Errorf("RunLength decode limit exceeded")
 		}
 		size += count
 	}
@@ -758,6 +838,13 @@ func readAllEstimated(input io.Reader, hint int) ([]byte, error) {
 	return buf.Bytes(), err
 }
 
+// DecodeStream 使用当前阅读器及背景上下文解码通用流过滤器，支持多工作视图并发解码共享流
+// 入参: stream 数据流
+// 返回: []byte 独立解码数据, error 解码或关闭错误
+func (r *Reader) DecodeStream(stream *Stream) ([]byte, error) {
+	return r.DecodeStreamContext(context.Background(), stream)
+}
+
 // DecodeStreamContext 使用当前阅读器及诊断配置解码通用流过滤器，支持多工作视图并发解码共享流
 // 入参: ctx 取消上下文, stream 数据流
 // 返回: []byte 独立解码数据, error 解码、关闭或取消错误
@@ -830,9 +917,16 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 	if err != nil {
 		return nil, err
 	}
+	maxBytes, _ := effectiveStreamLimits(reader, s)
+	if limit > 0 && (maxBytes == 0 || limit < maxBytes) {
+		maxBytes = limit
+	}
 	data := s.Data
 	if limit > 0 && int64(len(data)) > limit {
 		return nil, fmt.Errorf("stream recovery decode limit exceeded")
+	}
+	if maxBytes > 0 && int64(len(data)) > maxBytes && len(filters) == 0 {
+		return nil, fmt.Errorf("stream decode limit exceeded")
 	}
 	for i, filter := range filters {
 		if err := ctx.Err(); err != nil {
@@ -858,14 +952,17 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 			reader, err = acquireZlibReader(bytes.NewReader(data))
 			if err == nil {
 				var input io.Reader = &contextInput{ctx: ctx, reader: reader}
-				if limit > 0 {
-					input = io.LimitReader(input, limit+1)
+				if maxBytes > 0 {
+					input = io.LimitReader(input, maxBytes+1)
 				}
-				data, err = readAllEstimated(input, estimateFlateCapacity(s.Dictionary, len(encoded), limit))
+				data, err = readAllEstimated(input, estimateFlateCapacity(s.Dictionary, len(encoded), maxBytes))
 				closeErr := reader.Close()
 				releaseZlibReader(reader)
-				if limit > 0 && int64(len(data)) > limit {
-					return nil, fmt.Errorf("stream recovery decode limit exceeded")
+				if maxBytes > 0 && int64(len(data)) > maxBytes {
+					if limit > 0 {
+						return nil, fmt.Errorf("stream recovery decode limit exceeded")
+					}
+					return nil, fmt.Errorf("Flate decode limit exceeded")
 				}
 				if err == nil {
 					err = closeErr
@@ -881,14 +978,13 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 			}
 		case "BrotliDecode":
 			encoded := data
-			maxBytes := int64(brotliDecodeLimit)
-			if limit > 0 && limit < maxBytes {
-				maxBytes = limit
-			}
 			reader := acquireBrotliReader(&contextInput{ctx: ctx, reader: bytes.NewReader(encoded)})
-			input := io.LimitReader(&contextInput{ctx: ctx, reader: reader}, maxBytes+1)
+			var input io.Reader = &contextInput{ctx: ctx, reader: reader}
+			if maxBytes > 0 {
+				input = io.LimitReader(input, maxBytes+1)
+			}
 			data, err = readAllEstimated(input, estimateFlateCapacity(s.Dictionary, len(encoded), maxBytes))
-			exceeded := int64(len(data)) > maxBytes
+			exceeded := maxBytes > 0 && int64(len(data)) > maxBytes
 			releaseBrotliReader(reader, int64(len(data)), exceeded || err != nil)
 			if exceeded {
 				if limit > 0 {
@@ -904,14 +1000,17 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 			var early int64
 			early, err = integerDefault(dict, "EarlyChange", 1)
 			if err == nil {
-				data, _, err = decodeLZWBytesContext(ctx, data, early)
+				data, _, err = decodeLZWBytesLimitContext(ctx, data, early, maxBytes)
+				if errors.Is(err, io.ErrShortBuffer) {
+					err = fmt.Errorf("LZW decode limit exceeded")
+				}
 			}
 		case "ASCIIHexDecode":
-			data, err = decodeASCIIHexContext(ctx, data, warning)
+			data, err = decodeASCIIHexLimitContext(ctx, data, warning, maxBytes)
 		case "ASCII85Decode":
-			data, err = decodeASCII85Context(ctx, data, warning)
+			data, err = decodeASCII85LimitContext(ctx, data, warning, maxBytes)
 		case "RunLengthDecode":
-			data, err = decodeRunLength(ctx, data, warning)
+			data, err = decodeRunLengthLimit(ctx, data, warning, maxBytes)
 		default:
 			return nil, &UnsupportedError{Feature: "stream filter " + string(name)}
 		}
@@ -1065,6 +1164,9 @@ func (s *Stream) filterChainWith(reader *Reader, warning func(Diagnostic)) (Arra
 		filters = append(Array(nil), v...)
 	default:
 		return nil, nil, fmt.Errorf("invalid stream filter")
+	}
+	if _, maxChain := effectiveStreamLimits(reader, s); maxChain > 0 && len(filters) > maxChain {
+		return nil, nil, fmt.Errorf("stream filter chain depth exceeded")
 	}
 	params := make(Array, len(filters))
 	switch v := parameters.(type) {

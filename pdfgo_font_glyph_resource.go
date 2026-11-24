@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"os"
 	"slices"
 	"strings"
 )
@@ -73,7 +74,7 @@ func (f *Font) GlyphFontContext(ctx context.Context, glyphs []GlyphWidth) (*Font
 		return nil, err
 	}
 	if f.reader.closed {
-		return nil, fmt.Errorf("reader is closed")
+		return nil, os.ErrClosed
 	}
 	if len(f.Program) == 0 || len(glyphs) == 0 {
 		return nil, fmt.Errorf("missing embedded program or glyph widths")

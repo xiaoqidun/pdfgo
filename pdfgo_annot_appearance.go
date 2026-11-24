@@ -15,11 +15,15 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
 	"strings"
 )
+
+// maxSquigglyWaves 限制波浪线注释外观单段最大锯齿数，防止极端长宽比触发死循环或内存耗尽
+const maxSquigglyWaves = 65536
 
 // annotationBorder 保存注解边框和笔画的公共样式
 type annotationBorder struct {
@@ -280,18 +284,23 @@ func (r *Reader) linkAppearance(annotation Annotation) (*Stream, error) {
 				return nil, err
 			}
 		case "U":
-			fmt.Fprintf(&content, "%g %g m %g %g l S\n", x0, y0, x1, y0)
+			writeAnnotationOperation(&content, "m", x0, y0)
+			writeAnnotationOperation(&content, "l S", x1, y0)
 		default:
 			rx, ry = math.Min(rx, (x1-x0)/2), math.Min(ry, (y1-y0)/2)
 			if rx == 0 || ry == 0 {
-				fmt.Fprintf(&content, "%g %g %g %g re S\n", x0, y0, x1-x0, y1-y0)
+				writeAnnotationOperation(&content, "re S", x0, y0, x1-x0, y1-y0)
 			} else {
 				k := 4 * (math.Sqrt2 - 1) / 3
-				fmt.Fprintf(&content, "%g %g m %g %g l\n", x0+rx, y0, x1-rx, y0)
-				fmt.Fprintf(&content, "%g %g %g %g %g %g c\n", x1-rx+k*rx, y0, x1, y0+ry-k*ry, x1, y0+ry)
-				fmt.Fprintf(&content, "%g %g l %g %g %g %g %g %g c\n", x1, y1-ry, x1, y1-ry+k*ry, x1-rx+k*rx, y1, x1-rx, y1)
-				fmt.Fprintf(&content, "%g %g l %g %g %g %g %g %g c\n", x0+rx, y1, x0+rx-k*rx, y1, x0, y1-ry+k*ry, x0, y1-ry)
-				fmt.Fprintf(&content, "%g %g l %g %g %g %g %g %g c h S\n", x0, y0+ry, x0, y0+ry-k*ry, x0+rx-k*rx, y0, x0+rx, y0)
+				writeAnnotationOperation(&content, "m", x0+rx, y0)
+				writeAnnotationOperation(&content, "l", x1-rx, y0)
+				writeAnnotationOperation(&content, "c", x1-rx+k*rx, y0, x1, y0+ry-k*ry, x1, y0+ry)
+				writeAnnotationOperation(&content, "l", x1, y1-ry)
+				writeAnnotationOperation(&content, "c", x1, y1-ry+k*ry, x1-rx+k*rx, y1, x1-rx, y1)
+				writeAnnotationOperation(&content, "l", x0+rx, y1)
+				writeAnnotationOperation(&content, "c", x0+rx-k*rx, y1, x0, y1-ry+k*ry, x0, y1-ry)
+				writeAnnotationOperation(&content, "l", x0, y0+ry)
+				writeAnnotationOperation(&content, "c h S", x0, y0+ry-k*ry, x0+rx-k*rx, y0, x0+rx, y0)
 			}
 		}
 	}
@@ -346,12 +355,12 @@ func (r *Reader) inkAppearance(annotation Annotation) (*Stream, error) {
 		if !stroke {
 			continue
 		}
-		fmt.Fprintf(&content, "%g %g m\n", coordinates[0], coordinates[1])
+		writeAnnotationOperation(&content, "m", coordinates[0], coordinates[1])
 		if len(coordinates) == 2 {
-			fmt.Fprintf(&content, "%g %g l\n", coordinates[0], coordinates[1])
+			writeAnnotationOperation(&content, "l", coordinates[0], coordinates[1])
 		}
 		for i := 2; i < len(coordinates); i += 2 {
-			fmt.Fprintf(&content, "%g %g l\n", coordinates[i], coordinates[i+1])
+			writeAnnotationOperation(&content, "l", coordinates[i], coordinates[i+1])
 		}
 	}
 	content.WriteString("S\n")
@@ -361,9 +370,12 @@ func (r *Reader) inkAppearance(annotation Annotation) (*Stream, error) {
 }
 
 // textMarkupAppearance 按文字四边形生成高亮、下划线、删除线或波浪线外观
-// 入参: annotation 文字标记注解
-// 返回: *Stream 外观流, error 坐标或颜色错误
-func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
+// 入参: ctx 取消上下文, annotation 文字标记注解
+// 返回: *Stream 外观流, error 坐标、超限、取消或颜色错误
+func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation) (*Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.Resolve(annotation.Dictionary["QuadPoints"])
 	if err != nil {
 		return nil, err
@@ -386,6 +398,9 @@ func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
 		return nil, err
 	}
 	for i := 0; i < len(values); i += 8 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		points := [4]Point{}
 		for j := range points {
 			points[j] = Point{values[i+j*2], values[i+j*2+1]}
@@ -407,26 +422,35 @@ func (r *Reader) textMarkupAppearance(annotation Annotation) (*Stream, error) {
 			continue
 		}
 		if annotation.Subtype == "Highlight" {
-			fmt.Fprintf(&content, "%g %g m %g %g l %g %g l %g %g l h f\n", a.X, a.Y, b.X, b.Y, c.X, c.Y, d.X, d.Y)
+			writeAnnotationOperation(&content, "m", a.X, a.Y)
+			writeAnnotationOperation(&content, "l", b.X, b.Y)
+			writeAnnotationOperation(&content, "l", c.X, c.Y)
+			writeAnnotationOperation(&content, "l", d.X, d.Y)
+			content.WriteString("h f\n")
 			continue
 		}
-		fmt.Fprintf(&content, "%g w\n", width)
+		writeAnnotationOperation(&content, "w", width)
 		if annotation.Subtype == "StrikeOut" {
 			a, b = Point{(a.X + d.X) / 2, (a.Y + d.Y) / 2}, Point{(b.X + c.X) / 2, (b.Y + c.Y) / 2}
 		}
-		fmt.Fprintf(&content, "%g %g m\n", a.X, a.Y)
+		writeAnnotationOperation(&content, "m", a.X, a.Y)
 		if annotation.Subtype == "Squiggly" {
 			steps := math.Ceil(length / (2 * width))
-			if math.IsInf(steps, 0) || steps >= float64(int(^uint(0)>>1)) {
-				return nil, fmt.Errorf("text markup wave count overflow")
+			if math.IsInf(steps, 0) || steps > maxSquigglyWaves {
+				return nil, fmt.Errorf("text markup wave count exceeds limit")
 			}
 			for j := 1; j < int(steps); j++ {
+				if j&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				distance := float64(j) * length / steps
 				offset := float64(j%2) * 2 * width
-				fmt.Fprintf(&content, "%g %g l\n", a.X+(distance*dx-offset*dy)/length, a.Y+(distance*dy+offset*dx)/length)
+				writeAnnotationOperation(&content, "l", a.X+(distance*dx-offset*dy)/length, a.Y+(distance*dy+offset*dx)/length)
 			}
 		}
-		fmt.Fprintf(&content, "%g %g l S\n", b.X, b.Y)
+		writeAnnotationOperation(&content, "l S", b.X, b.Y)
 	}
 	return r.annotationAppearance(annotation, content.String(), nil)
 }
@@ -514,9 +538,9 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 				return nil, err
 			}
 		} else {
-			fmt.Fprintf(&content, "%g %g m\n", vertices[0], vertices[1])
+			writeAnnotationOperation(&content, "m", vertices[0], vertices[1])
 			for j := 2; j < len(vertices); j += 2 {
-				fmt.Fprintf(&content, "%g %g l\n", vertices[j], vertices[j+1])
+				writeAnnotationOperation(&content, "l", vertices[j], vertices[j+1])
 			}
 			if annotation.Subtype == "Polygon" {
 				content.WriteString("h\n")
@@ -529,15 +553,15 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 			return nil, err
 		}
 	} else if annotation.Subtype == "Square" {
-		fmt.Fprintf(&content, "%g %g %g %g re\n", x0, y0, x1-x0, y1-y0)
+		writeAnnotationOperation(&content, "re", x0, y0, x1-x0, y1-y0)
 	} else {
 		cx, cy, rx, ry := (x0+x1)/2, (y0+y1)/2, (x1-x0)/2, (y1-y0)/2
 		k := 4 * (math.Sqrt2 - 1) / 3
-		fmt.Fprintf(&content, "%g %g m\n", x1, cy)
-		fmt.Fprintf(&content, "%g %g %g %g %g %g c\n", x1, cy+k*ry, cx+k*rx, y1, cx, y1)
-		fmt.Fprintf(&content, "%g %g %g %g %g %g c\n", cx-k*rx, y1, x0, cy+k*ry, x0, cy)
-		fmt.Fprintf(&content, "%g %g %g %g %g %g c\n", x0, cy-k*ry, cx-k*rx, y0, cx, y0)
-		fmt.Fprintf(&content, "%g %g %g %g %g %g c h\n", cx+k*rx, y0, x1, cy-k*ry, x1, cy)
+		writeAnnotationOperation(&content, "m", x1, cy)
+		writeAnnotationOperation(&content, "c", x1, cy+k*ry, cx+k*rx, y1, cx, y1)
+		writeAnnotationOperation(&content, "c", cx-k*rx, y1, x0, cy+k*ry, x0, cy)
+		writeAnnotationOperation(&content, "c", x0, cy-k*ry, cx-k*rx, y0, cx, y0)
+		writeAnnotationOperation(&content, "c h", cx+k*rx, y0, x1, cy-k*ry, x1, cy)
 	}
 	switch {
 	case fill && stroke:
@@ -645,7 +669,8 @@ func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Ann
 			return fmt.Errorf("annotation line ending has no direction")
 		}
 		dx, dy = dx/length, dy/length
-		fmt.Fprintf(content, "q [] 0 d %g %g %g %g %g %g cm\n", dx, dy, -dy, dx, x, y)
+		content.WriteString("q [] 0 d ")
+		writeAnnotationOperation(content, "cm", dx, dy, -dy, dx, x, y)
 		fill := false
 		value, err = r.Resolve(annotation.Dictionary["IC"])
 		if err != nil {
@@ -664,30 +689,41 @@ func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Ann
 		size, closed := 3*border.width, false
 		switch style {
 		case "Square":
-			fmt.Fprintf(content, "%g %g %g %g re\n", -size/2, -size/2, size, size)
+			writeAnnotationOperation(content, "re", -size/2, -size/2, size, size)
 			closed = true
 		case "Diamond":
-			fmt.Fprintf(content, "%g 0 m 0 %g l %g 0 l 0 %g l h\n", -size/2, size/2, size/2, -size/2)
+			writeAnnotationOperation(content, "m", -size/2, 0)
+			writeAnnotationOperation(content, "l", 0, size/2)
+			writeAnnotationOperation(content, "l", size/2, 0)
+			writeAnnotationOperation(content, "l h", 0, -size/2)
 			closed = true
 		case "Circle":
 			radius := size / 2
 			k := 4 * (math.Sqrt2 - 1) / 3 * radius
-			fmt.Fprintf(content, "%g 0 m %g %g %g %g 0 %g c %g %g %g %g %g 0 c %g %g %g %g 0 %g c %g %g %g %g %g 0 c h\n", radius, radius, k, k, radius, radius, -k, radius, -radius, k, -radius, -radius, -k, -k, -radius, -radius, k, -radius, radius, -k, radius)
+			writeAnnotationOperation(content, "m", radius, 0)
+			writeAnnotationOperation(content, "c", radius, k, k, radius, 0, radius)
+			writeAnnotationOperation(content, "c", -k, radius, -radius, k, -radius, 0)
+			writeAnnotationOperation(content, "c", -radius, -k, -k, -radius, 0, -radius)
+			writeAnnotationOperation(content, "c h", k, -radius, radius, -k, radius, 0)
 			closed = true
 		case "OpenArrow", "ClosedArrow", "ROpenArrow", "RClosedArrow":
 			x := size
 			if style == "ROpenArrow" || style == "RClosedArrow" {
 				x = -x
 			}
-			fmt.Fprintf(content, "%g %g m 0 0 l %g %g l\n", x, size/2, x, -size/2)
+			writeAnnotationOperation(content, "m", x, size/2)
+			writeAnnotationOperation(content, "l", 0, 0)
+			writeAnnotationOperation(content, "l", x, -size/2)
 			closed = style == "ClosedArrow" || style == "RClosedArrow"
 			if closed {
 				content.WriteString("h\n")
 			}
 		case "Butt":
-			fmt.Fprintf(content, "0 %g m 0 %g l\n", -size/2, size/2)
+			writeAnnotationOperation(content, "m", 0, -size/2)
+			writeAnnotationOperation(content, "l", 0, size/2)
 		case "Slash":
-			fmt.Fprintf(content, "%g %g m %g %g l\n", -size/4, -size*math.Sqrt(3)/4, size/4, size*math.Sqrt(3)/4)
+			writeAnnotationOperation(content, "m", -size/4, -size*math.Sqrt(3)/4)
+			writeAnnotationOperation(content, "l", size/4, size*math.Sqrt(3)/4)
 		}
 		if closed && fill {
 			content.WriteString("B Q\n")

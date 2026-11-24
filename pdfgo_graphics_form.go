@@ -125,7 +125,7 @@ func (p *pageInterpreter) walkContent(data []byte) ([]Operation, int, error) {
 		operations = []Operation{}
 	}
 	size := 0
-	err := walkOperations(p.ctx, data, func(operation Operation) error {
+	err := walkOperationsReader(p.ctx, data, func(operation Operation) error {
 		if operations != nil {
 			cost, ok := formOperationSize(operation)
 			if !ok || cost > formCacheLimit-p.forms.bytes-size {
@@ -141,7 +141,7 @@ func (p *pageInterpreter) walkContent(data []byte) ([]Operation, int, error) {
 			}
 		}
 		return p.operation(operation)
-	}, p.contentColorSpace, p.visitor.Warning, true)
+	}, p.contentColorSpace, p.visitor.Warning, true, p.reader)
 	return operations, size, err
 }
 

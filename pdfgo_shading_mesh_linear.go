@@ -89,7 +89,7 @@ func (g *MeshGradient) LinearTriangles(index int) ([]MeshTriangle, error) {
 // 入参: ctx 取消上下文, index 三角形索引，不计曲面数量
 // 返回: []MeshTriangle 使用Space颜色分量的独立三角形, error 参数、转换或取消错误
 func (g *MeshGradient) LinearTrianglesContext(ctx context.Context, index int) ([]MeshTriangle, error) {
-	if ctx == nil {
+	if ctx == nil || g == nil {
 		return nil, fmt.Errorf("invalid mesh gradient context")
 	}
 	if err := ctx.Err(); err != nil {

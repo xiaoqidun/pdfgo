@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"os"
 )
 
 // ErrDestinationNotFound 表示命名目标在文档目标表中不存在
@@ -161,11 +162,14 @@ func (p *Page) Annotations() ([]Annotation, error) {
 // 入参: ctx 取消上下文
 // 返回: []Annotation 注解信息, error 错误信息
 func (p *Page) AnnotationsContext(ctx context.Context) ([]Annotation, error) {
-	if ctx == nil {
+	if p == nil || p.reader == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid annotation context")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if p.reader.closed {
+		return nil, os.ErrClosed
 	}
 	value, err := p.reader.Resolve(p.Dictionary["Annots"])
 	if err != nil {
@@ -303,6 +307,9 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if r.closed {
+		return os.ErrClosed
+	}
 	if page == nil || page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
 	}
@@ -381,7 +388,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		case "Redact":
 			stream, synthErr = r.redactionAppearance(ctx, annotation)
 		case "Highlight", "Underline", "StrikeOut", "Squiggly":
-			stream, synthErr = r.textMarkupAppearance(annotation)
+			stream, synthErr = r.textMarkupAppearance(ctx, annotation)
 		case "Square", "Circle", "Polygon", "PolyLine":
 			stream, synthErr = r.shapeAppearance(annotation)
 		case "Screen":
@@ -506,6 +513,11 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: rect}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
+	for _, operator := range []string{"g", "G"} {
+		if err := interpreter.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
+			return err
+		}
+	}
 	if parent != nil {
 		interpreter.sequence = parent.sequence
 		interpreter.state.matrix = parent.state.matrix.Mul(interpreter.state.matrix)
@@ -524,6 +536,12 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 // 入参: annotation 表单控件
 // 返回: Dictionary 字段属性, error 字段或继承链错误
 func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	if annotation.Subtype != "Widget" {
 		return nil, fmt.Errorf("annotation is not a widget")
 	}
@@ -612,6 +630,12 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 // BaseURI 读取文档声明的链接基准地址，不访问外部资源
 // 返回: string 基准地址，未声明时为空, error 错误信息
 func (r *Reader) BaseURI() (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return "", os.ErrClosed
+	}
 	root, err := r.Resolve(r.Trailer["Root"])
 	if err != nil {
 		return "", err

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 )
 
 // Movie 保存视频文件说明、显示参数和海报，不解码媒体或执行播放
@@ -57,20 +58,19 @@ type FileResolver func(context.Context, FileSpecification) ([]byte, error)
 // 入参: ctx 取消上下文, file 文件说明, resolver 外部文件读取器，可为空
 // 返回: []byte 文件数据, error 解码、取消或外部文件不可用
 func (r *Reader) ReadFileData(ctx context.Context, file FileSpecification, resolver FileResolver) ([]byte, error) {
-	if ctx == nil {
+	if r == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid file data context")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	var data []byte
 	var err error
 	if file.Embedded != nil {
-		if r != nil && !r.closed && r.ownsObject(file.Embedded.reader, file.Embedded.cache) {
-			data, err = r.DecodeStreamContext(ctx, file.Embedded)
-		} else {
-			data, err = file.Embedded.DecodeContext(ctx)
-		}
+		data, err = r.DecodeStreamContext(ctx, file.Embedded)
 	} else if resolver != nil {
 		data, err = resolver(ctx, file)
 	} else {

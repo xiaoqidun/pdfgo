@@ -157,6 +157,9 @@ func equalObject(a, b Object, depth int) bool {
 // 入参: h 目标哈希器, value 待摘要对象
 // 返回: bool 是否完成确定性摘要
 func HashObject(h hash.Hash, value Object) bool {
+	if h == nil {
+		return false
+	}
 	return hashObject(h, value, 0)
 }
 

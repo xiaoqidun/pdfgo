@@ -23,6 +23,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"io"
+	"os"
 )
 
 // jpegRecoveryPixelLimit 限制异常JPEG恢复验证的像素预算，不按损坏帧头扩大分配
@@ -376,11 +377,14 @@ func (i *Image) JPEGFile() ([]byte, error) {
 // 入参: ctx 取消上下文
 // 返回: []byte 未重编码的JPEG或空值, error 参数、编码或取消错误
 func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
-	if ctx == nil {
+	if ctx == nil || i == nil || i.Stream == nil {
 		return nil, fmt.Errorf("invalid image context")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if i.reader != nil && i.reader.closed {
+		return nil, os.ErrClosed
 	}
 	invertedCMYK := i.ColorSpace == Name("DeviceCMYK") && i.isInvertedCMYKDecode()
 	if i.ImageMask || !invertedCMYK && (len(i.Decode) != 0 || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB")) {
@@ -425,7 +429,7 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 		if frame.displayMetadata {
 			return jpegDisplayFileContext(ctx, data)
 		}
-		return data, nil
+		return bytes.Clone(data), nil
 	}
 	if invertedCMYK && frame.components == 4 && config.ColorModel == color.CMYKModel {
 		if frame.displayMetadata {
@@ -442,7 +446,7 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 			copy(out[2+len(marker):], data[2:])
 			return out, nil
 		}
-		return data, nil
+		return bytes.Clone(data), nil
 	}
 	return nil, nil
 }

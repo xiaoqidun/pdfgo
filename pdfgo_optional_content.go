@@ -14,13 +14,22 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // OptionalContentVisible 按文档默认配置判断可选内容的可见性，供固定版式输出使用
 // 不应用交互阅读器的Usage自动状态；交互状态可通过Visitor.OptionalContent提供
 // 入参: object OCG引用或OCMD字典
 // 返回: bool 是否可见, error 配置或表达式错误
 func (r *Reader) OptionalContentVisible(object Object) (bool, error) {
+	if r == nil {
+		return false, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return false, os.ErrClosed
+	}
 	root, err := r.optionalDictionary(r.Trailer["Root"])
 	if err != nil {
 		return false, err

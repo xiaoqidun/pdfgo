@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"unicode/utf8"
@@ -258,7 +259,13 @@ func (f *Font) characterLookup(ctx context.Context, wanted map[rune]bool) (map[r
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		glyph, ok, _ := f.encodingGlyph(ctx, code)
+		glyph, ok, err := f.encodingGlyph(ctx, code)
+		if err != nil {
+			if ignorableEncodingGlyphError(err) {
+				continue
+			}
+			return nil, err
+		}
 		if !ok || utf8.RuneCountInString(glyph.Text) != 1 {
 			continue
 		}
@@ -301,7 +308,13 @@ func (f *Font) sequenceLookup(ctx context.Context, text string) (map[string]font
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		glyph, ok, _ := f.encodingGlyph(ctx, code)
+		glyph, ok, err := f.encodingGlyph(ctx, code)
+		if err != nil {
+			if ignorableEncodingGlyphError(err) {
+				continue
+			}
+			return nil, err
+		}
 		if !ok || !accept(glyph.Text) {
 			continue
 		}
@@ -315,10 +328,24 @@ func (f *Font) sequenceLookup(ctx context.Context, text string) (map[string]font
 	return lookup, nil
 }
 
+// ignorableEncodingGlyphError 判断单候选字符码的解码错误是否仅表示该槽位无可用字形
+// 入参: err 解码错误
+// 返回: bool 是否可跳过该候选码
+func ignorableEncodingGlyphError(err error) bool {
+	if errors.Is(err, errRecoveredCmapGlyphUnavailable) {
+		return true
+	}
+	var unsupported *UnsupportedError
+	return errors.As(err, &unsupported) && (unsupported.Feature == "unmapped simple font character" || unsupported.Feature == "CID without Unicode mapping")
+}
+
 // encodingGlyph 验证候选字符码对应单个已定义字形，不使用缺省字形代替原文
 // 入参: ctx 取消上下文, code 字符码
 // 返回: Glyph 原字形, bool 是否可用于编码, error 解码错误
 func (f *Font) encodingGlyph(ctx context.Context, code string) (Glyph, bool, error) {
+	if f.cidMap == nil && (f.composite && len(code) != 2 || !f.composite && len(code) != 1) {
+		return Glyph{}, false, nil
+	}
 	if f.cidMap != nil {
 		data := []byte(code)
 		if n, valid := f.cidMap.next(data); !valid || n != len(data) {

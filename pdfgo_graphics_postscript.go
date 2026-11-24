@@ -14,7 +14,10 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // PostScriptMark 交付仅用于PostScript输出的原始程序，不执行程序
 // Data及Level1为独立解码数据，Level1为nil表示未提供低版本程序
@@ -52,7 +55,22 @@ func (p *pageInterpreter) postscript(stream *Stream) error {
 	if err != nil {
 		return err
 	}
-	mark := PostScriptMark{Data: data, Matrix: p.state.matrix, Style: p.state.style, Resources: p.resources}
+	style := p.state.style
+	style.Dash = slices.Clone(style.Dash)
+	style.Clips = slices.Clone(style.Clips)
+	if style.Smoothness != nil {
+		v := *style.Smoothness
+		style.Smoothness = &v
+	}
+	if style.Antialias != nil {
+		v := *style.Antialias
+		style.Antialias = &v
+	}
+	if style.HalftoneOrigin != nil {
+		v := *style.HalftoneOrigin
+		style.HalftoneOrigin = &v
+	}
+	mark := PostScriptMark{Data: data, Matrix: p.state.matrix, Style: style, Resources: p.resources}
 	value, err := p.reader.Resolve(stream.Dictionary["Level1"])
 	if err != nil {
 		return err

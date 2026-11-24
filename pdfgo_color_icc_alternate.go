@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -153,7 +154,109 @@ func (r *Reader) readICCAlternate(stream *Stream, count int, ranges *[8]float64,
 	if alternate.components != count {
 		return nil, fmt.Errorf("invalid ICC alternate component count")
 	}
-	return &iccColorSpace{alternate: alternate, alternateCount: count, ranges: ranges, alternateBlending: alternate.blending}, nil
+	profile := &iccColorSpace{alternate: alternate, alternateCount: count, ranges: ranges, alternateBlending: alternate.blending}
+	if alternate.blending == nil {
+		profile.alternateDigest, profile.hasAlternateDigest = r.canonicalObjectDigest(object)
+	}
+	return profile, nil
+}
+
+// canonicalObjectDigest 计算颜色空间定义对象的内容摘要，用于无并发竞态的等价性判定
+// 入参: object 颜色空间定义对象
+// 返回: [32]byte 内容摘要, bool 是否生成有效摘要
+func (r *Reader) canonicalObjectDigest(object Object) ([32]byte, bool) {
+	h := sha256.New()
+	var buf [8]byte
+	writeU64 := func(v uint64) {
+		binary.LittleEndian.PutUint64(buf[:], v)
+		h.Write(buf[:])
+	}
+	visited := make(map[Reference]bool)
+	var walk func(Object, int) bool
+	walk = func(value Object, depth int) bool {
+		if depth > 64 {
+			return false
+		}
+		switch v := value.(type) {
+		case nil:
+			h.Write([]byte{0})
+		case Boolean:
+			if v {
+				h.Write([]byte{1, 1})
+			} else {
+				h.Write([]byte{1, 0})
+			}
+		case Integer:
+			h.Write([]byte{2})
+			writeU64(uint64(v))
+		case Real:
+			f := float64(v)
+			if f == 0 {
+				f = 0
+			}
+			h.Write([]byte{3})
+			writeU64(math.Float64bits(f))
+		case Name:
+			h.Write([]byte{4})
+			writeU64(uint64(len(v)))
+			h.Write([]byte(v))
+		case String:
+			h.Write([]byte{5})
+			writeU64(uint64(len(v)))
+			h.Write(v)
+		case Array:
+			h.Write([]byte{6})
+			writeU64(uint64(len(v)))
+			for _, item := range v {
+				if !walk(item, depth+1) {
+					return false
+				}
+			}
+		case Dictionary:
+			h.Write([]byte{7})
+			writeU64(uint64(len(v)))
+			for _, key := range slices.Sorted(maps.Keys(v)) {
+				writeU64(uint64(len(key)))
+				h.Write([]byte(key))
+				if !walk(v[key], depth+1) {
+					return false
+				}
+			}
+		case *Stream:
+			if v == nil {
+				h.Write([]byte{0})
+				return true
+			}
+			h.Write([]byte{8})
+			if !walk(v.Dictionary, depth+1) {
+				return false
+			}
+			writeU64(uint64(len(v.Data)))
+			h.Write(v.Data)
+		case Reference:
+			if r == nil || visited[v] {
+				h.Write([]byte{9})
+				writeU64(uint64(v.Number))
+				writeU64(uint64(v.Generation))
+				return true
+			}
+			visited[v] = true
+			resolved, err := r.Object(v)
+			if err != nil {
+				return false
+			}
+			return walk(resolved, depth+1)
+		default:
+			return false
+		}
+		return true
+	}
+	if !walk(object, 0) {
+		return [32]byte{}, false
+	}
+	var sum [32]byte
+	h.Sum(sum[:0])
+	return sum, true
 }
 
 // alternateValues 裁切源范围后原样传入备用空间，不先归一化源分量

@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"context"
 	"fmt"
+	"os"
 )
 
 // StructureTree 保存逻辑结构根、角色映射和属性类，树索引及扩展信息保留在原始字典中
@@ -83,12 +84,13 @@ func (r *Reader) StructureContent(item StructureItem) (StructureContent, error) 
 		if item.MCID < 0 {
 			return result, fmt.Errorf("invalid structure marked-content identifier")
 		}
-		if item.Page == (Reference{}) {
-			return result, fmt.Errorf("missing structure content page")
-		}
-		ref, keyName, otherName = item.Page, otherName, keyName
 		if item.Stream != (Reference{}) {
-			ref = item.Stream
+			ref, keyName, otherName = item.Stream, otherName, keyName
+		} else {
+			if item.Page == (Reference{}) {
+				return result, fmt.Errorf("missing structure content page")
+			}
+			ref, keyName, otherName = item.Page, otherName, keyName
 		}
 	case "OBJR":
 	default:
@@ -200,6 +202,12 @@ func (r *Reader) ResolveStructureRole(ctx context.Context, tag Name, accepts fun
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
+	if r.closed {
+		return "", false, os.ErrClosed
+	}
+	if accepts == nil {
+		return "", false, fmt.Errorf("missing structure role matcher")
+	}
 	tree, err := r.StructureTree()
 	if err != nil {
 		return "", false, err
@@ -252,6 +260,12 @@ func (r *Reader) WalkStructure(ctx context.Context, visit func(int, StructureIte
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing structure visitor")
 	}
 	tree, err := r.StructureTree()
 	if err != nil || tree == nil {
@@ -414,6 +428,12 @@ func (r *Reader) WalkStructureIDs(ctx context.Context, visit func(string, Struct
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing structure visitor")
+	}
 	tree, err := r.StructureTree()
 	if err != nil || tree == nil {
 		return err
@@ -448,6 +468,12 @@ func (r *Reader) WalkStructureParents(ctx context.Context, visit func(StructureP
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing structure visitor")
 	}
 	tree, err := r.StructureTree()
 	if err != nil || tree == nil {
@@ -663,7 +689,7 @@ func (r *Reader) structureItem(object Object, parent, page Reference) (Structure
 		}
 		*field.dest = ref
 	}
-	if item.Type != "StructElem" && item.Page == (Reference{}) {
+	if item.Type == "MCR" && item.Page == (Reference{}) && item.Stream == (Reference{}) {
 		return item, fmt.Errorf("missing structure content page")
 	}
 	if item.Type == "OBJR" && item.Target == (Reference{}) {

@@ -51,6 +51,70 @@ type standardSecurity struct {
 	embeddedFilter  Name
 	encryptMetadata bool
 	authenticated   bool
+	unencrypted     map[Reference]bool
+}
+
+// collectUnencryptedRefs 递归收集Trailer中Encrypt与ID可达的全部非流间接引用
+// 入参: trailer 文件尾字典, fetch 对象读取函数
+// 返回: map[Reference]bool 豁免加密及对象流打包的引用集合, error 读取或嵌套错误
+func collectUnencryptedRefs(trailer Dictionary, fetch func(Reference) (Object, error)) (map[Reference]bool, error) {
+	if trailer == nil || (trailer["Encrypt"] == nil && trailer["ID"] == nil) {
+		return nil, nil
+	}
+	unencrypted := make(map[Reference]bool)
+	visited := make(map[Reference]bool)
+	var walk func(Object, int) error
+	walk = func(value Object, depth int) error {
+		if depth > 256 {
+			return fmt.Errorf("excessive PDF object nesting")
+		}
+		if value == nil {
+			return nil
+		}
+		switch v := value.(type) {
+		case Reference:
+			if visited[v] {
+				return nil
+			}
+			visited[v] = true
+			obj, err := fetch(v)
+			if err != nil {
+				return err
+			}
+			if _, isStream := obj.(*Stream); isStream {
+				return nil
+			}
+			unencrypted[v] = true
+			return walk(obj, depth+1)
+		case Array:
+			for _, item := range v {
+				if err := walk(item, depth+1); err != nil {
+					return err
+				}
+			}
+		case Dictionary:
+			for _, item := range v {
+				if err := walk(item, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if trailer["Encrypt"] != nil {
+		if err := walk(trailer["Encrypt"], 0); err != nil {
+			return nil, err
+		}
+	}
+	if trailer["ID"] != nil {
+		if err := walk(trailer["ID"], 0); err != nil {
+			return nil, err
+		}
+	}
+	if len(unencrypted) == 0 {
+		return nil, nil
+	}
+	return unencrypted, nil
 }
 
 // padPassword 截断或填充密码为32字节
@@ -66,7 +130,7 @@ func padPassword(password []byte) []byte {
 // Encryption 返回加密信息副本，未加密文档返回nil
 // 返回: *EncryptionInfo 加密信息
 func (r *Reader) Encryption() *EncryptionInfo {
-	if r.security == nil {
+	if r == nil || r.closed || r.security == nil {
 		return nil
 	}
 	info := r.security.info
@@ -77,6 +141,13 @@ func (r *Reader) Encryption() *EncryptionInfo {
 // 入参: password 用户或所有者密码
 // 返回: error 认证或加密参数错误
 func (r *Reader) openSecurity(password []byte) error {
+	if r.Trailer["Encrypt"] == nil {
+		return nil
+	}
+	unencrypted, err := collectUnencryptedRefs(r.Trailer, r.Object)
+	if err != nil {
+		return err
+	}
 	object, err := r.Resolve(r.Trailer["Encrypt"])
 	if err != nil || object == nil {
 		return err
@@ -85,29 +156,64 @@ func (r *Reader) openSecurity(password []byte) error {
 	if !ok {
 		return fmt.Errorf("invalid encryption dictionary")
 	}
-	if dict["Filter"] != Name("Standard") {
+	filterObj, err := r.Resolve(dict["Filter"])
+	if err != nil {
+		return err
+	}
+	if filterObj != Name("Standard") {
 		return &UnsupportedError{Feature: "PDF security handler"}
 	}
-	v, vok := dict["V"].(Integer)
-	revision, rok := dict["R"].(Integer)
+	vObj, err := r.Resolve(dict["V"])
+	if err != nil {
+		return err
+	}
+	rObj, err := r.Resolve(dict["R"])
+	if err != nil {
+		return err
+	}
+	v, vok := vObj.(Integer)
+	revision, rok := rObj.(Integer)
 	if vok && rok && v == 5 && (revision == 5 || revision == 6) {
-		return r.openAES256Security(dict, password, int(revision))
+		return r.openAES256Security(dict, password, int(revision), unencrypted)
 	}
 	if !vok || !rok || !(v == 1 && (revision == 2 || revision == 3) || v == 2 && revision == 3 || v == 4 && revision == 4) {
 		return &UnsupportedError{Feature: "PDF encryption revision"}
 	}
 	defaultLength := int64(40)
-	if v == 4 && r.warning != nil && dict["Length"] == nil {
+	lengthObj, err := r.Resolve(dict["Length"])
+	if err != nil {
+		return err
+	}
+	if v == 4 && r.warning != nil && lengthObj == nil {
 		defaultLength = 128
 		r.warning(Diagnostic{Message: "missing V4 encryption Length; authenticating with the 128-bit default"})
 	}
-	length, err := integerDefault(dict, "Length", defaultLength)
-	if err != nil || length < 40 || length > 128 || length%8 != 0 || v == 1 && length != 40 {
+	length := defaultLength
+	if lengthObj != nil {
+		n, ok := lengthObj.(Integer)
+		if !ok {
+			return fmt.Errorf("Length is not an integer")
+		}
+		length = int64(n)
+	}
+	if length < 40 || length > 128 || length%8 != 0 || v == 1 && length != 40 {
 		return fmt.Errorf("invalid encryption key length")
 	}
-	owner, ook := dict["O"].(String)
-	user, uok := dict["U"].(String)
-	permissions, pok := dict["P"].(Integer)
+	ownerObj, err := r.Resolve(dict["O"])
+	if err != nil {
+		return err
+	}
+	userObj, err := r.Resolve(dict["U"])
+	if err != nil {
+		return err
+	}
+	permObj, err := r.Resolve(dict["P"])
+	if err != nil {
+		return err
+	}
+	owner, ook := ownerObj.(String)
+	user, uok := userObj.(String)
+	permissions, pok := permObj.(Integer)
 	idObject, err := r.Resolve(r.Trailer["ID"])
 	if err != nil {
 		return err
@@ -124,10 +230,14 @@ func (r *Reader) openSecurity(password []byte) error {
 	if !ok {
 		return fmt.Errorf("invalid encryption file identifier")
 	}
-	s := &standardSecurity{info: EncryptionInfo{Revision: int(revision), Permissions: uint32(permissions)}, encryptMetadata: true, streamFilter: "V2", stringFilter: "V2", embeddedFilter: "V2"}
+	s := &standardSecurity{info: EncryptionInfo{Revision: int(revision), Permissions: uint32(permissions)}, encryptMetadata: true, streamFilter: "V2", stringFilter: "V2", embeddedFilter: "V2", unencrypted: unencrypted}
 	if v == 4 {
-		if value := dict["EncryptMetadata"]; value != nil {
-			b, ok := value.(Boolean)
+		metaObj, err := r.Resolve(dict["EncryptMetadata"])
+		if err != nil {
+			return err
+		}
+		if metaObj != nil {
+			b, ok := metaObj.(Boolean)
 			if !ok {
 				return fmt.Errorf("invalid EncryptMetadata")
 			}
@@ -146,7 +256,11 @@ func (r *Reader) openSecurity(password []byte) error {
 			value *Name
 		}{{"StmF", &s.streamFilter}, {"StrF", &s.stringFilter}} {
 			*entry.value = "Identity"
-			if value := dict[entry.name]; value != nil {
+			value, err := r.Resolve(dict[entry.name])
+			if err != nil {
+				return err
+			}
+			if value != nil {
 				*entry.value, ok = value.(Name)
 				if !ok {
 					return fmt.Errorf("invalid %s crypt filter", entry.name)
@@ -154,8 +268,12 @@ func (r *Reader) openSecurity(password []byte) error {
 			}
 		}
 		s.embeddedFilter = s.streamFilter
-		if value := dict["EFF"]; value != nil {
-			s.embeddedFilter, ok = value.(Name)
+		effObj, err := r.Resolve(dict["EFF"])
+		if err != nil {
+			return err
+		}
+		if effObj != nil {
+			s.embeddedFilter, ok = effObj.(Name)
 			if !ok {
 				return fmt.Errorf("invalid embedded file crypt filter")
 			}

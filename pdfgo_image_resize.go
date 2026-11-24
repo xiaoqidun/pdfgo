@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"os"
 
 	"golang.org/x/image/draw"
 )
@@ -99,6 +100,12 @@ func (i *Image) DecodeImageSize(size image.Point) (image.Image, error) {
 func (i *Image) DecodeImageSizeContext(ctx context.Context, size image.Point) (image.Image, error) {
 	if ctx == nil || i == nil || i.Stream == nil {
 		return nil, fmt.Errorf("missing image decode context or source")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if i.reader != nil && i.reader.closed {
+		return nil, os.ErrClosed
 	}
 	decoded, err := i.decodeImageSize(ctx, nil, false, size)
 	if err != nil {

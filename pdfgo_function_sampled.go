@@ -20,6 +20,9 @@ import (
 	"math"
 )
 
+// maxSampledEvalPoints 限制单次多维采样插值展开的最大角点或控制点数，防止高维组合爆炸
+const maxSampledEvalPoints = 4096
+
 // sampledFunction 保存多输入采样函数及高位优先的数据表
 type sampledFunction struct {
 	domain, encode, decode, bounds []float64
@@ -32,6 +35,9 @@ type sampledFunction struct {
 // 入参: position 采样位置, size 样本数量
 // 返回: [4]int 样本索引, [4]float64 插值权重
 func sampledSplineSpan(position float64, size int) ([4]int, [4]float64) {
+	if size <= 1 {
+		return [4]int{0}, [4]float64{1}
+	}
 	position = math.Max(0, math.Min(float64(size-1), position))
 	lower := int(position)
 	t := position - float64(lower)
@@ -117,13 +123,27 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 	f.sizes, f.strides = make([]int, inputs), make([]int, inputs)
 	f.encode = make([]float64, 2*inputs)
 	count := outputs
+	evalPoints := 1
 	for i, size := range sizes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if size < 1 || math.Trunc(size) != size || size >= float64(int(^uint(0)>>1))/float64(count) || size > float64(len(data))*8/(float64(count)*bits) {
 			return nil, fmt.Errorf("invalid or truncated sampled function size")
 		}
 		f.sizes[i], f.strides[i] = int(size), count
 		count *= int(size)
 		f.encode[2*i+1] = size - 1
+		if int(size) > 1 {
+			branch := 2
+			if f.order == 3 && int(size) >= 4 {
+				branch = 4
+			}
+			if evalPoints > maxSampledEvalPoints/branch {
+				return nil, fmt.Errorf("sampled function interpolation complexity exceeds limit")
+			}
+			evalPoints *= branch
+		}
 	}
 	value, err := r.Resolve(dict["Encode"])
 	if err != nil {
@@ -174,12 +194,21 @@ func (f *sampledFunction) evaluate(inputs, outputs []float64) {
 		weights[i] = value - float64(lower[i])
 	}
 	clear(outputs)
+	steps := 0
 	var accumulate func(int, int, float64)
 	accumulate = func(dimension, index int, weight float64) {
+		if steps >= maxSampledEvalPoints {
+			return
+		}
 		if dimension == len(inputs) {
+			steps++
 			for c := range outputs {
 				outputs[c] += weight * f.table.sample(index+c)
 			}
+			return
+		}
+		if lower[dimension] == upper[dimension] {
+			accumulate(dimension+1, index+lower[dimension]*f.strides[dimension], weight)
 			return
 		}
 		if weights[dimension] != 1 {
@@ -212,9 +241,14 @@ func (f *sampledFunction) evaluateCubic(inputs, outputs []float64) {
 		indices[i], weights[i] = sampledSplineSpan(value, f.sizes[i])
 	}
 	clear(outputs)
+	steps := 0
 	var accumulate func(int, int, float64)
 	accumulate = func(dimension, index int, weight float64) {
+		if steps >= maxSampledEvalPoints {
+			return
+		}
 		if dimension == len(inputs) {
+			steps++
 			for c := range outputs {
 				outputs[c] += weight * f.table.sample(index+c)
 			}

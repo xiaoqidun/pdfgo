@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 )
 
 // Rectangle 表示PDF用户空间中的矩形坐标
@@ -37,6 +38,7 @@ type Page struct {
 	Rotation   int
 	UserUnit   float64
 	reader     *Reader
+	cache      *objectCache
 }
 
 // pageAttributes 保存页面树可继承的四项属性
@@ -56,6 +58,12 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if visit == nil {
+		return fmt.Errorf("missing page visitor")
 	}
 	root, err := r.Resolve(r.Trailer["Root"])
 	if err != nil {
@@ -172,8 +180,18 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 // Content 读取并依次连接页面内容流，保留流间的图形状态语义
 // 返回: []byte 内容操作符数据, error 错误信息
 func (p *Page) Content() ([]byte, error) {
+	return p.ContentContext(context.Background())
+}
+
+// ContentContext 按取消上下文读取并依次连接页面内容流，保留流间的图形状态语义
+// 入参: ctx 取消上下文
+// 返回: []byte 内容操作符数据, error 解码、关闭或取消错误
+func (p *Page) ContentContext(ctx context.Context) ([]byte, error) {
+	if p == nil || p.reader == nil {
+		return nil, fmt.Errorf("invalid page reader")
+	}
 	var out bytes.Buffer
-	if _, err := p.WriteContent(context.Background(), &out); err != nil {
+	if _, err := p.WriteContent(ctx, &out); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
@@ -183,11 +201,14 @@ func (p *Page) Content() ([]byte, error) {
 // 入参: ctx 取消上下文，在流解码及写出间检查, writer 输出流
 // 返回: int64 已写字节数, error 解码或写入错误，出错时可能已有部分输出
 func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error) {
-	if ctx == nil {
+	if p == nil || p.reader == nil || ctx == nil || writer == nil {
 		return 0, fmt.Errorf("invalid page content context")
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
+	}
+	if p.reader.closed {
+		return 0, os.ErrClosed
 	}
 	value, err := p.reader.Resolve(p.Dictionary["Contents"])
 	if err != nil {
@@ -305,7 +326,7 @@ func (r *Reader) readPage(ref Reference, dict Dictionary, attrs pageAttributes) 
 			return nil, fmt.Errorf("invalid page user unit")
 		}
 	}
-	return &Page{Reference: ref, Dictionary: dict, Resources: resourceDict, MediaBox: media, CropBox: crop, Rotation: int((rotation%360 + 360) % 360), UserUnit: unit, reader: r}, nil
+	return &Page{Reference: ref, Dictionary: dict, Resources: resourceDict, MediaBox: media, CropBox: crop, Rotation: int((rotation%360 + 360) % 360), UserUnit: unit, reader: r, cache: r.cache}, nil
 }
 
 // number 解析直接或间接数字对象

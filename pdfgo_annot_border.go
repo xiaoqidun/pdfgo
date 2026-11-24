@@ -15,7 +15,6 @@
 package pdfgo
 
 import (
-	"fmt"
 	"math"
 	"strings"
 )
@@ -44,6 +43,7 @@ func (r *Reader) writeAnnotationRelief(content *strings.Builder, border *annotat
 	content.WriteString("q\n")
 	for side, path := range paths {
 		light := (side == 0) == (border.style == "B")
+		var color [4]float64
 		for i, value := range values[:len(border.color)] {
 			if len(border.color) == 4 {
 				if light {
@@ -56,22 +56,22 @@ func (r *Reader) writeAnnotationRelief(content *strings.Builder, border *annotat
 			} else {
 				value *= .5
 			}
-			fmt.Fprintf(content, "%g ", value)
+			color[i] = value
 		}
 		switch len(border.color) {
 		case 1:
-			content.WriteString("g\n")
+			writeAnnotationOperation(content, "g", color[:1]...)
 		case 3:
-			content.WriteString("rg\n")
+			writeAnnotationOperation(content, "rg", color[:3]...)
 		case 4:
-			content.WriteString("k\n")
+			writeAnnotationOperation(content, "k", color[:4]...)
 		}
 		for i, point := range path {
 			op := "l"
 			if i == 0 {
 				op = "m"
 			}
-			fmt.Fprintf(content, "%g %g %s\n", point.X, point.Y, op)
+			writeAnnotationOperation(content, op, point.X, point.Y)
 		}
 		content.WriteString("h f\n")
 	}

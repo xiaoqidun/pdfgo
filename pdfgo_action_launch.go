@@ -44,35 +44,18 @@ type LaunchAction struct {
 // 返回: LaunchAction 启动信息, error 结构、参数或取消错误
 func (r *Reader) ReadLaunchAction(ctx context.Context, object Object) (LaunchAction, error) {
 	var result LaunchAction
-	if ctx == nil {
-		return result, fmt.Errorf("invalid launch action context")
-	}
-	if err := ctx.Err(); err != nil {
-		return result, err
-	}
-	value, err := r.Resolve(object)
+	dict, err := r.actionDictionary(ctx, object, "Launch")
 	if err != nil {
 		return result, err
 	}
-	dict, ok := value.(Dictionary)
-	if !ok || dict == nil {
-		return result, fmt.Errorf("invalid launch action")
-	}
-	value, err = r.Resolve(dict["S"])
-	if err != nil {
-		return result, err
-	}
-	if value != Name("Launch") {
-		return result, fmt.Errorf("invalid launch action type")
-	}
-	value, err = r.Resolve(dict["F"])
+	value, err := r.Resolve(dict["F"])
 	if err != nil {
 		return result, err
 	}
 	if value != nil {
 		file, err := r.ReadFileSpecification(value)
 		if err != nil {
-			return result, err
+			return result, wrapActionError(err)
 		}
 		result.File = &file
 	}
@@ -83,7 +66,7 @@ func (r *Reader) ReadLaunchAction(ctx context.Context, object Object) (LaunchAct
 	if value != nil {
 		parameters, ok := value.(Dictionary)
 		if !ok || parameters == nil {
-			return result, fmt.Errorf("invalid Windows launch parameters")
+			return result, fmt.Errorf("%w: invalid Windows launch parameters", ErrInvalidAction)
 		}
 		windows := &WindowsLaunchParameters{Operation: "open"}
 		for _, field := range []struct {
@@ -99,7 +82,7 @@ func (r *Reader) ReadLaunchAction(ctx context.Context, object Object) (LaunchAct
 			}
 			encoded, ok := value.(String)
 			if !ok {
-				return result, fmt.Errorf("invalid Windows launch %s", field.key)
+				return result, fmt.Errorf("%w: invalid Windows launch %s", ErrInvalidAction, field.key)
 			}
 			*field.target = String(bytes.Clone(encoded))
 		}
@@ -110,7 +93,7 @@ func (r *Reader) ReadLaunchAction(ctx context.Context, object Object) (LaunchAct
 		if value != nil {
 			operation, ok := value.(String)
 			if !ok || string(operation) != "open" && string(operation) != "print" {
-				return result, fmt.Errorf("invalid Windows launch operation")
+				return result, fmt.Errorf("%w: invalid Windows launch operation", ErrInvalidAction)
 			}
 			windows.Operation = string(operation)
 		}
@@ -125,7 +108,7 @@ func (r *Reader) ReadLaunchAction(ctx context.Context, object Object) (LaunchAct
 		return result, err
 	}
 	if result.File == nil && result.Windows == nil && result.Mac == nil && result.Unix == nil {
-		return result, fmt.Errorf("missing launch target")
+		return result, fmt.Errorf("%w: missing launch target", ErrInvalidAction)
 	}
 	value, err = r.Resolve(dict["NewWindow"])
 	if err != nil {
@@ -134,7 +117,7 @@ func (r *Reader) ReadLaunchAction(ctx context.Context, object Object) (LaunchAct
 	if value != nil {
 		window, ok := value.(Boolean)
 		if !ok {
-			return result, fmt.Errorf("invalid launch window flag")
+			return result, fmt.Errorf("%w: invalid launch window flag", ErrInvalidAction)
 		}
 		flag := bool(window)
 		result.NewWindow = &flag

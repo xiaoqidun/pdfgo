@@ -21,6 +21,8 @@ import (
 	"io"
 	"maps"
 	"math"
+	"os"
+	"slices"
 )
 
 // Matrix 表示PDF二维仿射矩阵，使用列向量坐标约定
@@ -80,27 +82,28 @@ type Paint struct {
 // Transfer在最终设备颜色转换及透明合成后应用，不预先改变Fill和Stroke
 // HalftoneOrigin保存设置时的页面用户坐标，后续变换不移动原点，空值采用设备默认值
 type Style struct {
-	Fill, Stroke    Paint
-	LineWidth       float64
-	Cap, Join       int
-	MiterLimit      float64
-	Dash            []float64
-	DashPhase       float64
-	Clips           []Path
-	StrokeAdjust    bool
-	FillOverprint   bool
-	StrokeOverprint bool
-	OverprintMode   int
-	RenderingIntent Name
-	BlendMode       Name
-	AlphaIsShape    bool
-	SoftMask        *SoftMask
-	Smoothness      *float64
-	Antialias       *bool
-	Halftone        *Halftone
-	HalftoneOrigin  *Point
-	Transfer        *TransferFunction
-	ColorConversion ColorConversion
+	Fill, Stroke           Paint
+	LineWidth              float64
+	Cap, Join              int
+	MiterLimit             float64
+	Dash                   []float64
+	DashPhase              float64
+	Clips                  []Path
+	StrokeAdjust           bool
+	FillOverprint          bool
+	StrokeOverprint        bool
+	OverprintMode          int
+	RenderingIntent        Name
+	BlackPointCompensation Name
+	BlendMode              Name
+	AlphaIsShape           bool
+	SoftMask               *SoftMask
+	Smoothness             *float64
+	Antialias              *bool
+	Halftone               *Halftone
+	HalftoneOrigin         *Point
+	Transfer               *TransferFunction
+	ColorConversion        ColorConversion
 }
 
 // PathMark 表示一次路径绘制，路径及裁剪坐标始终位于页面用户空间
@@ -512,6 +515,10 @@ func (r *Reader) Fork(source io.ReaderAt, warning func(Diagnostic), shapeText Te
 		copied.key = bytes.Clone(r.security.key)
 		security = &copied
 	}
+	owner := r.owner
+	if owner == nil {
+		owner = r
+	}
 	if r.cache != nil {
 		r.cache.shared.Store(true)
 	}
@@ -530,19 +537,27 @@ func (r *Reader) Fork(source io.ReaderAt, warning func(Diagnostic), shapeText Te
 		warning:        warning,
 		textShaper:     shapeText,
 		decodeWorkers:  1,
+		maxStreamBytes: r.maxStreamBytes,
+		maxFilterChain: r.maxFilterChain,
 		jbig2Globals:   r.jbig2Globals,
+		owner:          owner,
 	}
 }
 
 // BindPage 将来源同一文档的页面浅拷贝绑定到当前工作视图，不修改原页面对象
+// 阅读器为空或已关闭，或页面不属于同源文档时返回nil
 // 入参: page 原阅读器页面
 // 返回: *Page 绑定到当前视图的页面副本
 func (r *Reader) BindPage(page *Page) *Page {
-	if page == nil {
+	if r == nil || r.closed || page == nil {
+		return nil
+	}
+	if page.reader != nil && !r.ownsObject(page.reader, page.cache) {
 		return nil
 	}
 	bound := *page
 	bound.reader = r
+	bound.cache = r.cache
 	return &bound
 }
 
@@ -555,6 +570,9 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r.closed {
+		return os.ErrClosed
 	}
 	if page == nil || page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
@@ -678,6 +696,12 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	if (groupSpace != nil || knockout) && visitor.Group != nil {
 		return visitor.Group(GroupMark{Page: true, Alpha: 1, Isolated: true, Knockout: knockout, ColorSpace: groupSpace}, func(v Visitor) error {
 			child := interpreter
+			if v.MarkedContent == nil {
+				v.MarkedContent = visitor.MarkedContent
+			}
+			if v.OptionalContent == nil {
+				v.OptionalContent = visitor.OptionalContent
+			}
 			if v.Reference == nil {
 				v.Reference = visitor.Reference
 			}
@@ -689,6 +713,9 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			}
 			if v.PostScript == nil {
 				v.PostScript = visitor.PostScript
+			}
+			if v.Warning == nil {
+				v.Warning = visitor.Warning
 			}
 			child.visitor = v
 			return child.run(data.Bytes())
@@ -706,6 +733,12 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if r == nil {
+		return fmt.Errorf("invalid Type3 glyph reader")
+	}
+	if r.closed {
+		return os.ErrClosed
 	}
 	if visitor.Halftones == nil {
 		visitor.Halftones = mark.halftones
@@ -985,7 +1018,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 	}
 	if p.uncoloredType3 {
 		switch op.Operator {
-		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN":
+		case "g", "G", "rg", "RG", "k", "K", "cs", "CS", "sc", "SC", "scn", "SCN", "sh", "ri":
 			return nil
 		}
 	}
@@ -1151,7 +1184,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.pendingClip = true
 		p.clipEvenOdd = op.Operator == "W*"
 	case "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n":
-		if op.Operator == "s" || op.Operator == "b" || op.Operator == "b*" {
+		if (op.Operator == "s" || op.Operator == "b" || op.Operator == "b*") && p.hasPoint {
 			add("C")
 		}
 		fill := op.Operator == "f" || op.Operator == "F" || op.Operator == "f*" || op.Operator == "B" || op.Operator == "B*" || op.Operator == "b" || op.Operator == "b*"
@@ -2295,7 +2328,8 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 	if err != nil {
 		return err
 	}
-	for key, value := range dict {
+	for _, key := range slices.Sorted(maps.Keys(dict)) {
+		value := dict[key]
 		switch key {
 		case "Type", "TK", "HT", "HTO", "UseBlackPtComp", "D", "FL", "TR", "TR2", "Font", "RI", "ca", "CA", "LW", "LC", "LJ", "ML", "BM", "SMask", "AIS", "SA", "OP", "op", "OPM", "SM", "AAPL:AA", "BG", "BG2", "UCR", "UCR2":
 		default:
@@ -2353,6 +2387,12 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				return fmt.Errorf("invalid halftone origin")
 			}
 			p.state.style.HalftoneOrigin = &origin
+		case "UseBlackPtComp":
+			mode, ok := value.(Name)
+			if !ok || mode != "ON" && mode != "OFF" && mode != "Default" {
+				return fmt.Errorf("invalid black point compensation")
+			}
+			p.state.style.BlackPointCompensation = mode
 		case "D":
 			values, ok := value.(Array)
 			if !ok || len(values) != 2 {

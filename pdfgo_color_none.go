@@ -151,7 +151,11 @@ func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 		if value == Name("None") {
 			return true, r.ignoredTintSpace(array)
 		}
-		if family := colorSpaceFamily(array[2]); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
+		alternate, err := r.resolveColorSpace(array[2])
+		if err != nil {
+			return false, err
+		}
+		if family := colorSpaceFamily(alternate); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
 			space, err := r.readSeparationSpace(array, effective, 0)
 			if err != nil {
 				return false, err
@@ -166,7 +170,11 @@ func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 		if none {
 			return true, r.ignoredTintSpace(array)
 		}
-		if family := colorSpaceFamily(array[2]); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
+		alternate, err := r.resolveColorSpace(array[2])
+		if err != nil {
+			return false, err
+		}
+		if family := colorSpaceFamily(alternate); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
 			space, err := r.readDeviceNSpace(array, effective, 0)
 			if err != nil {
 				return false, err

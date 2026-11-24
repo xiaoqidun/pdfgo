@@ -104,7 +104,7 @@ func glyphNameUnicodeMap(name string, names map[string]string) (string, bool) {
 		}
 		return value.String(), true
 	}
-	if strings.HasPrefix(name, "uni") && len(name) > 3 && (len(name)-3)%4 == 0 {
+	if strings.HasPrefix(name, "uni") && len(name) > 3 && (len(name)-3)%4 == 0 && isUpperHex(name[3:]) {
 		var value strings.Builder
 		for i := 3; i < len(name); i += 4 {
 			n, err := strconv.ParseUint(name[i:i+4], 16, 16)
@@ -115,11 +115,24 @@ func glyphNameUnicodeMap(name string, names map[string]string) (string, bool) {
 		}
 		return value.String(), true
 	}
-	if strings.HasPrefix(name, "u") && len(name) >= 5 && len(name) <= 7 {
+	if strings.HasPrefix(name, "u") && len(name) >= 5 && len(name) <= 7 && isUpperHex(name[1:]) {
 		n, err := strconv.ParseUint(name[1:], 16, 32)
 		if err == nil && n <= 0x10FFFF && (n < 0xD800 || n > 0xDFFF) {
 			return string(rune(n)), true
 		}
 	}
 	return "", false
+}
+
+// isUpperHex 判断字符串是否全部由大写十六进制数字组成
+// 入参: text 待检字符串
+// 返回: bool 是否全为大写十六进制数字
+func isUpperHex(text string) bool {
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if (c < '0' || c > '9') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return len(text) != 0
 }

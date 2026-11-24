@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 )
 
 // threeDBinding 计算视口或注解区域的绑定倍率
@@ -96,7 +97,13 @@ func (r *Reader) WalkThreeDOverlay(ctx context.Context, page *Page, source Three
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r == nil || r.closed || page == nil || page.reader != r {
+	if r == nil {
+		return fmt.Errorf("3D overlay reader unavailable")
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
+	if page == nil || page.reader != r {
 		return fmt.Errorf("3D overlay reader unavailable")
 	}
 	stream := source.Presentation.Overlay
@@ -159,5 +166,10 @@ func (r *Reader) WalkThreeDOverlay(ctx context.Context, page *Page, source Three
 	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: clip}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: matrix, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal", Clips: []Path{path}}}
+	for _, operator := range []string{"g", "G"} {
+		if err := interpreter.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
+			return err
+		}
+	}
 	return interpreter.form(stream)
 }

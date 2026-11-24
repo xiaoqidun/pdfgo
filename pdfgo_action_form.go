@@ -60,7 +60,7 @@ func (r *Reader) ReadResetFormAction(ctx context.Context, object Object) (ResetF
 	if value != nil {
 		flags, ok := value.(Integer)
 		if !ok || flags < 0 || flags&^1 != 0 {
-			return result, fmt.Errorf("invalid reset-form flags")
+			return result, fmt.Errorf("%w: invalid reset-form flags", ErrInvalidAction)
 		}
 		result.Exclude = flags&1 != 0
 	}
@@ -74,7 +74,7 @@ func (r *Reader) ReadResetFormAction(ctx context.Context, object Object) (ResetF
 	}
 	array, ok := value.(Array)
 	if !ok {
-		return result, fmt.Errorf("invalid reset-form fields")
+		return result, fmt.Errorf("%w: invalid reset-form fields", ErrInvalidAction)
 	}
 	result.Fields, err = r.actionTargets(ctx, array, false)
 	return result, err
@@ -91,7 +91,7 @@ func (r *Reader) ReadImportDataAction(ctx context.Context, object Object) (Impor
 	}
 	result.File, err = r.ReadFileSpecification(dict["F"])
 	if err != nil {
-		return result, err
+		return result, wrapActionError(err)
 	}
 	return result, ctx.Err()
 }
@@ -112,7 +112,7 @@ func (r *Reader) ReadHideAction(ctx context.Context, object Object) (HideAction,
 	if value != nil {
 		flag, ok := value.(Boolean)
 		if !ok {
-			return result, fmt.Errorf("invalid hide action flag")
+			return result, fmt.Errorf("%w: invalid hide action flag", ErrInvalidAction)
 		}
 		result.Hide = bool(flag)
 	}
@@ -144,7 +144,7 @@ func (r *Reader) actionTargets(ctx context.Context, objects Array, annotations b
 		if text, ok := value.(String); ok {
 			name, err := DecodeTextString(text)
 			if err != nil {
-				return nil, err
+				return nil, wrapActionError(err)
 			}
 			result = append(result, ActionTarget{Name: name})
 			continue
@@ -152,7 +152,7 @@ func (r *Reader) actionTargets(ctx context.Context, objects Array, annotations b
 		ref, indirect := object.(Reference)
 		dict, valid := value.(Dictionary)
 		if !indirect || ref.Number <= 0 || !valid || dict == nil {
-			return nil, fmt.Errorf("invalid action target")
+			return nil, fmt.Errorf("%w: invalid action target", ErrInvalidAction)
 		}
 		if annotations {
 			subtype, err := r.Resolve(dict["Subtype"])
@@ -160,7 +160,7 @@ func (r *Reader) actionTargets(ctx context.Context, objects Array, annotations b
 				return nil, err
 			}
 			if name, ok := subtype.(Name); !ok || name == "" {
-				return nil, fmt.Errorf("invalid hide annotation target")
+				return nil, fmt.Errorf("%w: invalid hide annotation target", ErrInvalidAction)
 			}
 		}
 		result = append(result, ActionTarget{Reference: ref})

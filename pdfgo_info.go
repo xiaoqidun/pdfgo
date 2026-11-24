@@ -178,6 +178,12 @@ func (r *Reader) readOutputIntent(object Object) (OutputIntent, error) {
 // 返回: DocumentInfo 文档信息, error 字典或字段类型错误
 func (r *Reader) Info() (DocumentInfo, error) {
 	result := DocumentInfo{Trapped: "Unknown"}
+	if r == nil {
+		return result, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return result, os.ErrClosed
+	}
 	value, err := r.Resolve(r.Trailer["Info"])
 	if err != nil || value == nil {
 		if r.recoverAuxiliary(err) {

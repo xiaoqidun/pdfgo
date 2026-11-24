@@ -249,6 +249,10 @@ func (o RewriteOptions) actionSequences() iter.Seq[[]NavigationAction] {
 // 入参: replacements 替换对象
 // 返回: *Reader 独立对象缓存的读取视图
 func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
+	owner := r.owner
+	if owner == nil {
+		owner = r
+	}
 	return &Reader{
 		Version:        r.Version,
 		Trailer:        r.Trailer,
@@ -256,12 +260,17 @@ func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
 		size:           r.size,
 		originalSource: r.originalSource,
 		originalSize:   r.originalSize,
-		xref:           r.xref,
+		xref:           maps.Clone(r.xref),
 		cache:          r.cache.cloneWithPinned(replacements),
 		loading:        make(map[Reference]bool),
+		deviceProfile:  r.deviceProfile,
 		security:       r.security,
 		warning:        r.warning,
 		decodeWorkers:  r.decodeWorkers,
+		maxStreamBytes: r.maxStreamBytes,
+		maxFilterChain: r.maxFilterChain,
+		jbig2Globals:   r.jbig2Globals,
+		owner:          owner,
 	}
 }
 

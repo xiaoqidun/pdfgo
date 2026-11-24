@@ -21,7 +21,7 @@ import (
 )
 
 // SoundAction 保存音频及有效播放参数，不解码采样或执行播放
-// Volume取值范围[-1,1]，Repeat出现时Synchronous无效
+// Volume取值范围[-1,1]，Repeat为true时忽略Synchronous
 type SoundAction struct {
 	Sound       Sound
 	Volume      float64
@@ -48,7 +48,7 @@ func (r *Reader) ReadSoundAction(ctx context.Context, object Object) (SoundActio
 	result := SoundAction{Volume: 1}
 	result.Sound, err = r.ReadSound(value)
 	if err != nil {
-		return result, err
+		return result, wrapActionError(err)
 	}
 	value, err = r.Resolve(dict["Volume"])
 	if err != nil {
@@ -57,15 +57,14 @@ func (r *Reader) ReadSoundAction(ctx context.Context, object Object) (SoundActio
 	if value != nil {
 		result.Volume, err = r.number(value)
 		if err != nil || math.IsNaN(result.Volume) || math.IsInf(result.Volume, 0) || result.Volume < -1 || result.Volume > 1 {
-			return result, fmt.Errorf("invalid sound action volume")
+			return result, fmt.Errorf("%w: invalid sound action volume", ErrInvalidAction)
 		}
 	}
-	repeatPresent := false
 	for _, field := range []struct {
 		key    Name
 		target *bool
 	}{{"Repeat", &result.Repeat}, {"Mix", &result.Mix}, {"Synchronous", &result.Synchronous}} {
-		if field.key == "Synchronous" && repeatPresent {
+		if field.key == "Synchronous" && result.Repeat {
 			continue
 		}
 		value, err := r.Resolve(dict[field.key])
@@ -77,10 +76,9 @@ func (r *Reader) ReadSoundAction(ctx context.Context, object Object) (SoundActio
 		}
 		flag, ok := value.(Boolean)
 		if !ok {
-			return result, fmt.Errorf("invalid sound action %s", field.key)
+			return result, fmt.Errorf("%w: invalid sound action %s", ErrInvalidAction, field.key)
 		}
 		*field.target = bool(flag)
-		repeatPresent = repeatPresent || field.key == "Repeat"
 	}
 	return result, ctx.Err()
 }

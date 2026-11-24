@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"os"
 )
 
 // EncodePNG 按原始尺寸无损导出图像，颜色、遮罩及精度与DecodeImage一致
@@ -35,6 +36,9 @@ func (i *Image) EncodePNG(writer io.Writer) error {
 func (i *Image) EncodePNGContext(ctx context.Context, writer io.Writer) error {
 	if ctx == nil || writer == nil || i == nil || i.Stream == nil || i.reader == nil {
 		return fmt.Errorf("missing image export context, writer or source")
+	}
+	if i.reader.closed {
+		return os.ErrClosed
 	}
 	_, err := i.decodeImageOutput(ctx, nil, false, image.Point{}, writer)
 	return err

@@ -183,12 +183,27 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 	p := pageInterpreter{reader: r, ctx: ctx, resources: resources, visitor: Visitor{MarkedContent: func(MarkedContentMark) error { return nil }}}
 	var result bytes.Buffer
 	var frames []int64
+	var gstack []int64
 	position, object, current := 0, 0, 0
 	inside, replacing := false, false
 	var frame int64 = -1
-	depth := 0
+	var gframe int64 = -1
+	depth, gdepth := 0, 0
 	err := walkOperations(ctx, data, func(op Operation) error {
 		switch op.Operator {
+		case "q":
+			if len(op.Operands) != 0 {
+				return fmt.Errorf("invalid PDF graphics state save")
+			}
+			gstack = append(gstack, op.Offset)
+		case "Q":
+			if len(op.Operands) != 0 || len(gstack) == 0 {
+				return fmt.Errorf("invalid PDF graphics state restore")
+			}
+			gstack = gstack[:len(gstack)-1]
+			if replacing && len(gstack) < gdepth {
+				return fmt.Errorf("PDF text replacement crosses graphics state boundary")
+			}
 		case "BMC", "BDC", "EMC", "MP", "DP":
 			if err := p.markedContent(op); err != nil {
 				return err
@@ -197,6 +212,9 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 				frames = append(frames, op.Offset)
 			} else if op.Operator == "EMC" {
 				frames = frames[:len(frames)-1]
+				if replacing && len(frames) < depth {
+					return fmt.Errorf("PDF text replacement crosses marked content boundary")
+				}
 			}
 		case "BT":
 			if inside || len(op.Operands) != 0 {
@@ -210,6 +228,10 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 				depth, frame = len(frames), -1
 				if depth > 0 {
 					frame = frames[depth-1]
+				}
+				gdepth, gframe = len(gstack), -1
+				if gdepth > 0 {
+					gframe = gstack[gdepth-1]
 				}
 				result.Write(data[position:int(op.Offset)])
 				result.WriteString("\n/Span << /ActualText <")
@@ -226,6 +248,9 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 			if replacing && object == spans[current].First+spans[current].Count {
 				if len(frames) != depth || depth > 0 && frames[depth-1] != frame {
 					return fmt.Errorf("PDF text replacement crosses marked content boundary")
+				}
+				if len(gstack) != gdepth || gdepth > 0 && gstack[gdepth-1] != gframe {
+					return fmt.Errorf("PDF text replacement crosses graphics state boundary")
 				}
 				end := int(op.Offset) + len(op.Operator)
 				result.Write(data[position:end])

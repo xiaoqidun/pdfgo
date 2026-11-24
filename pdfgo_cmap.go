@@ -23,6 +23,9 @@ import (
 	"unicode/utf16"
 )
 
+// maxCMapEntries 限制展开为字符映射表时的最大总条目数，防止大范围区间展开耗尽内存
+const maxCMapEntries uint64 = 262144
+
 // errInvalidUnicodeSurrogate 表示Unicode映射中的代理项配对无效
 var errInvalidUnicodeSurrogate = errors.New("invalid Unicode surrogate")
 
@@ -53,6 +56,7 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 	p := objectParser{data: data}
 	result := UnicodeMap{}
 	var inherited UnicodeMap
+	var expanded uint64
 	previous := ""
 	var name Name
 	for {
@@ -70,6 +74,9 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 				}
 				index++
 				if _, exists := result[code]; !exists {
+					if uint64(len(result)) >= maxCMapEntries {
+						return nil, p.fail("CMap mapping entries exceed limit")
+					}
 					result[code] = text
 				}
 			}
@@ -141,6 +148,10 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 				if err != nil {
 					return nil, err
 				}
+				if expanded >= maxCMapEntries {
+					return nil, p.fail("CMap mapping entries exceed limit")
+				}
+				expanded++
 				result[string(first)] = value
 			} else {
 				lastObject, err := p.object()
@@ -155,6 +166,11 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 				if b < a || b-a > 65535 {
 					return nil, p.fail("excessive CMap source range")
 				}
+				span := b - a + 1
+				if span > maxCMapEntries-expanded {
+					return nil, p.fail("CMap mapping entries exceed limit")
+				}
+				expanded += span
 				to, err := p.object()
 				if err != nil {
 					return nil, err

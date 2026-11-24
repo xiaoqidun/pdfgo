@@ -14,7 +14,10 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // ProjectionAnnotation 保存依赖运行环境的批注及其可选三维测量关联
 // Measurement为空不代表无效，其他运行环境可不提供ExData或使用其他子类型
@@ -29,7 +32,13 @@ type ProjectionAnnotation struct {
 // 返回: ProjectionAnnotation 关联数据, error 类型、参数或引用错误
 func (r *Reader) ReadProjectionAnnotation(annotation Annotation) (ProjectionAnnotation, error) {
 	result := ProjectionAnnotation{Dictionary: annotation.Dictionary}
-	if r == nil || r.closed || annotation.Subtype != "Projection" {
+	if r == nil {
+		return result, fmt.Errorf("invalid projection annotation")
+	}
+	if r.closed {
+		return result, os.ErrClosed
+	}
+	if annotation.Subtype != "Projection" {
 		return result, fmt.Errorf("invalid projection annotation")
 	}
 	dict, err := r.mediaDictionary(annotation.Dictionary["ExData"], true)

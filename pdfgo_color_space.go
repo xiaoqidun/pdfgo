@@ -15,11 +15,12 @@
 package pdfgo
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"math"
-	"reflect"
+	"slices"
 	"sync/atomic"
 )
 
@@ -77,20 +78,102 @@ func (s *ColorSpace) DefaultIntent() Name {
 	return "RelativeColorimetric"
 }
 
-// Equal 判断颜色模型、配置定义与分量范围是否相同，不受逆向缓存初始化影响
+// Equal 判断颜色模型、配置定义与分量范围是否相同，仅比较不可变定义字段且不访问懒加载状态
 // 入参: other 待比较空间
 // 返回: bool 是否相同
 func (s *ColorSpace) Equal(other *ColorSpace) bool {
-	if s == nil || other == nil || s.Model != other.Model {
+	if s == nil || other == nil || s.Model != other.Model || s.mapped != other.mapped {
 		return false
 	}
-	if s.profile == other.profile {
+	return equalICCProfile(s.profile, other.profile)
+}
+
+// equalICCProfile 按不可变定义字段比较两个ICC或校准颜色配置，不访问逆向懒加载与函数字段
+// 入参: a 首个配置, b 对比配置
+// 返回: bool 是否相同
+func equalICCProfile(a, b *iccColorSpace) bool {
+	if a == b {
 		return true
 	}
-	if s.profile != nil && other.profile != nil && s.profile.signature != nil && other.profile.signature != nil {
-		return *s.profile.signature == *other.profile.signature && reflect.DeepEqual(s.profile.ranges, other.profile.ranges)
+	if a == nil || b == nil {
+		return false
 	}
-	return reflect.DeepEqual(s.profile, other.profile)
+	if a.lab != b.lab || a.intent != b.intent || a.absoluteScale != b.absoluteScale || !equalICCRanges(a.ranges, b.ranges) {
+		return false
+	}
+	if (a.signature != nil) != (b.signature != nil) {
+		return false
+	}
+	if a.signature != nil {
+		return *a.signature == *b.signature && bytes.Equal(a.data, b.data)
+	}
+	if (a.alternate != nil) != (b.alternate != nil) {
+		return false
+	}
+	if a.alternate != nil {
+		if a.alternateCount != b.alternateCount || a.alternate.components != b.alternate.components || a.alternate.invisible != b.alternate.invisible {
+			return false
+		}
+		if a.alternateBlending != nil || b.alternateBlending != nil {
+			return a.alternateBlending.Equal(b.alternateBlending)
+		}
+		return a.hasAlternateDigest && b.hasAlternateDigest && a.alternateDigest == b.alternateDigest
+	}
+	return equalICCGray(a.gray, b.gray) && equalICCRGB(a.rgb, b.rgb)
+}
+
+// equalICCRanges 比较两个可选分量范围指针的内容是否相等
+// 入参: a 首个范围, b 对比范围
+// 返回: bool 是否相等
+func equalICCRanges(a, b *[8]float64) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+// equalICCGray 比较两个不可变灰度校准配置是否相同
+// 入参: a 首个配置, b 对比配置
+// 返回: bool 是否相同
+func equalICCGray(a, b *iccGraySpace) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.lab == b.lab && a.matrix == b.matrix && equalICCToneCurve(a.curve, b.curve)
+}
+
+// equalICCRGB 比较两个不可变RGB校准配置是否相同
+// 入参: a 首个配置, b 对比配置
+// 返回: bool 是否相同
+func equalICCRGB(a, b *iccRGBSpace) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.matrix != b.matrix || a.inverse != b.inverse {
+		return false
+	}
+	for i := range a.curves {
+		if !equalICCToneCurve(a.curves[i], b.curves[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// equalICCToneCurve 比较两条不可变色调响应曲线定义是否相同
+// 入参: a 首条曲线, b 对比曲线
+// 返回: bool 是否相同
+func equalICCToneCurve(a, b iccToneCurve) bool {
+	return a.function == b.function && a.direction == b.direction && slices.Equal(a.samples, b.samples) && slices.Equal(a.parameters, b.parameters)
 }
 
 // Digest 返回颜色空间配置的内容摘要，不支持确定性摘要的复合空间返回false

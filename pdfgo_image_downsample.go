@@ -303,15 +303,23 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 		if err != nil || predictor != 1 {
 			return nil, false, nil
 		}
-		if int64(stride)*int64(i.Height) > int64(brotliDecodeLimit) {
+		maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+		if maxBytes > 0 && int64(stride)*int64(i.Height) > maxBytes {
 			return nil, true, fmt.Errorf("Brotli decode limit exceeded")
 		}
 		brotliReader = acquireBrotliReader(&contextInput{ctx: ctx, reader: bytes.NewReader(i.Stream.Data)})
-		brotliLimited = &io.LimitedReader{R: &contextInput{ctx: ctx, reader: brotliReader}, N: int64(brotliDecodeLimit) + 1}
-		defer func() {
-			releaseBrotliReader(brotliReader, int64(brotliDecodeLimit)+1-brotliLimited.N, brotliFailed)
-		}()
-		reader = brotliLimited
+		if maxBytes > 0 {
+			brotliLimited = &io.LimitedReader{R: &contextInput{ctx: ctx, reader: brotliReader}, N: maxBytes + 1}
+			defer func() {
+				releaseBrotliReader(brotliReader, maxBytes+1-brotliLimited.N, brotliFailed)
+			}()
+			reader = brotliLimited
+		} else {
+			defer func() {
+				releaseBrotliReader(brotliReader, int64(stride)*int64(i.Height), brotliFailed)
+			}()
+			reader = &contextInput{ctx: ctx, reader: brotliReader}
+		}
 		isBrotli = true
 	case "RunLengthDecode":
 		reader = &runLengthStreamReader{ctx: ctx, data: i.Stream.Data, warning: i.Warning}
@@ -329,7 +337,7 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 	if trailingErr == nil {
 		excessBytes, trailingErr = checkStreamTrailingSamples(ctx, reader, i.Warning, i.Width, i.Height)
 	}
-	if isBrotli && brotliLimited.N == 0 {
+	if isBrotli && brotliLimited != nil && brotliLimited.N == 0 {
 		return nil, true, fmt.Errorf("Brotli decode limit exceeded")
 	}
 	if isFlate {

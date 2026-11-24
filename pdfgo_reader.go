@@ -62,6 +62,8 @@ type Reader struct {
 	warning            func(Diagnostic)
 	textShaper         TextShaper
 	decodeWorkers      int
+	maxStreamBytes     int64
+	maxFilterChain     int
 	jbig2Globals       *jbig2GlobalsCache
 	owner              *Reader
 	closed             bool
@@ -69,17 +71,21 @@ type Reader struct {
 	recoveryTried      bool
 }
 
-// ReaderOptions 设置密码编码、结构诊断、解码并发及生成注释外观时的文字整形
+// ReaderOptions 设置密码编码、结构诊断、解码并发、流解压预算及生成注释外观时的文字整形
 // Warning非空时诊断并恢复可确定的结构、字体及解码声明，不修改输入数据
 // 源读取、取消及认证错误仍返回，绘制诊断由Visitor.Warning控制
 // ShapeText用于横排纯文本字段、列表选项及注释标题，空值不生成需要整形的外观，已有外观不受影响
 // Workers限制图像解码内部并发数，零值自动选择，外层并发调度时可设为1避免过度订阅
+// MaxStreamBytes限制单个流最大解压字节数，零值默认256MiB，负值不限制
+// MaxFilterChain限制单个流过滤器链最大深度，零值默认16，负值不限制
 type ReaderOptions struct {
-	Password     []byte
-	PasswordUTF8 bool
-	Warning      func(Diagnostic)
-	ShapeText    TextShaper
-	Workers      int
+	Password       []byte
+	PasswordUTF8   bool
+	Warning        func(Diagnostic)
+	ShapeText      TextShaper
+	Workers        int
+	MaxStreamBytes int64
+	MaxFilterChain int
 }
 
 // objectStream 保存对象流索引、解码数据及实际缓存字节数
@@ -173,6 +179,13 @@ func OpenWithPassword(path string, password []byte) (*Reader, error) {
 	return OpenWithOptions(path, ReaderOptions{Password: password})
 }
 
+// OpenWithUTF8Password 自动按安全处理器版本转换UTF-8密码并打开PDF文件
+// 入参: path 文件路径, password 用户或所有者密码的UTF-8字节，nil表示空密码
+// 返回: *Reader 阅读器, error 错误信息
+func OpenWithUTF8Password(path string, password []byte) (*Reader, error) {
+	return OpenWithOptions(path, ReaderOptions{Password: password, PasswordUTF8: true})
+}
+
 // OpenWithOptions 按读取选项打开PDF文件并读取交叉引用
 // 入参: path 文件路径, options 读取及外观选项
 // 返回: *Reader 阅读器, error 错误信息
@@ -249,7 +262,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	if end >= 5 && bytes.HasPrefix(data, []byte("%PDF-")) {
 		version = string(bytes.Trim(data[5:end], "\x00\t\n\f\r "))
 	}
-	if version != "2.0" && (len(version) != 3 || version[0:2] != "1." || version[2] < '0' || version[2] > '7') {
+	if !validPDFVersion(version) {
 		if options.Warning == nil {
 			return nil, &UnsupportedError{Feature: "PDF version " + version}
 		}
@@ -263,6 +276,8 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	if options.Workers > 0 {
 		r.decodeWorkers = options.Workers
 	}
+	r.maxStreamBytes = normalizeMaxStreamBytes(options.MaxStreamBytes)
+	r.maxFilterChain = normalizeMaxFilterChain(options.MaxFilterChain)
 	err := r.loadCrossReferences()
 	if err != nil {
 		if options.Warning == nil || !readerStructuralError(err) {
@@ -298,10 +313,29 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		r.Close()
 		return nil, fmt.Errorf("missing document catalog")
 	}
-	if v, ok := catalog["Version"].(Name); ok && string(v) > r.Version {
-		r.Version = string(v)
+	if versionObj, err := r.Resolve(catalog["Version"]); err != nil {
+		r.Close()
+		return nil, err
+	} else if versionObj != nil {
+		v, ok := versionObj.(Name)
+		if !ok || !validPDFVersion(string(v)) {
+			if r.warning == nil {
+				r.Close()
+				return nil, fmt.Errorf("invalid catalog PDF version")
+			}
+			r.warning(Diagnostic{Message: "invalid catalog Version ignored"})
+		} else if string(v) > r.Version {
+			r.Version = string(v)
+		}
 	}
 	return r, nil
+}
+
+// validPDFVersion 判断版本字符串是否为ISO 32000允许的PDF版本格式
+// 入参: version 版本号文本
+// 返回: bool 是否为合法版本
+func validPDFVersion(version string) bool {
+	return version == "2.0" || (len(version) == 3 && version[0] == '1' && version[1] == '.' && version[2] >= '0' && version[2] <= '7')
 }
 
 // readerStructuralError 排除源读取、取消、关闭和安全错误，限定结构恢复范围
@@ -604,6 +638,9 @@ func (r *Reader) Close() error {
 // 入参: object 待解析对象
 // 返回: Object 解析后的对象, error 错误信息
 func (r *Reader) Resolve(object Object) (Object, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
 	if r.closed {
 		return nil, os.ErrClosed
 	}
@@ -641,6 +678,9 @@ func (r *Reader) Resolve(object Object) (Object, error) {
 // 入参: ref 间接引用
 // 返回: Object 对象, error 错误信息
 func (r *Reader) Object(ref Reference) (Object, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
 	if r.closed {
 		return nil, os.ErrClosed
 	}
@@ -712,7 +752,7 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 				}
 			}
 		}
-		if err == nil && r.security != nil {
+		if err == nil && r.security != nil && !r.security.unencrypted[ref] {
 			value, err = r.security.decryptObject(value, ref)
 			if err != nil {
 				err = &objectSecurityError{err: err}
@@ -723,6 +763,8 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 		return nil, err
 	}
 	if stream, ok := value.(*Stream); ok && stream != nil {
+		stream.maxStreamBytes = r.maxStreamBytes
+		stream.maxFilterChain = r.maxFilterChain
 		stream.cacheFilterRefs(r)
 		if r.owner != nil {
 			stream.reader = r.owner
@@ -2121,16 +2163,25 @@ func (r *Reader) readObjectStreamLimit(ref Reference, limit int64) (*objectStrea
 	if !ok || stream.Dictionary["Type"] != Name("ObjStm") {
 		return nil, fmt.Errorf("missing object stream")
 	}
-	count, e1 := integerDefault(stream.Dictionary, "N", -1)
-	first, e2 := integerDefault(stream.Dictionary, "First", -1)
-	if e1 != nil || e2 != nil || count <= 0 || first < 0 {
+	nObj, err := r.Resolve(stream.Dictionary["N"])
+	if err != nil {
+		return nil, err
+	}
+	firstObj, err := r.Resolve(stream.Dictionary["First"])
+	if err != nil {
+		return nil, err
+	}
+	nVal, ok1 := nObj.(Integer)
+	firstVal, ok2 := firstObj.(Integer)
+	count, first := int64(nVal), int64(firstVal)
+	if !ok1 || !ok2 || count <= 0 || first < 0 {
 		return nil, fmt.Errorf("invalid object stream header")
 	}
 	data, err := stream.decodeWith(context.Background(), r, r.warning, limit)
 	if err != nil {
 		return nil, err
 	}
-	if first > int64(len(data)) || count > first/4 {
+	if first > int64(len(data)) || count > (first+1)/4 {
 		return nil, fmt.Errorf("invalid object stream dimensions")
 	}
 	if limit > 0 && (int64(cap(data))+8 > limit || count > (limit-int64(cap(data))-8)/80) {
@@ -2139,6 +2190,7 @@ func (r *Reader) readObjectStreamLimit(ref Reference, limit int64) (*objectStrea
 	p := objectParser{data: data[:first]}
 	ids, offsets := make([]int64, count), make([]int64, count+1)
 	indices := make(map[int64]int64, count)
+	var e1, e2 error
 	for i := int64(0); i < count; i++ {
 		ids[i], e1 = strconv.ParseInt(p.token(), 10, 64)
 		offsets[i], e2 = strconv.ParseInt(p.token(), 10, 64)

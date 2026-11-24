@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"unicode/utf8"
@@ -27,6 +28,7 @@ import (
 )
 
 // Font 保存PDF字体程序、字符映射及字宽，不依赖渲染后端
+// Font实例可由阅读器缓存共享，字段及映射切片均为只读，调用方不得修改
 // Vertical为true时使用竖排度量，字形本身仍以横排原点描述
 // BoundingBox保留非Type3字体描述符边界，未提供有效边界时为空
 // FallbackBoundingBox保留未内嵌标准字体的AFM保守边界，不用于排版，边界单位为千分之一文字空间
@@ -874,7 +876,7 @@ func (f *Font) Decode(data []byte) ([]Glyph, error) {
 // 入参: ctx 取消上下文, data 原始文字字节
 // 返回: []Glyph 字符信息, error 解码或取消错误
 func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) {
-	if ctx == nil {
+	if f == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid font context")
 	}
 	if err := ctx.Err(); err != nil {
@@ -1066,7 +1068,11 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 			}
 		}
 		if f.Subtype == Name("Type3") {
-			width *= f.type3Matrix[0] * 1000
+			if f.type3Matrix[1] != 0 {
+				width *= math.Hypot(f.type3Matrix[0], f.type3Matrix[1]) * 1000
+			} else {
+				width *= f.type3Matrix[0] * 1000
+			}
 		}
 		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && !f.allowMissingWidth && (core == nil || name != ".notdef") {
 			if len(f.Program) != 0 {
