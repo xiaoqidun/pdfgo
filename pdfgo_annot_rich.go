@@ -64,7 +64,7 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 	}
 	style := annotationRichStyle{align: align}
 	if defaults != nil {
-		value, err := r.ReadAnnotationTextContext(ctx, Annotation{Dictionary: Dictionary{"DS": defaults}}, "DS", nil)
+		value, err := r.readAnnotationText(ctx, Annotation{Dictionary: Dictionary{"DS": defaults}}, "DS", nil)
 		if err != nil {
 			return nil, err
 		}

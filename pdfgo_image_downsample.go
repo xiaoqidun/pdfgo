@@ -199,9 +199,9 @@ func readSampleRow(reader io.Reader, line []byte, lastRow bool) error {
 }
 
 // checkStreamTrailingSamples 检查原始图像流读满声明行后的尾部多余字节
-// 入参: ctx 取消上下文, reader 剩余数据源, warning 可恢复诊断, width 图像宽, height 图像高
-// 返回: int64 多余字节总数, error 多余非零数据、读取或取消错误
-func checkStreamTrailingSamples(ctx context.Context, reader io.Reader, warning func(Diagnostic), width, height int) (int64, error) {
+// 入参: ctx 取消上下文, reader 剩余数据源, warning 可恢复诊断, width 图像宽, height 图像高, limited 可选流字节限流器
+// 返回: int64 多余字节总数, error 多余非零数据、超限、读取或取消错误
+func checkStreamTrailingSamples(ctx context.Context, reader io.Reader, warning func(Diagnostic), width, height int, limited *io.LimitedReader) (int64, error) {
 	var buf [4096]byte
 	var excess int64
 	nonZero := false
@@ -212,6 +212,9 @@ func checkStreamTrailingSamples(ctx context.Context, reader io.Reader, warning f
 		n, err := reader.Read(buf[:])
 		if n > 0 {
 			excess += int64(n)
+			if limited != nil && limited.N == 0 {
+				return excess, ErrStreamLimitExceeded
+			}
 			if !nonZero {
 				for _, b := range buf[:n] {
 					if b != 0 {
@@ -226,6 +229,9 @@ func checkStreamTrailingSamples(ctx context.Context, reader io.Reader, warning f
 		}
 		if err != nil {
 			if err == io.EOF {
+				if limited != nil && limited.N == 0 {
+					return excess, ErrStreamLimitExceeded
+				}
 				break
 			}
 			if nonZero && warning != nil {
@@ -267,10 +273,12 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 	} else if len(filters) > 1 {
 		return nil, false, nil
 	}
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	declaredBytes := int64(stride) * int64(i.Height)
 	var reader io.Reader
 	var flateCloser io.ReadCloser
 	var brotliReader *brotli.Reader
-	var brotliLimited *io.LimitedReader
+	var limited *io.LimitedReader
 	flateClosed := false
 	isFlate := false
 	isBrotli := false
@@ -280,11 +288,17 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 		if filterName == "Crypt" && filterParams["Name"] != nil && filterParams["Name"] != Name("Identity") {
 			return nil, false, &UnsupportedError{Feature: "stream crypt filter"}
 		}
+		if maxBytes > 0 && (declaredBytes > maxBytes || int64(len(i.Stream.Data)) > maxBytes) {
+			return nil, true, ErrStreamLimitExceeded
+		}
 		reader = bytes.NewReader(i.Stream.Data)
 	case "FlateDecode":
 		predictor, err := integerDefault(filterParams, "Predictor", 1)
 		if err != nil || predictor != 1 {
 			return nil, false, nil
+		}
+		if maxBytes > 0 && declaredBytes > maxBytes {
+			return nil, true, ErrStreamLimitExceeded
 		}
 		flateCloser, err = acquireZlibReader(bytes.NewReader(i.Stream.Data))
 		if err != nil {
@@ -303,42 +317,49 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 		if err != nil || predictor != 1 {
 			return nil, false, nil
 		}
-		maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
-		if maxBytes > 0 && int64(stride)*int64(i.Height) > maxBytes {
-			return nil, true, fmt.Errorf("Brotli decode limit exceeded")
+		if maxBytes > 0 && declaredBytes > maxBytes {
+			return nil, true, ErrStreamLimitExceeded
 		}
 		brotliReader = acquireBrotliReader(&contextInput{ctx: ctx, reader: bytes.NewReader(i.Stream.Data)})
-		if maxBytes > 0 {
-			brotliLimited = &io.LimitedReader{R: &contextInput{ctx: ctx, reader: brotliReader}, N: maxBytes + 1}
-			defer func() {
-				releaseBrotliReader(brotliReader, maxBytes+1-brotliLimited.N, brotliFailed)
-			}()
-			reader = brotliLimited
-		} else {
-			defer func() {
-				releaseBrotliReader(brotliReader, int64(stride)*int64(i.Height), brotliFailed)
-			}()
-			reader = &contextInput{ctx: ctx, reader: brotliReader}
-		}
+		reader = &contextInput{ctx: ctx, reader: brotliReader}
 		isBrotli = true
 	case "RunLengthDecode":
+		if maxBytes > 0 && declaredBytes > maxBytes {
+			return nil, true, ErrStreamLimitExceeded
+		}
 		reader = &runLengthStreamReader{ctx: ctx, data: i.Stream.Data, warning: i.Warning}
 	default:
 		return nil, false, nil
 	}
+	if maxBytes > 0 {
+		limited = &io.LimitedReader{R: reader, N: maxBytes + 1}
+		reader = limited
+	}
+	if isBrotli {
+		defer func() {
+			decodedBytes := declaredBytes
+			if limited != nil {
+				decodedBytes = maxBytes + 1 - limited.N
+			}
+			releaseBrotliReader(brotliReader, decodedBytes, brotliFailed)
+		}()
+	}
 	result, trailingErr, err := i.downsampleRawReaderContext(ctx, reader, components, stride, target, isFlate || isBrotli)
 	if canceled := ctx.Err(); canceled != nil {
 		return nil, true, canceled
+	}
+	if limited != nil && limited.N == 0 {
+		return nil, true, ErrStreamLimitExceeded
 	}
 	if err != nil {
 		return nil, true, err
 	}
 	var excessBytes int64
 	if trailingErr == nil {
-		excessBytes, trailingErr = checkStreamTrailingSamples(ctx, reader, i.Warning, i.Width, i.Height)
+		excessBytes, trailingErr = checkStreamTrailingSamples(ctx, reader, i.Warning, i.Width, i.Height, limited)
 	}
-	if isBrotli && brotliLimited != nil && brotliLimited.N == 0 {
-		return nil, true, fmt.Errorf("Brotli decode limit exceeded")
+	if limited != nil && limited.N == 0 {
+		return nil, true, ErrStreamLimitExceeded
 	}
 	if isFlate {
 		closeErr := flateCloser.Close()
@@ -346,7 +367,7 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 		if trailingErr == nil {
 			trailingErr = closeErr
 		}
-		if trailingErr != nil && i.Warning != nil && ctx.Err() == nil && (errors.Is(trailingErr, zlib.ErrChecksum) || trailingErr == io.ErrUnexpectedEOF && completeFlatePayload(ctx, i.Stream.Data, int64(stride)*int64(i.Height)+excessBytes)) {
+		if trailingErr != nil && i.Warning != nil && ctx.Err() == nil && (errors.Is(trailingErr, zlib.ErrChecksum) || trailingErr == io.ErrUnexpectedEOF && completeFlatePayload(ctx, i.Stream.Data, declaredBytes+excessBytes)) {
 			message := "Flate checksum truncated; complete compressed data retained"
 			if errors.Is(trailingErr, zlib.ErrChecksum) {
 				message = "Flate checksum mismatch; complete compressed data retained"
@@ -419,6 +440,9 @@ func (i *Image) downsampleRawReaderContext(ctx context.Context, reader io.Reader
 			return nil, nil, err
 		}
 		outDeviceN = &packedDeviceNImage{data: make([]byte, outBytes), rect: rect, stride: outStride, depth: 16, channels: components}
+	}
+	if _, _, err := imageBufferSize(dstW, components, 8); err != nil {
+		return nil, nil, err
 	}
 	line := make([]byte, stride)
 	acc := make([]uint64, dstW*components)
@@ -618,7 +642,7 @@ func downsampleYCbCr(ctx context.Context, src *image.YCbCr, target image.Point, 
 					sumY += uint64(v)
 				}
 			}
-			yCount := uint64((x1 - x0) * (y1 - y0))
+			yCount := uint64(x1-x0) * uint64(y1-y0)
 			avgY := uint8((sumY + yCount/2) / yCount)
 			cx0 := (b.Min.X + x0) >> shiftX
 			cx1 := (b.Min.X + x1 - 1) >> shiftX
@@ -633,7 +657,7 @@ func downsampleYCbCr(ctx context.Context, src *image.YCbCr, target image.Point, 
 					sumCr += uint64(v)
 				}
 			}
-			cCount := uint64((cx1 - cx0 + 1) * (cy1 - cy0 + 1))
+			cCount := uint64(cx1-cx0+1) * uint64(cy1-cy0+1)
 			avgCb := uint8((sumCb + cCount/2) / cCount)
 			avgCr := uint8((sumCr + cCount/2) / cCount)
 			var r, g, bl uint8
@@ -693,7 +717,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						sum += uint64(v)
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				outRow[dx] = uint8((sum + count/2) / count)
 			}
 		}
@@ -718,7 +742,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						sum += uint64(binary.BigEndian.Uint16(s.Pix[off+sx*2:]))
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				binary.BigEndian.PutUint16(outRow[dx*2:], uint16((sum+count/2)/count))
 			}
 		}
@@ -748,7 +772,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						}
 					}
 				}
-				denom := uint64((x1-x0)*(y1-y0)) * maximum
+				denom := uint64(x1-x0) * uint64(y1-y0) * maximum
 				outRow[dx] = uint8((sum*255 + denom/2) / denom)
 			}
 		}
@@ -774,7 +798,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 							sum += uint64(s.lookup[packedSample(line, int64(sx), s.source.depth)] >> 8)
 						}
 					}
-					count := uint64((x1 - x0) * (y1 - y0))
+					count := uint64(x1-x0) * uint64(y1-y0)
 					outRow[dx] = uint8((sum + count/2) / count)
 				}
 			}
@@ -799,7 +823,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						sum += uint64(s.lookup[packedSample(line, int64(sx), s.source.depth)])
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				binary.BigEndian.PutUint16(outRow[dx*2:], uint16((sum+count/2)/count))
 			}
 		}
@@ -828,7 +852,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						sumA += a
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				if sumA == 0 {
 					continue
 				}
@@ -862,7 +886,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						sumA += uint64(s.Pix[pos+3])
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				if sumA == 0 {
 					continue
 				}
@@ -910,7 +934,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						}
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				if outDepth == 8 {
 					for c := 0; c < 4; c++ {
 						outRow[dx*4+c] = uint8((sum[c] + count/2) / count)
@@ -947,7 +971,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						}
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				for c := 0; c < s.channels; c++ {
 					binary.BigEndian.PutUint16(outRow[(dx*s.channels+c)*2:], uint16((sum[c]+count/2)/count))
 				}
@@ -979,7 +1003,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 						sumA += a
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				if sumA == 0 {
 					continue
 				}
@@ -1030,7 +1054,7 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 						}
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				for c := 0; c < channels; c++ {
 					binary.BigEndian.PutUint16(outRow[(dx*channels+c)*2:], uint16((sum[c]+count/2)/count))
 				}
@@ -1061,7 +1085,7 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 						}
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				for c := 0; c < 4; c++ {
 					binary.BigEndian.PutUint16(outRow[dx*8+c*2:], uint16((sum[c]+count/2)/count))
 				}
@@ -1089,7 +1113,7 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 							sum += uint64(s.sample(s.channels[0], b.Min.X+sx, b.Min.Y+sy) >> 8)
 						}
 					}
-					count := uint64((x1 - x0) * (y1 - y0))
+					count := uint64(x1-x0) * uint64(y1-y0)
 					outRow[dx] = uint8((sum + count/2) / count)
 				}
 			}
@@ -1113,7 +1137,7 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 						sum += uint64(s.sample(s.channels[0], b.Min.X+sx, b.Min.Y+sy))
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				binary.BigEndian.PutUint16(outRow[dx*2:], uint16((sum+count/2)/count))
 			}
 		}
@@ -1141,7 +1165,7 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 						sumB += uint64(p.values[2] >> 8)
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				outRow[dx*4] = uint8((sumR + count/2) / count)
 				outRow[dx*4+1] = uint8((sumG + count/2) / count)
 				outRow[dx*4+2] = uint8((sumB + count/2) / count)
@@ -1171,7 +1195,7 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 						sumB += uint64(p.values[2])
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				out.SetNRGBA64(dx, dy, color.NRGBA64{
 					R: uint16((sumR + count/2) / count),
 					G: uint16((sumG + count/2) / count),
@@ -1200,7 +1224,7 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 					sumA += a
 				}
 			}
-			count := uint64((x1 - x0) * (y1 - y0))
+			count := uint64(x1-x0) * uint64(y1-y0)
 			if sumA == 0 {
 				continue
 			}
@@ -1295,7 +1319,7 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 						}
 					}
 				}
-				count := uint64((x1 - x0) * (y1 - y0))
+				count := uint64(x1-x0) * uint64(y1-y0)
 				outRow[dx*4] = uint8((sumR + count/2) / count)
 				outRow[dx*4+1] = uint8((sumG + count/2) / count)
 				outRow[dx*4+2] = uint8((sumB + count/2) / count)
@@ -1349,7 +1373,7 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 					}
 				}
 			}
-			count := uint64((x1 - x0) * (y1 - y0))
+			count := uint64(x1-x0) * uint64(y1-y0)
 			if sumA == 0 {
 				continue
 			}

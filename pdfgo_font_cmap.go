@@ -104,7 +104,6 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool, warning fu
 		encoding        Name
 	}
 	var candidates []candidate
-	var offsets []uint32
 	for n := 0; n < entries; n++ {
 		if n&255 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -113,11 +112,6 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool, warning fu
 		}
 		record := cmap[4+n*8:]
 		offset := binary.BigEndian.Uint32(record[4:])
-		if warning != nil {
-			if uint64(offset) >= uint64(4+entries*8) && uint64(offset)+2 <= uint64(len(cmap)) {
-				offsets = append(offsets, offset)
-			}
-		}
 		platform, encoding := binary.BigEndian.Uint16(record), binary.BigEndian.Uint16(record[2:])
 		priority := -1
 		if symbolic {
@@ -163,27 +157,18 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool, warning fu
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].priority > candidates[j].priority })
 	if warning == nil {
 		candidates = candidates[:1]
-	} else {
-		sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
 	}
 	var firstErr error
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
-		limit := len(cmap)
-		if warning != nil {
-			next := sort.Search(len(offsets), func(n int) bool { return offsets[n] > candidate.offset })
-			if next < len(offsets) {
-				limit = int(offsets[next])
-			}
-		}
 		var table []byte
 		var err error
 		if warning != nil && uint64(candidate.offset) < uint64(4+entries*8) {
 			err = fmt.Errorf("invalid cmap offset")
 		} else {
-			table, err = fontCmapSubtableContext(ctx, cmap[:limit], uint64(candidate.offset))
+			table, err = fontCmapSubtableContext(ctx, cmap, uint64(candidate.offset))
 		}
 		if cancelled := ctx.Err(); cancelled != nil {
 			return nil, "", cancelled

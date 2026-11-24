@@ -350,14 +350,20 @@ func pngJPXRow(ctx context.Context, row []byte, source image.Image, y, depth, ch
 			for x := start; x < end; x++ {
 				value := uint16(65535)
 				if index >= 0 {
-					raw := uint64(data[x-start] + bias)
-					switch {
-					case palette != nil:
+					sample := data[x-start] + bias
+					if sample < 0 {
+						sample = 0
+					}
+					raw := uint64(sample)
+					if palette != nil {
 						value = palette[min(raw, uint64(len(palette)-1))]
-					case step != 0:
-						value = uint16(raw * step)
-					default:
-						value = uint16((raw*65535 + maximum/2) / maximum)
+					} else {
+						raw = min(raw, maximum)
+						if step != 0 {
+							value = uint16(raw * step)
+						} else {
+							value = uint16((raw*65535 + maximum/2) / maximum)
+						}
 					}
 				}
 				offset := x*stride + channel*depth/8

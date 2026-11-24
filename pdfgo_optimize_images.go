@@ -442,12 +442,6 @@ func (r *Reader) isInvertedCMYKDecodeValue(value Object) bool {
 // 入参: ctx 取消上下文, orig 原始流, img 已缩放图像, wantGray 是否目标灰度, options 压缩配置, sourceJPEG 原流是否为JPEG编码
 // 返回: *Stream 编码后的图像流或空值, error 取消或编码错误
 func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img image.Image, wantGray bool, options CompressionOptions, sourceJPEG bool) (*Stream, error) {
-	base := *orig
-	base.Dictionary = maps.Clone(orig.Dictionary)
-	base.Dictionary["BitsPerComponent"] = Integer(8)
-	delete(base.Dictionary, "Decode")
-	delete(base.Dictionary, "DecodeParms")
-	delete(base.Dictionary, "SMaskInData")
 	var encodeImg image.Image = img
 	channels := 3
 	if wantGray {
@@ -457,9 +451,6 @@ func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img imag
 		}
 		encodeImg = grayImg
 		channels = 1
-		base.Dictionary["ColorSpace"] = Name("DeviceGray")
-	} else {
-		base.Dictionary["ColorSpace"] = Name("DeviceRGB")
 	}
 	useJPEG := sourceJPEG
 	if !useJPEG {
@@ -470,7 +461,18 @@ func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img imag
 		}
 	}
 	if !useJPEG {
-		candidate, err := r.encodeLosslessPixels(ctx, &base, encodeImg, channels)
+		base := *orig
+		base.Dictionary = maps.Clone(orig.Dictionary)
+		base.Dictionary["BitsPerComponent"] = Integer(8)
+		delete(base.Dictionary, "Decode")
+		delete(base.Dictionary, "DecodeParms")
+		delete(base.Dictionary, "SMaskInData")
+		if wantGray {
+			base.Dictionary["ColorSpace"] = Name("DeviceGray")
+		} else {
+			base.Dictionary["ColorSpace"] = Name("DeviceRGB")
+		}
+		candidate, err := r.encodeLosslessPixels(ctx, &base, orig, encodeImg, channels)
 		if err != nil {
 			return nil, err
 		}
@@ -496,10 +498,13 @@ func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img imag
 	if err != nil {
 		return nil, err
 	}
-	result, err := r.reencodedStream(&base, encoded, Name("DCTDecode"))
+	result, err := r.reencodedStream(orig, encoded, Name("DCTDecode"))
 	if err != nil {
 		return nil, err
 	}
+	result.Dictionary["BitsPerComponent"] = Integer(8)
+	delete(result.Dictionary, "Decode")
+	delete(result.Dictionary, "SMaskInData")
 	if _, isGray := jpegSource.(*image.Gray); isGray {
 		result.Dictionary["ColorSpace"] = Name("DeviceGray")
 	} else {
@@ -590,6 +595,10 @@ func (r *Reader) optimizationValue(value Object) (Object, error) {
 // 入参: ctx 取消上下文, stream 原始流, filters 过滤器链, params 解码参数链
 // 返回: *Stream 剥壳后的内层流，不支持时为空, error 取消错误
 func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters, params Array) (*Stream, error) {
+	limit := optimizationBufferLimit
+	if maxBytes, _ := effectiveStreamLimits(r, stream); maxBytes > 0 && maxBytes < int64(limit) {
+		limit = int(maxBytes)
+	}
 	data := stream.Data
 	for i, filter := range filters[:len(filters)-1] {
 		if err := ctx.Err(); err != nil {
@@ -603,9 +612,9 @@ func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters,
 			if e != nil {
 				return nil, nil
 			}
-			data, err = io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1))
+			data, err = io.ReadAll(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1))
 			input.Close()
-			if err == nil && len(data) <= optimizationBufferLimit {
+			if err == nil && len(data) <= limit {
 				data, err = restorePredictorContext(ctx, data, dict)
 			}
 		case Name("LZWDecode"):
@@ -613,32 +622,32 @@ func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters,
 			if e != nil {
 				return nil, nil
 			}
-			data, _, err = decodeLZWBytesLimitContext(ctx, data, early, optimizationBufferLimit)
+			data, _, err = decodeLZWBytesLimitContext(ctx, data, early, int64(limit))
 			if err == nil {
 				data, err = restorePredictorContext(ctx, data, dict)
 			}
 		case Name("ASCIIHexDecode"):
 			_, size, e := asciiHexSize(ctx, data, nil)
-			if e != nil || size > optimizationBufferLimit {
+			if e != nil || size > limit {
 				return nil, ctx.Err()
 			}
 			data, err = decodeASCIIHexContext(ctx, data, nil)
 		case Name("ASCII85Decode"):
 			_, size, e := ascii85Size(ctx, data, nil)
-			if e != nil || size > optimizationBufferLimit {
+			if e != nil || size > limit {
 				return nil, ctx.Err()
 			}
 			data, err = decodeASCII85Context(ctx, data, nil)
 		case Name("RunLengthDecode"):
 			size, e := runLengthSize(ctx, data, nil)
-			if e != nil || size > optimizationBufferLimit {
+			if e != nil || size > limit {
 				return nil, ctx.Err()
 			}
 			data, err = decodeRunLength(ctx, data, nil)
 		default:
 			return nil, nil
 		}
-		if err != nil || len(data) > optimizationBufferLimit {
+		if err != nil || len(data) > limit {
 			return nil, ctx.Err()
 		}
 	}
@@ -656,6 +665,31 @@ func (r *Reader) unwrapImageStream(ctx context.Context, stream *Stream, filters,
 		return nil, nil
 	}
 	return &inner, ctx.Err()
+}
+
+// resolveOptimizationObjectRef 解析压缩阶段间接引用并维护原有缓存快照
+// 入参: value 待解析对象, cached 原缓存快照, cycleErr 循环引用错误文案
+// 返回: Object 解析结果, Reference 最终对象引用, error 循环或读取错误
+func (r *Reader) resolveOptimizationObjectRef(value Object, cached map[Reference]bool, cycleErr string) (Object, Reference, error) {
+	var ref Reference
+	for n := 0; ; n++ {
+		next, ok := value.(Reference)
+		if !ok {
+			return value, ref, nil
+		}
+		if n > 32 {
+			return nil, Reference{}, fmt.Errorf("%s", cycleErr)
+		}
+		ref = next
+		var err error
+		value, err = r.Object(ref)
+		if !cached[ref] {
+			r.cache.delete(ref)
+		}
+		if err != nil {
+			return nil, Reference{}, err
+		}
+	}
 }
 
 // imageOutputSizes 汇总页面、表单、注释外观及平铺图案中的图片最大显示尺寸，Type3字形图仅禁降采样
@@ -676,25 +710,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 	formActive := make(map[Reference]bool)
 	patternActive := make(map[Reference]bool)
 	resolveObjectRef := func(value Object) (Object, Reference, error) {
-		var ref Reference
-		for n := 0; ; n++ {
-			next, ok := value.(Reference)
-			if !ok {
-				return value, ref, nil
-			}
-			if n > 32 {
-				return nil, Reference{}, fmt.Errorf("cyclic image reference")
-			}
-			ref = next
-			var err error
-			value, err = r.Object(ref)
-			if !cached[ref] {
-				r.cache.delete(ref)
-			}
-			if err != nil {
-				return nil, Reference{}, err
-			}
-		}
+		return r.resolveOptimizationObjectRef(value, cached, "cyclic image reference")
 	}
 	var markResourcesUnsafe func(Dictionary, map[Reference]bool, map[Reference]bool, int) bool
 	markResourcesUnsafe = func(res Dictionary, target map[Reference]bool, visited map[Reference]bool, depth int) bool {
@@ -1453,25 +1469,7 @@ func (r *Reader) imageDefaultColorResources(ctx context.Context, refs []Referenc
 	cached := r.cache.snapshot()
 	defer r.cache.prune(cached)
 	resolveObjectRef := func(value Object) (Object, Reference, error) {
-		var ref Reference
-		for n := 0; ; n++ {
-			next, ok := value.(Reference)
-			if !ok {
-				return value, ref, nil
-			}
-			if n > 32 {
-				return nil, Reference{}, fmt.Errorf("cyclic color resource reference")
-			}
-			ref = next
-			var err error
-			value, err = r.Object(ref)
-			if !cached[ref] {
-				r.cache.delete(ref)
-			}
-			if err != nil {
-				return nil, Reference{}, err
-			}
-		}
+		return r.resolveOptimizationObjectRef(value, cached, "cyclic color resource reference")
 	}
 	extractDefaults := func(res Dictionary) Dictionary {
 		if res == nil || res["ColorSpace"] == nil {
@@ -2000,6 +1998,12 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 		if err != nil {
 			return finish(baseMain, baseSMask, false)
 		}
+		if downscale {
+			decoded, err = ResizeImage(ctx, decoded, size)
+			if err != nil {
+				return nil, nil, false, err
+			}
+		}
 		b := decoded.Bounds()
 		rgbImg := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
 		alphaImg := image.NewGray(image.Rect(0, 0, b.Dx(), b.Dy()))
@@ -2021,16 +2025,6 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 		}
 		var mainImg image.Image = rgbImg
 		var maskImg image.Image = alphaImg
-		if downscale {
-			mainImg, err = ResizeImage(ctx, mainImg, size)
-			if err != nil {
-				return nil, nil, false, err
-			}
-			maskImg, err = ResizeImage(ctx, maskImg, mainImg.Bounds().Size())
-			if err != nil {
-				return nil, nil, false, err
-			}
-		}
 		wantGray := targetSpace == Name("DeviceGray")
 		if wantGray {
 			wantGray, err = imageAllGray(ctx, mainImg)
@@ -2051,7 +2045,7 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 		delete(smaskBase.Dictionary, "Matte")
 		delete(smaskBase.Dictionary, "Decode")
 		delete(smaskBase.Dictionary, "DecodeParms")
-		candSMask, err := r.encodeLosslessPixels(ctx, &smaskBase, maskImg, 1)
+		candSMask, err := r.encodeLosslessPixels(ctx, &smaskBase, smaskStream, maskImg, 1)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -2088,7 +2082,7 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 					smaskBase.Dictionary["BitsPerComponent"] = Integer(8)
 					delete(smaskBase.Dictionary, "Decode")
 					delete(smaskBase.Dictionary, "DecodeParms")
-					scaledSMask, err := r.encodeLosslessPixels(ctx, &smaskBase, resizedMask, 1)
+					scaledSMask, err := r.encodeLosslessPixels(ctx, &smaskBase, smaskStream, resizedMask, 1)
 					if err != nil {
 						return nil, nil, false, err
 					}

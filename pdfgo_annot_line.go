@@ -207,7 +207,11 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 					}
 					continue
 				}
-				writeAnnotationOperation(&content, "Tm", 1, 0, 0, 1, -caption.widths[i]/2, baseline-float64(i)*annotationCaptionLeading)
+				tx, ty := -caption.widths[i]/2, baseline-float64(i)*annotationCaptionLeading
+				if math.IsNaN(tx) || math.IsInf(tx, 0) || math.IsNaN(ty) || math.IsInf(ty, 0) {
+					return nil, fmt.Errorf("annotation caption text position overflow")
+				}
+				writeAnnotationOperation(&content, "Tm", 1, 0, 0, 1, tx, ty)
 				content.WriteByte('<')
 				for _, letter := range caption.lines[i] {
 					fmt.Fprintf(&content, "%x", letter.code)
@@ -269,7 +273,7 @@ func (r *Reader) readLineCaption(ctx context.Context, page *Page, annotation Ann
 	if value != nil {
 		return r.readRichLineCaption(ctx, page, value, caption)
 	}
-	text, err := r.ReadAnnotationTextContext(ctx, annotation, "Contents", warning)
+	text, err := r.readAnnotationText(ctx, annotation, "Contents", warning)
 	if err != nil || text == "" {
 		return nil, err
 	}

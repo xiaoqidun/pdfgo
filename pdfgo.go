@@ -15,7 +15,19 @@
 // Package pdfgo 原生、全平台、纯 Go 语言高性能 PDF 处理引擎
 package pdfgo
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+var (
+	// ErrStreamLimitExceeded 表示流解码、滤镜链或结构展开超出安全上限
+	ErrStreamLimitExceeded = errors.New("stream decode limit exceeded")
+	// ErrSignedDocument 表示已签名PDF不支持修改对象
+	ErrSignedDocument = errors.New("cannot rewrite objects in a signed PDF")
+	// ErrDecrypt 表示加密对象解密或安全校验失败
+	ErrDecrypt = errors.New("pdf decryption failed")
+)
 
 // Diagnostic 记录可恢复的问题或未保留的语义，Page从1开始，未知页码为0
 // Offset为解码后当前页面或表单内容流内的字节位置

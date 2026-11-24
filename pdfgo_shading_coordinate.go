@@ -233,7 +233,7 @@ func (p *pageInterpreter) functionShading(shading Dictionary, matrix Matrix) (Pa
 		return Paint{}, fmt.Errorf("invalid function shading color space")
 	}
 	var components int
-	g.Space, g.tint, g.lab, components, err = p.reader.readShadingColorSpace(object, true)
+	g.Space, g.tint, g.lab, components, err = p.reader.readShadingColorSpaceContext(p.ctx, object, true)
 	if err != nil {
 		return Paint{}, err
 	}

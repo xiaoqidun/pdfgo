@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -35,6 +36,19 @@ type ColorConversion struct {
 // 入参: object 函数字典或数据流
 // 返回: *ColorFunction 已解析函数, error 引用或函数错误
 func (r *Reader) ReadColorFunction(object Object) (*ColorFunction, error) {
+	return r.readColorFunctionContext(context.Background(), object)
+}
+
+// readColorFunctionContext 在取消上下文内解析单分量颜色函数
+// 入参: ctx 取消上下文, object 函数字典或数据流
+// 返回: *ColorFunction 已解析函数, error 引用、函数或取消错误
+func (r *Reader) readColorFunctionContext(ctx context.Context, object Object) (*ColorFunction, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if r.closed {
 		return nil, os.ErrClosed
 	}
@@ -47,7 +61,7 @@ func (r *Reader) ReadColorFunction(object Object) (*ColorFunction, error) {
 	default:
 		return nil, fmt.Errorf("invalid color function")
 	}
-	function, err := r.readGradientFunction(value, 1, 0)
+	function, err := r.readGradientFunctionContext(ctx, value, 1, 0)
 	if err != nil {
 		return nil, err
 	}

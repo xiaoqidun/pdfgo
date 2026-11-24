@@ -532,11 +532,9 @@ func (s *annotationShaper) writeLine(content *strings.Builder, line *annotationS
 		}
 		x := left + (glyph.X*size/1000+extra[glyph.VisualOrder])*state.hscale
 		y := baseline + glyph.Y*size/1000
-		point := matrix.Apply(Point{x, y})
-		if math.IsNaN(point.X) || math.IsInf(point.X, 0) || math.IsNaN(point.Y) || math.IsInf(point.Y, 0) {
-			return fmt.Errorf("shaped text position exceeds coordinate range")
+		if err := writeAnnotationTextMatrix(content, matrix, x, y); err != nil {
+			return err
 		}
-		writeAnnotationTextMatrix(content, matrix, x, y)
 		fmt.Fprintf(content, "<%x> Tj\n", s.entries[glyph.ID].code)
 	}
 	return s.ctx.Err()

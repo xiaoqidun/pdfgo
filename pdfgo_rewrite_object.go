@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"reflect"
+	"slices"
 )
 
 // rewriteObjectIdentity 区分共享字典、数组和流，避免展开重复对象
@@ -92,8 +94,8 @@ func (c *rewriteObjectCopy) copy(value Object, depth int) (Object, error) {
 	switch v := value.(type) {
 	case Dictionary:
 		result := make(Dictionary, len(v))
-		for key, value := range v {
-			result[key], err = c.copy(value, depth+1)
+		for _, key := range slices.Sorted(maps.Keys(v)) {
+			result[key], err = c.copy(v[key], depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -145,11 +147,11 @@ func (c *rewriteObjectCopy) copyStream(stream *Stream, depth int) (*Stream, erro
 	if len(filters) != 0 && filters[0] == Name("Crypt") {
 		filters, parameters = filters[1:], parameters[1:]
 	}
-	for key, value := range stream.Dictionary {
+	for _, key := range slices.Sorted(maps.Keys(stream.Dictionary)) {
 		if key == "Length" || key == "Filter" || key == "DecodeParms" {
 			continue
 		}
-		dict[key], err = nested.copy(value, depth+1)
+		dict[key], err = nested.copy(stream.Dictionary[key], depth+1)
 		if err != nil {
 			return nil, err
 		}

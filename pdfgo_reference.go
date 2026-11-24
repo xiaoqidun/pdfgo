@@ -286,11 +286,11 @@ func (r *Reader) ReferenceIDMatches(reference ReferenceXObject) (bool, error) {
 // 返回: error 内容、注解或访问错误
 func (p *pageInterpreter) referencePage(page *Page) error {
 	initial := *p
-	var data bytes.Buffer
-	if _, err := page.WriteContent(p.ctx, &data); err != nil {
+	data, err := page.readContentBytes(p.ctx)
+	if err != nil {
 		return err
 	}
-	if err := p.run(data.Bytes()); err != nil {
+	if err := p.run(data); err != nil {
 		return err
 	}
 	annotations, err := page.AnnotationsContext(p.ctx)

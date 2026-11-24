@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -51,12 +52,15 @@ func validateICCSourceHeader(data []byte, count int) error {
 }
 
 // remapICCAlternate 仅重映射实际使用的备用设备色，保留原流与源范围
-// 入参: object ICCBased数组, resources 当前资源, remap 是否替换设备色, depth 嵌套深度
-// 返回: Object 有效ICC定义, error 配置或资源错误
-func (r *Reader) remapICCAlternate(object Array, resources Dictionary, remap bool, depth int) (Object, error) {
+// 入参: ctx 取消上下文, object ICCBased数组, resources 当前资源, remap 是否替换设备色, depth 嵌套深度
+// 返回: Object 有效ICC定义, error 配置、资源或取消错误
+func (r *Reader) remapICCAlternate(ctx context.Context, object Array, resources Dictionary, remap bool, depth int) (Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	stream, count, err := r.iccProfileStream(object)
 	if err != nil {
-		if r.warning != nil && len(object) == 2 && object[0] == Name("ICCBased") {
+		if r.warning != nil && len(object) == 2 {
 			value, resolveErr := r.Resolve(object[1])
 			if resolveErr != nil {
 				return nil, resolveErr
@@ -74,7 +78,7 @@ func (r *Reader) remapICCAlternate(object Array, resources Dictionary, remap boo
 		}
 		return nil, err
 	}
-	data, cause := r.decodeStream(stream)
+	data, cause := r.DecodeStreamContext(ctx, stream)
 	if cause == nil {
 		var profile *iccColorSpace
 		profile, cause = r.readICCProfileData(data, int(count))
@@ -82,14 +86,14 @@ func (r *Reader) remapICCAlternate(object Array, resources Dictionary, remap boo
 			return object, nil
 		}
 	}
-	if cause != nil && (r.warning == nil || errors.Is(cause, errICCSourceProfileClass)) {
+	if cause != nil && (ctx.Err() != nil || r.warning == nil || errors.Is(cause, errICCSourceProfileClass)) {
 		return nil, cause
 	}
 	alternate, err := r.iccAlternateObject(stream, int(count))
 	if err != nil {
 		return nil, err
 	}
-	alternate, err = r.remapColorSpace(alternate, resources, false, depth+1)
+	alternate, err = r.remapColorSpaceContext(ctx, alternate, resources, false, depth+1)
 	if err != nil {
 		return nil, err
 	}
@@ -99,10 +103,10 @@ func (r *Reader) remapICCAlternate(object Array, resources Dictionary, remap boo
 	if !remap {
 		return Array{Name("ICCBased"), &copy}, nil
 	}
-	if _, err := r.readICCColorSpace(Array{Name("ICCBased"), &copy}); err != nil {
+	if _, err := r.readICCColorSpaceContext(ctx, Array{Name("ICCBased"), &copy}); err != nil {
 		return nil, err
 	}
-	alternate, err = r.remapColorSpace(alternate, resources, remap, depth+1)
+	alternate, err = r.remapColorSpaceContext(ctx, alternate, resources, remap, depth+1)
 	if err != nil {
 		return nil, err
 	}
@@ -111,14 +115,17 @@ func (r *Reader) remapICCAlternate(object Array, resources Dictionary, remap boo
 }
 
 // recoverICCAlternate 仅在备用空间及分量范围有效时恢复损坏配置，保留原始配置
-// 入参: stream 配置流, count 源分量数, ranges 源范围, effective 是否已重映射, cause 配置错误
-// 返回: *iccColorSpace 备用变换, error 严格校验或备用空间错误
-func (r *Reader) recoverICCAlternate(stream *Stream, count int, ranges *[8]float64, effective bool, cause error) (*iccColorSpace, error) {
-	if r.warning == nil || errors.Is(cause, errICCSourceProfileClass) {
+// 入参: ctx 取消上下文, stream 配置流, count 源分量数, ranges 源范围, effective 是否已重映射, cause 配置错误
+// 返回: *iccColorSpace 备用变换, error 严格校验、备用空间或取消错误
+func (r *Reader) recoverICCAlternate(ctx context.Context, stream *Stream, count int, ranges *[8]float64, effective bool, cause error) (*iccColorSpace, error) {
+	if ctx.Err() != nil || r.warning == nil || errors.Is(cause, errICCSourceProfileClass) {
 		return nil, cause
 	}
-	space, err := r.readICCAlternate(stream, count, ranges, effective)
+	space, err := r.readICCAlternate(ctx, stream, count, ranges, effective)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w; ICC alternate: %v", cause, err)
 	}
 	r.warning(Diagnostic{Message: "invalid ICC profile recovered using valid alternate color space: " + cause.Error()})
@@ -140,14 +147,14 @@ func (r *Reader) iccAlternateObject(stream *Stream, count int) (Object, error) {
 }
 
 // readICCAlternate 编译同分量备用空间，不预先转换原始分量或共享配置缓存
-// 入参: stream 配置流, count 源分量数, ranges 源范围, effective 是否已按资源校验并替换
-// 返回: *iccColorSpace 备用源变换, error 定义或分量错误
-func (r *Reader) readICCAlternate(stream *Stream, count int, ranges *[8]float64, effective bool) (*iccColorSpace, error) {
+// 入参: ctx 取消上下文, stream 配置流, count 源分量数, ranges 源范围, effective 是否已按资源校验并替换
+// 返回: *iccColorSpace 备用源变换, error 定义、分量或取消错误
+func (r *Reader) readICCAlternate(ctx context.Context, stream *Stream, count int, ranges *[8]float64, effective bool) (*iccColorSpace, error) {
 	object, err := r.iccAlternateObject(stream, count)
 	if err != nil {
 		return nil, err
 	}
-	alternate, err := r.readPatternColorSpace(object, effective)
+	alternate, err := r.readPatternColorSpaceContext(ctx, object, effective)
 	if err != nil {
 		return nil, err
 	}

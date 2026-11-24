@@ -21,11 +21,9 @@ import (
 	"slices"
 )
 
-// MovieAnnotation 描述新增视频注解，Rect使用默认用户空间，Title使用UTF-8文字
-// Movie指针相同的注解复用视频资源，源数据在写出期间须保持可读
-// Activation接受nil、Boolean或Dictionary；nil采用标准默认播放，false关闭注解自身的点击播放
-// 播放参数中的引用须属于当前文件；海报接受Boolean或图像流，流引用随所属Reader解析
-// 文件说明按结构化字段写出，Dictionary不参与写出，不自动添加时间或作者信息
+// MovieAnnotation 描述新增视频注解（Rect用默认用户空间，Title为UTF-8），同Movie指针复用资源且源数据在写出期间须可读
+// Activation接受nil（默认播放）、Boolean（false禁用点击）或Dictionary，其中引用须属当前文件；海报支持Boolean或图像流
+// 文件说明仅按结构化字段写出，忽略Dictionary且不自动补充时间与作者
 type MovieAnnotation struct {
 	Rect       Rectangle
 	Title      string
@@ -40,13 +38,7 @@ func (r *Reader) movieAnnotationReplacements(ctx context.Context, additions map[
 	if len(additions) == 0 {
 		return nil, nil
 	}
-	number := int64(0)
-	for id := range r.xref {
-		number = max(number, id)
-	}
-	for ref := range result {
-		number = max(number, ref.Number)
-	}
+	number := r.maxRewriteObjectID(result)
 	refs := make(map[*MovieAnnotation]Reference)
 	media := make(map[*Movie]Reference)
 	visited := make(map[Reference]bool)

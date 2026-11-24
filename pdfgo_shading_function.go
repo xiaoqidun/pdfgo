@@ -15,10 +15,14 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"slices"
 )
+
+// maxGradientLinearStops 限制一维采样渐变展开为线性分段的最大断点数，超限时退回按需函数求值
+const maxGradientLinearStops = 65536
 
 // gradientFunction 保存已解析的一维颜色函数及可精确展开的线性分段
 type gradientFunction struct {
@@ -118,9 +122,6 @@ func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
 				if i > 0 && stops[i-1].Position < stop.Position {
 					previous := stops[i-1]
 					mappedStops := tint.linear([2]float64{previous.Values[0], stop.Values[0]})
-					if len(mappedStops) == 0 {
-						return nil
-					}
 					for _, mapped := range mappedStops {
 						mapped.Position = gradientPosition(previous.Position, stop.Position, mapped.Position)
 						if len(result) == 0 || result[len(result)-1] != mapped {
@@ -129,9 +130,6 @@ func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
 					}
 				} else {
 					mappedStops := tint.linear([2]float64{stop.Values[0], stop.Values[0]})
-					if len(mappedStops) == 0 {
-						return nil
-					}
 					values := gradientValue(mappedStops, 0)
 					mapped := GradientStop{Position: stop.Position, Values: values}
 					if len(result) == 0 || result[len(result)-1] != mapped {
@@ -204,9 +202,6 @@ func mergeGradientFunctions(functions []*gradientFunction, interval [2]float64) 
 	positions := []float64{0, 1}
 	for i, function := range functions {
 		parts[i] = function.linear(interval)
-		if len(parts[i]) == 0 {
-			return nil
-		}
 		for _, stop := range parts[i] {
 			positions = append(positions, stop.Position)
 		}
@@ -225,16 +220,34 @@ func mergeGradientFunctions(functions []*gradientFunction, interval [2]float64) 
 	return slices.Compact(stops)
 }
 
-// sampledGradientStops 展开采样函数的精确断点及范围截断
+// sampledGradientStops 展开采样函数的精确断点及范围截断，超限时返回nil退回按需求值
 // 入参: f 已解析采样函数
 // 返回: []GradientStop 定义域中的线性分段
 func sampledGradientStops(f *tintFunction) []GradientStop {
 	positions := []float64{f.domain[0], f.domain[1]}
 	if f.encoded[0] != f.encoded[1] {
-		for i := 0; i < f.size; i++ {
+		start, end := 0, f.size-1
+		if lo := min(f.encoded[0], f.encoded[1]); lo > 0 {
+			if lo >= float64(f.size) {
+				start = f.size
+			} else {
+				start = int(math.Floor(lo))
+			}
+		}
+		if hi := max(f.encoded[0], f.encoded[1]); hi < float64(end) {
+			if hi < 0 {
+				end = -1
+			} else {
+				end = int(math.Ceil(hi))
+			}
+		}
+		for i := start; i <= end; i++ {
 			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
 			if x > f.domain[0] && x < f.domain[1] {
 				positions = append(positions, x)
+				if len(positions) > maxGradientLinearStops {
+					return nil
+				}
 			}
 		}
 	}
@@ -250,7 +263,11 @@ func sampledGradientStops(f *tintFunction) []GradientStop {
 		stops[i].Position = functionPosition(x, f.domain[0], f.domain[1])
 		raw.colorInto(x, stops[i].Values[:f.channels])
 	}
-	return clipGradientValues(stops, f.values)
+	stops = clipGradientValues(stops, f.values)
+	if len(stops) > maxGradientLinearStops {
+		return nil
+	}
+	return stops
 }
 
 // evaluate 计算颜色函数并传递运行时算术错误
@@ -267,6 +284,16 @@ func (f *gradientFunction) evaluate(x float64) ([4]float64, error) {
 // 入参: object 函数对象, channels 输出分量数, depth 嵌套深度
 // 返回: *gradientFunction 颜色函数, error 解析错误
 func (r *Reader) readGradientFunction(object Object, channels, depth int) (*gradientFunction, error) {
+	return r.readGradientFunctionContext(context.Background(), object, channels, depth)
+}
+
+// readGradientFunctionContext 在取消上下文内解析采样、指数、拼接及计算器函数
+// 入参: ctx 取消上下文, object 函数对象, channels 输出分量数, depth 嵌套深度
+// 返回: *gradientFunction 颜色函数, error 解析或取消错误
+func (r *Reader) readGradientFunctionContext(ctx context.Context, object Object, channels, depth int) (*gradientFunction, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if channels < 1 || channels > 4 {
 		return nil, &UnsupportedError{Feature: "gradient function component count"}
 	}
@@ -284,7 +311,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		parts := make([]*gradientFunction, channels)
 		linear := true
 		for i, object := range array {
-			parts[i], err = r.readGradientFunction(object, 1, depth+1)
+			parts[i], err = r.readGradientFunctionContext(ctx, object, 1, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -317,7 +344,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		return nil, err
 	}
 	if kind == Integer(0) || kind == Integer(2) {
-		tint, err := r.readTintFunction(v, channels)
+		tint, err := r.readTintFunction(ctx, v, channels)
 		if err != nil {
 			return nil, err
 		}
@@ -375,7 +402,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		if !ok {
 			return nil, fmt.Errorf("missing calculator function stream")
 		}
-		data, err := r.decodeStream(stream)
+		data, err := r.DecodeStreamContext(ctx, stream)
 		if err != nil {
 			return nil, err
 		}
@@ -459,7 +486,7 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 		if points[i] > points[i+1] {
 			return nil, fmt.Errorf("invalid gradient stitching bounds")
 		}
-		parts[i], err = r.readGradientFunction(object, channels, depth+1)
+		parts[i], err = r.readGradientFunctionContext(ctx, object, channels, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -492,10 +519,6 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 			if points[i] == points[i+1] {
 				if i == len(parts)-1 {
 					partStops := part.linear([2]float64{encode[2*i], encode[2*i]})
-					if len(partStops) == 0 {
-						linear = false
-						break
-					}
 					for _, stop := range partStops {
 						stop.Position = 1
 						stops = append(stops, stop)
@@ -504,21 +527,15 @@ func (r *Reader) readGradientFunction(object Object, channels, depth int) (*grad
 				continue
 			}
 			partStops := part.linear([2]float64{encode[2*i], encode[2*i+1]})
-			if len(partStops) == 0 {
-				linear = false
-				break
-			}
 			for _, stop := range partStops {
 				position := gradientPosition(points[i], points[i+1], stop.Position)
 				stop.Position = functionPosition(position, domain[0], domain[1])
 				stops = append(stops, stop)
 			}
 		}
-		if linear {
-			stops = clipGradientValues(stops, limits)
-			if len(stops) > 0 {
-				f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
-			}
+		stops = clipGradientValues(stops, limits)
+		if len(stops) > 0 {
+			f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
 		}
 	}
 	return f, nil

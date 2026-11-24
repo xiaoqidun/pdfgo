@@ -135,14 +135,11 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 		}
 		s.encryptMetadata = bool(flag)
 	}
-	if value, err := r.securityFilters(dict["CF"]); err != nil {
+	filters, err := r.securityFilters(dict["CF"])
+	if err != nil {
 		return err
-	} else if value != nil {
-		s.filters, ok = value.(Dictionary)
-		if !ok {
-			return fmt.Errorf("invalid crypt filter dictionary")
-		}
 	}
+	s.filters = filters
 	for _, entry := range []struct {
 		name   Name
 		target *Name
@@ -219,7 +216,6 @@ func (r *Reader) openAES256Security(dict Dictionary, password []byte, revision i
 			return err
 		}
 	}
-	s.authenticated = true
 	r.security = s
 	valid = true
 	return nil

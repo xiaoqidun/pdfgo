@@ -283,6 +283,7 @@ func (g *MeshGradient) sourceColorsAt(patch int, u, v float64) ([4]float64, [4][
 	if patch < 0 || patch >= len(g.Patches)+len(g.Triangles) || math.IsNaN(u) || math.IsNaN(v) || u < 0 || u > 1 || v < 0 || v > 1 {
 		return weights, colors, fmt.Errorf("invalid mesh evaluation")
 	}
+	corners := 4
 	if patch < len(g.Patches) {
 		weights = [4]float64{(1 - u) * (1 - v), (1 - u) * v, u * v, u * (1 - v)}
 		colors = g.Patches[patch].Colors
@@ -293,15 +294,21 @@ func (g *MeshGradient) sourceColorsAt(patch int, u, v float64) ([4]float64, [4][
 		if sum := u + v; sum > 1 {
 			u, v = u/sum, v/sum
 		}
+		corners = 3
 		weights = [4]float64{math.Max(0, 1-u-v), u, v, 0}
 		copy(colors[:], g.Triangles[patch-len(g.Patches)].Colors[:])
 	}
 	if len(colors[0]) == 0 {
 		return weights, colors, fmt.Errorf("missing mesh color components")
 	}
-	for i, weight := range weights {
-		if weight != 0 && len(colors[i]) != len(colors[0]) {
+	for i := range corners {
+		if len(colors[i]) != len(colors[0]) {
 			return weights, colors, fmt.Errorf("inconsistent mesh color components")
+		}
+		for _, value := range colors[i] {
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return weights, colors, fmt.Errorf("nonfinite mesh vertex color")
+			}
 		}
 	}
 	return weights, colors, nil

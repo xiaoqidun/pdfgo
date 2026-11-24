@@ -21,7 +21,11 @@ import (
 	"io"
 	"math"
 	"os"
+	"reflect"
 )
+
+// maxRepeatedPageNodes 限制诊断模式下页面树非循环重复节点的累计重访次数，防止DAG指数展开
+const maxRepeatedPageNodes = 4096
 
 // Rectangle 表示PDF用户空间中的矩形坐标
 type Rectangle struct {
@@ -75,6 +79,8 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 	}
 	seen := map[Reference]bool{}
 	active := map[Reference]bool{}
+	var seenDicts map[uintptr]Dictionary
+	repeated := 0
 	index := 0
 	type frame struct {
 		kids  Array
@@ -110,9 +116,25 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 			return fmt.Errorf("invalid page tree node")
 		}
 		if ref.Number == 0 {
+			identity := reflect.ValueOf(dict).Pointer()
+			if seenDicts == nil {
+				seenDicts = map[uintptr]Dictionary{}
+			}
+			if _, exists := seenDicts[identity]; exists {
+				repeated++
+				if repeated > maxRepeatedPageNodes {
+					return fmt.Errorf("%w: repeated page tree node limit exceeded", ErrStreamLimitExceeded)
+				}
+			} else {
+				seenDicts[identity] = dict
+			}
 			r.warning(Diagnostic{Message: "direct dictionary in page tree retained"})
 		} else {
 			if seen[ref] {
+				repeated++
+				if repeated > maxRepeatedPageNodes {
+					return fmt.Errorf("%w: repeated page tree node limit exceeded", ErrStreamLimitExceeded)
+				}
 				r.warning(Diagnostic{Message: "repeated non-cyclic page tree node retained"})
 			}
 			seen[ref] = true
@@ -183,18 +205,42 @@ func (p *Page) Content() ([]byte, error) {
 	return p.ContentContext(context.Background())
 }
 
+// limitedBuffer 将写入数据缓存在内存中，超出正数字节上限时中止写入
+type limitedBuffer struct {
+	buf   bytes.Buffer
+	limit int64
+}
+
+// Write 校验累计字节上限后追加数据
+// 入参: p 待写入字节
+// 返回: int 已写字节数, error 超限错误
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.limit > 0 && int64(len(p)) > b.limit-int64(b.buf.Len()) {
+		return 0, fmt.Errorf("page content %w", ErrStreamLimitExceeded)
+	}
+	return b.buf.Write(p)
+}
+
+// readContentBytes 按生效流字节上限读取并拼接页面内容流
+// 入参: ctx 取消上下文
+// 返回: []byte 页面内容字节, error 读取、超限、关闭或取消错误
+func (p *Page) readContentBytes(ctx context.Context) ([]byte, error) {
+	if p == nil || p.reader == nil {
+		return nil, fmt.Errorf("invalid page reader")
+	}
+	maxBytes, _ := effectiveStreamLimits(p.reader, nil)
+	out := limitedBuffer{limit: maxBytes}
+	if _, err := p.WriteContent(ctx, &out); err != nil {
+		return nil, err
+	}
+	return out.buf.Bytes(), nil
+}
+
 // ContentContext 按取消上下文读取并依次连接页面内容流，保留流间的图形状态语义
 // 入参: ctx 取消上下文
 // 返回: []byte 内容操作符数据, error 解码、关闭或取消错误
 func (p *Page) ContentContext(ctx context.Context) ([]byte, error) {
-	if p == nil || p.reader == nil {
-		return nil, fmt.Errorf("invalid page reader")
-	}
-	var out bytes.Buffer
-	if _, err := p.WriteContent(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
+	return p.readContentBytes(ctx)
 }
 
 // WriteContent 逐个解码并输出页面内容流，以换行分隔，不拼接整页内容；单个流仍完整解码

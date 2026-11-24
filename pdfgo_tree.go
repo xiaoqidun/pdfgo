@@ -38,14 +38,14 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 	if visit == nil {
 		return fmt.Errorf("missing name tree visitor")
 	}
-	value, err := r.Resolve(root)
-	if err != nil || value == nil {
-		return err
+	if root == nil {
+		return nil
 	}
 	seen := map[Reference]bool{}
 	dictionaries := map[uintptr]Dictionary{}
 	names := map[string]bool{}
 	stack := []Array{{root}}
+	isRoot := true
 	for len(stack) > 0 {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -70,6 +70,12 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 		value, err := r.Resolve(object)
 		if err != nil {
 			return err
+		}
+		if isRoot {
+			isRoot = false
+			if value == nil {
+				return nil
+			}
 		}
 		node, ok := value.(Dictionary)
 		if !ok {
@@ -158,9 +164,8 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 	if visit == nil {
 		return fmt.Errorf("missing number tree visitor")
 	}
-	value, err := r.Resolve(root)
-	if err != nil || value == nil {
-		return err
+	if root == nil {
+		return nil
 	}
 	type frame struct {
 		object      Object
@@ -178,6 +183,7 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 	dictionaries := make(map[uintptr]Dictionary)
 	var previous int64
 	hasPrevious := false
+	isRoot := true
 	for len(stack) != 0 {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -229,6 +235,12 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 		value, err := r.Resolve(object)
 		if err != nil {
 			return err
+		}
+		if isRoot {
+			isRoot = false
+			if value == nil {
+				return nil
+			}
 		}
 		node, ok := value.(Dictionary)
 		if !ok {

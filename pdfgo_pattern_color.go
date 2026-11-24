@@ -14,7 +14,10 @@
 
 package pdfgo
 
-import "math"
+import (
+	"context"
+	"math"
+)
 
 // patternColorSpace 保存无色图案的底层分量数和颜色变换
 type patternColorSpace struct {
@@ -28,13 +31,30 @@ type patternColorSpace struct {
 // 入参: object 底层颜色空间
 // 返回: *patternColorSpace 颜色变换, error 解析错误
 func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
-	return r.readPatternColorSpace(object, false)
+	return r.readPatternColorSpaceContext(context.Background(), object, false)
+}
+
+// readPatternBaseContext 在取消上下文内读取无色图案的设备、校准、索引或专色空间
+// 入参: ctx 取消上下文, object 底层颜色空间
+// 返回: *patternColorSpace 颜色变换, error 解析或取消错误
+func (r *Reader) readPatternBaseContext(ctx context.Context, object Object) (*patternColorSpace, error) {
+	return r.readPatternColorSpaceContext(ctx, object, false)
 }
 
 // readPatternColorSpace 读取原始或已按资源校验的图案基础空间
 // 入参: object 基础空间, effective 是否已按资源校验并替换
 // 返回: *patternColorSpace 分量数及颜色变换, error 颜色空间错误
 func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternColorSpace, error) {
+	return r.readPatternColorSpaceContext(context.Background(), object, effective)
+}
+
+// readPatternColorSpaceContext 在取消上下文内读取原始或已按资源校验的图案基础空间
+// 入参: ctx 取消上下文, object 基础空间, effective 是否已按资源校验并替换
+// 返回: *patternColorSpace 分量数及颜色变换, error 颜色空间或取消错误
+func (r *Reader) readPatternColorSpaceContext(ctx context.Context, object Object, effective bool) (*patternColorSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	object, err := r.resolveColorSpace(object)
 	if err != nil {
 		return nil, err
@@ -42,7 +62,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 	if array, ok := object.(Array); ok && len(array) > 0 {
 		switch array[0] {
 		case Name("Separation"):
-			space, err := r.readSeparationSpace(array, effective, 0)
+			space, err := r.readSeparationSpaceContext(ctx, array, effective, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -52,7 +72,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 				return paint, err
 			}, space.name == "None" || space.none, nil}, nil
 		case Name("DeviceN"):
-			space, err := r.readDeviceNSpace(array, effective, 0)
+			space, err := r.readDeviceNSpaceContext(ctx, array, effective, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -94,7 +114,7 @@ func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternC
 			}, palette.colors[0].A == 0, nil}, nil
 		}
 	}
-	space, err := r.readEffectiveColorSpace(object, effective)
+	space, err := r.readEffectiveColorSpaceContext(ctx, object, effective)
 	if err != nil {
 		return nil, err
 	}

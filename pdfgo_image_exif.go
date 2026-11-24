@@ -72,8 +72,7 @@ func resizeJPEGExif(ctx context.Context, metadata []byte, before, after image.Po
 	return append(output, metadata[copied:]...), true, ctx.Err()
 }
 
-// resizeExifGeometry 更新主图及Exif目录的尺寸、密度和主体坐标，保留缩略图目录
-// 新数值单独存放，避免改写与缩略图、厂商数据或其他字段共享的原始值
+// resizeExifGeometry 独立存放并更新主图与Exif目录的尺寸、密度和主体坐标，保留缩略图及共享原始值
 // 入参: ctx 取消上下文, data TIFF结构的Exif数据, before 原尺寸, after 新尺寸
 // 返回: []byte 更新后的Exif, bool 已识别字段是否可安全更新
 func resizeExifGeometry(ctx context.Context, data []byte, before, after image.Point) ([]byte, bool) {

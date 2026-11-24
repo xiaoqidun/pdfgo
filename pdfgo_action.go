@@ -91,11 +91,11 @@ func (r *Reader) WalkActions(ctx context.Context, object Object, visit func(Acti
 		}
 		frame := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if frame.leave != 0 || frame.leaveRef.Number != 0 {
+		if frame.leave != 0 || frame.leaveRef != (Reference{}) {
 			if frame.leave != 0 {
 				delete(active, frame.leave)
 			}
-			if frame.leaveRef.Number != 0 {
+			if frame.leaveRef != (Reference{}) {
 				delete(activeRefs, frame.leaveRef)
 			}
 			continue
@@ -104,7 +104,11 @@ func (r *Reader) WalkActions(ctx context.Context, object Object, visit func(Acti
 		if steps > maxActionWalkSteps {
 			return fmt.Errorf("%w: action chain limit exceeded", ErrInvalidAction)
 		}
-		ref, isRef := frame.object.(Reference)
+		ref, err := r.resolveIndirectReference(frame.object)
+		if err != nil {
+			return wrapActionError(err)
+		}
+		isRef := ref != (Reference{})
 		if isRef && activeRefs[ref] {
 			return fmt.Errorf("%w: cyclic action chain", ErrInvalidAction)
 		}
@@ -162,11 +166,7 @@ func (r *Reader) WalkActions(ctx context.Context, object Object, visit func(Acti
 				stack = append(stack, actionFrame{object: list[i]})
 			}
 		} else {
-			if nextRef, ok := dict["Next"].(Reference); ok {
-				stack = append(stack, actionFrame{object: nextRef})
-			} else {
-				stack = append(stack, actionFrame{object: next})
-			}
+			stack = append(stack, actionFrame{object: dict["Next"]})
 		}
 	}
 	return nil

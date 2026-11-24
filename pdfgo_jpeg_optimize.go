@@ -62,9 +62,7 @@ type jpegScan struct {
 	tables  [8]jpegHuffman
 }
 
-// OptimizeJPEG 在不改变量化系数、尺寸和元数据的情况下优化JPEG熵编码
-// 当前优化单扫描顺序霍夫曼JPEG，其他编码及没有体积收益的图片返回原数据
-// 返回数据可能与输入共享内存，调用方不得修改；取消与损坏扫描返回错误
+// OptimizeJPEG 在不改变量化、尺寸与元数据下优化单扫描顺序霍夫曼JPEG熵编码（其余或无收益返回原数据），结果可能共享输入内存须只读，取消或损坏返回错误
 // 入参: ctx 取消上下文, data JPEG原始数据
 // 返回: []byte 优化数据, error 编码错误
 func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
@@ -75,8 +73,11 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	scan, err := readJPEGScan(ctx, data)
-	if err != nil || scan == nil {
-		return data, err
+	if err != nil {
+		return nil, err
+	}
+	if scan == nil {
+		return data, nil
 	}
 	var frequencies [8][256]uint64
 	var bitCount uint64
@@ -107,7 +108,10 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 		limit -= len(part)
 	}
 	if limit <= 0 {
-		return data, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return data, nil
 	}
 	output := jpegBitWriter{limit: limit}
 	maxEntropy := 2 * ((bitCount + 7) / 8)
@@ -127,7 +131,10 @@ func OptimizeJPEG(ctx context.Context, data []byte) ([]byte, error) {
 	}
 	output.flush()
 	if output.exceeded {
-		return data, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return data, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

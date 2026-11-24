@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -32,6 +33,18 @@ type ColorSpace struct {
 	srgbState uint32
 	blending  uint32
 	mapped    bool
+}
+
+// NewDeviceColorSpace 创建标准设备颜色空间
+// 入参: model 设备颜色模型，仅接受DeviceGray、DeviceRGB或DeviceCMYK
+// 返回: *ColorSpace 设备颜色空间, error 不支持的模型错误
+func NewDeviceColorSpace(model Name) (*ColorSpace, error) {
+	switch model {
+	case "DeviceGray", "DeviceRGB", "DeviceCMYK":
+		return &ColorSpace{Model: model}, nil
+	default:
+		return nil, fmt.Errorf("invalid device color space %q", model)
+	}
 }
 
 // NewCalRGBColorSpace 以校准参数建立独立源空间，不生成或声明ICC配置
@@ -176,7 +189,7 @@ func equalICCToneCurve(a, b iccToneCurve) bool {
 	return a.function == b.function && a.direction == b.direction && slices.Equal(a.samples, b.samples) && slices.Equal(a.parameters, b.parameters)
 }
 
-// Digest 返回颜色空间配置的内容摘要，不支持确定性摘要的复合空间返回false
+// Digest 返回颜色空间配置的确定性摘要，仅规范模型及含原始签名或配置数据的空间返回true，无原始数据的CalGray/CalRGB与复合空间返回false，nil接收者返回零值与true
 // 返回: [32]byte 内容摘要, bool 是否生成确定性摘要
 func (s *ColorSpace) Digest() ([32]byte, bool) {
 	var zero [32]byte
@@ -451,7 +464,14 @@ func (s *ColorSpace) validate(values []float64) error {
 // 入参: value 颜色空间定义
 // 返回: *ColorSpace 混合空间, error 格式或能力错误
 func (r *Reader) readBlendingSpace(value Object) (*ColorSpace, error) {
-	s, err := r.readColorSpace(value)
+	return r.readBlendingSpaceContext(context.Background(), value)
+}
+
+// readBlendingSpaceContext 在取消上下文内解析设备或可双向变换的ICC混合空间
+// 入参: ctx 取消上下文, value 颜色空间定义
+// 返回: *ColorSpace 混合空间, error 格式、能力或取消错误
+func (r *Reader) readBlendingSpaceContext(ctx context.Context, value Object) (*ColorSpace, error) {
+	s, err := r.readEffectiveColorSpaceContext(ctx, value, false)
 	if err != nil {
 		return nil, err
 	}
@@ -506,6 +526,16 @@ func (r *Reader) readColorSpace(value Object) (*ColorSpace, error) {
 // 入参: value 颜色定义, effective 是否已按资源校验并替换
 // 返回: *ColorSpace 源空间, error 定义或配置错误
 func (r *Reader) readEffectiveColorSpace(value Object, effective bool) (*ColorSpace, error) {
+	return r.readEffectiveColorSpaceContext(context.Background(), value, effective)
+}
+
+// readEffectiveColorSpaceContext 在取消上下文内读取原始或已按资源校验的设备及校准空间
+// 入参: ctx 取消上下文, value 颜色定义, effective 是否已按资源校验并替换
+// 返回: *ColorSpace 源空间, error 定义、配置或取消错误
+func (r *Reader) readEffectiveColorSpaceContext(ctx context.Context, value Object, effective bool) (*ColorSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.resolveColorSpace(value)
 	if err != nil {
 		return nil, err
@@ -524,7 +554,7 @@ func (r *Reader) readEffectiveColorSpace(value Object, effective bool) (*ColorSp
 		return r.readCalibratedSpace(array)
 	}
 	if array, ok := value.(Array); ok && len(array) == 2 && array[0] == Name("ICCBased") {
-		profile, err := r.readICCSourceSpace(array, effective)
+		profile, err := r.readICCSourceSpaceContext(ctx, array, effective)
 		if err != nil {
 			return nil, err
 		}

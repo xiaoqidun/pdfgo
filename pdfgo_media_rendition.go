@@ -132,8 +132,12 @@ func (r *mediaReader) readRendition(ctx context.Context, object Object, depth in
 		r.renditions[id] = mediaReadEntry[Rendition]{value: result, height: height}
 		return result, nil
 	}
-	if dict["C"] != nil {
-		result.Clip, err = r.readMediaClip(ctx, dict["C"], 0)
+	clip, err := r.Resolve(dict["C"])
+	if err != nil {
+		return nil, err
+	}
+	if clip != nil {
+		result.Clip, err = r.readMediaClip(ctx, clip, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -221,10 +225,11 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 	}
 	if result.Subtype == "MCS" {
 		result.Section, err = r.readMediaClip(ctx, dict["D"], depth+1)
-		if err == nil {
-			r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1 + r.clips[reflect.ValueOf(result.Section.Dictionary).Pointer()].height}
+		if err != nil {
+			return nil, err
 		}
-		return result, err
+		r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1 + r.clips[reflect.ValueOf(result.Section.Dictionary).Pointer()].height}
+		return result, nil
 	}
 	if result.Subtype != "MCD" {
 		r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1}
@@ -235,6 +240,9 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 		return nil, err
 	}
 	if stream, ok := value.(*Stream); ok {
+		if stream == nil {
+			return nil, fmt.Errorf("invalid form media clip")
+		}
 		typeValue, err := r.Resolve(stream.Dictionary["Type"])
 		if err != nil {
 			return nil, err
@@ -243,7 +251,11 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 		if err != nil {
 			return nil, err
 		}
-		if typeValue != Name("XObject") || kind != Name("Form") || dict["CT"] != nil {
+		contentType, err := r.Resolve(dict["CT"])
+		if err != nil {
+			return nil, err
+		}
+		if typeValue != Name("XObject") || kind != Name("Form") || contentType != nil {
 			return nil, fmt.Errorf("invalid form media clip")
 		}
 		result.Form = stream
@@ -286,10 +298,14 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 		return nil, err
 	}
 	result.Players, err = r.mediaParameters(dict["PL"], "MediaPlayers")
-	if err == nil {
-		r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1}
+	if err != nil {
+		return nil, err
 	}
-	return result, err
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1}
+	return result, nil
 }
 
 // mediaParameters 验证媒体参数对象类型及约束字典，不评估设备可用性

@@ -92,13 +92,7 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 	if len(changes) == 0 {
 		return nil, false, nil
 	}
-	number := int64(0)
-	for id := range r.xref {
-		number = max(number, id)
-	}
-	for ref := range result {
-		number = max(number, ref.Number)
-	}
+	number := r.maxRewriteObjectID(result)
 	var pending map[Reference][]byte
 	if deferCompress {
 		pending = make(map[Reference][]byte, len(changes))
@@ -275,13 +269,7 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 // 入参: ctx 取消上下文, transform 内容变换, pending 文字替换后的未压缩页面内容, result 本次替换对象, compressLevel 流压缩级别
 // 返回: error 读取、变换或写出错误
 func (r *Reader) transformPageContent(ctx context.Context, transform func(context.Context, *Page, []byte) ([]byte, error), pending map[Reference][]byte, result map[Reference]Object, compressLevel int) error {
-	number := int64(0)
-	for id := range r.xref {
-		number = max(number, id)
-	}
-	for ref := range result {
-		number = max(number, ref.Number)
-	}
+	number := r.maxRewriteObjectID(result)
 	return r.rewriteReader(result).WalkPages(ctx, func(_ int, page *Page) error {
 		raw, hasPending := pending[page.Reference]
 		var input []byte

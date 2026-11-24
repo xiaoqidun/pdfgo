@@ -27,12 +27,9 @@ import (
 	"golang.org/x/text/encoding/charmap"
 )
 
-// Font 保存PDF字体程序、字符映射及字宽，不依赖渲染后端
-// Font实例可由阅读器缓存共享，字段及映射切片均为只读，调用方不得修改
-// Vertical为true时使用竖排度量，字形本身仍以横排原点描述
-// BoundingBox保留非Type3字体描述符边界，未提供有效边界时为空
-// FallbackBoundingBox保留未内嵌标准字体的AFM保守边界，不用于排版，边界单位为千分之一文字空间
-// Recovered表示已诊断恢复源字体声明，Dictionary仍保留原始字段供调用方保存
+// Font 保存PDF字体程序、字符映射及字宽（不依赖渲染后端），可由阅读器缓存共享，所有字段及切片均只读
+// Vertical为true时采用竖排度量（字形仍以横排原点描述）；Recovered表示已诊断恢复，Dictionary仍保留原始声明
+// BoundingBox为非Type3描述符边界，FallbackBoundingBox为未内嵌标准字体AFM保守边界（千分之一文字空间，不用于排版）
 type Font struct {
 	Name                 string
 	Subtype              Name
@@ -125,7 +122,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 // 入参: ctx 取消上下文, object 字体字典或引用
 // 返回: *Font 完整字体资源, error 读取或取消错误
 func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, error) {
-	if ctx == nil {
+	if r == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid font context")
 	}
 	if err := ctx.Err(); err != nil {
@@ -136,9 +133,6 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	}
 	ref, indirect := object.(Reference)
 	if indirect && r.fonts[ref] != nil {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		return r.fonts[ref], nil
 	}
 	object, err := r.Resolve(object)
@@ -213,7 +207,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			return nil, err
 		}
 		font.encoding, _ = encoding.(Name)
-		font.cidMap, err = r.readCIDCMapContext(ctx, encoding, nil)
+		font.cidMap, err = r.readCIDCMapContext(ctx, dict["Encoding"], nil, nil, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -478,7 +472,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		return nil, &UnsupportedError{Feature: "font subtype " + string(subtype)}
 	}
 	if dict["ToUnicode"] != nil {
-		font.Unicode, err = r.readUnicodeCMapContext(ctx, dict["ToUnicode"], nil)
+		font.Unicode, err = r.readUnicodeCMapContext(ctx, dict["ToUnicode"], nil, nil, 0)
 		if err != nil {
 			if cause := ctx.Err(); cause != nil {
 				return nil, cause
@@ -688,7 +682,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "MacExpertEncoding" && font.encoding != "StandardEncoding" {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
-		font.cffGlyphs, font.cffNames, err = cffFontMappingWithGlyphMap(cffProgram, font.composite, font.encoding, font.differences, font.composite, font.ProgramType, font.glyphMap)
+		font.cffGlyphs, font.cffNames, err = cffFontMappingWithGlyphMap(cffProgram, font.composite, font.encoding, font.differences, font.ProgramType, font.glyphMap)
 		if err != nil {
 			return nil, err
 		}
@@ -882,9 +876,12 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if len(data) == 0 {
+		return nil, nil
+	}
 	var type1Metrics *type1FontMetrics
 	var cffMetrics *cffFontMetrics
-	if f.programMetrics != nil && len(data) != 0 {
+	if f.programMetrics != nil {
 		var err error
 		type1Metrics, cffMetrics, err = f.programMetrics.load(ctx)
 		if err != nil {
@@ -1074,7 +1071,7 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 				width *= f.type3Matrix[0] * 1000
 			}
 		}
-		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && !f.allowMissingWidth && (core == nil || name != ".notdef") {
+		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && !f.defaultWidthDeclared && !f.allowMissingWidth && (core == nil || name != ".notdef") {
 			if len(f.Program) != 0 {
 				return nil, &UnsupportedError{Feature: "embedded font metrics"}
 			}

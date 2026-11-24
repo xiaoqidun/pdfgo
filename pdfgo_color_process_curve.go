@@ -119,7 +119,7 @@ func (c *iccSegmentedCurve) evaluate(value float64) float64 {
 // 返回: float64 曲线值
 func (s *iccCurveSegment) evaluate(x float64) float64 {
 	if len(s.samples) != 0 {
-		if x <= s.lower {
+		if !(x > s.lower) {
 			return s.initial
 		}
 		if x >= s.upper {

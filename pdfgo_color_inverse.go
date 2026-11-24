@@ -116,7 +116,7 @@ func (s *iccColorSpace) validateBlending() error {
 // 返回: *iccLUTSpace 传统变换, [4]*iccProcessElements 浮点变换, error 无效逆向信息
 func (s *iccColorSpace) inverseTransforms() (*iccLUTSpace, [4]*iccProcessElements, error) {
 	if s.inverse == nil {
-		return s.lut, s.fromFloat, nil
+		return s.lut, [4]*iccProcessElements{}, nil
 	}
 	i := s.inverse
 	i.once.Do(i.initialize)

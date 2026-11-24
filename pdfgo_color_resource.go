@@ -15,9 +15,8 @@
 package pdfgo
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"os"
 )
 
 // cloneColorantDictionary 复制需重映射的属性字典，不改变共享资源
@@ -45,40 +44,27 @@ func colorSpaceFamily(value Object) Name {
 	return ""
 }
 
-// SetDeviceColorProfile 设置未标定设备色的ICC配置，不覆盖显式颜色空间及Default资源
-// 仅应用到与配置通道数一致的Device颜色空间，不执行打样或改变输入PDF；需在页面解释前调用
-// 入参: profile 独立ICC数据，nil清除；调用后可修改输入切片
-// 返回: error 配置错误，失败保留原设置
-func (r *Reader) SetDeviceColorProfile(profile []byte) error {
-	if r == nil {
-		return fmt.Errorf("invalid reader")
-	}
-	if r.closed {
-		return os.ErrClosed
-	}
-	if profile == nil {
-		r.deviceProfile = nil
-		return nil
-	}
-	space, err := NewICCColorSpace(profile)
-	if err != nil {
-		return err
-	}
-	r.deviceProfile = &Stream{Dictionary: Dictionary{"N": Integer(space.Components())}, Data: bytes.Clone(profile)}
-	return nil
-}
-
 // resourceColorSpace 解析当前资源的颜色空间及默认设备色，不修改共享定义
 // 入参: value 颜色空间, resources 当前资源字典
 // 返回: Object 有效颜色空间, error 引用或定义错误
 func (r *Reader) resourceColorSpace(value Object, resources Dictionary) (Object, error) {
-	return r.remapColorSpace(value, resources, true, 0)
+	return r.remapColorSpaceContext(context.Background(), value, resources, true, 0)
 }
 
-// remapColorSpace 解析资源别名和底层设备色，默认空间本身不重复重映射
-// 入参: value 颜色空间, resources 当前资源, remap 是否替换设备色, depth 嵌套深度
-// 返回: Object 有效定义, error 引用或定义错误
-func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool, depth int) (Object, error) {
+// resourceColorSpaceContext 在取消上下文内解析当前资源的颜色空间及默认设备色
+// 入参: ctx 取消上下文, value 颜色空间, resources 当前资源字典
+// 返回: Object 有效颜色空间, error 引用、定义或取消错误
+func (r *Reader) resourceColorSpaceContext(ctx context.Context, value Object, resources Dictionary) (Object, error) {
+	return r.remapColorSpaceContext(ctx, value, resources, true, 0)
+}
+
+// remapColorSpaceContext 在取消上下文内解析资源别名和底层设备色，默认空间本身不重复重映射
+// 入参: ctx 取消上下文, value 颜色空间, resources 当前资源, remap 是否替换设备色, depth 嵌套深度
+// 返回: Object 有效定义, error 引用、定义或取消错误
+func (r *Reader) remapColorSpaceContext(ctx context.Context, value Object, resources Dictionary, remap bool, depth int) (Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if depth >= 64 {
 		return nil, fmt.Errorf("color space recursion limit exceeded")
 	}
@@ -127,7 +113,7 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 				r.warning(Diagnostic{Message: fmt.Sprintf("missing named color space %q; PDF viewer DeviceGray default used", name)})
 				return Name("DeviceGray"), nil
 			}
-			return r.remapColorSpace(resolved, resources, remap, depth+1)
+			return r.remapColorSpaceContext(ctx, resolved, resources, remap, depth+1)
 		}
 		defaultValue, err := r.Resolve(spaces[key])
 		if err != nil {
@@ -139,7 +125,7 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 			}
 			return name, nil
 		}
-		defaultValue, err = r.remapColorSpace(defaultValue, resources, false, depth+1)
+		defaultValue, err = r.remapColorSpaceContext(ctx, defaultValue, resources, false, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -147,7 +133,7 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 		if family == "Lab" || family == "Indexed" || family == "Pattern" {
 			return nil, fmt.Errorf("invalid %s color space %q", key, family)
 		}
-		base, err := r.readPatternBase(defaultValue)
+		base, err := r.readPatternBaseContext(ctx, defaultValue)
 		if err != nil {
 			return nil, err
 		}
@@ -160,7 +146,7 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 		return value, nil
 	}
 	if array[0] == Name("ICCBased") {
-		return r.remapICCAlternate(array, resources, remap, depth)
+		return r.remapICCAlternate(ctx, array, resources, remap, depth)
 	}
 	base := -1
 	switch array[0] {
@@ -197,7 +183,7 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 		return value, nil
 	}
 	if base == 2 {
-		original, err := r.remapColorSpace(array[base], resources, false, depth+1)
+		original, err := r.remapColorSpaceContext(ctx, array[base], resources, false, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -207,22 +193,22 @@ func (r *Reader) remapColorSpace(value Object, resources Dictionary, remap bool,
 			return nil, fmt.Errorf("invalid alternate color space")
 		}
 	}
-	resolved, err := r.remapColorSpace(array[base], resources, remap, depth+1)
+	resolved, err := r.remapColorSpaceContext(ctx, array[base], resources, remap, depth+1)
 	if err != nil {
 		return nil, err
 	}
 	array = append(Array(nil), array...)
 	array[base] = resolved
 	if array[0] == Name("DeviceN") && len(array) == 5 {
-		return r.remapNChannelAttributes(array, resources, remap, depth+1)
+		return r.remapNChannelAttributes(ctx, array, resources, remap, depth+1)
 	}
 	return array, nil
 }
 
 // remapNChannelAttributes 解析过程空间别名与所用专色备用色，忽略未用和过程色的同名专色定义
-// 入参: space 多色定义, resources 当前资源, remap 是否替换设备备用色, depth 嵌套深度
-// 返回: Object 独立属性副本, error 引用或定义错误
-func (r *Reader) remapNChannelAttributes(space Array, resources Dictionary, remap bool, depth int) (Object, error) {
+// 入参: ctx 取消上下文, space 多色定义, resources 当前资源, remap 是否替换设备备用色, depth 嵌套深度
+// 返回: Object 独立属性副本, error 引用、定义或取消错误
+func (r *Reader) remapNChannelAttributes(ctx context.Context, space Array, resources Dictionary, remap bool, depth int) (Object, error) {
 	value, err := r.Resolve(space[4])
 	if err != nil {
 		return nil, err
@@ -247,7 +233,7 @@ func (r *Reader) remapNChannelAttributes(space Array, resources Dictionary, rema
 			return nil, fmt.Errorf("invalid NChannel process dictionary")
 		}
 		process = cloneColorantDictionary(process)
-		process["ColorSpace"], err = r.remapColorSpace(process["ColorSpace"], resources, false, depth)
+		process["ColorSpace"], err = r.remapColorSpaceContext(ctx, process["ColorSpace"], resources, false, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +241,7 @@ func (r *Reader) remapNChannelAttributes(space Array, resources Dictionary, rema
 		if family != "DeviceGray" && family != "DeviceRGB" && family != "DeviceCMYK" && family != "CalGray" && family != "CalRGB" && family != "Lab" && family != "ICCBased" {
 			return nil, fmt.Errorf("invalid NChannel process color space")
 		}
-		output, _, err := r.readDeviceNAlternate(process["ColorSpace"])
+		output, _, err := r.readDeviceNAlternateContext(ctx, process["ColorSpace"])
 		if err != nil {
 			return nil, err
 		}
@@ -303,7 +289,7 @@ func (r *Reader) remapNChannelAttributes(space Array, resources Dictionary, rema
 			}
 			colorants = cloneColorantDictionary(dictionary)
 		}
-		colorants[name], err = r.remapColorSpace(colorants[name], resources, remap, depth)
+		colorants[name], err = r.remapColorSpaceContext(ctx, colorants[name], resources, remap, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -315,13 +301,13 @@ func (r *Reader) remapNChannelAttributes(space Array, resources Dictionary, rema
 	return space, nil
 }
 
-// resourceBlendingSpace 解析当前资源中的混合空间及默认设备色
-// 入参: value 混合空间, resources 当前资源字典
-// 返回: *ColorSpace 混合空间, error 定义或双向变换错误
-func (r *Reader) resourceBlendingSpace(value Object, resources Dictionary) (*ColorSpace, error) {
-	value, err := r.resourceColorSpace(value, resources)
+// resourceBlendingSpaceContext 在取消上下文内解析当前资源中的混合空间及默认设备色
+// 入参: ctx 取消上下文, value 混合空间, resources 当前资源字典
+// 返回: *ColorSpace 混合空间, error 定义、双向变换或取消错误
+func (r *Reader) resourceBlendingSpaceContext(ctx context.Context, value Object, resources Dictionary) (*ColorSpace, error) {
+	value, err := r.resourceColorSpaceContext(ctx, value, resources)
 	if err != nil {
 		return nil, err
 	}
-	return r.readBlendingSpace(value)
+	return r.readBlendingSpaceContext(ctx, value)
 }

@@ -71,7 +71,7 @@ func (r *Reader) ReadRedaction(ctx context.Context, annotation Annotation) (Reda
 	}
 	if value != nil {
 		stream, ok := value.(*Stream)
-		if !ok {
+		if !ok || stream == nil {
 			return redaction, fmt.Errorf("invalid redaction overlay form")
 		}
 		subtype, err := r.Resolve(stream.Dictionary["Subtype"])

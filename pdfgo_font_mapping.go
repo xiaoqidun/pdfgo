@@ -43,7 +43,7 @@ func (f *Font) GlyphMapContext(ctx context.Context) (map[rune]uint16, error) {
 	}
 	codes, err := f.encodingCodes(ctx, func(value string) bool {
 		return utf8.ValidString(value) && utf8.RuneCountInString(value) == 1
-	}, !f.composite && f.Subtype != "Type0")
+	}, !f.composite)
 	if err != nil {
 		return nil, err
 	}

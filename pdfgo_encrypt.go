@@ -50,7 +50,6 @@ type standardSecurity struct {
 	stringFilter    Name
 	embeddedFilter  Name
 	encryptMetadata bool
-	authenticated   bool
 	unencrypted     map[Reference]bool
 }
 
@@ -243,14 +242,11 @@ func (r *Reader) openSecurity(password []byte) error {
 			}
 			s.encryptMetadata = bool(b)
 		}
-		if value, err := r.securityFilters(dict["CF"]); err != nil {
+		filters, err := r.securityFilters(dict["CF"])
+		if err != nil {
 			return err
-		} else if value != nil {
-			s.filters, ok = value.(Dictionary)
-			if !ok {
-				return fmt.Errorf("invalid crypt filter dictionary")
-			}
 		}
+		s.filters = filters
 		for _, entry := range []struct {
 			name  Name
 			value *Name
@@ -319,15 +315,14 @@ func (r *Reader) openSecurity(password []byte) error {
 			return err
 		}
 	}
-	s.authenticated = true
 	r.security = s
 	return nil
 }
 
 // securityFilters 在认证前解析加密过滤器的间接字典，不改变原始加密参数
 // 入参: object CF字典或间接引用
-// 返回: Object 已解析的字典, error 引用或类型错误
-func (r *Reader) securityFilters(object Object) (Object, error) {
+// 返回: Dictionary 已解析的字典, error 引用或类型错误
+func (r *Reader) securityFilters(object Object) (Dictionary, error) {
 	if object == nil {
 		return nil, nil
 	}
@@ -349,17 +344,21 @@ func (r *Reader) securityFilters(object Object) (Object, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid crypt filter %s dictionary", name)
 		}
-		copy := make(Dictionary, len(filter))
-		for key, value := range filter {
-			copy[key] = value
+		copied := make(Dictionary, len(filter))
+		for key, item := range filter {
+			resolved, err := r.Resolve(item)
+			if err != nil {
+				return nil, err
+			}
+			copied[key] = resolved
 		}
 		if r.warning != nil {
-			if length, ok := copy["Length"].(Integer); ok && ((copy["CFM"] == Name("AESV2") && length == 128) || (copy["CFM"] == Name("AESV3") && length == 256)) {
-				copy["Length"] = length / 8
+			if length, ok := copied["Length"].(Integer); ok && ((copied["CFM"] == Name("AESV2") && length == 128) || (copied["CFM"] == Name("AESV3") && length == 256)) {
+				copied["Length"] = length / 8
 				r.warning(Diagnostic{Message: fmt.Sprintf("crypt filter %s Length is in bits; equivalent byte length retained", name)})
 			}
 		}
-		result[name] = copy
+		result[name] = copied
 	}
 	return result, nil
 }
@@ -417,6 +416,9 @@ func (s *standardSecurity) cryptMethod(name Name) (Name, error) {
 		return name, nil
 	}
 	if s.info.Revision < 4 {
+		if name != "V2" {
+			return "", fmt.Errorf("unsupported crypt filter %s for encryption revision %d", name, s.info.Revision)
+		}
 		return "V2", nil
 	}
 	dict, ok := s.filters[name].(Dictionary)
@@ -532,9 +534,6 @@ func (s *standardSecurity) decryptObject(value Object, ref Reference) (Object, e
 		if v.Dictionary["Type"] == Name("Metadata") && !s.encryptMetadata {
 			name = "Identity"
 		}
-		if v.Dictionary["F"] != nil {
-			name = "Identity"
-		}
 		filters, params, err := v.filterChain(v.reader)
 		if err != nil {
 			return nil, err
@@ -542,6 +541,9 @@ func (s *standardSecurity) decryptObject(value Object, ref Reference) (Object, e
 		for i, filter := range filters {
 			if filter != Name("Crypt") {
 				continue
+			}
+			if s.info.Revision < 4 {
+				return nil, fmt.Errorf("Crypt stream filter requires encryption revision 4 or higher")
 			}
 			if i != 0 {
 				return nil, fmt.Errorf("Crypt must be the first stream filter")
@@ -554,7 +556,10 @@ func (s *standardSecurity) decryptObject(value Object, ref Reference) (Object, e
 				}
 			}
 		}
-		if len(v.Data) == aes.BlockSize && s.authenticated && v.reader != nil && v.reader.security == s && v.reader.warning != nil {
+		if v.Dictionary["F"] != nil {
+			name = "Identity"
+		}
+		if len(v.Data) == aes.BlockSize && v.reader != nil && v.reader.warning != nil {
 			method, err := s.cryptMethod(name)
 			if err != nil {
 				return nil, fmt.Errorf("decrypt stream %d %d: %w", ref.Number, ref.Generation, err)

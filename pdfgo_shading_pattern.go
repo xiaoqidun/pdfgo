@@ -221,7 +221,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		if err != nil {
 			return Paint{}, err
 		}
-		base, err := child.reader.readPatternColorSpace(space, true)
+		base, err := child.reader.readPatternColorSpaceContext(child.ctx, space, true)
 		if err != nil {
 			return Paint{}, err
 		}

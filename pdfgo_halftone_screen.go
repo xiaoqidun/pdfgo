@@ -267,7 +267,7 @@ func (r *Reader) compileHalftone(ctx context.Context, h *Halftone, options Halft
 	if value == Name("Default") && !overridden {
 		value = nil
 	}
-	function, err := transferReader.ReadTransferFunction(value)
+	function, err := transferReader.readTransferFunctionContext(ctx, value)
 	if err != nil {
 		return nil, err
 	}

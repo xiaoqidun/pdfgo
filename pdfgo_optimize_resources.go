@@ -130,13 +130,18 @@ func hashLazyReplacementImage(ctx context.Context, item *lazyReplacementImage, a
 		var palLen [4]byte
 		binary.BigEndian.PutUint32(palLen[:], uint32(len(src.Palette)))
 		hash.Write(palLen[:])
-		var entry [8]byte
+		var entry [9]byte
 		for _, colorEntry := range src.Palette {
-			c := imageNRGBASample(colorEntry)
-			binary.BigEndian.PutUint16(entry[0:2], c.R)
-			binary.BigEndian.PutUint16(entry[2:4], c.G)
-			binary.BigEndian.PutUint16(entry[4:6], c.B)
-			binary.BigEndian.PutUint16(entry[6:8], c.A)
+			if colorEntry == nil {
+				entry = [9]byte{}
+			} else {
+				c := imageNRGBASample(colorEntry)
+				entry[0] = 1
+				binary.BigEndian.PutUint16(entry[1:3], c.R)
+				binary.BigEndian.PutUint16(entry[3:5], c.G)
+				binary.BigEndian.PutUint16(entry[5:7], c.B)
+				binary.BigEndian.PutUint16(entry[7:9], c.A)
+			}
 			hash.Write(entry[:])
 		}
 		for y := b.Min.Y; y < b.Max.Y; y++ {
@@ -147,6 +152,40 @@ func hashLazyReplacementImage(ctx context.Context, item *lazyReplacementImage, a
 			hash.Write(src.Pix[off : off+b.Dx()])
 		}
 	default:
+		if channels == 4 && space == Name("DeviceCMYK") {
+			binary.BigEndian.PutUint32(dims[8:12], 8)
+			hash.Write(dims[:])
+			stride := 8
+			if !alwaysOpaque {
+				stride = 10
+			}
+			line := make([]byte, b.Dx()*stride)
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				if err := ctx.Err(); err != nil {
+					return [32]byte{}, err
+				}
+				for x := 0; x < b.Dx(); x++ {
+					var values [4]uint16
+					if c, ok := imageCMYKAt(img, b.Min.X+x, y); ok {
+						values = [4]uint16(c)
+					} else {
+						c := color.CMYKModel.Convert(img.At(b.Min.X+x, y)).(color.CMYK)
+						values = [4]uint16{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}
+					}
+					off := x * stride
+					binary.BigEndian.PutUint16(line[off:off+2], values[0])
+					binary.BigEndian.PutUint16(line[off+2:off+4], values[1])
+					binary.BigEndian.PutUint16(line[off+4:off+6], values[2])
+					binary.BigEndian.PutUint16(line[off+6:off+8], values[3])
+					if !alwaysOpaque {
+						_, _, _, alphaValue := img.At(b.Min.X+x, y).RGBA()
+						binary.BigEndian.PutUint16(line[off+8:off+10], uint16(alphaValue))
+					}
+				}
+				hash.Write(line)
+			}
+			break
+		}
 		binary.BigEndian.PutUint32(dims[8:12], 7)
 		hash.Write(dims[:])
 		line := make([]byte, b.Dx()*8)
@@ -170,8 +209,7 @@ func hashLazyReplacementImage(ctx context.Context, item *lazyReplacementImage, a
 	return key, nil
 }
 
-// optimizationAliases 合并完全一致的图片、字体、内容流、表单、ToUnicode、状态与资源字典及替换图像
-// 复用扫描阶段已计算的流内容摘要，不重复读取原始流数据，并保持对象身份与语义边界
+// optimizationAliases 复用扫描流摘要合并完全一致的图片、字体、流、资源与替换图像，同时维持对象身份与语义边界
 // 入参: ctx 取消上下文, refs 可达对象, isStream 流对象标记, metadata 已读取的对象属性, streamHashes 已计算的流内容摘要, skip 延迟编码替换图像集合, protected 不可合并的根级保护引用, lightOnly 是否仅执行轻量流与替换图去重
 // 返回: map[Reference]Reference 重复引用映射, error 哈希或取消错误
 func (r *Reader) optimizationAliases(ctx context.Context, refs []Reference, isStream map[Reference]bool, metadata map[Reference]Object, streamHashes map[Reference][32]byte, skip map[Reference]*lazyReplacementImage, protected map[Reference]bool, lightOnly bool) (map[Reference]Reference, error) {

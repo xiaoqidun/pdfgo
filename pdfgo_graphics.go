@@ -53,13 +53,10 @@ type TextClip struct {
 	Size, HorizontalScale float64
 }
 
-// Paint 保存颜色及不透明度，CMYK保留设备四色，Space与Values保留ICC源分量
-// None表示丢弃着色输出，与零透明度不同，不参与挖空合成
-// Process保留原生过程通道，区分未指定通道和已指定的零分量
-// Colorant保留专色定义和源浓度快照，不随后续图形状态变化
-// ColorantDevice访问器可接收备用色为None但原生色料可用的画刷，None仅描述其备用显示
-// SourceSpace保留普通颜色的来源空间族，图案基色使用底层空间族，不以转换后的Space或CMYK代替
-// Shading保留着色图案的内部状态，Alpha仍属于使用图案的对象
+// Paint 保存颜色及不透明度，CMYK保留设备四色，Space与Values保留ICC源分量，SourceSpace保留原始空间族（图案用底层空间族）
+// None表示丢弃着色且不参与挖空合成（有别于零Alpha），在ColorantDevice下仅描述备用显示而非原生色料可用性
+// Process保留原生过程通道并区分未指定与零分量；Colorant保留专色定义与浓度快照，不随后续状态变化
+// Shading保留着色图案内部状态，Alpha仍归属使用该图案的绘制对象
 type Paint struct {
 	RGB         [3]float64
 	CMYK        *[4]float64
@@ -116,13 +113,10 @@ type PathMark struct {
 	StrokeMatrix Matrix
 }
 
-// TextMark 保存文字字形及其相对于文字矩阵的基线位置
-// Positions始终使用字形横排原点，竖排位置已扣除竖排原点向量
-// StrokeMatrix保留图形状态坐标变换，描边参数不受文字矩阵和字号影响
-// Mode保留有效绘制模式，Type3除不可见模式3外均按0交付，不产生文字裁剪
-// Object只读共享同一BT与ET边界，不同文字对象使用不同实例
-// Resources保留所在页面的只读资源，供未声明资源字典的Type3字形查找
-// Replacement保留所属替换文本区段，同一区段共享实例，不改变Glyphs中的原始字符映射
+// TextMark 保存文字字形及相对文字矩阵的基线位置，Positions始终使用横排原点（竖排已扣除竖排原点向量）
+// StrokeMatrix保留图形状态变换且描边参数不受文字矩阵与字号影响；Mode为有效模式，Type3非模式3按0交付且不产裁剪
+// Object由同一BT/ET内共享（不同文字对象独立）；Resources为所在页只读资源，供未声明资源的Type3字形查找
+// Replacement指向所属替换文本区段且同区段共享实例，不改变Glyphs原始字符映射
 type TextMark struct {
 	Object                *TextObject
 	Sequence              *ContentSequence
@@ -138,8 +132,12 @@ type TextMark struct {
 	Mode                  int
 	Clip                  *TextClip
 	page                  *Page
+	depth                 int
 	glyphStreams          []*Stream
+	formStreams           []*Stream
+	patternStreams        []*Stream
 	halftones             map[string]*Halftone
+	state                 *graphicsState
 }
 
 // TextObject 保留文字对象身份，Knockout为真时整段挖空，为假时逐字合成
@@ -157,7 +155,7 @@ type ImageMark struct {
 
 // FormMark 保存表单的引用标识、局部边界、到页面坐标的变换、外层裁剪数量及可选透明组状态
 type FormMark struct {
-	Ref        Reference
+	Reference  Reference
 	Stream     *Stream
 	Bounds     Rectangle
 	Matrix     Matrix
@@ -178,20 +176,16 @@ type GroupMark struct {
 	ColorSpace      *ColorSpace
 	ColorConversion ColorConversion
 	RenderingIntent Name
-	Ref             Reference
+	Reference       Reference
 	Stream          *Stream
 	Bounds          Rectangle
 	Matrix          Matrix
 	OuterClips      int
 }
 
-// MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标记的标签
-// Replacement在含ActualText的Span开始和结束时共享实例，Hidden表示区段当前不可见
-// Offset为当前解码内容流中的操作位置
-// Page标识来源页面，Stream为空表示页面合并内容，否则标识Form、字形或图案内容流
-// 来源对象沿用阅读器生命周期，独立构造的绘制输入可能没有Page
-// Sequence在区段开始和结束时共享实例，MP和DP不创建区段
-// Reader用于解析Properties中的间接引用，包括不创建区段的点标记
+// MarkedContentMark 保存内容标记及其属性，结束标记沿用开始标签，Offset为当前解码流位置，Hidden表示不可见
+// Sequence与含ActualText的Replacement在区段起止时共享实例（MP/DP不创建区段）；Reader用于解析Properties中的间接引用
+// Page标识来源页面（独立构造输入可能为nil），Stream为nil表示页面合并内容，否则为Form/字形/图案流，均沿用阅读器生命周期
 type MarkedContentMark struct {
 	Reader      *Reader
 	Page        *Page
@@ -205,11 +199,9 @@ type MarkedContentMark struct {
 	Hidden      bool
 }
 
-// ContentSequence 保存绘制所属的只读内容区段，Parent保留外层区段
-// PathMark、TextMark和ImageMark通过Sequence引用区段
-// 相邻区段即使标签及属性相同也使用不同实例，区段不随图形状态保存或恢复
-// Reader用于解析Properties中的间接引用，来源对象沿用阅读器生命周期
-// Object标识带StructParent的XObject调用或注解外观，此类区段没有Tag和Properties
+// ContentSequence 保存绘制图元所属的只读内容区段，Parent指向外层区段，不随图形状态保存或恢复且相邻同标签区段为独立实例
+// Reader用于解析Properties间接引用，来源对象沿用阅读器生命周期
+// Object标识带StructParent的XObject调用或注解外观，此类区段无Tag与Properties
 type ContentSequence struct {
 	Reader     *Reader
 	Page       *Page
@@ -228,16 +220,9 @@ type ReplacementText struct {
 }
 
 // Visitor 按内容顺序接收页面绘制对象，缺少对应绘制回调时返回错误
-// Warning非空时报告空Type3字形、缺失的ExtGState或Shading资源及未保留的内容语义，其他解析错误仍返回错误
-// OptionalContent可覆盖内容区段及XObject的可选内容状态，缺省使用文档默认配置
-// Reference可提供引用表单的目标页面，缺省或返回nil时绘制代理内容
-// ColorantDevice声明输出设备，保留其可用色料，实际分色求值与合成由访问器完成
-// Halftones提供只读设备命名网屏，优先于文件中的同名备用定义
-// Form可保留普通表单边界，缺省直接展开；透明表单仍由Group接收
-// Form的子访问器接收已变换并裁剪的图元，不应再次应用表单矩阵
-// Form及Group的子访问器未指定内容标记、可选内容、PostScript及警告回调时沿用上层回调
-// PostScript接收PostScript XObject原始程序，缺省在Warning非空时发出诊断并跳过，Warning为空时返回错误
-// Warning非空时诊断无效内容指令及可恢复外观，保留有效绘制和已有文字定位
+// Form保留普通表单边界（缺省直接展开），透明表单交由Group；子访问器接收已变换裁剪的图元，未设标记、可选内容、PostScript或Warning时沿用上层回调
+// OptionalContent覆盖可见性，Reference解析引用表单（缺省绘代理），ColorantDevice声明可用色料，Halftones提供优先匹配的只读设备命名网屏
+// PostScript接收原始程序（缺省有Warning则诊断跳过，否则报错）；Warning非空时诊断无效指令、缺失资源、空Type3字形及可恢复外观，其他解析错误仍返回
 type Visitor struct {
 	Path            func(PathMark) error
 	Text            func(TextMark) error
@@ -317,6 +302,7 @@ type pageInterpreter struct {
 	uncoloredType3         bool
 	glyphStreams           []*Stream
 	formStreams            []*Stream
+	patternStreams         []*Stream
 	maskGroup              *Stream
 	blendingSpace          *ColorSpace
 	forms                  *formCache
@@ -326,6 +312,25 @@ type pageInterpreter struct {
 // Identity 返回单位矩阵
 // 返回: Matrix 单位矩阵
 func Identity() Matrix { return Matrix{1, 0, 0, 1, 0, 0} }
+
+// matrixFinite 判断仿射矩阵各分量是否全部为有限数值
+// 入参: m 仿射矩阵
+// 返回: bool 是否全部有限
+func matrixFinite(m Matrix) bool {
+	for _, value := range m {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// rectFinite 判断矩形边界是否全部为有限数值
+// 入参: box 矩形边界
+// 返回: bool 是否全部有限
+func rectFinite(box Rectangle) bool {
+	return !math.IsNaN(box.XMin) && !math.IsInf(box.XMin, 0) && !math.IsNaN(box.YMin) && !math.IsInf(box.YMin, 0) && !math.IsNaN(box.XMax) && !math.IsInf(box.XMax, 0) && !math.IsNaN(box.YMax) && !math.IsInf(box.YMax, 0)
+}
 
 // matrixProductDifference 补偿乘积相减的舍入残差，检查溢出、下溢及严重相消
 // 入参: a 第一个乘数, b 第二个乘数, c 第三个乘数, d 第四个乘数
@@ -492,15 +497,23 @@ func (m Matrix) MaxScale() float64 {
 	return scale * ((math.Hypot(a+d, b-c) + math.Hypot(a-d, b+c)) / 2)
 }
 
+// ForkOptions 配置工作视图的数据源、诊断回调与文字整形回调
+// Source为空时沿用原阅读器数据源，调用方须在视图使用期间保持源Reader未关闭
+type ForkOptions struct {
+	Source    io.ReaderAt
+	Warning   func(Diagnostic)
+	ShapeText TextShaper
+}
+
 // Fork 创建共享只读底层数据与并发安全缓存的独立工作视图，供多页并发读取使用
 // 视图固定内部图像解码并发度为1，避免外层并行调度过度订阅
-// source为nil时沿用原数据源，调用方须在视图使用期间保持源Reader未关闭
-// 入参: source 可选数据源，nil沿用原数据源, warning 可选警告回调, shapeText 可选文字整形回调
+// 入参: options 工作视图选项
 // 返回: *Reader 独立工作视图
-func (r *Reader) Fork(source io.ReaderAt, warning func(Diagnostic), shapeText TextShaper) *Reader {
+func (r *Reader) Fork(options ForkOptions) *Reader {
 	if r == nil || r.closed {
 		return &Reader{closed: true}
 	}
+	source := options.Source
 	originalSource := r.originalSource
 	if source == nil {
 		source = r.source
@@ -523,24 +536,25 @@ func (r *Reader) Fork(source io.ReaderAt, warning func(Diagnostic), shapeText Te
 		r.cache.shared.Store(true)
 	}
 	return &Reader{
-		Version:        r.Version,
-		Trailer:        r.Trailer,
-		source:         source,
-		size:           r.size,
-		originalSource: originalSource,
-		originalSize:   r.originalSize,
-		xref:           maps.Clone(r.xref),
-		cache:          r.cache,
-		loading:        make(map[Reference]bool),
-		deviceProfile:  r.deviceProfile,
-		security:       security,
-		warning:        warning,
-		textShaper:     shapeText,
-		decodeWorkers:  1,
-		maxStreamBytes: r.maxStreamBytes,
-		maxFilterChain: r.maxFilterChain,
-		jbig2Globals:   r.jbig2Globals,
-		owner:          owner,
+		Version:         r.Version,
+		Trailer:         r.Trailer,
+		source:          source,
+		size:            r.size,
+		originalSource:  originalSource,
+		originalSize:    r.originalSize,
+		xref:            maps.Clone(r.xref),
+		cache:           r.cache,
+		loading:         make(map[Reference]bool),
+		deviceProfile:   r.deviceProfile,
+		security:        security,
+		warning:         options.Warning,
+		textShaper:      options.ShapeText,
+		decodeWorkers:   1,
+		maxStreamBytes:  r.maxStreamBytes,
+		maxFilterChain:  r.maxFilterChain,
+		jbig2Globals:    r.jbig2Globals,
+		owner:           owner,
+		ownerHasWarning: r.rootHasWarning(),
 	}
 }
 
@@ -610,7 +624,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 				}
 			case "S":
 			case "CS":
-				groupSpace, err = r.resourceBlendingSpace(value, page.Resources)
+				groupSpace, err = r.resourceBlendingSpaceContext(ctx, value, page.Resources)
 				if err != nil {
 					return err
 				}
@@ -677,8 +691,8 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 			}
 		}
 	}
-	var data bytes.Buffer
-	if _, err := page.WriteContent(ctx, &data); err != nil {
+	data, err := page.readContentBytes(ctx)
+	if err != nil {
 		return err
 	}
 	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: page.CropBox}
@@ -718,10 +732,10 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 				v.Warning = visitor.Warning
 			}
 			child.visitor = v
-			return child.run(data.Bytes())
+			return child.run(data)
 		})
 	}
-	return interpreter.run(data.Bytes())
+	return interpreter.run(data)
 }
 
 // WalkType3Glyph 按文字位置解释Type3字形内容流并访问其中的图元
@@ -778,7 +792,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 			return ctx.Err()
 		}
 	}
-	if len(mark.glyphStreams) >= 64 {
+	if len(mark.glyphStreams) >= 64 || mark.depth >= 1024 {
 		return fmt.Errorf("Type3 character procedure depth exceeded")
 	}
 	if len(stream.Data) == 0 {
@@ -795,17 +809,41 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	}
 	position := mark.Positions[index]
 	text := Matrix{mark.Size * mark.HorizontalScale, 0, 0, mark.Size, position.X, position.Y}
+	matrix := mark.Matrix.Mul(text).Mul(font.type3Matrix)
+	if !matrixFinite(matrix) {
+		return fmt.Errorf("nonfinite Type3 glyph matrix")
+	}
 	resources := font.type3Resources
 	if resources == nil {
 		resources = mark.Resources
 	}
-	interpreter := pageInterpreter{reader: r, page: mark.page, stream: stream, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), type3: true, replacement: mark.Replacement, sequence: mark.Sequence}
+	interpreter := pageInterpreter{reader: r, page: mark.page, stream: stream, resources: resources, pageResources: mark.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), depth: mark.depth + 1, type3: true, replacement: mark.Replacement, sequence: mark.Sequence}
 	interpreter.glyphStreams = append(append([]*Stream(nil), mark.glyphStreams...), stream)
+	interpreter.formStreams = mark.formStreams
+	interpreter.patternStreams = mark.patternStreams
 	interpreter.patternMatrix = Identity()
-	interpreter.state = graphicsState{matrix: mark.Matrix.Mul(text).Mul(font.type3Matrix), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: mark.Style}
+	if mark.state != nil {
+		interpreter.state = *mark.state
+		interpreter.state.matrix = matrix
+		interpreter.state.hscale = 1
+		interpreter.state.style = mark.Style
+	} else {
+		fillSpace, strokeSpace := Name("DeviceGray"), Name("DeviceGray")
+		if mark.Style.Fill.SourceSpace == "Pattern" {
+			fillSpace = "Pattern"
+		}
+		if mark.Style.Stroke.SourceSpace == "Pattern" {
+			strokeSpace = "Pattern"
+		}
+		interpreter.state = graphicsState{matrix: matrix, hscale: 1, fillSpace: fillSpace, strokeSpace: strokeSpace, style: mark.Style}
+	}
 	interpreter.state.nonKnockout = mark.Object != nil && !mark.Object.Knockout
 	if font.type3Bounds != nil {
-		interpreter.bounds = transformedBounds(*font.type3Bounds, interpreter.state.matrix)
+		bounds := transformedBounds(*font.type3Bounds, interpreter.state.matrix)
+		if !rectFinite(bounds) {
+			return fmt.Errorf("nonfinite Type3 glyph bounds")
+		}
+		interpreter.bounds = bounds
 	}
 	return interpreter.run(data)
 }
@@ -1038,7 +1076,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 		}
 		p.uncoloredType3 = op.Operator == "d1"
 		if op.Operator == "d1" {
-			p.bounds = transformedBounds(Rectangle{v[2], v[3], v[4], v[5]}, p.state.matrix)
+			bounds := transformedBounds(Rectangle{v[2], v[3], v[4], v[5]}, p.state.matrix)
+			if !rectFinite(bounds) {
+				return p.operationWarning(op, "nonfinite Type3 glyph bounds")
+			}
+			p.bounds = bounds
 		}
 	case "q":
 		if len(p.stack) >= 256 {
@@ -1052,7 +1094,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.state = p.stack[len(p.stack)-1]
 		p.stack = p.stack[:len(p.stack)-1]
 	case "cm":
-		p.state.matrix = p.state.matrix.Mul(Matrix(v))
+		next := p.state.matrix.Mul(Matrix(v))
+		if !matrixFinite(next) {
+			return p.operationWarning(op, "nonfinite transform matrix")
+		}
+		p.state.matrix = next
 	case "w":
 		if v[0] < 0 {
 			if err := p.operationWarning(op, "negative line width uses hairline default"); err != nil {
@@ -1210,7 +1256,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if stroke {
 				m := p.state.matrix
 				sx, sy := math.Hypot(m[0], m[1]), math.Hypot(m[2], m[3])
-				if math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy) {
+				if sx == 0 || sy == 0 || math.IsNaN(sx) || math.IsInf(sx, 0) || math.IsNaN(sy) || math.IsInf(sy, 0) || math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy) {
 					strokeMatrix = Matrix{m[0], m[1], m[2], m[3], 0, 0}
 					if _, ok := strokeMatrix.Inverse(); !ok {
 						if p.visitor.Warning == nil {
@@ -1259,7 +1305,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if p.resources["ColorSpace"] == nil && p.reader.deviceProfile == nil {
 			return p.setDeviceColor(v, name, fill)
 		}
-		object, err := p.reader.resourceColorSpace(name, p.resources)
+		object, err := p.reader.resourceColorSpaceContext(p.ctx, name, p.resources)
 		if err != nil {
 			return err
 		}
@@ -1286,11 +1332,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if !ok {
 			return fmt.Errorf("invalid color space name")
 		}
-		original, err := p.reader.remapColorSpace(name, p.resources, false, 0)
+		original, err := p.reader.remapColorSpaceContext(p.ctx, name, p.resources, false, 0)
 		if err != nil {
 			return err
 		}
-		object, err := p.reader.resourceColorSpace(original, p.resources)
+		object, err := p.reader.resourceColorSpaceContext(p.ctx, original, p.resources)
 		if err != nil {
 			return err
 		}
@@ -1428,6 +1474,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 					return err
 				}
 				patternBase = nil
+				a = a[len(a)-1:]
 			}
 			if patternBase != nil {
 				if err := patternBaseColor(&paint, patternBase, a[:len(a)-1], p.state.style.RenderingIntent); err != nil {
@@ -1540,14 +1587,22 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.textMatrix = Matrix(v)
 		p.lineMatrix = p.textMatrix
 	case "Td", "TD":
+		next := p.lineMatrix.Mul(Matrix{1, 0, 0, 1, v[0], v[1]})
+		if !matrixFinite(next) {
+			return p.operationWarning(op, "nonfinite text matrix")
+		}
 		if op.Operator == "TD" {
 			p.state.leading = -v[1]
 		}
-		p.lineMatrix = p.lineMatrix.Mul(Matrix{1, 0, 0, 1, v[0], v[1]})
-		p.textMatrix = p.lineMatrix
+		p.lineMatrix = next
+		p.textMatrix = next
 	case "T*":
-		p.lineMatrix = p.lineMatrix.Mul(Matrix{1, 0, 0, 1, 0, -p.state.leading})
-		p.textMatrix = p.lineMatrix
+		next := p.lineMatrix.Mul(Matrix{1, 0, 0, 1, 0, -p.state.leading})
+		if !matrixFinite(next) {
+			return p.operationWarning(op, "nonfinite text matrix")
+		}
+		p.lineMatrix = next
+		p.textMatrix = next
 	case "'", "\"":
 		if op.Operator == "\"" {
 			if len(a) != 3 {
@@ -1601,7 +1656,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 				} else {
 					shift[4] = -adjustment[0] / 1000 * p.state.fontSize * p.state.hscale
 				}
-				p.textMatrix = p.textMatrix.Mul(shift)
+				next := p.textMatrix.Mul(shift)
+				if !matrixFinite(next) {
+					return p.operationWarning(op, "nonfinite text matrix")
+				}
+				p.textMatrix = next
 			}
 		}
 	case "sh":
@@ -1701,6 +1760,10 @@ func (p *pageInterpreter) showText(data []byte) error {
 		if p.hidden {
 			mode = 3
 		} else if mode != 3 {
+			fill, _ := p.visiblePaint(true, false)
+			if err := p.validatePaint(fill, false); err != nil {
+				return err
+			}
 			mode = 0
 		}
 	} else {
@@ -1752,13 +1815,22 @@ func (p *pageInterpreter) showText(data []byte) error {
 		if p.visitor.Text == nil {
 			return fmt.Errorf("text visitor missing")
 		}
-		mark := TextMark{Object: p.textObject, Replacement: p.replacement, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: p.state.matrix.Mul(p.textMatrix), StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
+		combined := p.state.matrix.Mul(p.textMatrix)
+		if !matrixFinite(combined) {
+			return p.operationWarning(Operation{Operator: "Tj"}, "nonfinite text matrix")
+		}
+		mark := TextMark{Object: p.textObject, Replacement: p.replacement, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: combined, StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
 		mark.Sequence = p.sequence
 		if mark.Font.Subtype == "Type3" {
 			mark.page = p.page
 			mark.Resources = p.pageResources
+			stateCopy := p.state
+			mark.state = &stateCopy
 		}
+		mark.depth = p.depth
 		mark.glyphStreams = p.glyphStreams
+		mark.formStreams = p.formStreams
+		mark.patternStreams = p.patternStreams
 		mark.halftones = p.visitor.Halftones
 		if mark.Mode >= 4 {
 			mark.Clip = &TextClip{Font: mark.Font, Glyphs: glyphs, Positions: positions, Matrix: mark.Matrix, Size: mark.Size, HorizontalScale: mark.HorizontalScale}
@@ -1768,7 +1840,11 @@ func (p *pageInterpreter) showText(data []byte) error {
 			return err
 		}
 	}
-	p.textMatrix = p.textMatrix.Mul(Matrix{1, 0, 0, 1, advance.X, advance.Y})
+	next := p.textMatrix.Mul(Matrix{1, 0, 0, 1, advance.X, advance.Y})
+	if !matrixFinite(next) {
+		return p.operationWarning(Operation{Operator: "Tj"}, "nonfinite text matrix")
+	}
+	p.textMatrix = next
 	return nil
 }
 
@@ -2107,17 +2183,17 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 			return err
 		}
 		if space != nil {
-			space, err = groupReader.resourceColorSpace(space, groupResources)
+			space, err = groupReader.resourceColorSpaceContext(p.ctx, space, groupResources)
 			if err != nil {
 				return err
 			}
-			groupMark.ColorSpace, err = groupReader.readBlendingSpace(space)
+			groupMark.ColorSpace, err = groupReader.readBlendingSpaceContext(p.ctx, space)
 			if err != nil {
 				return err
 			}
 		}
 		if p.visitor.Group == nil && groupMark.ColorSpace != nil {
-			if err := groupReader.validateRGBGroupSpace(space); err != nil {
+			if err := groupReader.validateRGBGroupSpaceContext(p.ctx, space); err != nil {
 				return err
 			}
 		}
@@ -2159,6 +2235,9 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 			return err
 		}
 		child.state.matrix = child.state.matrix.Mul(Matrix(m))
+		if !matrixFinite(child.state.matrix) {
+			return fmt.Errorf("nonfinite form matrix")
+		}
 	}
 	box, err := p.reader.rectangle(stream.Dictionary["BBox"])
 	if err != nil {
@@ -2166,10 +2245,13 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 	}
 	m := child.state.matrix
 	child.bounds = transformedBounds(box, m)
+	if !rectFinite(child.bounds) {
+		return fmt.Errorf("nonfinite form bounds")
+	}
 	if p.bounds.XMax > p.bounds.XMin && p.bounds.YMax > p.bounds.YMin {
 		child.bounds.XMin, child.bounds.YMin = math.Max(child.bounds.XMin, p.bounds.XMin), math.Max(child.bounds.YMin, p.bounds.YMin)
 		child.bounds.XMax, child.bounds.YMax = math.Min(child.bounds.XMax, p.bounds.XMax), math.Min(child.bounds.YMax, p.bounds.YMax)
-		if child.bounds.XMax <= child.bounds.XMin || child.bounds.YMax <= child.bounds.YMin {
+		if !rectFinite(child.bounds) || child.bounds.XMax <= child.bounds.XMin || child.bounds.YMax <= child.bounds.YMin {
 			return p.ctx.Err()
 		}
 	}
@@ -2198,7 +2280,7 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 	if groupMark != nil && p.visitor.Group != nil {
 		mark := *groupMark
 		if target == nil {
-			mark.Ref = formRef
+			mark.Reference = formRef
 			mark.Stream = source
 		}
 		mark.Bounds = box
@@ -2234,7 +2316,7 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 	if groupMark == nil && p.visitor.Form != nil {
 		mark := FormMark{Bounds: box, Matrix: m, OuterClips: outerClips}
 		if target == nil {
-			mark.Ref = formRef
+			mark.Reference = formRef
 			mark.Stream = source
 		}
 		return p.visitor.Form(mark, func(visitor Visitor) error {
@@ -2267,7 +2349,7 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 	return walk(&child)
 }
 
-// extState 读取可表达的外部图形状态，不忽略未知绘制效果
+// extState 读取已支持的外部图形状态，未列出的私有或扩展键按规范忽略
 // 入参: a 图形状态操作数, offset 当前内容流中的字节位置
 // 返回: error 错误信息
 func (p *pageInterpreter) extState(a []Object, offset int64) error {
@@ -2439,7 +2521,7 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				p.state.style.Transfer = nil
 				continue
 			}
-			p.state.style.Transfer, err = p.reader.ReadTransferFunction(value)
+			p.state.style.Transfer, err = p.reader.readTransferFunctionContext(p.ctx, value)
 			if err != nil {
 				return err
 			}
@@ -2576,7 +2658,7 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 					return err
 				}
 			} else if (key != "BG2" && key != "UCR2") || value != Name("Default") {
-				function, err = p.reader.ReadColorFunction(value)
+				function, err = p.reader.readColorFunctionContext(p.ctx, value)
 				if err != nil {
 					return err
 				}
@@ -2586,8 +2668,6 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 			} else {
 				p.state.style.ColorConversion.UndercolorRemoval = function
 			}
-		default:
-			return &UnsupportedError{Feature: fmt.Sprintf("graphics state field %q", key)}
 		}
 	}
 	return nil

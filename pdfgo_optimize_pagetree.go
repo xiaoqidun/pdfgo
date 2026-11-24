@@ -29,8 +29,7 @@ type balancedPageTree struct {
 	added     []Reference
 }
 
-// buildBalancedPageTree 在页面数超阈值且原树过宽或过深时重建度为64的平衡Pages树
-// 复用原根Pages引用并下推被移除中间节点的可继承属性，存在外部引用或未知扩展键时保守跳过
+// buildBalancedPageTree 在页面树过宽过深时重建度为64的平衡Pages树并下推可继承属性，有外部引用或未知键时保守跳过
 // 入参: ctx 取消上下文, trailer 尾字典, refs 当前可达对象, isStream 流对象标记, metadata 对象属性映射, aliases 对象别名映射, maxID 当前最大对象号指针
 // 返回: *balancedPageTree 重建结果，无需或不宜重建时为nil, error 取消错误
 func buildBalancedPageTree(ctx context.Context, trailer Dictionary, refs []Reference, isStream map[Reference]bool, metadata map[Reference]Object, aliases map[Reference]Reference, maxID *int64) (*balancedPageTree, error) {

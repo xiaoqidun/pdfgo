@@ -14,7 +14,10 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // ProcessColorants 保存过程空间及源分量对应的过程通道，专色通道为-1，Channels切片只读
 type ProcessColorants struct {
@@ -59,9 +62,12 @@ func (p *ProcessColorants) CMYKMask() ([4]bool, bool) {
 }
 
 // applyNChannelProcess 按过程字典映射可直接输出的过程分量，保留备用着色函数校验
-// 入参: space 多色定义, tint 已解析的备用变换, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: error 过程定义错误
-func (r *Reader) applyNChannelProcess(space Array, tint *deviceNSpace, effective bool, depth int) error {
+// 入参: ctx 取消上下文, space 多色定义, tint 已解析的备用变换, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: error 过程定义或取消错误
+func (r *Reader) applyNChannelProcess(ctx context.Context, space Array, tint *deviceNSpace, effective bool, depth int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(space) != 5 {
 		return nil
 	}
@@ -89,14 +95,14 @@ func (r *Reader) applyNChannelProcess(space Array, tint *deviceNSpace, effective
 				return fmt.Errorf("missing NChannel process dictionary")
 			}
 		}
-		tint.colorants.spots, err = r.readNChannelSpots(attrs, names, nil, effective, depth+1)
+		tint.colorants.spots, err = r.readNChannelSpots(ctx, attrs, names, nil, effective, depth+1)
 		return err
 	}
 	process, ok := value.(Dictionary)
 	if !ok {
 		return fmt.Errorf("invalid NChannel process dictionary")
 	}
-	output, lab, err := r.readDeviceNAlternate(process["ColorSpace"])
+	output, lab, err := r.readDeviceNAlternateContext(ctx, process["ColorSpace"])
 	if err != nil {
 		return err
 	}
@@ -159,7 +165,7 @@ func (r *Reader) applyNChannelProcess(space Array, tint *deviceNSpace, effective
 			}
 		}
 	}
-	tint.colorants.spots, err = r.readNChannelSpots(attrs, names, channels, effective, depth+1)
+	tint.colorants.spots, err = r.readNChannelSpots(ctx, attrs, names, channels, effective, depth+1)
 	if err != nil {
 		return err
 	}
@@ -180,13 +186,18 @@ func (r *Reader) applyNChannelProcess(space Array, tint *deviceNSpace, effective
 	tint.input, tint.output = gradientUnitBounds(tint.components), gradientUnitBounds(output.Components())
 	if lab != nil {
 		tint.output = []float64{0, 100, lab.rangeAB[0], lab.rangeAB[1], lab.rangeAB[2], lab.rangeAB[3]}
+	} else if output.profile != nil && output.profile.ranges != nil {
+		ranges := output.profile.sourceRanges()
+		tint.output = append([]float64(nil), ranges[:output.Components()*2]...)
 	}
 	tint.transform, tint.sampled, tint.program = nil, nil, nil
 	tint.expressions = make([]affineValue, output.Components())
 	for channel, input := range indices {
+		low, high := tint.output[2*channel], tint.output[2*channel+1]
 		tint.expressions[channel] = make(affineValue, tint.components+1)
+		tint.expressions[channel][0] = low
 		if input >= 0 {
-			tint.expressions[channel][input+1] = 1
+			tint.expressions[channel][input+1] = high - low
 			tint.process.Channels[input] = channel
 		}
 	}
@@ -194,9 +205,12 @@ func (r *Reader) applyNChannelProcess(space Array, tint *deviceNSpace, effective
 }
 
 // readNChannelSpots 编译所用专色的独立分色定义，忽略过程分量的同名定义
-// 入参: attrs 属性字典, names 色料名称, process 过程分量映射, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: []*separationSpace 按源分量保存的专色变换, error 专色定义错误
-func (r *Reader) readNChannelSpots(attrs Dictionary, names []Name, process map[Name]int, effective bool, depth int) ([]*separationSpace, error) {
+// 入参: ctx 取消上下文, attrs 属性字典, names 色料名称, process 过程分量映射, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: []*separationSpace 按源分量保存的专色变换, error 专色定义或取消错误
+func (r *Reader) readNChannelSpots(ctx context.Context, attrs Dictionary, names []Name, process map[Name]int, effective bool, depth int) ([]*separationSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var colorants Dictionary
 	var spots []*separationSpace
 	loaded := false
@@ -232,7 +246,7 @@ func (r *Reader) readNChannelSpots(attrs Dictionary, names []Name, process map[N
 		if value != name {
 			return nil, fmt.Errorf("mismatched NChannel spot colorant %q", name)
 		}
-		spots[i], err = r.readSeparationSpace(definition, effective, depth)
+		spots[i], err = r.readSeparationSpaceContext(ctx, definition, effective, depth)
 		if err != nil {
 			return nil, fmt.Errorf("NChannel spot colorant %q: %w", name, err)
 		}

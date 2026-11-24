@@ -182,6 +182,9 @@ func inlineFilterLength(ctx context.Context, data []byte, filter Name, params Ob
 		if errors.Is(err, zlib.ErrChecksum) && warning != nil {
 			warning(Diagnostic{Message: "inline Flate checksum mismatch; complete compressed data retained"})
 			err = nil
+			if errors.Is(closeErr, zlib.ErrChecksum) {
+				closeErr = nil
+			}
 		}
 		if err != nil {
 			return 0, err

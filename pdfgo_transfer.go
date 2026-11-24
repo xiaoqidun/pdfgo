@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -47,6 +48,19 @@ func transferChannel(colorant Name) (int, bool) {
 // 入参: object 传递函数定义或Identity
 // 返回: *TransferFunction 已解析函数, error 引用或函数错误
 func (r *Reader) ReadTransferFunction(object Object) (*TransferFunction, error) {
+	return r.readTransferFunctionContext(context.Background(), object)
+}
+
+// readTransferFunctionContext 在取消上下文内解析单函数或四通道传递函数
+// 入参: ctx 取消上下文, object 传递函数定义或Identity
+// 返回: *TransferFunction 已解析函数, error 引用、函数或取消错误
+func (r *Reader) readTransferFunctionContext(ctx context.Context, object Object) (*TransferFunction, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if r.closed {
 		return nil, os.ErrClosed
 	}
@@ -73,7 +87,7 @@ func (r *Reader) ReadTransferFunction(object Object) (*TransferFunction, error) 
 		if object == Name("Identity") {
 			continue
 		}
-		function, err := r.ReadColorFunction(object)
+		function, err := r.readColorFunctionContext(ctx, object)
 		if err != nil {
 			return nil, err
 		}
@@ -104,6 +118,9 @@ func (r *Reader) ReadTransferFunction(object Object) (*TransferFunction, error) 
 // 入参: fallback 图形状态函数, halftone 网屏定义, model 原生设备颜色空间
 // 返回: *TransferFunction 有效函数, error 通道或函数错误
 func (r *Reader) DeviceTransfer(fallback *TransferFunction, halftone *Halftone, model Name) (*TransferFunction, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
 	if r.closed {
 		return nil, os.ErrClosed
 	}
@@ -182,6 +199,9 @@ func (f *TransferFunction) deviceChannels(colorants [4]Name) *TransferFunction {
 // 入参: fallback 图形状态函数, halftone 网屏定义, colorant 原生分量名称
 // 返回: *TransferFunction 各通道相同的独立函数，空值为恒等, error 分量或函数错误
 func (r *Reader) ColorantTransfer(fallback *TransferFunction, halftone *Halftone, colorant Name) (*TransferFunction, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
 	if r.closed {
 		return nil, os.ErrClosed
 	}

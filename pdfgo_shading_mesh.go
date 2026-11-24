@@ -277,12 +277,12 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	}
 	g := &MeshGradient{Intent: p.state.style.RenderingIntent, Matrix: matrix}
 	var components int
-	g.Space, g.tint, g.lab, components, err = p.reader.readShadingColorSpace(object, true)
+	g.Space, g.tint, g.lab, components, err = p.reader.readShadingColorSpaceContext(p.ctx, object, true)
 	if err != nil {
 		return Paint{}, err
 	}
 	if d["Function"] != nil {
-		g.function, err = p.reader.readGradientVector(d["Function"], components, 0)
+		g.function, err = p.reader.readGradientVectorContext(p.ctx, d["Function"], components, 0)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -297,8 +297,20 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	if err != nil {
 		return Paint{}, err
 	}
+	maxBytes, _ := effectiveStreamLimits(p.reader, stream)
+	var maxTriangles, maxPatches int64
+	if maxBytes > 0 {
+		maxMeshBudget := int64(256 << 20)
+		if maxBytes > math.MaxInt64/4 {
+			maxMeshBudget = math.MaxInt64
+		} else if budget := maxBytes * 4; budget > maxMeshBudget {
+			maxMeshBudget = budget
+		}
+		maxTriangles = maxMeshBudget / 144
+		maxPatches = maxMeshBudget / 400
+	}
 	if kind == 4 || kind == 5 {
-		g.Triangles, err = p.meshTriangleData(d, data, depths, ranges, colorBounds, components, kind == 5)
+		g.Triangles, err = p.meshTriangleData(d, data, depths, ranges, colorBounds, components, kind == 5, maxTriangles)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -319,15 +331,25 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		value, err := bits.read(depth)
 		return functionValue(float64(value)/float64(uint64(1)<<uint(depth)-1), ranges[index], ranges[index+1]), err
 	}
+	warnedFlag := false
 	for bits.pos < len(data)*8 {
 		if err := p.ctx.Err(); err != nil {
 			return Paint{}, err
+		}
+		if maxPatches > 0 && int64(len(g.Patches)) >= maxPatches {
+			return Paint{}, fmt.Errorf("%w: mesh shading element limit exceeded", ErrStreamLimitExceeded)
 		}
 		flag, err := bits.read(depths[2])
 		if err != nil {
 			return Paint{}, err
 		}
-		flag &= 3
+		if flag > 3 {
+			if !warnedFlag && p.reader.warning != nil {
+				warnedFlag = true
+				p.reader.warning(Diagnostic{Message: "mesh shading flag high bits ignored"})
+			}
+			flag &= 3
+		}
 		var points [16]Point
 		startPoint, startColor := 0, 0
 		if flag != 0 {
@@ -387,9 +409,9 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 }
 
 // meshTriangleData 按边标志或格点行顺序解码三角网格，保留绘制顺序
-// 入参: dict 着色字典, data 解码数据, depths 数值位宽, ranges 解码区间, colorBounds 顶点颜色范围，函数参数不设此范围, components 分量数, lattice 是否为格点网格
-// 返回: []MeshTriangle 三角形, error 结构或取消错误
-func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths [3]int, ranges, colorBounds []float64, components int, lattice bool) ([]MeshTriangle, error) {
+// 入参: dict 着色字典, data 解码数据, depths 数值位宽, ranges 解码区间, colorBounds 顶点颜色范围，函数参数不设此范围, components 分量数, lattice 是否为格点网格, maxTriangles 三角形数量预算，零值不限制
+// 返回: []MeshTriangle 三角形, error 结构、预算或取消错误
+func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths [3]int, ranges, colorBounds []float64, components int, lattice bool, maxTriangles int64) ([]MeshTriangle, error) {
 	type vertex struct {
 		point Point
 		color []float64
@@ -400,11 +422,19 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 	}
 	count := len(data) / stride
 	bits := meshBits{data: data}
+	warnedFlag := false
 	read := func() (vertex, uint32, error) {
 		v := vertex{color: make([]float64, components)}
 		flag, err := bits.read(depths[2])
 		if err != nil {
 			return v, 0, err
+		}
+		if flag > 3 {
+			if !warnedFlag && p.reader.warning != nil {
+				warnedFlag = true
+				p.reader.warning(Diagnostic{Message: "mesh shading flag high bits ignored"})
+			}
+			flag &= 3
 		}
 		for index := 0; index < 2+components; index++ {
 			depth := depths[1]
@@ -430,7 +460,7 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 			}
 		}
 		bits.pos = (bits.pos + 7) / 8 * 8
-		return v, flag & 3, nil
+		return v, flag, nil
 	}
 	var result []MeshTriangle
 	appendTriangle := func(a, b, c vertex) {
@@ -444,6 +474,11 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 		columns, ok := value.(Integer)
 		if !ok || columns < 2 || columns > Integer(count/2) || Integer(count)%columns != 0 {
 			return nil, fmt.Errorf("invalid mesh lattice dimensions")
+		}
+		rows := int64(count) / int64(columns)
+		cols := int64(columns)
+		if maxTriangles > 0 && (rows-1 > maxTriangles/2/(cols-1) || (rows-1)*(cols-1)*2 > maxTriangles) {
+			return nil, fmt.Errorf("%w: mesh shading element limit exceeded", ErrStreamLimitExceeded)
 		}
 		row := make([]vertex, int(columns))
 		var aboveLeft, left vertex
@@ -468,6 +503,9 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 		for bits.pos < len(data)*8 {
 			if err := p.ctx.Err(); err != nil {
 				return nil, err
+			}
+			if maxTriangles > 0 && int64(len(result)) >= maxTriangles {
+				return nil, fmt.Errorf("%w: mesh shading element limit exceeded", ErrStreamLimitExceeded)
 			}
 			v, flag, err := read()
 			if err != nil {

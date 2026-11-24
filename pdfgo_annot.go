@@ -371,7 +371,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 			stream, synthErr = r.widgetAppearance(ctx, page, annotation)
 		case "FreeText":
 			var text string
-			text, synthErr = r.ReadAnnotationTextContext(ctx, annotation, "Contents", visitor.Warning)
+			text, synthErr = r.readAnnotationText(ctx, annotation, "Contents", visitor.Warning)
 			if synthErr == nil {
 				annotation.Dictionary = maps.Clone(annotation.Dictionary)
 				annotation.Dictionary["Contents"] = String("\xef\xbb\xbf" + text)
@@ -392,16 +392,18 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		case "Square", "Circle", "Polygon", "PolyLine":
 			stream, synthErr = r.shapeAppearance(annotation)
 		case "Screen":
-			return nil
+			return ctx.Err()
 		case "Movie":
 			var movie Movie
 			movie, synthErr = r.ReadMovie(annotation.Dictionary["Movie"])
 			if synthErr == nil {
 				if movie.Poster == Boolean(true) {
 					synthErr = &UnsupportedError{Feature: "poster extraction from movie"}
-				} else if poster, ok := movie.Poster.(*Stream); !ok {
-					return nil
 				} else {
+					poster, ok := movie.Poster.(*Stream)
+					if !ok || poster == nil {
+						return ctx.Err()
+					}
 					stream = &Stream{Dictionary: Dictionary{"Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Integer(1), Integer(1)}, "Resources": Dictionary{"XObject": Dictionary{"Poster": poster}}}, Data: []byte("/Poster Do"), reader: r, cache: r.cache, hasWarning: r.warning != nil}
 				}
 			}
@@ -510,9 +512,13 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	}
 	rect := annotation.Rect
 	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
+	tx, ty := rect.XMin-minX*scaleX, rect.YMin-minY*scaleY
+	if math.IsInf(scaleX, 0) || math.IsNaN(scaleX) || math.IsInf(scaleY, 0) || math.IsNaN(scaleY) || math.IsInf(tx, 0) || math.IsNaN(tx) || math.IsInf(ty, 0) || math.IsNaN(ty) {
+		return fmt.Errorf("invalid appearance transform")
+	}
 	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: rect}
 	interpreter.patternMatrix = Identity()
-	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, rect.XMin - minX*scaleX, rect.YMin - minY*scaleY}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
+	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, tx, ty}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
 	for _, operator := range []string{"g", "G"} {
 		if err := interpreter.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
 			return err
@@ -663,17 +669,13 @@ func (r *Reader) BaseURI() (string, error) {
 	return string(base), nil
 }
 
-// ReadDestination 解析直接目标或名称树中的命名目标，不跳转页面
-// 入参: object 目标数组、名称、字符串或引用
+// ReadDestination 解析直接目标或名称树中的命名目标，保留名称对象与名称树的区别，不跳转页面
+// 入参: ctx 取消上下文, object 目标数组、名称、字符串或引用
 // 返回: Destination 跳转目标, error 错误信息
-func (r *Reader) ReadDestination(object Object) (Destination, error) {
-	return r.readDestination(context.Background(), object)
-}
-
-// readDestination 按上下文解析当前文档目标，保留名称对象与名称树的区别
-// 入参: ctx 取消上下文, object 目标对象
-// 返回: Destination 跳转目标, error 错误信息
-func (r *Reader) readDestination(ctx context.Context, object Object) (Destination, error) {
+func (r *Reader) ReadDestination(ctx context.Context, object Object) (Destination, error) {
+	if ctx == nil {
+		return Destination{}, fmt.Errorf("invalid destination context")
+	}
 	if err := ctx.Err(); err != nil {
 		return Destination{}, err
 	}

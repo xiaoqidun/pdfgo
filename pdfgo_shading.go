@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"math"
 	"slices"
@@ -478,7 +479,7 @@ func (p *pageInterpreter) shadingPatternPaint(v Object, m Matrix) (Paint, error)
 		if err != nil {
 			return Paint{}, err
 		}
-		base, err := p.reader.readPatternColorSpace(object, true)
+		base, err := p.reader.readPatternColorSpaceContext(p.ctx, object, true)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -669,10 +670,23 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 			return Paint{None: true}, p.ctx.Err()
 		}
 		dx, dy := end.X-start.X, end.Y-start.Y
-		gx, gy := inverse[0]*dx+inverse[1]*dy, inverse[2]*dx+inverse[3]*dy
-		factor := (dx*dx + dy*dy) / (gx*gx + gy*gy)
+		dNorm := math.Hypot(dx, dy)
+		if dNorm == 0 || math.IsNaN(dNorm) || math.IsInf(dNorm, 0) {
+			return Paint{}, fmt.Errorf("invalid axial shading axis")
+		}
+		ux, uy := dx/dNorm, dy/dNorm
+		gx, gy := inverse[0]*ux+inverse[1]*uy, inverse[2]*ux+inverse[3]*uy
+		gNorm := math.Hypot(gx, gy)
+		if gNorm == 0 || math.IsNaN(gNorm) || math.IsInf(gNorm, 0) {
+			return Paint{}, fmt.Errorf("invalid axial shading axis")
+		}
+		step := dNorm / gNorm
 		start = m.Apply(start)
-		paint.Axial = &AxialGradient{Matrix: m, Start: start, End: Point{start.X + gx*factor, start.Y + gy*factor}}
+		endPoint := Point{start.X + (gx/gNorm)*step, start.Y + (gy/gNorm)*step}
+		if math.IsNaN(start.X) || math.IsInf(start.X, 0) || math.IsNaN(start.Y) || math.IsInf(start.Y, 0) || math.IsNaN(endPoint.X) || math.IsInf(endPoint.X, 0) || math.IsNaN(endPoint.Y) || math.IsInf(endPoint.Y, 0) {
+			return Paint{}, fmt.Errorf("invalid axial shading axis")
+		}
+		paint.Axial = &AxialGradient{Matrix: m, Start: start, End: endPoint}
 	} else {
 		end := Point{coords[3], coords[4]}
 		paint.Radial = &RadialGradient{Matrix: m, Start: start, End: end, StartRadius: coords[2], EndRadius: coords[5]}
@@ -707,6 +721,9 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		return Paint{}, err
 	}
 	for i := range stops {
+		if err := p.ctx.Err(); err != nil {
+			return Paint{}, err
+		}
 		stop := &stops[i]
 		stop.RGB, err = space.SRGB(stop.Values[:space.Components()], p.state.style.RenderingIntent)
 		if err != nil {
@@ -723,7 +740,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		paint.Radial.function, paint.Radial.domain = function, domain
 	}
 	if array, ok := object.(Array); ok && len(array) == 5 && array[0] == Name("DeviceN") {
-		tint, err := p.reader.readDeviceNSpace(array, true, 0)
+		tint, err := p.reader.readDeviceNSpaceContext(p.ctx, array, true, 0)
 		if err != nil {
 			return Paint{}, err
 		}
@@ -742,10 +759,10 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 	}
 	array, ok := object.(Array)
 	if ok && len(array) > 0 && array[0] == Name("DeviceN") {
-		return p.reader.readDeviceNGradient(array, function, domain, true)
+		return p.reader.readDeviceNGradientContext(p.ctx, array, function, domain, true)
 	}
 	if ok && len(array) > 0 && array[0] == Name("Separation") {
-		separation, err := p.reader.readSeparationSpace(array, true, 0)
+		separation, err := p.reader.readSeparationSpaceContext(p.ctx, array, true, 0)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -753,7 +770,7 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 			return nil, nil, nil, &UnsupportedError{Feature: "Separation None shading"}
 		}
 		space, lab := separation.space, separation.lab
-		source, err := p.reader.readGradientFunction(function, 1, 0)
+		source, err := p.reader.readGradientFunctionContext(p.ctx, function, 1, 0)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -781,11 +798,11 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 		}
 		return stops, space, f, nil
 	}
-	space, _, lab, channels, err := p.reader.readShadingColorSpace(object, true)
+	space, _, lab, channels, err := p.reader.readShadingColorSpaceContext(p.ctx, object, true)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	f, err := p.reader.readGradientFunction(function, channels, 0)
+	f, err := p.reader.readGradientFunctionContext(p.ctx, function, channels, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -805,23 +822,26 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 // 入参: object 颜色空间
 // 返回: Object 颜色空间定义, error 解析错误
 func (p *pageInterpreter) shadingColorSpace(object Object) (Object, error) {
-	return p.reader.resourceColorSpace(object, p.resources)
+	return p.reader.resourceColorSpaceContext(p.ctx, object, p.resources)
 }
 
-// readShadingColorSpace 读取原始或已按资源校验的着色源空间
-// 入参: object 颜色空间, effective 是否已按资源校验并替换
-// 返回: *ColorSpace 输出空间, *deviceNSpace 专色变换, *labSpace Lab变换, int 源分量数, error 格式或能力错误
-func (r *Reader) readShadingColorSpace(object Object, effective bool) (*ColorSpace, *deviceNSpace, *labSpace, int, error) {
+// readShadingColorSpaceContext 在取消上下文内读取原始或已按资源校验的着色源空间
+// 入参: ctx 取消上下文, object 颜色空间, effective 是否已按资源校验并替换
+// 返回: *ColorSpace 输出空间, *deviceNSpace 专色变换, *labSpace Lab变换, int 源分量数, error 格式、能力或取消错误
+func (r *Reader) readShadingColorSpaceContext(ctx context.Context, object Object, effective bool) (*ColorSpace, *deviceNSpace, *labSpace, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, 0, err
+	}
 	if array, ok := object.(Array); ok && len(array) > 0 {
 		switch array[0] {
 		case Name("DeviceN"):
-			tint, err := r.readDeviceNSpace(array, effective, 0)
+			tint, err := r.readDeviceNSpaceContext(ctx, array, effective, 0)
 			if err != nil {
 				return nil, nil, nil, 0, err
 			}
 			return tint.alternate, tint, nil, tint.components, nil
 		case Name("Separation"):
-			separation, err := r.readSeparationSpace(array, effective, 0)
+			separation, err := r.readSeparationSpaceContext(ctx, array, effective, 0)
 			if err != nil {
 				return nil, nil, nil, 0, err
 			}
@@ -835,25 +855,25 @@ func (r *Reader) readShadingColorSpace(object Object, effective bool) (*ColorSpa
 			return &ColorSpace{Model: "DeviceRGB", mapped: true}, nil, lab, 3, err
 		}
 	}
-	space, err := r.readEffectiveColorSpace(object, effective)
+	space, err := r.readEffectiveColorSpaceContext(ctx, object, effective)
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
 	return space, nil, nil, space.Components(), nil
 }
 
-// readDeviceNGradient 组合原始或已按资源校验的多色渐变，不线性化非线性嵌套
-// 入参: space 多色定义, function 渐变函数, domain 输入区间, effective 是否已按资源校验并替换
-// 返回: []GradientStop 分段, *ColorSpace 输出空间, *gradientFunction 颜色函数, error 定义或函数错误
-func (r *Reader) readDeviceNGradient(space Array, function Object, domain [2]float64, effective bool) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	tint, err := r.readDeviceNSpace(space, effective, 0)
+// readDeviceNGradientContext 在取消上下文内组合原始或已按资源校验的多色渐变
+// 入参: ctx 取消上下文, space 多色定义, function 渐变函数, domain 输入区间, effective 是否已按资源校验并替换
+// 返回: []GradientStop 分段, *ColorSpace 输出空间, *gradientFunction 颜色函数, error 定义、函数或取消错误
+func (r *Reader) readDeviceNGradientContext(ctx context.Context, space Array, function Object, domain [2]float64, effective bool) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
+	tint, err := r.readDeviceNSpaceContext(ctx, space, effective, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	if tint.components > 4 {
-		return r.deviceNWideGradient(function, tint, domain)
+		return r.deviceNWideGradientContext(ctx, function, tint, domain)
 	}
-	source, err := r.readGradientFunction(function, tint.components, 0)
+	source, err := r.readGradientFunctionContext(ctx, function, tint.components, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}

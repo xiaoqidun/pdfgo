@@ -17,6 +17,8 @@ package pdfgo
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 )
 
 // RenditionAction 描述媒体呈现操作，Annotation和Target分别引用原有或新增屏幕注解，须指定一项
@@ -117,13 +119,7 @@ func (r *Reader) renditionActions(ctx context.Context, options RewriteOptions, a
 			}
 		}
 	}
-	number := int64(0)
-	for id := range r.xref {
-		number = max(number, id)
-	}
-	for ref := range result {
-		number = max(number, ref.Number)
-	}
+	number := r.maxRewriteObjectID(result)
 	output := renditionOutput{
 		reader:     r,
 		copy:       rewriteObjectCopy{ctx: ctx, source: r, objects: result, number: &number, copied: make(map[rewriteObjectIdentity]Reference)},
@@ -152,7 +148,9 @@ func (r *Reader) renditionActions(ctx context.Context, options RewriteOptions, a
 	}
 	view := r.rewriteReader(result)
 	validation := mediaReader{Reader: view, renditions: make(map[uintptr]mediaReadEntry[Rendition]), clips: make(map[uintptr]mediaReadEntry[MediaClip])}
-	for _, ref := range output.renditions {
+	renditionRefs := slices.Collect(maps.Values(output.renditions))
+	slices.SortFunc(renditionRefs, compareReference)
+	for _, ref := range renditionRefs {
 		if _, err := validation.readRendition(ctx, ref, 0); err != nil {
 			return nil, err
 		}
@@ -188,9 +186,12 @@ func (w *renditionOutput) rendition(media *Rendition, depth int) (Reference, err
 				return Reference{}, err
 			}
 		}
-		for key, value := range map[Name]Dictionary{"P": media.Play, "SP": media.Screen} {
-			if value != nil {
-				dict[key], err = w.copy.copy(value, 0)
+		for _, item := range []struct {
+			key   Name
+			value Dictionary
+		}{{"P", media.Play}, {"SP", media.Screen}} {
+			if item.value != nil {
+				dict[item.key], err = w.copy.copy(item.value, 0)
 				if err != nil {
 					return Reference{}, err
 				}
@@ -274,9 +275,12 @@ func (w *renditionOutput) clip(clip *MediaClip, depth int) (Reference, error) {
 				return Reference{}, err
 			}
 		}
-		for key, value := range map[Name]Dictionary{"P": clip.Permissions, "PL": clip.Players} {
-			if value != nil {
-				dict[key], err = w.copy.copy(value, 0)
+		for _, item := range []struct {
+			key   Name
+			value Dictionary
+		}{{"P", clip.Permissions}, {"PL", clip.Players}} {
+			if item.value != nil {
+				dict[item.key], err = w.copy.copy(item.value, 0)
 				if err != nil {
 					return Reference{}, err
 				}
@@ -304,8 +308,8 @@ func (w *renditionOutput) header(kind, subtype Name, name string, parameters map
 		}
 		dict["N"] = text
 	}
-	for key, value := range parameters {
-		if value != nil {
+	for _, key := range slices.Sorted(maps.Keys(parameters)) {
+		if value := parameters[key]; value != nil {
 			copy, err := w.copy.copy(value, 0)
 			if err != nil {
 				return nil, err

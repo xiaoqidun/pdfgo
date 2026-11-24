@@ -133,6 +133,9 @@ func (r *Reader) readRichLineCaption(ctx context.Context, page *Page, object Obj
 	for _, line := range caption.rich {
 		caption.width = max(caption.width, line.width)
 	}
+	if math.IsNaN(caption.width) || math.IsInf(caption.width, 0) || math.IsNaN(caption.height) || math.IsInf(caption.height, 0) {
+		return nil, fmt.Errorf("annotation caption dimensions overflow")
+	}
 	caption.resources = resources
 	return caption, nil
 }

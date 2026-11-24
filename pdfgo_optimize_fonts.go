@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -27,8 +28,7 @@ import (
 	"sync"
 )
 
-// compactTrueType 裁剪静态TrueType轮廓并保留编号、复合依赖、字符表和提示指令
-// 移除失效点阵与辅助提示表，按裁剪后轮廓长度自动选择loca格式并同步head表
+// compactTrueType 裁剪静态TrueType轮廓并移除失效点阵与辅助表，保留字形依赖与提示并同步loca/head表
 // 入参: ctx 取消上下文, data 字体程序, glyphs 可寻址字形
 // 返回: []byte 更小的程序或原文, error 取消错误
 func compactTrueType(ctx context.Context, data []byte, glyphs []uint16) ([]byte, error) {
@@ -268,6 +268,8 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 	} else {
 		workCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
+		var firstErrOnce sync.Once
+		var firstErr error
 		jobs := make(chan int, len(fontRefs))
 		for idx := range fontRefs {
 			jobs <- idx
@@ -291,6 +293,9 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 					value, err := wr.Object(ref)
 					if err != nil {
 						results[idx].err = err
+						if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+							firstErrOnce.Do(func() { firstErr = err })
+						}
 						cancel()
 						continue
 					}
@@ -301,6 +306,9 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 					out, err := wr.optimizeFontStream(workCtx, stream, glyphs[ref])
 					if err != nil {
 						results[idx].err = err
+						if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+							firstErrOnce.Do(func() { firstErr = err })
+						}
 						cancel()
 						continue
 					}
@@ -314,6 +322,9 @@ func (r *Reader) optimizationFontUpdates(ctx context.Context, glyphs map[Referen
 		}
 		for _, res := range results {
 			if res.err != nil {
+				if errors.Is(res.err, context.Canceled) && ctx.Err() == nil && firstErr != nil {
+					return nil, nil, firstErr
+				}
 				return nil, nil, res.err
 			}
 		}
@@ -1178,6 +1189,9 @@ func (r *Reader) optimizationContentData(ctx context.Context, stream *Stream, li
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if maxBytes, _ := effectiveStreamLimits(r, stream); maxBytes > 0 && int64(limit) > maxBytes {
+		limit = int(maxBytes)
+	}
 	if stream.Dictionary["F"] != nil || len(stream.Data) > limit {
 		return nil, io.ErrShortBuffer
 	}
@@ -1202,7 +1216,7 @@ func (r *Reader) optimizationContentData(ctx context.Context, stream *Stream, li
 			if err != nil {
 				return nil, err
 			}
-			data, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1), estimateFlateCapacity(stream.Dictionary, len(data), int64(limit)))
+			data, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1), estimateFlateCapacity(len(data), int64(limit)))
 			closeErr := input.Close()
 			releaseZlibReader(input)
 			if len(data) > limit {
@@ -1232,6 +1246,13 @@ func (r *Reader) optimizationContentData(ctx context.Context, stream *Stream, li
 				return nil, err
 			}
 		case "ASCIIHexDecode":
+			_, size, err := asciiHexSize(ctx, data, nil)
+			if err != nil {
+				return nil, err
+			}
+			if size > limit {
+				return nil, io.ErrShortBuffer
+			}
 			data, err = decodeASCIIHexContext(ctx, data, nil)
 			if err != nil {
 				return nil, err
@@ -1274,6 +1295,9 @@ func (r *Reader) optimizationContentData(ctx context.Context, stream *Stream, li
 // 入参: ctx 取消上下文, stream 字体或映射流, limit 解码上限
 // 返回: []byte 解码数据, error 解码或容量错误
 func (r *Reader) optimizationFontData(ctx context.Context, stream *Stream, limit int) ([]byte, error) {
+	if maxBytes, _ := effectiveStreamLimits(r, stream); maxBytes > 0 && int64(limit) > maxBytes {
+		limit = int(maxBytes)
+	}
 	filters, params, err := stream.filterChain(r)
 	if err != nil {
 		return nil, err
@@ -1287,7 +1311,7 @@ func (r *Reader) optimizationFontData(ctx context.Context, stream *Stream, limit
 		if err != nil {
 			return nil, err
 		}
-		data, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1), estimateFlateCapacity(stream.Dictionary, len(data), int64(limit)))
+		data, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1), estimateFlateCapacity(len(data), int64(limit)))
 		input.Close()
 		releaseZlibReader(input)
 		if err != nil {

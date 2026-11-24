@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -151,9 +152,12 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 }
 
 // readSingleDeviceN 解析单分量DeviceN颜色空间，不将专色浓度解释为设备灰度
-// 入参: space 颜色空间数组, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: *deviceNSpace 着色定义, error 解析或未支持的分量错误
-func (r *Reader) readSingleDeviceN(space Array, effective bool, depth int) (*deviceNSpace, error) {
+// 入参: ctx 取消上下文, space 颜色空间数组, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: *deviceNSpace 着色定义, error 解析、未支持的分量或取消错误
+func (r *Reader) readSingleDeviceN(ctx context.Context, space Array, effective bool, depth int) (*deviceNSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	names, none, err := r.deviceNColorants(space)
 	if err != nil {
 		return nil, err
@@ -167,11 +171,11 @@ func (r *Reader) readSingleDeviceN(space Array, effective bool, depth int) (*dev
 		}
 		return &deviceNSpace{alternate: &ColorSpace{Model: "DeviceRGB"}, components: 1, none: true}, nil
 	}
-	alternate, err := r.readTintAlternate(space[2], effective, depth+1)
+	alternate, err := r.readTintAlternateContext(ctx, space[2], effective, depth+1)
 	if err != nil {
 		return nil, err
 	}
-	transform, err := r.readGradientFunction(space[3], alternate.components, 0)
+	transform, err := r.readGradientFunctionContext(ctx, space[3], alternate.components, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +190,16 @@ func (r *Reader) readSingleDeviceN(space Array, effective bool, depth int) (*dev
 // 入参: space 多色数组, effective 是否已按资源校验并替换, depth 嵌套深度
 // 返回: *deviceNSpace 专色变换, error 定义或函数错误
 func (r *Reader) readDeviceNSpace(space Array, effective bool, depth int) (*deviceNSpace, error) {
+	return r.readDeviceNSpaceContext(context.Background(), space, effective, depth)
+}
+
+// readDeviceNSpaceContext 在取消上下文内读取原始多色或已校验的默认空间替换
+// 入参: ctx 取消上下文, space 多色数组, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: *deviceNSpace 专色变换, error 定义、函数或取消错误
+func (r *Reader) readDeviceNSpaceContext(ctx context.Context, space Array, effective bool, depth int) (*deviceNSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if depth >= 64 {
 		return nil, fmt.Errorf("color space recursion limit exceeded")
 	}
@@ -198,9 +212,9 @@ func (r *Reader) readDeviceNSpace(space Array, effective bool, depth int) (*devi
 	}
 	var result *deviceNSpace
 	if names, ok := object.(Array); ok && len(names) == 1 {
-		result, err = r.readSingleDeviceN(space, effective, depth)
+		result, err = r.readSingleDeviceN(ctx, space, effective, depth)
 	} else {
-		result, err = r.readMultiDeviceN(space, effective, depth)
+		result, err = r.readMultiDeviceN(ctx, space, effective, depth)
 	}
 	if err != nil {
 		return nil, err
@@ -211,16 +225,19 @@ func (r *Reader) readDeviceNSpace(space Array, effective bool, depth int) (*devi
 	}
 	fallback := *result
 	result.colorants = &ColorantSpace{Names: names, tint: &fallback, none: none}
-	if err := r.applyNChannelProcess(space, result, effective, depth); err != nil {
+	if err := r.applyNChannelProcess(ctx, space, result, effective, depth); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
 // readMultiDeviceN 读取多分量专色的备用空间、区间和着色函数
-// 入参: space 多色定义, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: *deviceNSpace 专色变换, error 解析错误
-func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*deviceNSpace, error) {
+// 入参: ctx 取消上下文, space 多色定义, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: *deviceNSpace 专色变换, error 解析或取消错误
+func (r *Reader) readMultiDeviceN(ctx context.Context, space Array, effective bool, depth int) (*deviceNSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	names, none, err := r.deviceNColorants(space)
 	if err != nil {
 		return nil, err
@@ -231,7 +248,7 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 		}
 		return &deviceNSpace{alternate: &ColorSpace{Model: "DeviceRGB"}, components: len(names), none: true}, nil
 	}
-	alternate, err := r.readTintAlternate(space[2], effective, depth+1)
+	alternate, err := r.readTintAlternateContext(ctx, space[2], effective, depth+1)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +268,7 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 		}
 	}
 	if kind == Integer(0) {
-		function, err := r.readSampledFunction(stream, len(names), alternate.components)
+		function, err := r.readSampledFunctionContext(ctx, stream, len(names), alternate.components)
 		if err != nil {
 			return nil, err
 		}
@@ -279,7 +296,7 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 			}
 		}
 	}
-	data, err := r.decodeStream(stream)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
@@ -306,17 +323,20 @@ func (r *Reader) readMultiDeviceN(space Array, effective bool, depth int) (*devi
 	return s, nil
 }
 
-// readDeviceNAlternate 读取专色备用空间，Lab在着色求值后转换为RGB
-// 入参: object 备用颜色空间
-// 返回: *ColorSpace 输出空间, *labSpace Lab变换, error 解析错误
-func (r *Reader) readDeviceNAlternate(object Object) (*ColorSpace, *labSpace, error) {
-	return r.readDeviceNAlternateSpace(object, false)
+// readDeviceNAlternateContext 在取消上下文内读取专色备用空间，Lab在着色求值后转换为RGB
+// 入参: ctx 取消上下文, object 备用颜色空间
+// 返回: *ColorSpace 输出空间, *labSpace Lab变换, error 解析或取消错误
+func (r *Reader) readDeviceNAlternateContext(ctx context.Context, object Object) (*ColorSpace, *labSpace, error) {
+	return r.readDeviceNAlternateSpaceContext(ctx, object, false)
 }
 
-// readDeviceNAlternateSpace 读取原始或已按资源校验的专色备用空间
-// 入参: object 备用定义, effective 是否已按资源校验并替换
-// 返回: *ColorSpace 输出空间, *labSpace Lab变换, error 定义错误
-func (r *Reader) readDeviceNAlternateSpace(object Object, effective bool) (*ColorSpace, *labSpace, error) {
+// readDeviceNAlternateSpaceContext 在取消上下文内读取原始或已按资源校验的专色备用空间
+// 入参: ctx 取消上下文, object 备用定义, effective 是否已按资源校验并替换
+// 返回: *ColorSpace 输出空间, *labSpace Lab变换, error 定义或取消错误
+func (r *Reader) readDeviceNAlternateSpaceContext(ctx context.Context, object Object, effective bool) (*ColorSpace, *labSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	object, err := r.resolveColorSpace(object)
 	if err != nil {
 		return nil, nil, err
@@ -325,6 +345,6 @@ func (r *Reader) readDeviceNAlternateSpace(object Object, effective bool) (*Colo
 		lab, err := r.readLab(array)
 		return &ColorSpace{Model: "DeviceRGB", mapped: true}, lab, err
 	}
-	space, err := r.readEffectiveColorSpace(object, effective)
+	space, err := r.readEffectiveColorSpaceContext(ctx, object, effective)
 	return space, nil, err
 }

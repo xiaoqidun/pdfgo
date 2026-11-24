@@ -960,9 +960,9 @@ func encodePDFImagePass(ctx context.Context, img image.Image, bounds image.Recta
 }
 
 // CreateImage 从像素创建独立PDF图像及软遮罩，不修改文档或分配间接对象编号
-// 入参: ctx 取消上下文, source 像素图像, options 可选编码参数，至多一项
+// 入参: ctx 取消上下文, source 像素图像, options 编码参数
 // 返回: *Image 图像描述及独立编码数据, error 参数、编码或关闭错误
-func (r *Reader) CreateImage(ctx context.Context, source image.Image, options ...ImageWriteOptions) (*Image, error) {
+func (r *Reader) CreateImage(ctx context.Context, source image.Image, options ImageWriteOptions) (*Image, error) {
 	if ctx == nil || r == nil {
 		return nil, fmt.Errorf("invalid image creation context")
 	}
@@ -972,14 +972,7 @@ func (r *Reader) CreateImage(ctx context.Context, source image.Image, options ..
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(options) > 1 {
-		return nil, fmt.Errorf("too many image write options")
-	}
-	var settings ImageWriteOptions
-	if len(options) == 1 {
-		settings = options[0]
-	}
-	stream, mask, err := encodePDFImage(ctx, source, settings)
+	stream, mask, err := encodePDFImage(ctx, source, options)
 	if err != nil {
 		return nil, err
 	}
@@ -989,20 +982,12 @@ func (r *Reader) CreateImage(ctx context.Context, source image.Image, options ..
 	return r.ReadImage(stream)
 }
 
-// ReplaceImagesTo 无损替换间接图像，保留页面布局、其他对象及原加密配置
-// 默认保留非预乘颜色和透明度的八位或十六位精度；不修改源对象，不替换遮罩图像或签名文档
-// 出错时应丢弃本次输出，Reader及图片须在调用期间保持可读
-// 入参: ctx 取消上下文, writer 输出流, images 图像引用与替换像素, options 可选替换参数，至多一项
+// ReplaceImagesTo 无损替换间接图像并保留布局、其余对象及加密配置，默认保留8/16位非预乘精度，不修改源对象且不替换遮罩或签名文档
+// 出错须丢弃输出，调用期间Reader及替换图片须保持可读
+// 入参: ctx 取消上下文, writer 输出流, images 图像引用与替换像素, options 替换参数
 // 返回: OptimizeReport 写出结果, error 参数、编码或写入错误
-func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images map[Reference]image.Image, options ...ImageWriteOptions) (OptimizeReport, error) {
-	if len(options) > 1 {
-		return OptimizeReport{}, fmt.Errorf("too many image write options")
-	}
-	var settings ImageWriteOptions
-	if len(options) == 1 {
-		settings = options[0]
-	}
-	return r.RewriteTo(ctx, writer, RewriteOptions{Images: images, ImageOptions: settings})
+func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images map[Reference]image.Image, options ImageWriteOptions) (OptimizeReport, error) {
+	return r.RewriteTo(ctx, writer, RewriteOptions{Images: images, ImageOptions: options})
 }
 
 // prepareImageReplacements 校验替换图像并准备延迟编码元信息，不提前压缩像素
@@ -1013,29 +998,12 @@ func (r *Reader) prepareImageReplacements(ctx context.Context, images map[Refere
 	if len(images) == 0 {
 		return lazy, nil
 	}
-	maximum := int64(0)
-	for number := range r.xref {
-		maximum = max(maximum, number)
-	}
+	maximum := r.maxRewriteObjectID(nil)
 	if maximum > math.MaxInt32-int64(len(images))-1024 {
 		return nil, fmt.Errorf("PDF object number exceeds output limit")
 	}
 	refs := slices.Collect(maps.Keys(images))
-	slices.SortFunc(refs, func(a, b Reference) int {
-		if a.Number != b.Number {
-			if a.Number < b.Number {
-				return -1
-			}
-			return 1
-		}
-		if a.Generation < b.Generation {
-			return -1
-		}
-		if a.Generation > b.Generation {
-			return 1
-		}
-		return 0
-	})
+	slices.SortFunc(refs, compareReference)
 	for _, ref := range refs {
 		if err := ctx.Err(); err != nil {
 			return nil, err

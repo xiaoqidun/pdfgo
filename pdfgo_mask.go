@@ -53,24 +53,10 @@ func (m *SoftMask) Transfer(value float64) (float64, error) {
 	return math.Max(0, math.Min(1, value)), nil
 }
 
-// Walk 访问蒙版图元，坐标与引用蒙版的页面一致
-// 入参: visitor 蒙版图元访问器
-// 返回: error 解析或访问错误
-func (m *SoftMask) Walk(visitor Visitor) error {
-	if m == nil {
-		return fmt.Errorf("invalid soft mask")
-	}
-	ctx := m.interpreter.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return m.WalkContext(ctx, visitor)
-}
-
-// WalkContext 使用本次取消上下文访问蒙版图元，不修改原始解析状态
+// Walk 使用取消上下文访问蒙版图元，坐标与引用蒙版的页面一致，不修改原始解析状态
 // 入参: ctx 取消上下文, visitor 蒙版图元访问器
 // 返回: error 解析、访问或取消错误
-func (m *SoftMask) WalkContext(ctx context.Context, visitor Visitor) error {
+func (m *SoftMask) Walk(ctx context.Context, visitor Visitor) error {
 	if ctx == nil {
 		return fmt.Errorf("invalid soft mask context")
 	}
@@ -177,7 +163,7 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 				return nil, fmt.Errorf("invalid soft mask resources")
 			}
 		}
-		m.ColorSpace, err = p.reader.resourceBlendingSpace(v, resources)
+		m.ColorSpace, err = p.reader.resourceBlendingSpaceContext(p.ctx, v, resources)
 		if err != nil {
 			return nil, err
 		}
@@ -229,7 +215,7 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		return nil, err
 	}
 	if transfer != nil && transfer != Name("Identity") {
-		m.transfer, err = p.reader.readGradientFunction(transfer, 1, 0)
+		m.transfer, err = p.reader.readGradientFunctionContext(p.ctx, transfer, 1, 0)
 		if err != nil {
 			return nil, err
 		}

@@ -177,13 +177,6 @@ func fontPostGlyphsContext(ctx context.Context, data []byte) (map[string]uint16,
 	return result, nil
 }
 
-// lookup 查询名称映射，空名称表返回未定义字形
-// 入参: name 字形名称
-// 返回: uint16 字形编号, error 实际使用的名称表错误
-func (p *fontPostMapping) lookup(name string) (uint16, error) {
-	return p.lookupContext(context.Background(), name)
-}
-
 // lookupContext 查询字形名称，取消的解析不进入共用缓存
 // 入参: ctx 取消上下文, name 字形名称
 // 返回: uint16 字形编号, error 名称表或取消错误

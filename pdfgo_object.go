@@ -53,28 +53,28 @@ type Reference struct {
 	Generation int64
 }
 
-// pdfObject 将布尔值标记为PDF对象
+// pdfObject 实现Object接口
 func (Boolean) pdfObject() {}
 
-// pdfObject 将整数标记为PDF对象
+// pdfObject 实现Object接口
 func (Integer) pdfObject() {}
 
-// pdfObject 将实数标记为PDF对象
+// pdfObject 实现Object接口
 func (Real) pdfObject() {}
 
-// pdfObject 将名称标记为PDF对象
+// pdfObject 实现Object接口
 func (Name) pdfObject() {}
 
-// pdfObject 将字符串标记为PDF对象
+// pdfObject 实现Object接口
 func (String) pdfObject() {}
 
-// pdfObject 将数组标记为PDF对象
+// pdfObject 实现Object接口
 func (Array) pdfObject() {}
 
-// pdfObject 将字典标记为PDF对象
+// pdfObject 实现Object接口
 func (Dictionary) pdfObject() {}
 
-// pdfObject 将间接引用标记为PDF对象
+// pdfObject 实现Object接口
 func (Reference) pdfObject() {}
 
 // EqualObject 按PDF值语义深度比较两个对象，流对象仅比较引用、字典与字节内容而不访问内部阅读器状态
@@ -153,7 +153,7 @@ func equalObject(a, b Object, depth int) bool {
 	}
 }
 
-// HashObject 按PDF值语义将对象写入哈希器，流对象仅写入引用、字典与字节内容而不访问内部阅读器状态
+// HashObject 按PDF值语义将对象写入哈希器，最大递归深度64，流仅写引用、字典与字节内容，返回false时可能已写入部分字节
 // 入参: h 目标哈希器, value 待摘要对象
 // 返回: bool 是否完成确定性摘要
 func HashObject(h hash.Hash, value Object) bool {

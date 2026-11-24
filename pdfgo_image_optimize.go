@@ -45,20 +45,11 @@ type pngIDATReader struct {
 	offset int
 }
 
-// OptimizeImage 优化PNG或JPEG编码，只采用更小的结果，不改变尺寸和透明度
-// 无损保留像素与元数据，有损可降低RGB精度或JPEG质量；未知格式原样返回
-// 返回值可能引用输入数据；不修改输入，调用方应将结果视为只读
-// 入参: ctx 取消上下文, data 图片数据, options 压缩配置
-// 返回: []byte 图片数据, error 编码错误
-func OptimizeImage(ctx context.Context, data []byte, options CompressionOptions) ([]byte, error) {
-	return OptimizeImageSize(ctx, data, options, image.Point{})
-}
-
-// OptimizeImageSize 优化图片编码，有损模式按两轴像素需求等比缩小，只采用更小的结果
-// 未知显示尺寸时传零值，不降采样；不会放大图片或修改输入数据
+// OptimizeImage 优化PNG/JPEG且仅采用更小结果（未知格式原样返回），无损保留像素与元数据，有损可按像素需求等比缩小（不放大，未知尺寸传零）并降精度/质量
+// 不修改输入，返回值可能共享输入内存须视为只读
 // 入参: ctx 取消上下文, data 图片数据, options 压缩配置, size 像素需求
 // 返回: []byte 图片数据, error 编码错误
-func OptimizeImageSize(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
+func OptimizeImage(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("invalid image context")
 	}

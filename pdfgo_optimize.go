@@ -26,6 +26,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"io"
@@ -36,17 +37,18 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"unicode/utf16"
 )
 
 // OptimizeOptions 配置原生PDF重写，不经过页面渲染
 // 原始模式或包含签名时保留源文件；加密文档保留原安全处理器、密码和权限
 // Creator非空时设置重写结果的制作软件；OnProgress回报scan、compress、write阶段，支持取消
-// Parallelism限制并行优化的工作协程数，零值自动按处理器核数选择，WASM环境恒为单线程
+// Workers限制并行优化的工作协程数，零值自动按处理器核数选择，WASM环境恒为单线程
 type OptimizeOptions struct {
 	Compression CompressionOptions
 	Creator     string
-	Parallelism int
+	Workers     int
 	OnProgress  func(stage string, completed, total int) error
 }
 
@@ -98,14 +100,14 @@ type streamOptJob struct {
 }
 
 // optimizeWorkers 按配置与运行平台计算并行工作协程数，WASM环境恒返回1
-// 入参: parallelism 用户指定的并发数，非正数时按处理器核数自动选择
+// 入参: workers 用户指定的并发数，非正数时按处理器核数自动选择
 // 返回: int 有效工作协程数
-func optimizeWorkers(parallelism int) int {
+func optimizeWorkers(workers int) int {
 	if runtime.GOOS == "js" || runtime.GOARCH == "wasm" {
 		return 1
 	}
-	if parallelism > 0 {
-		return parallelism
+	if workers > 0 {
+		return workers
 	}
 	return max(1, runtime.GOMAXPROCS(0))
 }
@@ -237,9 +239,8 @@ func recompressPDFBytes(ctx context.Context, data []byte) ([]byte, error) {
 	return result.Bytes(), ctx.Err()
 }
 
-// OptimizeTo 重写PDF对象及资源，保留未知字典、表单、附件、导航和加密配置
-// 无损模式只改变表示与压缩；有损模式可重新编码可安全识别的RGB或灰度图片
-// 签名文件原样交付，不修改签名；出错时应丢弃本次输出，Reader须保持源数据可读
+// OptimizeTo 重写PDF对象及资源并保留未知字典、表单、附件、导航与加密配置，无损仅改表示压缩、有损可重编可识别RGB/灰度图
+// 签名文件原样交付，出错须丢弃输出，调用期间Reader须保持源数据可读
 // 入参: ctx 取消上下文, writer 输出流, options 优化配置
 // 返回: OptimizeReport 优化结果, error 读写错误
 func (r *Reader) OptimizeTo(ctx context.Context, writer io.Writer, options OptimizeOptions) (report OptimizeReport, err error) {
@@ -359,6 +360,12 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			if v.Number <= 0 || v.Generation < 0 || v.Generation > 65535 {
 				return fmt.Errorf("invalid PDF reference")
 			}
+			_, hasReplacement := replacements[v]
+			if !hasReplacement && lazyImages[v] == nil {
+				if entry, ok := r.xref[v.Number]; ok && entry.kind != 0 && (entry.kind == 1 && entry.generation != v.Generation || entry.kind == 2 && v.Generation != 0) {
+					return nil
+				}
+			}
 			if !seen[v] {
 				seen[v] = true
 				refs = append(refs, v)
@@ -455,7 +462,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		if signed {
 			if len(replacements) != 0 || len(lazyImages) != 0 || len(information) != 0 {
-				return report, fmt.Errorf("cannot rewrite objects in a signed PDF")
+				return report, ErrSignedDocument
 			}
 			return report, copySource()
 		}
@@ -543,7 +550,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	var fontGlyphs map[Reference][]uint16
 	var imageColorResources map[Reference]Dictionary
 	var colorConflicts map[Reference]bool
-	workers := optimizeWorkers(options.Parallelism)
+	workers := optimizeWorkers(options.Workers)
 	protectedAliases := make(map[Reference]bool)
 	for _, key := range []Name{"Root", "Encrypt", "Info"} {
 		if ref, ok := trailer[key].(Reference); ok {
@@ -689,26 +696,48 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			return report, err
 		}
 	}
-	slices.SortFunc(refs, func(a, b Reference) int {
-		if a.Number < b.Number {
-			return -1
+	slices.SortFunc(refs, compareReference)
+	isLiveRef := func(ref Reference) bool {
+		if _, ok := replacements[ref]; ok || lazyImages[ref] != nil {
+			return true
 		}
-		if a.Number > b.Number {
-			return 1
+		entry, ok := r.xref[ref.Number]
+		if !ok || entry.kind == 0 {
+			return false
 		}
-		if a.Generation < b.Generation {
-			return -1
+		if entry.kind == 2 {
+			return ref.Generation == 0
 		}
-		if a.Generation > b.Generation {
-			return 1
+		return entry.generation == ref.Generation
+	}
+	filteredRefs := refs[:0]
+	for i := 0; i < len(refs); {
+		j := i + 1
+		for j < len(refs) && refs[j].Number == refs[i].Number {
+			j++
 		}
-		return 0
-	})
-	for i := 1; i < len(refs); i++ {
-		if refs[i-1].Number == refs[i].Number {
+		if j-i == 1 {
+			filteredRefs = append(filteredRefs, refs[i])
+			i = j
+			continue
+		}
+		liveCount := 0
+		var liveRef Reference
+		for _, candidate := range refs[i:j] {
+			if isLiveRef(candidate) {
+				liveCount++
+				liveRef = candidate
+			}
+		}
+		if liveCount > 1 {
 			return report, fmt.Errorf("conflicting PDF object generations")
 		}
+		if liveCount == 1 {
+			filteredRefs = append(filteredRefs, liveRef)
+		}
+		i = j
 	}
+	refs = filteredRefs
 	maxID := int64(0)
 	for _, ref := range refs {
 		maxID = max(maxID, ref.Number)
@@ -990,6 +1019,8 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	var taskCh chan *streamOptJob
 	var wg sync.WaitGroup
 	var pendingJobs map[int]*streamOptJob
+	var firstErrOnce sync.Once
+	var firstErr atomic.Pointer[error]
 	prefetchCursor := 0
 	windowLimit := workers * 2
 	if useParallel {
@@ -1008,6 +1039,10 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 				for job := range taskCh {
 					wr.executeStreamJob(workCtx, job)
 					if job.err != nil {
+						if ctx.Err() == nil && !errors.Is(job.err, context.Canceled) {
+							errCopy := job.err
+							firstErrOnce.Do(func() { firstErr.Store(&errCopy) })
+						}
 						workCancel()
 					}
 					close(job.done)
@@ -1064,15 +1099,49 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		var maskRef Reference
 		var ownedMaskOut Object
 		var ownedMaskRef Reference
-		if job, ok := pendingJobs[i]; ok {
+		var job *streamOptJob
+		resolved := false
+		if pending, ok := pendingJobs[i]; ok {
 			delete(pendingJobs, i)
 			if err := fillPrefetch(i + 1); err != nil {
 				return report, err
 			}
-			<-job.done
-			if job.err != nil {
-				return report, job.err
+			<-pending.done
+			if pending.err != nil {
+				err := pending.err
+				if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+					if root := firstErr.Load(); root != nil {
+						err = *root
+					}
+				}
+				return report, err
 			}
+			job = pending
+		} else if ref == infoRef && newInfo != nil {
+			value = newInfo
+			resolved = true
+		} else if override, ok := pageTreeOverrides[ref]; ok {
+			value = override
+			resolved = true
+		} else if !useParallel {
+			var jobErr error
+			job, jobErr = buildStreamJob(ref)
+			if jobErr != nil {
+				return report, jobErr
+			}
+			if job != nil {
+				if options.Compression.Mode != CompressionUnchanged {
+					if err := progress("compress", report.Streams, 0); err != nil {
+						return report, err
+					}
+				}
+				r.executeStreamJob(ctx, job)
+				if job.err != nil {
+					return report, job.err
+				}
+			}
+		}
+		if job != nil {
 			value = job.outValue
 			maskStream = job.outLazyMask
 			ownedMaskOut = job.outOwnedMask
@@ -1096,83 +1165,8 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 					value = &updated
 				}
 			}
-			if _, isStreamVal := value.(*Stream); isStreamVal {
-				report.Streams++
-				if options.Compression.Mode != CompressionUnchanged {
-					if err := progress("compress", report.Streams, 0); err != nil {
-						return report, err
-					}
-				}
-			}
-		} else if ref == infoRef && newInfo != nil {
-			value = newInfo
-		} else if override, ok := pageTreeOverrides[ref]; ok {
-			value = override
-		} else if !useParallel {
-			job, jobErr := buildStreamJob(ref)
-			if jobErr != nil {
-				return report, jobErr
-			}
-			if job != nil {
-				if options.Compression.Mode != CompressionUnchanged {
-					if err := progress("compress", report.Streams, 0); err != nil {
-						return report, err
-					}
-				}
-				r.executeStreamJob(ctx, job)
-				if job.err != nil {
-					return report, job.err
-				}
-				value = job.outValue
-				maskStream = job.outLazyMask
-				ownedMaskOut = job.outOwnedMask
-				if job.ownedMaskRef.Number > 0 {
-					if job.droppedOwned {
-						report.Objects--
-					} else {
-						ownedMaskRef = job.ownedMaskRef
-					}
-					if !originalCache[job.ownedMaskRef] {
-						r.cache.delete(job.ownedMaskRef)
-					}
-				}
-				if maskStream != nil {
-					maxID++
-					maskRef = Reference{Number: maxID}
-					if mainStream, ok := value.(*Stream); ok {
-						updated := *mainStream
-						updated.Dictionary = maps.Clone(mainStream.Dictionary)
-						updated.Dictionary["SMask"] = maskRef
-						value = &updated
-					}
-				}
-				if _, isStreamVal := value.(*Stream); isStreamVal {
-					report.Streams++
-					if options.Compression.Mode != CompressionUnchanged {
-						if err := progress("compress", report.Streams, 0); err != nil {
-							return report, err
-						}
-					}
-				}
-			} else {
-				if optimized := fontUpdates[ref]; optimized != nil {
-					value = optimized
-				} else {
-					value, err = object(ref)
-					if err != nil {
-						return report, err
-					}
-				}
-				if _, isStreamVal := value.(*Stream); isStreamVal {
-					report.Streams++
-					if options.Compression.Mode != CompressionUnchanged {
-						if err := progress("compress", report.Streams, 0); err != nil {
-							return report, err
-						}
-					}
-				}
-			}
-		} else {
+			resolved = true
+		} else if !resolved {
 			if optimized := fontUpdates[ref]; optimized != nil {
 				value = optimized
 			} else {
@@ -1181,12 +1175,12 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 					return report, err
 				}
 			}
-			if _, isStreamVal := value.(*Stream); isStreamVal {
-				report.Streams++
-				if options.Compression.Mode != CompressionUnchanged {
-					if err := progress("compress", report.Streams, 0); err != nil {
-						return report, err
-					}
+		}
+		if _, isStreamVal := value.(*Stream); isStreamVal && (job != nil || !resolved) {
+			report.Streams++
+			if options.Compression.Mode != CompressionUnchanged {
+				if err := progress("compress", report.Streams, 0); err != nil {
+					return report, err
 				}
 			}
 		}
@@ -1301,32 +1295,61 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			return report, err
 		}
 	} else {
-		if _, err := io.WriteString(out, "xref\n"); err != nil {
+		ids := slices.Sorted(maps.Keys(entries))
+		if _, err := fmt.Fprintf(out, "xref\n0 %d\n", maxID+1); err != nil {
 			return report, err
 		}
-		ids := slices.Sorted(maps.Keys(entries))
-		for i := 0; i < len(ids); {
-			j := i + 1
-			for j < len(ids) && ids[j] == ids[j-1]+1 {
-				j++
+		freeNext := func(after int64, idx int) int64 {
+			cand := after + 1
+			for idx < len(ids) && ids[idx] < cand {
+				idx++
 			}
-			if _, err := fmt.Fprintf(out, "%d %d\n", ids[i], j-i); err != nil {
-				return report, err
+			for idx < len(ids) && ids[idx] == cand {
+				cand++
+				idx++
 			}
-			for _, id := range ids[i:j] {
-				entry := entries[id]
-				kind := "n"
-				if id == 0 {
-					kind = "f"
-				}
-				if entry.position > 9999999999 {
-					return report, fmt.Errorf("PDF cross-reference offset exceeds classic limit")
-				}
-				if _, err := fmt.Fprintf(out, "%010d %05d %s \n", entry.position, entry.generation, kind); err != nil {
+			if cand > maxID {
+				return 0
+			}
+			return cand
+		}
+		var xrefBuf bytes.Buffer
+		xrefBuf.Grow(4096)
+		flushXref := func() error {
+			if xrefBuf.Len() == 0 {
+				return nil
+			}
+			_, err := out.Write(xrefBuf.Bytes())
+			xrefBuf.Reset()
+			return err
+		}
+		idx := 1
+		for id := int64(0); id <= maxID; id++ {
+			if id&4095 == 0 {
+				if err := ctx.Err(); err != nil {
 					return report, err
 				}
 			}
-			i = j
+			if id == 0 {
+				fmt.Fprintf(&xrefBuf, "%010d 65535 f \n", freeNext(0, 1))
+			} else if idx < len(ids) && ids[idx] == id {
+				item := entries[id]
+				idx++
+				if item.position > 9999999999 {
+					return report, fmt.Errorf("PDF cross-reference offset exceeds classic limit")
+				}
+				fmt.Fprintf(&xrefBuf, "%010d %05d n \n", item.position, item.generation)
+			} else {
+				fmt.Fprintf(&xrefBuf, "%010d 65535 f \n", freeNext(id, idx))
+			}
+			if xrefBuf.Len() >= 4096 {
+				if err := flushXref(); err != nil {
+					return report, err
+				}
+			}
+		}
+		if err := flushXref(); err != nil {
+			return report, err
 		}
 		trailer["Size"] = Integer(maxID + 1)
 		if _, err := io.WriteString(out, "trailer\n"); err != nil {
@@ -1477,8 +1500,7 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 	return err
 }
 
-// workerReader 创建共享只读数据与并发安全缓存的轻量阅读器副本，供并行工作协程独占使用
-// 副本隔离交叉引用表并将内部图像解码并发度固定为1，避免外层并行池满载时引发竞态或过度订阅
+// workerReader 创建共享底层数据与安全缓存的工作阅读器副本，隔离xref并固定解码并发为1以防竞态与过度订阅
 // 入参: warning 并发安全的警告回调
 // 返回: *Reader 独立工作阅读器
 func (r *Reader) workerReader(warning func(Diagnostic)) *Reader {
@@ -1493,23 +1515,24 @@ func (r *Reader) workerReader(warning func(Diagnostic)) *Reader {
 		security = &copied
 	}
 	return &Reader{
-		Version:        r.Version,
-		Trailer:        r.Trailer,
-		source:         r.source,
-		size:           r.size,
-		originalSource: r.originalSource,
-		originalSize:   r.originalSize,
-		xref:           maps.Clone(r.xref),
-		cache:          r.cache,
-		loading:        make(map[Reference]bool),
-		deviceProfile:  r.deviceProfile,
-		security:       security,
-		warning:        warning,
-		decodeWorkers:  1,
-		maxStreamBytes: r.maxStreamBytes,
-		maxFilterChain: r.maxFilterChain,
-		jbig2Globals:   r.jbig2Globals,
-		owner:          owner,
+		Version:         r.Version,
+		Trailer:         r.Trailer,
+		source:          r.source,
+		size:            r.size,
+		originalSource:  r.originalSource,
+		originalSize:    r.originalSize,
+		xref:            maps.Clone(r.xref),
+		cache:           r.cache,
+		loading:         make(map[Reference]bool),
+		deviceProfile:   r.deviceProfile,
+		security:        security,
+		warning:         warning,
+		decodeWorkers:   1,
+		maxStreamBytes:  r.maxStreamBytes,
+		maxFilterChain:  r.maxFilterChain,
+		jbig2Globals:    r.jbig2Globals,
+		owner:           owner,
+		ownerHasWarning: r.rootHasWarning(),
 	}
 }
 
@@ -1999,11 +2022,14 @@ func (s *standardSecurity) explicitStreamCryptFilter(stream *Stream, r *Reader) 
 // 入参: stream 原始流, r 阅读器
 // 返回: Name 过滤器名称, error 解析错误
 func (s *standardSecurity) outputStreamFilter(stream *Stream, r *Reader) (Name, error) {
+	if stream.Dictionary["F"] != nil {
+		return "Identity", nil
+	}
 	name := s.streamFilter
 	if stream.Dictionary["Type"] == Name("EmbeddedFile") {
 		name = s.embeddedFilter
 	}
-	if stream.Dictionary["Type"] == Name("Metadata") && !s.encryptMetadata || stream.Dictionary["F"] != nil {
+	if stream.Dictionary["Type"] == Name("Metadata") && !s.encryptMetadata {
 		name = "Identity"
 	}
 	if explicitName, explicit, err := s.explicitStreamCryptFilter(stream, r); err != nil {

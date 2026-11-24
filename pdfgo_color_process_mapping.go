@@ -32,18 +32,18 @@ type ColorantProcess struct {
 // 入参: device 输出设备, group 组混合空间，nil继承设备, softMask 是否用于软蒙版
 // 返回: *ColorantProcess 原生映射，需备用色或独立专色时为nil
 func (s *ColorantSpace) PrepareProcess(device *ColorantDevice, group *ColorSpace, softMask bool) *ColorantProcess {
-	if s == nil || device == nil || device.Space == nil || !device.Space.Device() || softMask || len(s.Names) == 0 {
+	if s == nil || device == nil || device.space == nil || !device.space.Device() || softMask || len(s.Names) == 0 {
 		return nil
 	}
 	if group == nil {
-		group = device.Space
+		group = device.space
 	}
-	if !group.Device() || !group.Equal(device.Space) {
+	if !group.Device() || !group.Equal(device.space) {
 		return nil
 	}
 	p := &ColorantProcess{inputs: [4]int{-1, -1, -1, -1}, components: len(s.Names)}
 	if s.separation != nil && s.Names[0] == "All" {
-		if len(device.Spots) != 0 {
+		if len(device.spots) != 0 {
 			return nil
 		}
 		for i := range group.Components() {

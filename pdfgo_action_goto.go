@@ -219,7 +219,7 @@ func (r *Reader) ResolveRemoteDestination(ctx context.Context, remote RemoteDest
 			return destination, fmt.Errorf("invalid named remote destination")
 		}
 		var err error
-		destination, err = r.readDestination(ctx, remote.Named)
+		destination, err = r.ReadDestination(ctx, remote.Named)
 		if err != nil {
 			return destination, err
 		}
@@ -376,7 +376,7 @@ func (r *Reader) readEmbeddedTarget(dict Dictionary) (EmbeddedTarget, error) {
 func (r *Reader) embeddedTargetAnnotation(ctx context.Context, target EmbeddedTarget) (Object, error) {
 	var reference Reference
 	if name, ok := target.Page.(String); ok {
-		destination, err := r.readDestination(ctx, name)
+		destination, err := r.ReadDestination(ctx, name)
 		if err != nil {
 			return nil, err
 		}

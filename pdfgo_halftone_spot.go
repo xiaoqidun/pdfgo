@@ -107,6 +107,19 @@ func predefinedSpot(name Name) (func(float64, float64) float64, error) {
 // 入参: object 网点函数名称、数据流或间接引用
 // 返回: *SpotFunction 网点函数, error 定义错误
 func (r *Reader) ReadSpotFunction(object Object) (*SpotFunction, error) {
+	return r.readSpotFunctionContext(context.Background(), object)
+}
+
+// readSpotFunctionContext 在取消上下文内读取预定义、采样或计算器网点函数
+// 入参: ctx 取消上下文, object 网点函数名称、数据流或间接引用
+// 返回: *SpotFunction 网点函数, error 定义或取消错误
+func (r *Reader) readSpotFunctionContext(ctx context.Context, object Object) (*SpotFunction, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -127,7 +140,7 @@ func (r *Reader) ReadSpotFunction(object Object) (*SpotFunction, error) {
 		return nil, err
 	}
 	if kind == Integer(0) {
-		function, err := r.readSampledFunction(stream, 2, 1)
+		function, err := r.readSampledFunctionContext(ctx, stream, 2, 1)
 		if err != nil {
 			return nil, err
 		}
@@ -151,7 +164,7 @@ func (r *Reader) ReadSpotFunction(object Object) (*SpotFunction, error) {
 	if domain[0] > domain[1] || domain[2] > domain[3] || rangeValues[0] > rangeValues[1] {
 		return nil, fmt.Errorf("invalid spot function bounds")
 	}
-	data, err := r.decodeStream(stream)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +231,7 @@ func (r *Reader) spotThresholds(ctx context.Context, s *HalftoneScreen, h *Halft
 	if b > 0 || b == 0 && a < 0 {
 		s.ysign = -1
 	}
-	function, err := r.ReadSpotFunction(h.SpotFunction)
+	function, err := r.readSpotFunctionContext(ctx, h.SpotFunction)
 	if err != nil {
 		return err
 	}

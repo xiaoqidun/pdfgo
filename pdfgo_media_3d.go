@@ -122,17 +122,17 @@ func (r *Reader) ReadThreeDPresentation(object Object) (ThreeDPresentation, erro
 			return result, fmt.Errorf("invalid 3D node reset")
 		}
 		result.ResetNodes = bool(flag)
-		nodes, err := r.mediaDictionaries(dict["NA"])
-		if err != nil {
-			return result, err
-		}
-		if len(nodes) != 0 {
-			result.Nodes = make([]ThreeDNode, len(nodes))
-			for i, node := range nodes {
-				result.Nodes[i], err = r.ReadThreeDNode(node)
-				if err != nil {
-					return result, err
-				}
+	}
+	nodes, err := r.mediaDictionaries(dict["NA"])
+	if err != nil {
+		return result, err
+	}
+	if len(nodes) != 0 {
+		result.Nodes = make([]ThreeDNode, len(nodes))
+		for i, node := range nodes {
+			result.Nodes[i], err = r.ReadThreeDNode(node)
+			if err != nil {
+				return result, err
 			}
 		}
 	}

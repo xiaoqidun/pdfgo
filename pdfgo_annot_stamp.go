@@ -84,6 +84,9 @@ func (r *Reader) stampAppearance(annotation Annotation) (*Stream, error) {
 	size := math.Min((w-4*margin)/(advance/1000), (h-4*margin)/(ascent-descent))
 	x := box.XMin + (w-advance/1000*size)/2
 	y := box.YMin + (h-(ascent-descent)*size)/2 - descent*size
+	if size <= 0 || math.IsNaN(size) || math.IsInf(size, 0) || math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+		return nil, fmt.Errorf("invalid stamp text position")
+	}
 	var content strings.Builder
 	color := Array{Real(.95)}
 	value, err = r.Resolve(annotation.Dictionary["C"])

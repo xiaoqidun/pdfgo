@@ -195,8 +195,11 @@ func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation
 			if err != nil {
 				return nil, err
 			}
-			host = Annotation{Subtype: "3D", Rect: box, Dictionary: value}
-			host.Reference, _ = dict["3DA"].(Reference)
+			hostRef, err := r.resolveIndirectReference(dict["3DA"])
+			if err != nil {
+				return nil, err
+			}
+			host = Annotation{Reference: hostRef, Subtype: "3D", Rect: box, Dictionary: value}
 		default:
 			return nil, fmt.Errorf("invalid 3D markup annotation")
 		}

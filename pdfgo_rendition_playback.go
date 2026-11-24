@@ -77,7 +77,7 @@ func (r *Reader) ReadRenditionPlayback(ctx context.Context, object Object) (Rend
 	if value != nil {
 		result.Rendition, err = r.ReadRendition(ctx, value)
 		if err != nil {
-			return result, err
+			return result, wrapActionError(err)
 		}
 	} else if result.Operation != nil && (*result.Operation == 0 || *result.Operation == 4) {
 		return result, fmt.Errorf("%w: missing media rendition", ErrInvalidAction)
@@ -146,7 +146,7 @@ func (r *Reader) ReadRenditionPlayback(ctx context.Context, object Object) (Rend
 	}
 	box, err := r.rectangle(screen["Rect"])
 	if err != nil {
-		return result, err
+		return result, wrapActionError(err)
 	}
 	result.Annotation = Annotation{Reference: ref, Subtype: "Screen", Rect: box, Dictionary: screen}
 	result.Page = page

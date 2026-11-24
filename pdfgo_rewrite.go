@@ -27,21 +27,11 @@ import (
 	"slices"
 )
 
-// RewriteOptions 批量修改文档信息、图像、文字、链接、附件和动作，保留原加密配置
-// 图像及页面引用须指向原文件的间接对象；空配置原样写出，不修改源对象
-// 大纲通过原节点引用定位，标题使用UTF-8文字
-// OutlineActions替换整个动作序列，空序列移除动作及目标，不可与同节点的OutlineDestinations同时指定
-// LinkActions按相同规则替换链接动作，不可与同位置的LinkDestinations同时指定
-// OpenActions为nil时保留文档打开行为，非nil空列表清除，非空列表替换为指定动作序列
-// PageOpenActions和PageCloseActions按页面引用替换相应事件，空列表清除，不影响其他事件
-// Attachments按名称树原始键添加或替换附件，nil值删除该键，其他位置的文件引用不变
-// MovieAnnotations按页面追加视频注解，同一注解指针只能添加一次，可由MovieAction.Target引用
-// ScreenAnnotations按页面追加屏幕注解，可由RenditionAction.Target引用
-// TextReplacements按页面内容流中的文字对象序号写入整段替换文本，不改动字形及定位
-// Information按键更新文档信息字典，nil值删除字段，文本使用EncodeTextString编码，不同步XMP
-// TransformContent在文字替换后逐页变换解码内容，返回nil保留原内容，输入缓冲可原地修改
-// 回调中的Page及其资源为只读借用，不得修改，返回内容须使用该页已有资源
-// Optimization在同次写出中处理压缩及制作软件，Creator非空时覆盖Information中的Creator及Producer
+// RewriteOptions 批量修改文档信息、图像、文字、链接、大纲、附件及动作，保留原加密配置；图像与页面引用须指向原间接对象，空配置原样写出
+// Information按键更新且nil删除，文本须由调用方预先用EncodeTextString编码为String（不同步XMP），Optimization.Creator非空时覆盖Creator与Producer
+// OutlineActions与LinkActions替换动作序列（空序列清除）且不可与同项Destination并用；OpenActions为nil保留、空切片清除，页级事件按页替换
+// Attachments按名称树原始键增删（nil删除）；MovieAnnotations与ScreenAnnotations按页追加且同指针仅限一次，大纲标题使用UTF-8
+// TextReplacements按文字对象序号整段替换，TransformContent随后逐页变换内容（返回nil保留，输入可原地改），回调Page与资源只读且须使用已有资源
 type RewriteOptions struct {
 	Information         Dictionary
 	Images              map[Reference]image.Image
@@ -123,11 +113,9 @@ func rewriteInformation(ctx context.Context, changes Dictionary) (Dictionary, er
 	return result, ctx.Err()
 }
 
-// RewriteTo 一次写出图像、文字、链接、附件及事件修改，保留外观和未知属性
-// 指定目标时替换原主动作；已有GoTo动作保留后续动作，其他动作整体替换
-// 独占链接保留原引用；共享链接按页面复制，带结构标记的共享链接不能单独拆分
-// 修改大纲时按实际层级修正父节点引用，不改变节点顺序及显示样式
-// 不修改签名文件；出错时应丢弃本次输出，调用期间源数据和替换图像须保持可读
+// RewriteTo 按配置一次写出全部文档修改并保留外观与未知属性，不修改签名文件；出错须丢弃输出，调用期间源数据与替换图像须可读
+// 指定目标时替换主动作（已有GoTo保留后续动作，其余整体替换）；修改大纲按实际层级修正父引用且保持顺序与样式
+// 独占链接保留原引用，共享链接按页复制，带结构标记的共享链接不可单独拆分
 // 入参: ctx 取消上下文, writer 输出流, options 替换配置
 // 返回: OptimizeReport 写出结果, error 参数、编码或写入错误
 func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options RewriteOptions) (OptimizeReport, error) {
@@ -206,7 +194,7 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 			return OptimizeReport{}, err
 		}
 	}
-	if textChanged || options.TransformContent != nil || len(replacements) != 0 && options.Optimization.Compression.Mode != CompressionUnchanged {
+	if textChanged || options.TransformContent != nil || len(replacements) != 0 {
 		r = r.rewriteReader(replacements)
 	}
 	if textChanged {
@@ -215,7 +203,56 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	return r.rewriteTo(ctx, writer, options.Optimization, replacements, lazyImages, information)
 }
 
-// actionSequences 遍历待写动作序列，不改变各序列内部顺序
+// compareReference 按对象编号和代号升序比较间接引用
+// 入参: a 首个引用, b 第二个引用
+// 返回: int 比较结果
+func compareReference(a, b Reference) int {
+	if a.Number < b.Number {
+		return -1
+	}
+	if a.Number > b.Number {
+		return 1
+	}
+	if a.Generation < b.Generation {
+		return -1
+	}
+	if a.Generation > b.Generation {
+		return 1
+	}
+	return 0
+}
+
+// compareAnnotationLocation 按页面引用与注解索引升序比较注解位置
+// 入参: a 首个位置, b 第二个位置
+// 返回: int 比较结果
+func compareAnnotationLocation(a, b AnnotationLocation) int {
+	if cmp := compareReference(a.Page, b.Page); cmp != 0 {
+		return cmp
+	}
+	if a.Index < b.Index {
+		return -1
+	}
+	if a.Index > b.Index {
+		return 1
+	}
+	return 0
+}
+
+// maxRewriteObjectID 统计交叉引用表与替换对象表中的最大对象编号
+// 入参: replacements 已有替换对象
+// 返回: int64 最大对象编号
+func (r *Reader) maxRewriteObjectID(replacements map[Reference]Object) int64 {
+	maximum := int64(0)
+	for id := range r.xref {
+		maximum = max(maximum, id)
+	}
+	for ref := range replacements {
+		maximum = max(maximum, ref.Number)
+	}
+	return maximum
+}
+
+// actionSequences 按确定顺序遍历待写动作序列，不改变各序列内部顺序
 // 返回: iter.Seq[[]NavigationAction] 动作序列迭代器
 func (o RewriteOptions) actionSequences() iter.Seq[[]NavigationAction] {
 	return func(yield func([]NavigationAction) bool) {
@@ -223,19 +260,25 @@ func (o RewriteOptions) actionSequences() iter.Seq[[]NavigationAction] {
 			return
 		}
 		for _, group := range []map[Reference][]NavigationAction{o.OutlineActions, o.PageOpenActions, o.PageCloseActions} {
-			for _, actions := range group {
-				if !yield(actions) {
+			refs := slices.Collect(maps.Keys(group))
+			slices.SortFunc(refs, compareReference)
+			for _, ref := range refs {
+				if !yield(group[ref]) {
 					return
 				}
 			}
 		}
-		for _, actions := range o.LinkActions {
-			if !yield(actions) {
+		locations := slices.Collect(maps.Keys(o.LinkActions))
+		slices.SortFunc(locations, compareAnnotationLocation)
+		for _, location := range locations {
+			if !yield(o.LinkActions[location]) {
 				return
 			}
 		}
-		for _, annotations := range o.ScreenAnnotations {
-			for _, annotation := range annotations {
+		screenPages := slices.Collect(maps.Keys(o.ScreenAnnotations))
+		slices.SortFunc(screenPages, compareReference)
+		for _, pageRef := range screenPages {
+			for _, annotation := range o.ScreenAnnotations[pageRef] {
 				if annotation != nil && !yield(annotation.Actions) {
 					return
 				}
@@ -244,8 +287,7 @@ func (o RewriteOptions) actionSequences() iter.Seq[[]NavigationAction] {
 	}
 }
 
-// rewriteReader 建立替换后的独立读取视图，供压缩与资源去重读取一致的对象
-// 视图不接管源文件和加密密钥，仅在本次写出期间使用
+// rewriteReader 建立写出期间使用的替换后只读视图，不接管源文件与解密密钥，供压缩与去重读取一致对象
 // 入参: replacements 替换对象
 // 返回: *Reader 独立对象缓存的读取视图
 func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
@@ -254,23 +296,24 @@ func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
 		owner = r
 	}
 	return &Reader{
-		Version:        r.Version,
-		Trailer:        r.Trailer,
-		source:         r.source,
-		size:           r.size,
-		originalSource: r.originalSource,
-		originalSize:   r.originalSize,
-		xref:           maps.Clone(r.xref),
-		cache:          r.cache.cloneWithPinned(replacements),
-		loading:        make(map[Reference]bool),
-		deviceProfile:  r.deviceProfile,
-		security:       r.security,
-		warning:        r.warning,
-		decodeWorkers:  r.decodeWorkers,
-		maxStreamBytes: r.maxStreamBytes,
-		maxFilterChain: r.maxFilterChain,
-		jbig2Globals:   r.jbig2Globals,
-		owner:          owner,
+		Version:         r.Version,
+		Trailer:         r.Trailer,
+		source:          r.source,
+		size:            r.size,
+		originalSource:  r.originalSource,
+		originalSize:    r.originalSize,
+		xref:            maps.Clone(r.xref),
+		cache:           r.cache.cloneWithPinned(replacements),
+		loading:         make(map[Reference]bool),
+		deviceProfile:   r.deviceProfile,
+		security:        r.security,
+		warning:         r.warning,
+		decodeWorkers:   r.decodeWorkers,
+		maxStreamBytes:  r.maxStreamBytes,
+		maxFilterChain:  r.maxFilterChain,
+		jbig2Globals:    r.jbig2Globals,
+		owner:           owner,
+		ownerHasWarning: r.rootHasWarning(),
 	}
 }
 
@@ -292,38 +335,12 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 	if err != nil {
 		return err
 	}
-	maximum := int64(0)
-	for number := range r.xref {
-		maximum = max(maximum, number)
-	}
-	for ref := range result {
-		maximum = max(maximum, ref.Number)
-	}
+	maximum := r.maxRewriteObjectID(result)
 	if maximum > math.MaxInt32-int64(len(selected))-1024 {
 		return fmt.Errorf("PDF object number exceeds output limit")
 	}
 	locations := slices.Collect(maps.Keys(selected))
-	slices.SortFunc(locations, func(a, b AnnotationLocation) int {
-		if a.Page.Number != b.Page.Number {
-			if a.Page.Number < b.Page.Number {
-				return -1
-			}
-			return 1
-		}
-		if a.Page.Generation != b.Page.Generation {
-			if a.Page.Generation < b.Page.Generation {
-				return -1
-			}
-			return 1
-		}
-		if a.Index < b.Index {
-			return -1
-		}
-		if a.Index > b.Index {
-			return 1
-		}
-		return 0
-	})
+	slices.SortFunc(locations, compareAnnotationLocation)
 	for _, location := range locations {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -347,13 +364,10 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 		if kind != Name("Page") {
 			return fmt.Errorf("replacement target is not a PDF page")
 		}
-		if updated, ok := result[ref].(Dictionary); ok {
-			page = updated
-		} else if result[ref] != nil {
-			return fmt.Errorf("conflicting PDF replacement reference")
-		} else {
-			page = maps.Clone(page)
-			value, err := r.Resolve(page["Annots"])
+		updated, ok := result[ref].(Dictionary)
+		if !ok {
+			updated = maps.Clone(page)
+			value, err := r.Resolve(updated["Annots"])
 			if err != nil {
 				return err
 			}
@@ -361,9 +375,10 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 			if !ok {
 				return fmt.Errorf("invalid PDF page annotations")
 			}
-			page["Annots"] = slices.Clone(array)
-			result[ref] = page
+			updated["Annots"] = slices.Clone(array)
+			result[ref] = updated
 		}
+		page = updated
 		annotations, ok := page["Annots"].(Array)
 		if !ok || location.Index < 0 || location.Index >= len(annotations) {
 			return fmt.Errorf("PDF annotation index out of range")
@@ -384,7 +399,7 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 		if subtype != Name("Link") {
 			return fmt.Errorf("replacement object is not a PDF link")
 		}
-		updated := maps.Clone(dict)
+		updated = maps.Clone(dict)
 		updated["Subtype"], updated["P"] = Name("Link"), ref
 		if region, ok := regions[location]; ok {
 			points, err := region.quadPoints(ctx)

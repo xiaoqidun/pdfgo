@@ -232,17 +232,21 @@ func writeAnnotationOperand(content *strings.Builder, value Object) error {
 	return nil
 }
 
-// ReadAnnotationText 读取注解文本字段，RC和RV允许文本流，其他字段要求文本字符串
-// 入参: annotation 注解, field 文本字段名, warning 异常字段警告，空值使用严格检查
-// 返回: string Unicode文本, error 引用、类型或编码错误
-func (r *Reader) ReadAnnotationText(annotation Annotation, field Name, warning func(Diagnostic)) (string, error) {
-	return r.ReadAnnotationTextContext(context.Background(), annotation, field, warning)
+// ReadAnnotationText 读取注解文本字段并响应取消，RC和RV允许文本流，其他字段要求文本字符串
+// 入参: ctx 取消上下文, annotation 注解, field 文本字段名
+// 返回: string Unicode文本, error 引用、类型、编码或取消错误
+func (r *Reader) ReadAnnotationText(ctx context.Context, annotation Annotation, field Name) (string, error) {
+	var warning func(Diagnostic)
+	if r != nil {
+		warning = r.warning
+	}
+	return r.readAnnotationText(ctx, annotation, field, warning)
 }
 
-// ReadAnnotationTextContext 读取注解文本并响应取消，取消错误不作为异常字段忽略
+// readAnnotationText 按指定警告回调读取注解文本并响应取消，取消错误不作为异常字段忽略
 // 入参: ctx 取消上下文, annotation 注解, field 文本字段名, warning 异常字段警告，空值使用严格检查
 // 返回: string Unicode文本, error 引用、类型、编码或取消错误
-func (r *Reader) ReadAnnotationTextContext(ctx context.Context, annotation Annotation, field Name, warning func(Diagnostic)) (string, error) {
+func (r *Reader) readAnnotationText(ctx context.Context, annotation Annotation, field Name, warning func(Diagnostic)) (string, error) {
 	if ctx == nil {
 		return "", fmt.Errorf("missing annotation text context")
 	}
@@ -413,22 +417,25 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 	fw, fh := frame.XMax-frame.XMin, frame.YMax-frame.YMin
 	borderAnnotation := annotation
 	borderAnnotation.Dictionary = maps.Clone(dict)
-	background := mk["BG"]
-	borderAnnotation.Dictionary["C"] = mk["BC"]
-	if mk["BC"] == nil {
+	borderColor, err := r.Resolve(mk["BC"])
+	if err != nil {
+		return nil, err
+	}
+	borderAnnotation.Dictionary["C"] = borderColor
+	if borderColor == nil {
 		borderAnnotation.Dictionary["C"] = Array{}
 	}
 	border, err := r.readAnnotationBorder(borderAnnotation)
 	if err != nil {
 		return nil, err
 	}
+	background, err := r.Resolve(mk["BG"])
+	if err != nil {
+		return nil, err
+	}
 	var content strings.Builder
 	if background != nil {
-		value, err := r.Resolve(background)
-		if err != nil {
-			return nil, err
-		}
-		color, ok := value.(Array)
+		color, ok := background.(Array)
 		if !ok {
 			return nil, fmt.Errorf("invalid annotation background color")
 		}
@@ -792,7 +799,9 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		}
 		for i, letter := range letters {
 			left := x + (float64(start+i)+.5)*width/float64(comb) - letter.width*size*p.state.hscale/2000
-			writeAnnotationTextMatrix(content, matrix, left, baseline)
+			if err := writeAnnotationTextMatrix(content, matrix, left, baseline); err != nil {
+				return err
+			}
 			fmt.Fprintf(content, "<%x> Tj\n", letter.code)
 		}
 	} else {
@@ -809,7 +818,9 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 				}
 			}
 			left := x + float64(align)*(width-annotationLineWidth(line, p.state, size))/2
-			writeAnnotationTextMatrix(content, matrix, left, baseline-float64(i)*leading)
+			if err := writeAnnotationTextMatrix(content, matrix, left, baseline-float64(i)*leading); err != nil {
+				return err
+			}
 			content.WriteByte('<')
 			for _, letter := range line {
 				fmt.Fprintf(content, "%x", letter.code)

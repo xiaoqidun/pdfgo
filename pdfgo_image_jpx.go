@@ -572,9 +572,16 @@ func (s *jpxSampleImage) sample(index, x, y int) uint16 {
 	if spec.Signed {
 		raw += int64(1) << (spec.Precision - 1)
 	}
-	value := uint64(raw)
 	if palette != nil {
-		return palette[min(value, uint64(len(palette)-1))]
+		if raw < 0 {
+			raw = 0
+		}
+		return palette[min(uint64(raw), uint64(len(palette)-1))]
+	}
+	maximum := uint64(1)<<spec.Precision - 1
+	var value uint64
+	if raw > 0 {
+		value = min(uint64(raw), maximum)
 	}
 	switch spec.Precision {
 	case 1:
@@ -588,7 +595,6 @@ func (s *jpxSampleImage) sample(index, x, y int) uint16 {
 	case 16:
 		return uint16(value)
 	}
-	maximum := uint64(1)<<spec.Precision - 1
 	return uint16((value*65535 + maximum/2) / maximum)
 }
 
@@ -913,8 +919,9 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	}
 	bounds := image.Rect(0, 0, info.Bounds.Dx(), info.Bounds.Dy())
 	x0, y0 := int64(info.Bounds.Min.X), int64(info.Bounds.Min.Y)
+	ycc = ycc && len(channels) >= 3
 	out := &jpxSampleImage{planes: components, channels: channels, mapping: mapping, alpha: alpha, bounds: bounds, x0: x0, y0: y0, cmyk: count == 4, ycc: ycc, rows: rowReader}
-	if ycc {
+	if ycc && len(channels) >= 3 {
 		for n := range out.chroma {
 			precision := out.precision(channels[n+1])
 			out.chroma[n] = float64(uint64(1)<<(precision-1)) * 65535 / float64(uint64(1)<<precision-1)

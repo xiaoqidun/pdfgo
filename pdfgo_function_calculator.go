@@ -28,7 +28,7 @@ const calculatorStackSize = 100
 
 // 计算器操作数类型
 const (
-	calculatorRealKind uint8 = iota
+	_ uint8 = iota
 	calculatorIntegerKind
 	calculatorBooleanKind
 )

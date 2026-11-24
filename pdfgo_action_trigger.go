@@ -17,31 +17,59 @@ package pdfgo
 import (
 	"context"
 	"fmt"
-	"maps"
 	"os"
 )
 
-// ActionTrigger 保存附加动作的事件和只读字典，不执行动作或展开Next链
+// ActionTrigger 保存附加动作的事件、间接引用和只读字典，不执行动作或展开Next链
 type ActionTrigger struct {
-	Event  Name
-	Action Dictionary
+	Event     Name
+	Reference Reference
+	Action    Dictionary
+}
+
+// Entry 返回供WalkActions遍历的动作入口，优先保留原始间接引用
+// 返回: Object 动作引用或字典，无动作时为nil
+func (t ActionTrigger) Entry() Object {
+	if t.Reference != (Reference{}) {
+		return t.Reference
+	}
+	if t.Action == nil {
+		return nil
+	}
+	return t.Action
 }
 
 // OpenAction 区分文档初始目标与打开动作，均为空时使用阅读器默认视图
 type OpenAction struct {
 	Destination *Destination
+	Reference   Reference
 	Action      Dictionary
+}
+
+// Entry 返回供WalkActions遍历的打开动作入口，优先保留原始间接引用
+// 返回: Object 动作引用或字典，无动作时为nil
+func (o OpenAction) Entry() Object {
+	if o.Reference != (Reference{}) {
+		return o.Reference
+	}
+	if o.Action == nil {
+		return nil
+	}
+	return o.Action
 }
 
 // ReadOpenAction 读取文档初始目标或打开动作，不跳转页面或执行动作
 // 入参: ctx 取消上下文
 // 返回: OpenAction 打开行为, error 类型、目标或取消错误
 func (r *Reader) ReadOpenAction(ctx context.Context) (OpenAction, error) {
-	if ctx == nil {
+	if r == nil || ctx == nil {
 		return OpenAction{}, fmt.Errorf("invalid action context")
 	}
 	if err := ctx.Err(); err != nil {
 		return OpenAction{}, err
+	}
+	if r.closed {
+		return OpenAction{}, os.ErrClosed
 	}
 	catalog, err := r.catalogDictionary()
 	if err != nil {
@@ -53,17 +81,17 @@ func (r *Reader) ReadOpenAction(ctx context.Context) (OpenAction, error) {
 	}
 	switch value.(type) {
 	case Array:
-		destination, err := r.readDestination(ctx, value)
+		destination, err := r.ReadDestination(ctx, value)
 		if err != nil {
 			return OpenAction{}, err
 		}
 		return OpenAction{Destination: &destination}, ctx.Err()
 	case Dictionary:
-		action, err := r.readActionTrigger(ctx, "OpenAction", value)
+		action, err := r.readActionTrigger(ctx, "OpenAction", catalog["OpenAction"])
 		if err != nil {
 			return OpenAction{}, err
 		}
-		return OpenAction{Action: action.Action}, ctx.Err()
+		return OpenAction{Reference: action.Reference, Action: action.Action}, ctx.Err()
 	default:
 		return OpenAction{}, fmt.Errorf("%w: invalid document open action", ErrInvalidAction)
 	}
@@ -114,6 +142,9 @@ func (r *Reader) ReadPageTriggers(ctx context.Context, page *Page) ([]ActionTrig
 	if page == nil {
 		return nil, fmt.Errorf("missing action page")
 	}
+	if page.reader != r {
+		return nil, fmt.Errorf("page belongs to another reader")
+	}
 	return r.readAdditionalActions(ctx, page.Dictionary["AA"], []Name{"O", "C"})
 }
 
@@ -151,11 +182,15 @@ func (r *Reader) readAdditionalActions(ctx context.Context, object Object, event
 	return result, ctx.Err()
 }
 
-// readActionTrigger 校验单个事件的动作字典，空值表示未定义事件，返回浅拷贝防止污染缓存
+// readActionTrigger 校验单个事件的动作字典，空值表示未定义事件，保留原始引用和只读动作字典
 // 入参: ctx 取消上下文, event 事件名, object 动作对象
 // 返回: *ActionTrigger 动作, error 类型、引用或取消错误
 func (r *Reader) readActionTrigger(ctx context.Context, event Name, object Object) (*ActionTrigger, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ref, err := r.resolveIndirectReference(object)
+	if err != nil {
 		return nil, err
 	}
 	value, err := r.Resolve(object)
@@ -178,5 +213,5 @@ func (r *Reader) readActionTrigger(ctx context.Context, event Name, object Objec
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", event, err)
 	}
-	return &ActionTrigger{Event: event, Action: maps.Clone(action)}, nil
+	return &ActionTrigger{Event: event, Reference: ref, Action: action}, nil
 }

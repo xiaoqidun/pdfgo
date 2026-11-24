@@ -930,7 +930,6 @@ func preparePassword(password []byte) ([]byte, error) {
 	randal, left := false, false
 	for _, c := range string(result) {
 		if passwordRangeContains(passwordProhibited, c) {
-			clear(result)
 			return nil, ErrPassword
 		}
 		randal = randal || passwordRangeContains(passwordRandal, c)
@@ -939,7 +938,6 @@ func preparePassword(password []byte) ([]byte, error) {
 	first, _ := utf8.DecodeRune(result)
 	last, _ := utf8.DecodeLastRune(result)
 	if randal && (left || !passwordRangeContains(passwordRandal, first) || !passwordRangeContains(passwordRandal, last)) {
-		clear(result)
 		return nil, ErrPassword
 	}
 	return bytes.Clone(result[:min(len(result), 127)]), nil
@@ -965,7 +963,11 @@ func (r *Reader) encodePassword(password []byte) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid encryption dictionary")
 	}
-	revision, _ := dict["R"].(Integer)
+	rObj, err := r.Resolve(dict["R"])
+	if err != nil {
+		return nil, err
+	}
+	revision, _ := rObj.(Integer)
 	if revision >= 5 {
 		return preparePassword(password)
 	}

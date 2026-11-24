@@ -23,14 +23,10 @@ import (
 	"unicode/utf8"
 )
 
-// NavigationAction 描述导航或媒体播放动作，须且仅须指定一项
-// URI使用UTF-8文字或已转义地址，写出时转换为ASCII，不访问外部资源
-// External按结构化字段写出，File.Dictionary不参与写出，File.Name使用标准文件路径或URL
-// Sound的音量零值为静音，源流及文件数据在写出期间须保持可读；库不执行播放
-// Movie须指向原文件或本次新增的视频注解，跨页播放须由调用方先指定跳转动作
-// Movie未指定Annotation和Target时按Title查找原注解，允许空标题；Activation仅写出显式参数
-// Movie.Activation中的间接引用须属于当前文件
-// Rendition引用原有或本次新增的屏幕注解，不执行脚本或播放媒体
+// NavigationAction 描述导航或媒体播放动作，须且仅须指定一项，库不访问外部资源、不执行脚本或播放媒体
+// URI使用UTF-8或已转义地址并转为ASCII写出；External按结构化字段写出（忽略File.Dictionary），File.Name使用路径或URL
+// Sound音量零值为静音，写出期间源流及文件数据须保持可读；Rendition引用原有或新增屏幕注解
+// Movie指向原有或新增视频注解（未指定Annotation和Target时按Title查找，跨页播放须先跳转），Activation仅写出显式参数且引用须属当前文件
 type NavigationAction struct {
 	Destination *Destination
 	External    *ExternalGoToAction

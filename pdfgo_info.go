@@ -51,8 +51,15 @@ type OutputIntent struct {
 
 // OutputIntents 读取并验证文档输出意图，不将目标配置应用到普通屏显
 // 配置Warning时诊断无效辅助字段并返回可读取的部分，无效配置的Space为空，原始对象保持不变
-// 返回: []OutputIntent 按文档顺序排列的输出条件, error 字典、字段或ICC错误
-func (r *Reader) OutputIntents() ([]OutputIntent, error) {
+// 入参: ctx 取消上下文
+// 返回: []OutputIntent 按文档顺序排列的输出条件, error 字典、字段、ICC或取消错误
+func (r *Reader) OutputIntents(ctx context.Context) ([]OutputIntent, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid output intents context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	catalog, err := r.catalogDictionary()
 	if err != nil {
 		return nil, err
@@ -74,7 +81,10 @@ func (r *Reader) OutputIntents() ([]OutputIntent, error) {
 	}
 	result := make([]OutputIntent, len(array))
 	for n, object := range array {
-		result[n], err = r.readOutputIntent(object)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result[n], err = r.readOutputIntent(ctx, object)
 		if err != nil {
 			err = fmt.Errorf("output intent %d: %w", n+1, err)
 			if !r.recoverAuxiliary(err) {
@@ -87,10 +97,13 @@ func (r *Reader) OutputIntents() ([]OutputIntent, error) {
 }
 
 // readOutputIntent 解析输出条件并验证嵌入配置，不使用ICCBased的备用空间掩盖无效目标配置
-// 入参: object 输出意图字典或引用
-// 返回: OutputIntent 输出条件, error 定义或配置错误
-func (r *Reader) readOutputIntent(object Object) (OutputIntent, error) {
+// 入参: ctx 取消上下文, object 输出意图字典或引用
+// 返回: OutputIntent 输出条件, error 定义、配置或取消错误
+func (r *Reader) readOutputIntent(ctx context.Context, object Object) (OutputIntent, error) {
 	var result OutputIntent
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return result, err
@@ -154,11 +167,11 @@ func (r *Reader) readOutputIntent(object Object) (OutputIntent, error) {
 	if !ok {
 		return result, fmt.Errorf("invalid DestOutputProfile stream")
 	}
-	data, err := r.decodeStream(stream)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return result, fmt.Errorf("DestOutputProfile: %w", err)
 	}
-	result.Profile = append([]byte(nil), data...)
+	result.Profile = data
 	result.Space, err = NewICCColorSpace(data)
 	if err != nil {
 		return result, fmt.Errorf("DestOutputProfile: %w", err)
@@ -270,7 +283,7 @@ func (r *Reader) Info() (DocumentInfo, error) {
 func isFatalReaderError(err error) bool {
 	var read *ReadError
 	var security *objectSecurityError
-	return errors.As(err, &read) || errors.As(err, &security) || errors.Is(err, ErrPassword) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed)
+	return errors.As(err, &read) || errors.As(err, &security) || errors.Is(err, ErrPassword) || errors.Is(err, ErrStreamLimitExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrClosed)
 }
 
 // recoverAuxiliary 报告辅助信息错误，输入读取、解密、认证、关闭及取消错误继续传递

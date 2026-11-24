@@ -40,13 +40,7 @@ func (r *Reader) screenAnnotationReplacements(ctx context.Context, additions map
 	if len(additions) == 0 {
 		return nil, nil
 	}
-	number := int64(0)
-	for id := range r.xref {
-		number = max(number, id)
-	}
-	for ref := range result {
-		number = max(number, ref.Number)
-	}
+	number := r.maxRewriteObjectID(result)
 	refs := make(map[*ScreenAnnotation]Reference)
 	visited := make(map[Reference]bool)
 	copier := rewriteObjectCopy{ctx: ctx, source: r, objects: result, number: &number, copied: make(map[rewriteObjectIdentity]Reference)}

@@ -202,7 +202,7 @@ func iccIdentityCurve(curve []float64) bool {
 // 入参: curve 查找表, x 单位输入
 // 返回: float64 插值结果
 func iccLookupCurve(curve []float64, x float64) float64 {
-	if x <= 0 {
+	if !(x > 0) {
 		return curve[0]
 	}
 	if x >= 1 {
@@ -246,7 +246,7 @@ func iccXYZRGB(xyz [3]float64) [3]float64 {
 // 入参: table 编码查找表, v 线性分量
 // 返回: float64 单位sRGB分量
 func iccSRGBEncode(table *[8193]float32, v float64) float64 {
-	if v <= 0 {
+	if !(v > 0) {
 		return 0
 	}
 	if v >= 1 {
@@ -282,7 +282,13 @@ func (s *iccLUT) evaluate(values []float64) [4]float64 {
 	limit := s.grid - 2
 	if s.inputIdentity {
 		for i := range s.input {
-			x := math.Max(0, math.Min(1, input[i])) * scale
+			v := input[i]
+			if !(v > 0) {
+				v = 0
+			} else if v > 1 {
+				v = 1
+			}
+			x := v * scale
 			index[i] = min(int(x), limit)
 			fraction[i] = x - float64(index[i])
 		}

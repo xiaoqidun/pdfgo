@@ -24,6 +24,9 @@ import (
 	"strings"
 )
 
+// maxCMapStreamDepth 限制CMap流级UseCMap的最大继承深度
+const maxCMapStreamDepth = 64
+
 // CIDMap 保存字符码到CID的映射
 type CIDMap map[string]uint16
 
@@ -97,7 +100,7 @@ func ParseCIDMapContext(ctx context.Context, data []byte) (CIDMap, error) {
 				continue
 			}
 			span := entry.last - entry.first + 1
-			if span == 0 || span > maxCMapEntries-expanded {
+			if span > maxCMapEntries-expanded {
 				return nil, fmt.Errorf("CMap mapping entries exceed limit")
 			}
 			expanded += span
@@ -320,9 +323,9 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 	}
 }
 
-// copyUnicodeMapContext 合并独立映射，在复制期间及完成前检查取消
+// copyUnicodeMapContext 合并独立映射，在复制期间检查取消及总条目数上限
 // 入参: ctx 取消上下文, target 目标映射, source 源映射
-// 返回: error 取消错误
+// 返回: error 取消或条目超限错误
 func copyUnicodeMapContext(ctx context.Context, target, source UnicodeMap) error {
 	index := 0
 	for code, text := range source {
@@ -332,6 +335,9 @@ func copyUnicodeMapContext(ctx context.Context, target, source UnicodeMap) error
 			}
 		}
 		index++
+		if _, exists := target[code]; !exists && uint64(len(target)) >= maxCMapEntries {
+			return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
+		}
 		target[code] = text
 	}
 	return ctx.Err()
@@ -441,10 +447,14 @@ func (c *cidCMap) validateCode(raw []byte, valid bool) error {
 
 // characterCodes 反查指定CID的有效字符码，不展开无关映射区间
 // 入参: ctx 取消上下文, cids 升序排列的字符标识
-// 返回: []string 字符码, error 取消错误
+// 返回: []string 去重后的字符码, error 取消错误
 func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, error) {
+	if len(cids) == 0 {
+		return nil, ctx.Err()
+	}
 	var codes []string
-	for current := c; current != nil && len(cids) != 0; current = current.base {
+	seen := make(map[string]bool)
+	for current := c; current != nil; current = current.base {
 		for _, entry := range current.ranges {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -469,7 +479,11 @@ func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, 
 				}
 				data := raw[:size]
 				if n, valid := c.next(data); valid && n == size && c.validateCode(data, true) == nil && c.lookup(data, true) == cid {
-					codes = append(codes, string(data))
+					key := string(data)
+					if !seen[key] {
+						seen[key] = true
+						codes = append(codes, key)
+					}
 				}
 			}
 		}
@@ -497,11 +511,18 @@ func (c *cidCMap) undefined(raw []byte) uint16 {
 }
 
 // readCIDCMapContext 读取文档编码并沿用本次上下文解析继承流
-// 入参: ctx 取消上下文, object 编码对象, active 当前流继承链
-// 返回: *cidCMap 完整映射, error 解析或取消错误
-func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, active map[*Stream]bool) (*cidCMap, error) {
+// 入参: ctx 取消上下文, object 编码对象, activeRefs 当前流引用继承链, activeStreams 当前流指针继承链, depth 当前流继承深度
+// 返回: *cidCMap 完整映射, error 解析、环路、超限或取消错误
+func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, activeRefs map[Reference]bool, activeStreams map[*Stream]bool, depth int) (*cidCMap, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	ref, err := r.resolveIndirectReference(object)
+	if err != nil {
+		return nil, err
+	}
+	if ref != (Reference{}) && activeRefs[ref] {
+		return nil, fmt.Errorf("cyclic CMap stream inheritance")
 	}
 	value, err := r.Resolve(object)
 	if err != nil {
@@ -514,14 +535,24 @@ func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, active m
 	if !ok || stream == nil {
 		return nil, fmt.Errorf("invalid composite font encoding")
 	}
-	if active[stream] {
+	if activeStreams[stream] {
 		return nil, fmt.Errorf("cyclic CMap stream inheritance")
 	}
-	if active == nil {
-		active = map[*Stream]bool{}
+	if depth >= maxCMapStreamDepth {
+		return nil, fmt.Errorf("%w: CMap stream inheritance depth limit exceeded", ErrStreamLimitExceeded)
 	}
-	active[stream] = true
-	defer delete(active, stream)
+	if activeRefs == nil {
+		activeRefs = map[Reference]bool{}
+	}
+	if activeStreams == nil {
+		activeStreams = map[*Stream]bool{}
+	}
+	if ref != (Reference{}) {
+		activeRefs[ref] = true
+		defer delete(activeRefs, ref)
+	}
+	activeStreams[stream] = true
+	defer delete(activeStreams, stream)
 	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
@@ -530,15 +561,19 @@ func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, active m
 	if err != nil {
 		return nil, err
 	}
-	base, err := r.Resolve(stream.Dictionary["UseCMap"])
+	useRaw := stream.Dictionary["UseCMap"]
+	base, err := r.Resolve(useRaw)
 	if err != nil {
 		return nil, err
 	}
-	if base == nil && mapping.use != "" {
-		base = mapping.use
-	}
+	var next Object
 	if base != nil {
-		mapping.base, err = r.readCIDCMapContext(ctx, base, active)
+		next = useRaw
+	} else if mapping.use != "" {
+		next = mapping.use
+	}
+	if next != nil {
+		mapping.base, err = r.readCIDCMapContext(ctx, next, activeRefs, activeStreams, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -561,12 +596,19 @@ func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, active m
 	return mapping, nil
 }
 
-// readUnicodeCMapContext 读取独立Unicode映射，流继承及合并均检查取消
-// 入参: ctx 取消上下文, object 映射对象, active 当前流继承链
-// 返回: UnicodeMap 完整映射, error 解析或取消错误
-func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, active map[*Stream]bool) (UnicodeMap, error) {
+// readUnicodeCMapContext 读取独立Unicode映射，流继承及合并均检查取消与安全上限
+// 入参: ctx 取消上下文, object 映射对象, activeRefs 当前流引用继承链, activeStreams 当前流指针继承链, depth 当前流继承深度
+// 返回: UnicodeMap 完整映射, error 解析、环路、超限或取消错误
+func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, activeRefs map[Reference]bool, activeStreams map[*Stream]bool, depth int) (UnicodeMap, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	ref, err := r.resolveIndirectReference(object)
+	if err != nil {
+		return nil, err
+	}
+	if ref != (Reference{}) && activeRefs[ref] {
+		return nil, fmt.Errorf("cyclic ToUnicode stream inheritance")
 	}
 	value, err := r.Resolve(object)
 	if err != nil || value == nil {
@@ -587,14 +629,24 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 	if !ok || stream == nil {
 		return nil, fmt.Errorf("invalid ToUnicode")
 	}
-	if active[stream] {
+	if activeStreams[stream] {
 		return nil, fmt.Errorf("cyclic ToUnicode stream inheritance")
 	}
-	if active == nil {
-		active = map[*Stream]bool{}
+	if depth >= maxCMapStreamDepth {
+		return nil, fmt.Errorf("%w: ToUnicode stream inheritance depth limit exceeded", ErrStreamLimitExceeded)
 	}
-	active[stream] = true
-	defer delete(active, stream)
+	if activeRefs == nil {
+		activeRefs = map[Reference]bool{}
+	}
+	if activeStreams == nil {
+		activeStreams = map[*Stream]bool{}
+	}
+	if ref != (Reference{}) {
+		activeRefs[ref] = true
+		defer delete(activeRefs, ref)
+	}
+	activeStreams[stream] = true
+	defer delete(activeStreams, stream)
 	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
@@ -603,7 +655,8 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 	if err != nil {
 		return nil, err
 	}
-	base, err := r.Resolve(stream.Dictionary["UseCMap"])
+	useRaw := stream.Dictionary["UseCMap"]
+	base, err := r.Resolve(useRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -613,7 +666,7 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 		}
 		return result, nil
 	}
-	mapping, err := r.readUnicodeCMapContext(ctx, base, active)
+	mapping, err := r.readUnicodeCMapContext(ctx, useRaw, activeRefs, activeStreams, depth+1)
 	if err != nil {
 		return nil, err
 	}

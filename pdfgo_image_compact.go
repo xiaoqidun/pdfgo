@@ -57,9 +57,7 @@ type pngCompactPaletteImage struct {
 	indices map[color.NRGBA]uint8
 }
 
-// OptimizeImageResource 优化资源图片，有损模式允许无元数据的不透明照片改用JPEG
-// 调用方须按返回数据更新格式声明；固定格式导出应使用OptimizeImageSize
-// 不修改输入；返回值可能引用输入，调用方应视为只读
+// OptimizeImageResource 优化资源图片，有损模式允许无元数据不透明照片改用JPEG（调用方须更新格式声明，固定格式请用OptimizeImage），不修改输入且返回值只读
 // 入参: ctx 取消上下文, data 图片数据, options 压缩配置, size 像素需求
 // 返回: []byte 更小的图片数据, error 编码错误
 func OptimizeImageResource(ctx context.Context, data []byte, options CompressionOptions, size image.Point) ([]byte, error) {
@@ -75,20 +73,17 @@ func OptimizeImageResource(ctx context.Context, data []byte, options Compression
 	if options.Mode == CompressionLossy && bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
 		return optimizePNG(ctx, data, options, size, true)
 	}
-	return OptimizeImageSize(ctx, data, options, size)
+	return OptimizeImage(ctx, data, options, size)
 }
 
-// OptimizeImageFromPixels 从内存像素单次编码最优PNG，跳过冗余的PNG编码与解码回路
-// 不修改输入，不降采样，不附加密度或色彩配置；编码候选超过64MiB时返回io.ErrShortBuffer
+// OptimizeImageFromPixels 从内存像素单次编码最优PNG（不修改输入、不降采样、不附加元数据），候选超64MiB返回io.ErrShortBuffer
 // 入参: ctx 取消上下文, source 已解码图像, options 压缩配置
 // 返回: []byte 最优PNG数据, error 参数、编码或取消错误
 func OptimizeImageFromPixels(ctx context.Context, source image.Image, options CompressionOptions) ([]byte, error) {
 	return encodeImage(ctx, source, options, false)
 }
 
-// EncodePNGWithOptions 编码并优化固定PNG格式，直接基于内存像素单次输出，不修改输入
-// 不降采样，不附加密度或色彩配置；失败时输出可能不完整
-// 编码候选超过64MiB时返回io.ErrShortBuffer
+// EncodePNGWithOptions 基于内存像素单次编码优化PNG（不修改输入、不降采样、不附加元数据），候选超64MiB返回io.ErrShortBuffer，失败时输出可能不完整
 // 入参: ctx 取消上下文, writer 输出流, source 已解码图像, options 压缩配置
 // 返回: error 参数、编码、取消或写入错误
 func EncodePNGWithOptions(ctx context.Context, writer io.Writer, source image.Image, options CompressionOptions) error {
@@ -103,9 +98,7 @@ func EncodePNGWithOptions(ctx context.Context, writer io.Writer, source image.Im
 	return err
 }
 
-// EncodeImageResource 编码并优化资源图片，有损模式允许不透明照片采用JPEG，其余保留PNG
-// 不修改输入，不降采样，不附加密度或色彩配置；调用方须按返回数据设置格式声明
-// 编码候选超过64MiB时返回io.ErrShortBuffer，失败时不返回编码数据
+// EncodeImageResource 基于内存像素编码优化资源图片，有损模式不透明照片可用JPEG其余保留PNG（须按返回数据设格式，不降采样不附元数据），超64MiB返回io.ErrShortBuffer
 // 入参: ctx 取消上下文, source 已解码图像, options 压缩配置
 // 返回: []byte 图片编码, error 参数、编码或取消错误
 func EncodeImageResource(ctx context.Context, source image.Image, options CompressionOptions) ([]byte, error) {
@@ -762,7 +755,7 @@ func compactPNGSourceMode(ctx context.Context, data, best []byte, options Compre
 				}
 			}
 		}
-		if reused && options.Mode != CompressionLossy && !gray && len(palette) > 256 {
+		if reused && options.Mode != CompressionLossy && !gray && !opaque && len(palette) > 256 {
 			break
 		}
 	}
@@ -836,8 +829,7 @@ func compactPNGView(img image.Image, opaque bool) image.Image {
 	return &pngCompactImage{Image: img, opaque: opaque}
 }
 
-// compactPNGStorage 复用非预乘像素，其余颜色模型分配独立缓冲
-// 输入来自调用方时，复用结果仅可读取，不得用于原地量化
+// compactPNGStorage 复用非预乘像素或分配独立缓冲，复用的外部输入仅可读取不可原地量化
 // 入参: ctx 取消上下文, img 图像
 // 返回: *image.NRGBA 可写像素, bool 是否复用原像素, error 取消错误
 func compactPNGStorage(ctx context.Context, img image.Image) (*image.NRGBA, bool, error) {

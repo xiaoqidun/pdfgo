@@ -38,6 +38,12 @@ const readerRecoveryLimit = 64 << 20
 // readerTailLimit 限制文件尾部定位窗口
 const readerTailLimit = 1 << 20
 
+// maxXrefEntries 限制交叉引用表与交叉引用流允许累计加载的最大条目数
+const maxXrefEntries = 10_000_000
+
+// maxXrefSections 限制Prev交叉引用链允许遍历的最大区段数
+const maxXrefSections = 4096
+
 // Reader 读取PDF对象，方法不可并发调用，返回对象不可并发修改
 type Reader struct {
 	Version            string
@@ -66,26 +72,25 @@ type Reader struct {
 	maxFilterChain     int
 	jbig2Globals       *jbig2GlobalsCache
 	owner              *Reader
+	ownerHasWarning    bool
 	closed             bool
 	recoveryIndex      map[int64]xrefEntry
 	recoveryTried      bool
 }
 
-// ReaderOptions 设置密码编码、结构诊断、解码并发、流解压预算及生成注释外观时的文字整形
-// Warning非空时诊断并恢复可确定的结构、字体及解码声明，不修改输入数据
-// 源读取、取消及认证错误仍返回，绘制诊断由Visitor.Warning控制
-// ShapeText用于横排纯文本字段、列表选项及注释标题，空值不生成需要整形的外观，已有外观不受影响
-// Workers限制图像解码内部并发数，零值自动选择，外层并发调度时可设为1避免过度订阅
-// MaxStreamBytes限制单个流最大解压字节数，零值默认256MiB，负值不限制
-// MaxFilterChain限制单个流过滤器链最大深度，零值默认16，负值不限制
+// ReaderOptions 配置密码编码、结构诊断、文字整形、默认设备色ICC、解码并发及流解压预算
+// Warning非空时诊断并恢复可确定的结构、字体及解码声明（不改源数据，IO/取消/认证错仍返回；绘制诊断由Visitor.Warning控制）
+// ShapeText用于横排文本字段、选项及注释标题（nil不生成需整形的外观）；DeviceColorProfile仅作用于同通道未标定设备色，不覆盖显式或Default空间
+// Workers限制图像解码并发（0自动，外层并发建议设为1）；MaxStreamBytes默认256MiB、MaxFilterChain默认16（负值不限）
 type ReaderOptions struct {
-	Password       []byte
-	PasswordUTF8   bool
-	Warning        func(Diagnostic)
-	ShapeText      TextShaper
-	Workers        int
-	MaxStreamBytes int64
-	MaxFilterChain int
+	Password           []byte
+	PasswordUTF8       bool
+	Warning            func(Diagnostic)
+	ShapeText          TextShaper
+	DeviceColorProfile []byte
+	Workers            int
+	MaxStreamBytes     int64
+	MaxFilterChain     int
 }
 
 // objectStream 保存对象流索引、解码数据及实际缓存字节数
@@ -123,6 +128,7 @@ type objectCacheEntry struct {
 type objectCache struct {
 	mu      sync.Mutex
 	shared  atomic.Bool
+	closed  atomic.Bool
 	origin  *objectCache
 	objects map[Reference]Object
 	pinned  map[Reference]Object
@@ -163,6 +169,18 @@ func (r *Reader) ownsObject(objReader *Reader, objCache *objectCache) bool {
 		return false
 	}
 	return objReader == r || sameObjectCache(objCache, r.cache)
+}
+
+// rootHasWarning 返回根阅读器是否配置诊断回调，子视图读取不可变副本避免并发竞态
+// 返回: bool 根阅读器是否启用诊断
+func (r *Reader) rootHasWarning() bool {
+	if r == nil {
+		return false
+	}
+	if r.owner != nil {
+		return r.ownerHasWarning
+	}
+	return r.warning != nil
 }
 
 // Open 打开PDF文件并读取交叉引用
@@ -241,11 +259,19 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 	if size < 8 {
 		return nil, fmt.Errorf("invalid file size")
 	}
+	var deviceProfile *Stream
+	if options.DeviceColorProfile != nil {
+		space, err := NewICCColorSpace(options.DeviceColorProfile)
+		if err != nil {
+			return nil, err
+		}
+		deviceProfile = &Stream{Dictionary: Dictionary{"N": Integer(space.Components())}, Data: bytes.Clone(options.DeviceColorProfile)}
+	}
 	data := make([]byte, min(size, 1024))
 	if _, err := io.ReadFull(io.NewSectionReader(source, 0, size), data); err != nil {
 		return nil, err
 	}
-	header := bytes.Index(data[:min(len(data), 1024)], []byte("%PDF-"))
+	header := bytes.Index(data, []byte("%PDF-"))
 	if header < 0 {
 		if options.Warning == nil || !bytes.HasPrefix(data, []byte("%")) {
 			return nil, fmt.Errorf("missing PDF header")
@@ -269,7 +295,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		options.Warning(Diagnostic{Message: "invalid PDF version " + version + "; using 1.7"})
 		version = "1.7"
 	}
-	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: newObjectCache(streamCacheBudget), loading: map[Reference]bool{}, jbig2Globals: newJBIG2GlobalsCache()}
+	r := &Reader{Version: version, source: io.NewSectionReader(source, int64(header), size-int64(header)), size: size - int64(header), xref: map[int64]xrefEntry{}, cache: newObjectCache(streamCacheBudget), loading: map[Reference]bool{}, deviceProfile: deviceProfile, jbig2Globals: newJBIG2GlobalsCache()}
 	r.originalSource, r.originalSize = source, size
 	r.warning = options.Warning
 	r.textShaper = options.ShapeText
@@ -345,7 +371,7 @@ func readerStructuralError(err error) bool {
 	var read *ReadError
 	var unsupported *UnsupportedError
 	var security *objectSecurityError
-	return err != nil && !errors.As(err, &read) && !errors.As(err, &unsupported) && !errors.As(err, &security) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, ErrPassword)
+	return err != nil && !errors.As(err, &read) && !errors.As(err, &unsupported) && !errors.As(err, &security) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, ErrPassword) && !errors.Is(err, ErrStreamLimitExceeded)
 }
 
 // streamEndTypo 识别endstream关键字仅缺失一个字母的拼写，不匹配任意词
@@ -616,14 +642,16 @@ func (c *objectCache) evictLocked() {
 	}
 }
 
-// Close 释放源数据、对象缓存和解密密钥，关闭Open持有的文件
-// 不关闭NewReader的外部数据源；关闭后不可继续读取，重复关闭不产生错误
+// Close 释放源数据、缓存与解密密钥并关闭Open持有的文件（不关闭NewReader外部源，可重复调用），关闭后读取方法及关联流均返回os.ErrClosed，共享底层os.File的Fork视图随之失效
 // 返回: error 关闭错误
 func (r *Reader) Close() error {
 	if r == nil {
 		return nil
 	}
 	closer := r.closer
+	if r.owner == nil && r.cache != nil {
+		r.cache.closed.Store(true)
+	}
 	if r.security != nil {
 		clear(r.security.key)
 	}
@@ -762,13 +790,13 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	if stream, ok := value.(*Stream); ok && stream != nil {
+	if stream, ok := value.(*Stream); ok {
 		stream.maxStreamBytes = r.maxStreamBytes
 		stream.maxFilterChain = r.maxFilterChain
 		stream.cacheFilterRefs(r)
 		if r.owner != nil {
 			stream.reader = r.owner
-			stream.hasWarning = r.owner.warning != nil
+			stream.hasWarning = r.ownerHasWarning
 		}
 	}
 	r.cache.set(ref, value)
@@ -896,6 +924,13 @@ func (e *objectSecurityError) Unwrap() error {
 	return e.err
 }
 
+// Is 使对象安全错误匹配导出哨兵错误ErrDecrypt
+// 入参: target 目标错误
+// 返回: bool 是否匹配ErrDecrypt
+func (e *objectSecurityError) Is(target error) bool {
+	return target == ErrDecrypt
+}
+
 // loadCrossReferences 按文件尾声明读取交叉引用链并保留最新条目
 // 返回: error 声明、读取或交叉引用错误
 func (r *Reader) loadCrossReferences() error {
@@ -929,7 +964,12 @@ func (r *Reader) loadCrossReferences() error {
 		r.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "missing final EOF marker or trailing data after EOF"})
 	}
 	visited := map[int64]bool{}
+	sections := 0
 	for {
+		sections++
+		if sections > maxXrefSections {
+			return fmt.Errorf("%w: cross-reference section limit exceeded", ErrStreamLimitExceeded)
+		}
 		if visited[offset] {
 			if r.warning != nil && r.Trailer != nil {
 				r.warning(Diagnostic{Offset: offset, Message: "cyclic previous cross-reference; latest entries retained"})
@@ -938,25 +978,47 @@ func (r *Reader) loadCrossReferences() error {
 			return fmt.Errorf("cyclic cross-reference chain")
 		}
 		visited[offset] = true
-		trailer, entries, err := r.readXref(offset)
+		trailer, entries, actual, err := r.readXref(offset)
 		if err != nil {
 			return err
 		}
-		if hybrid, ok := trailer["XRefStm"].(Integer); ok {
+		if actual != offset {
+			if visited[actual] {
+				if r.warning != nil && r.Trailer != nil {
+					r.warning(Diagnostic{Offset: actual, Message: "cyclic previous cross-reference; latest entries retained"})
+					break
+				}
+				return fmt.Errorf("cyclic cross-reference chain")
+			}
+			visited[actual] = true
+		}
+		if hybridObj := trailer["XRefStm"]; hybridObj != nil {
+			hybrid, ok := hybridObj.(Integer)
+			if !ok || hybrid < 0 {
+				return fmt.Errorf("invalid hybrid cross-reference offset")
+			}
 			if visited[int64(hybrid)] {
 				return fmt.Errorf("cyclic hybrid cross-reference")
 			}
 			visited[int64(hybrid)] = true
-			_, supplement, err := r.readXref(int64(hybrid))
+			_, supplement, err := r.readXrefStream(int64(hybrid))
 			if err != nil {
 				return err
 			}
 			for id, entry := range supplement {
-				entries[id] = entry
+				if _, exists := entries[id]; !exists {
+					if len(entries) >= maxXrefEntries {
+						return fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
+					}
+					entries[id] = entry
+				}
 			}
 		}
 		for id, entry := range entries {
 			if _, exists := r.xref[id]; !exists {
+				if len(r.xref) >= maxXrefEntries {
+					return fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
+				}
 				r.xref[id] = entry
 			}
 		}
@@ -1269,7 +1331,7 @@ func (r *Reader) rebuildCompressedEntries(index map[int64]xrefEntry, trailer Dic
 		}
 		seen[ref] = true
 		if remaining <= 0 {
-			return fmt.Errorf("object stream recovery decode limit exceeded")
+			return fmt.Errorf("object stream recovery %w", ErrStreamLimitExceeded)
 		}
 		stream, err := local.readObjectStreamLimit(ref, remaining)
 		if err != nil {
@@ -1444,10 +1506,10 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 	if keyword == "stream" {
 		dict, ok := value.(Dictionary)
 		if !ok {
-			return ref, nil, p.fail("stream requires dictionary")
+			return ref, nil, &SyntaxError{Offset: offset + int64(p.pos), Message: "stream requires dictionary"}
 		}
 		if !streamStart {
-			return ref, nil, p.fail("missing stream line ending")
+			return ref, nil, &SyntaxError{Offset: offset + int64(p.pos), Message: "missing stream line ending"}
 		}
 		lengthObject, err := r.Resolve(dict["Length"])
 		if err != nil {
@@ -1456,7 +1518,7 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 		length, ok := lengthObject.(Integer)
 		start := offset + int64(p.pos)
 		if (!ok || length < 0 || int64(length) > r.size-start) && r.warning == nil {
-			return ref, nil, p.fail("invalid stream length")
+			return ref, nil, &SyntaxError{Offset: offset + int64(p.pos), Message: "invalid stream length"}
 		}
 		if !ok {
 			length = -1
@@ -1469,7 +1531,7 @@ func (r *Reader) indirect(offset int64) (Reference, Object, error) {
 		if err != nil {
 			return ref, nil, err
 		}
-		value = &Stream{Dictionary: dict, Data: data, Reference: ref, reader: r, cache: r.cache, hasWarning: r.warning != nil}
+		value = &Stream{Dictionary: dict, Data: data, Reference: ref, reader: r, cache: r.cache, maxStreamBytes: r.maxStreamBytes, maxFilterChain: r.maxFilterChain, hasWarning: r.warning != nil}
 		err = r.parseAt(start+actualLength, func(tail *objectParser) error {
 			token := tail.token()
 			if token != "endstream" && (r.warning == nil || !streamEndTypo(token)) {
@@ -1659,12 +1721,12 @@ func (r *Reader) streamExtent(start, length int64, ref Reference) (int64, int64,
 		if err != nil {
 			return 0, 0, err
 		}
-		if len(data) > 0 && data[len(data)-1] == '\n' {
+		if data[len(data)-1] == '\n' {
 			actual--
 			if len(data) > 1 && data[len(data)-2] == '\r' {
 				actual--
 			}
-		} else if len(data) > 0 && data[len(data)-1] == '\r' {
+		} else if data[len(data)-1] == '\r' {
 			actual--
 		}
 	}
@@ -1687,13 +1749,13 @@ func (p *objectParser) objectBoundary() bool {
 	return err == nil && generation >= 0 && generation <= 65535 && p.token() == "obj"
 }
 
-// readXref 读取传统或流式交叉引用区段
+// readXref 读取传统或流式交叉引用区段，并返回实际定位的区段偏移
 // 入参: offset 交叉引用区段的字节偏移
-// 返回: Dictionary 尾字典或交叉引用流字典, map[int64]xrefEntry 交叉引用条目, error 读取或解析错误
-func (r *Reader) readXref(offset int64) (Dictionary, map[int64]xrefEntry, error) {
+// 返回: Dictionary 尾字典或交叉引用流字典, map[int64]xrefEntry 交叉引用条目, int64 实际区段偏移, error 读取或解析错误
+func (r *Reader) readXref(offset int64) (Dictionary, map[int64]xrefEntry, int64, error) {
 	trailer, entries, original := r.readXrefAt(offset)
 	if original == nil || r.warning == nil || !readerStructuralError(original) {
-		return trailer, entries, original
+		return trailer, entries, offset, original
 	}
 	start, stop := max(int64(0), offset-1024), min(r.size, offset+1024)
 	if offset < 0 || offset >= r.size {
@@ -1705,20 +1767,20 @@ func (r *Reader) readXref(offset int64) (Dictionary, map[int64]xrefEntry, error)
 	}{{start, stop, false}, {max(int64(0), r.size-readerTailLimit), r.size, true}} {
 		trailer, entries, candidate, err := r.findXrefOffset(offset, region.start, region.stop, region.claim)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, -1, err
 		}
 		if candidate >= 0 {
 			if err := r.rebaseXrefEntries(offset, candidate, trailer, entries); err != nil {
 				if !readerStructuralError(err) {
-					return nil, nil, err
+					return nil, nil, -1, err
 				}
 				continue
 			}
 			r.warning(Diagnostic{Offset: candidate, Message: fmt.Sprintf("cross-reference offset %d recovered at %d", offset, candidate)})
-			return trailer, entries, nil
+			return trailer, entries, candidate, nil
 		}
 	}
-	return nil, nil, original
+	return nil, nil, -1, original
 }
 
 // rebaseXrefEntries 验证嵌入PDF文件头及全部在用对象头后修正相对该文件头的xref偏移
@@ -1946,6 +2008,9 @@ func (r *Reader) classicXref(p *objectParser) (Dictionary, map[int64]xrefEntry, 
 		if e1 != nil || e2 != nil || first < 0 || count < 0 || count > r.size/18 || first > (1<<63-1)-count {
 			return nil, nil, p.fail("invalid cross-reference subsection")
 		}
+		if count > maxXrefEntries-int64(len(entries)) {
+			return nil, nil, fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
+		}
 		for i := int64(0); i < count; i++ {
 			position, e1 := strconv.ParseInt(p.token(), 10, 64)
 			generation, e2 := strconv.ParseInt(p.token(), 10, 64)
@@ -2021,12 +2086,17 @@ func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, 
 	}
 	entries := map[int64]xrefEntry{}
 	pos := 0
+	var total int64
 	for i := 0; i < len(index); i += 2 {
 		first, ok1 := index[i].(Integer)
 		count, ok2 := index[i+1].(Integer)
 		if !ok1 || !ok2 || first < 0 || count < 0 || first > Integer(1<<63-1)-count || int64(count) > int64((len(data)-pos)/stride) {
 			return nil, nil, fmt.Errorf("invalid cross-reference range")
 		}
+		if int64(count) > maxXrefEntries-total {
+			return nil, nil, fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
+		}
+		total += int64(count)
 		if count > size || first > size-count {
 			if r.warning == nil {
 				return nil, nil, fmt.Errorf("invalid cross-reference range")
@@ -2184,28 +2254,35 @@ func (r *Reader) readObjectStreamLimit(ref Reference, limit int64) (*objectStrea
 	if first > int64(len(data)) || count > (first+1)/4 {
 		return nil, fmt.Errorf("invalid object stream dimensions")
 	}
-	if limit > 0 && (int64(cap(data))+8 > limit || count > (limit-int64(cap(data))-8)/80) {
-		return nil, fmt.Errorf("object stream recovery index limit exceeded")
+	if limit > 0 {
+		if int64(cap(data))+8 > limit || count > (limit-int64(cap(data))-8)/80 {
+			return nil, fmt.Errorf("object stream recovery index %w", ErrStreamLimitExceeded)
+		}
+	} else if maxBytes, _ := effectiveStreamLimits(r, stream); maxBytes > 0 && count > max(maxBytes, int64(objectStreamCacheLimit))/64 {
+		return nil, fmt.Errorf("%w: object stream index limit exceeded", ErrStreamLimitExceeded)
 	}
 	p := objectParser{data: data[:first]}
-	ids, offsets := make([]int64, count), make([]int64, count+1)
-	indices := make(map[int64]int64, count)
-	var e1, e2 error
+	initial := int(min(count, int64(4096)))
+	ids := make([]int64, 0, initial)
+	offsets := make([]int64, 0, initial+1)
+	indices := make(map[int64]int64, initial)
 	for i := int64(0); i < count; i++ {
-		ids[i], e1 = strconv.ParseInt(p.token(), 10, 64)
-		offsets[i], e2 = strconv.ParseInt(p.token(), 10, 64)
-		if e1 != nil || e2 != nil || ids[i] <= 0 || offsets[i] < 0 || offsets[i] > int64(len(data))-first || (i > 0 && offsets[i] <= offsets[i-1]) {
+		id, e1 := strconv.ParseInt(p.token(), 10, 64)
+		off, e2 := strconv.ParseInt(p.token(), 10, 64)
+		if e1 != nil || e2 != nil || id <= 0 || off < 0 || off > int64(len(data))-first || (i > 0 && off <= offsets[i-1]) {
 			return nil, fmt.Errorf("invalid object stream index")
 		}
-		if _, exists := indices[ids[i]]; exists {
+		if _, exists := indices[id]; exists {
 			return nil, fmt.Errorf("duplicate object stream number")
 		}
-		indices[ids[i]] = i
+		ids = append(ids, id)
+		offsets = append(offsets, off)
+		indices[id] = i
 	}
 	p.skipSpace()
 	if p.pos != len(p.data) {
 		return nil, fmt.Errorf("object stream index mismatch")
 	}
-	offsets[count] = int64(len(data)) - first
+	offsets = append(offsets, int64(len(data))-first)
 	return &objectStream{reference: ref, data: data[first:], ids: ids, indices: indices, offsets: offsets, bytes: int64(cap(data)) + 8*(count*2+1) + 64*count}, nil
 }

@@ -23,24 +23,26 @@ import (
 
 // TilingPattern 保存平铺图案的单元几何及独立内容流
 type TilingPattern struct {
-	BBox          Rectangle
-	Matrix        Matrix
-	XStep         float64
-	YStep         float64
-	PaintType     int
-	reader        *Reader
-	page          *Page
-	stream        *Stream
-	resources     Dictionary
-	pageResources Dictionary
-	data          []byte
-	depth         int
-	glyphStreams  []*Stream
-	initial       graphicsState
-	blendingSpace *ColorSpace
-	maskGroup     *Stream
-	halftones     map[string]*Halftone
-	empty         bool
+	BBox           Rectangle
+	Matrix         Matrix
+	XStep          float64
+	YStep          float64
+	PaintType      int
+	reader         *Reader
+	page           *Page
+	stream         *Stream
+	resources      Dictionary
+	pageResources  Dictionary
+	data           []byte
+	depth          int
+	glyphStreams   []*Stream
+	formStreams    []*Stream
+	patternStreams []*Stream
+	initial        graphicsState
+	blendingSpace  *ColorSpace
+	maskGroup      *Stream
+	halftones      map[string]*Halftone
+	empty          bool
 }
 
 // patternBaseColor 按底层颜色空间解释无色图案的颜色分量
@@ -76,6 +78,15 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	if p.empty {
 		return nil
 	}
+	for _, active := range p.patternStreams {
+		if active == p.stream {
+			if visitor.Warning == nil {
+				return fmt.Errorf("recursive tiling pattern")
+			}
+			visitor.Warning(Diagnostic{Message: "recursive tiling pattern ignored"})
+			return ctx.Err()
+		}
+	}
 	if p.depth > 64 {
 		return &UnsupportedError{Feature: "nested pattern depth"}
 	}
@@ -86,6 +97,8 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	clip := Path{Segments: []Segment{{"M", []Point{{box.XMin, box.YMin}}}, {"L", []Point{{box.XMax, box.YMin}}}, {"L", []Point{{box.XMax, box.YMax}}}, {"L", []Point{{box.XMin, box.YMax}}}, {"C", nil}}}
 	child := pageInterpreter{reader: p.reader, page: p.page, stream: p.stream, resources: p.resources, pageResources: p.pageResources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), depth: p.depth, uncoloredPattern: p.PaintType == 2, patternMatrix: Identity(), bounds: box}
 	child.glyphStreams = p.glyphStreams
+	child.formStreams = p.formStreams
+	child.patternStreams = append(append([]*Stream(nil), p.patternStreams...), p.stream)
 	child.blendingSpace, child.maskGroup = p.blendingSpace, p.maskGroup
 	child.state = p.initial
 	child.state.matrix = Identity()
@@ -166,6 +179,18 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if !ok || paintType != 1 && paintType != 2 {
 		return nil, fmt.Errorf("invalid tiling pattern paint type")
 	}
+	for _, active := range p.patternStreams {
+		if active == stream {
+			if p.visitor.Warning == nil {
+				return nil, fmt.Errorf("recursive tiling pattern")
+			}
+			p.visitor.Warning(Diagnostic{Message: "recursive tiling pattern ignored"})
+			if err := p.ctx.Err(); err != nil {
+				return nil, err
+			}
+			return &TilingPattern{Matrix: Identity(), XStep: 1, YStep: 1, PaintType: int(paintType), reader: p.reader, page: p.page, stream: stream, depth: p.depth + 1, glyphStreams: p.glyphStreams, formStreams: p.formStreams, patternStreams: p.patternStreams, empty: true}, nil
+		}
+	}
 	value, err = p.reader.Resolve(dict["TilingType"])
 	if err != nil {
 		return nil, err
@@ -230,7 +255,7 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err != nil {
 		return nil, err
 	}
-	pattern := &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones, empty: empty}
+	pattern := &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, formStreams: p.formStreams, patternStreams: p.patternStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones, empty: empty}
 	pattern.page, pattern.stream = p.page, stream
 	if p.tilingPatterns == nil {
 		p.tilingPatterns = make(map[Name]*TilingPattern)

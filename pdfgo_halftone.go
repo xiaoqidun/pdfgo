@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -44,16 +45,25 @@ type Halftone struct {
 }
 
 // ReadHalftone 读取类型1、5、6、10和16的网屏定义，Default返回空值
-// 入参: object 半色调字典、数据流、Default或间接引用
-// 返回: *Halftone 网屏参数, error 类型、尺寸或阈值数据错误
-func (r *Reader) ReadHalftone(object Object) (*Halftone, error) {
+// 入参: ctx 取消上下文, object 半色调字典、数据流、Default或间接引用
+// 返回: *Halftone 网屏参数, error 类型、尺寸、阈值数据或取消错误
+func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid halftone context")
+	}
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	ref, indirect := object.(Reference)
 	if indirect && !r.closed {
 		if cached, ok := r.halftones[ref]; ok {
 			return cached, nil
 		}
 	}
-	h, err := r.readHalftone(object, false, nil, nil)
+	h, err := r.readHalftone(ctx, object, false, nil, nil)
 	if err == nil && indirect {
 		if r.halftones == nil {
 			r.halftones = make(map[Reference]*Halftone)
@@ -64,11 +74,20 @@ func (r *Reader) ReadHalftone(object Object) (*Halftone, error) {
 }
 
 // ReadHalftoneForDevice 优先选择设备命名网屏，未匹配时解析文件中的备用定义
-// 入参: object 网屏对象, named 只读设备网屏，匹配后不解析其他字段或阈值流
-// 返回: *Halftone 有效网屏, error 名称或备用定义错误
-func (r *Reader) ReadHalftoneForDevice(object Object, named map[string]*Halftone) (*Halftone, error) {
+// 入参: ctx 取消上下文, object 网屏对象, named 只读设备网屏，匹配后不解析其他字段或阈值流
+// 返回: *Halftone 有效网屏, error 名称、备用定义或取消错误
+func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named map[string]*Halftone) (*Halftone, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid halftone context")
+	}
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(named) == 0 {
-		return r.ReadHalftone(object)
+		return r.ReadHalftone(ctx, object)
 	}
 	ref, indirect := object.(Reference)
 	if indirect && !r.closed {
@@ -77,7 +96,7 @@ func (r *Reader) ReadHalftoneForDevice(object Object, named map[string]*Halftone
 		}
 	}
 	used := false
-	h, err := r.readHalftone(object, false, named, &used)
+	h, err := r.readHalftone(ctx, object, false, named, &used)
 	if err == nil && indirect && !used {
 		if r.halftones == nil {
 			r.halftones = make(map[Reference]*Halftone)
@@ -109,7 +128,7 @@ func (h *Halftone) namedOverride(named map[string]*Halftone) bool {
 // 入参: object 网屏定义
 // 返回: *Halftone 网屏或连续色调缺省, error 严格校验、读取、解密、认证、关闭或取消错误
 func (p *pageInterpreter) displayHalftone(object Object) (*Halftone, error) {
-	h, cause := p.reader.ReadHalftoneForDevice(object, p.visitor.Halftones)
+	h, cause := p.reader.ReadHalftoneForDevice(p.ctx, object, p.visitor.Halftones)
 	if cause == nil || p.visitor.Warning == nil {
 		return h, cause
 	}
@@ -157,9 +176,12 @@ func (p *pageInterpreter) displayHalftone(object Object) (*Halftone, error) {
 }
 
 // readHalftone 读取单色或分量网屏，禁止嵌套类型5
-// 入参: object 网屏对象, component 是否为分量网屏, named 只读设备命名网屏, used 记录名称匹配
-// 返回: *Halftone 网屏参数, error 定义错误
-func (r *Reader) readHalftone(object Object, component bool, named map[string]*Halftone, used *bool) (*Halftone, error) {
+// 入参: ctx 取消上下文, object 网屏对象, component 是否为分量网屏, named 只读设备命名网屏, used 记录名称匹配
+// 返回: *Halftone 网屏参数, error 定义或取消错误
+func (r *Reader) readHalftone(ctx context.Context, object Object, component bool, named map[string]*Halftone, used *bool) (*Halftone, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -223,7 +245,7 @@ func (r *Reader) readHalftone(object Object, component bool, named map[string]*H
 			if key == "Type" || key == "HalftoneType" || key == "HalftoneName" {
 				continue
 			}
-			part, err := r.readHalftone(object, true, named, used)
+			part, err := r.readHalftone(ctx, object, true, named, used)
 			if err != nil {
 				return nil, err
 			}
@@ -308,7 +330,7 @@ func (r *Reader) readHalftone(object Object, component bool, named map[string]*H
 		}
 		*field.target = int(n)
 	}
-	data, err := r.decodeStream(stream)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
@@ -340,9 +362,9 @@ func (r *Reader) readHalftone(object Object, component bool, named map[string]*H
 	return h, nil
 }
 
-// IdentityTransfer 判断网屏中是否仅使用恒等传递函数，分量网屏逐项检查
-// 入参: reader 无所属阅读器时使用的PDF阅读器
-// 返回: bool 是否恒等, error 函数解析错误
+// IdentityTransfer 判断网屏是否仅使用恒等传递函数，分量网屏逐项检查，nil接收者返回true和nil
+// 入参: reader 同源Fork视图或备用阅读器，同源时优先使用以保证并发安全
+// 返回: bool 是否恒等, error 函数解析或关闭错误
 func (h *Halftone) IdentityTransfer(reader *Reader) (bool, error) {
 	return h.identityTransfer(reader, 0)
 }

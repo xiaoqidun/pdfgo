@@ -35,9 +35,9 @@ import (
 // jbig2FileHeader 为顺序组织且页数未知的JBIG2文件头
 var jbig2FileHeader = []byte{0x97, 0x4a, 0x42, 0x32, 0x0d, 0x0a, 0x1a, 0x0a, 3}
 
-// Image 保存图像有效属性及原始数据流，颜色空间和遮罩使用PDF对象
-// Warning非空时允许恢复完整图像的尺寸、Decode、遮罩及编码封装差异，并报告原因
-// Intent为空时继承绘图状态，单独解码使用相对色度
+// Image 保存图像有效属性及原始数据流，颜色空间和遮罩使用PDF对象，Intent为空时继承绘图状态或回退相对色度
+// Warning非空时恢复尺寸、Decode、遮罩及封装差异并报告，ReadImage返回时默认为nil且不自动继承ReaderOptions.Warning
+// Workers限制图像内部解码并发度，非正值沿用Reader配置或自动选择
 type Image struct {
 	Width               int
 	Height              int
@@ -766,11 +766,12 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 	w, widthErr := readInteger("Width")
 	h, heightErr := readInteger("Height")
 	if widthErr != nil || heightErr != nil || w <= 0 || h <= 0 || uint64(w) > uint64(^uint(0)>>1) || uint64(h) > uint64(^uint(0)>>1) {
-		width, height, encodedErr := 0, 0, fmt.Errorf("image dimensions unavailable")
+		width, height := 0, 0
+		var encodedErr error
 		if r.warning != nil {
 			width, height, encodedErr = r.encodedImageDimensions(stream)
 		}
-		if encodedErr == nil && width > 0 && height > 0 {
+		if r.warning != nil && encodedErr == nil && width > 0 && height > 0 {
 			w, h = int64(width), int64(height)
 			r.warning(Diagnostic{Message: fmt.Sprintf("invalid image dictionary dimensions; using encoded image dimensions %dx%d", width, height)})
 		} else if widthErr != nil {
@@ -1138,6 +1139,9 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
 	}
+	if i.BitsPerComponent != 1 && i.BitsPerComponent != 2 && i.BitsPerComponent != 4 && i.BitsPerComponent != 8 && i.BitsPerComponent != 16 {
+		return nil, fmt.Errorf("invalid image component depth")
+	}
 	filters, parameters, err := i.Stream.filterChain(i.reader)
 	if err != nil {
 		return nil, err
@@ -1177,7 +1181,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	}
 	data := i.Stream.Data
 	if terminal == "" || len(filters) != 0 {
-		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data}).decodeWith(ctx, nil, i.Warning, 0)
+		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data, maxStreamBytes: i.Stream.maxStreamBytes, maxFilterChain: i.Stream.maxFilterChain}).decodeWith(ctx, i.reader, i.Warning, 0)
 		if err != nil {
 			if terminal == "" {
 				recovered, recErr := i.recoverArrayPredictorSamplesContext(ctx, filters, parameters, err)
@@ -1378,21 +1382,35 @@ func (i *Image) recoverArrayPredictorSamplesContext(ctx context.Context, filters
 // 返回: []byte 全局字典字节, error 解析或解码错误
 func (i *Image) jbig2GlobalsRaw(ctx context.Context, obj Object) ([]byte, error) {
 	ref, isRef := obj.(Reference)
-	cache := i.reader.jbig2Globals
+	var cache *jbig2GlobalsCache
+	if i.reader != nil {
+		cache = i.reader.jbig2Globals
+	}
 	if isRef && cache != nil {
 		if cached, ok := cache.getRaw(ref); ok {
 			return cached, nil
 		}
 	}
-	value, err := i.reader.Resolve(obj)
-	if err != nil {
-		return nil, err
+	value := obj
+	var err error
+	if i.reader != nil {
+		value, err = i.reader.Resolve(obj)
+		if err != nil {
+			return nil, err
+		}
+	} else if isRef {
+		return nil, fmt.Errorf("missing reader for JBIG2 globals")
 	}
 	stream, ok := value.(*Stream)
 	if !ok || stream == nil {
 		return nil, fmt.Errorf("invalid JBIG2 globals")
 	}
-	data, err := i.reader.DecodeStreamContext(ctx, stream)
+	var data []byte
+	if i.reader != nil {
+		data, err = i.reader.DecodeStreamContext(ctx, stream)
+	} else {
+		data, err = stream.decodeWith(ctx, nil, i.Warning, 0)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1407,7 +1425,10 @@ func (i *Image) jbig2GlobalsRaw(ctx context.Context, obj Object) ([]byte, error)
 // 返回: *jbig2.Globals 已解析全局字典, error 解析错误
 func (i *Image) jbig2GlobalsParsed(ctx context.Context, obj Object, opts *jbig2.DecodeOptions) (*jbig2.Globals, error) {
 	ref, isRef := obj.(Reference)
-	cache := i.reader.jbig2Globals
+	var cache *jbig2GlobalsCache
+	if i.reader != nil {
+		cache = i.reader.jbig2Globals
+	}
 	if isRef && cache != nil {
 		if cached, ok := cache.getParsed(ref); ok {
 			return cached, nil
@@ -1573,6 +1594,9 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	}
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
+	}
+	if i.BitsPerComponent != 1 && i.BitsPerComponent != 2 && i.BitsPerComponent != 4 && i.BitsPerComponent != 8 && i.BitsPerComponent != 16 {
+		return nil, fmt.Errorf("invalid image component depth")
 	}
 	if target == nil && !i.ImageMask {
 		none, err := i.reader.colorSpaceNone(i.ColorSpace, i.effectiveColorSpace)
@@ -2093,9 +2117,6 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			copy(values[:], inputs)
 			if profile != nil {
 				values = profile.normalize(values[:components])
-			}
-			if components == 1 {
-				values[1], values[2] = values[0], values[0]
 			}
 			if target != nil && len(target.Colorants) > 0 {
 				tints := inputs

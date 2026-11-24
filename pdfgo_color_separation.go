@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -46,7 +47,14 @@ type tintFunction struct {
 // 入参: space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
 // 返回: *separationSpace 分色变换, error 定义或函数错误
 func (r *Reader) readSeparationSpace(space Array, effective bool, depth int) (*separationSpace, error) {
-	result, err := r.compileSeparationSpace(space, effective, depth)
+	return r.readSeparationSpaceContext(context.Background(), space, effective, depth)
+}
+
+// readSeparationSpaceContext 在取消上下文内读取原始分色或已校验的默认空间替换
+// 入参: ctx 取消上下文, space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: *separationSpace 分色变换, error 定义、函数或取消错误
+func (r *Reader) readSeparationSpaceContext(ctx context.Context, space Array, effective bool, depth int) (*separationSpace, error) {
+	result, err := r.compileSeparationSpace(ctx, space, effective, depth)
 	if err != nil {
 		return nil, err
 	}
@@ -55,9 +63,12 @@ func (r *Reader) readSeparationSpace(space Array, effective bool, depth int) (*s
 }
 
 // compileSeparationSpace 编译分色备用变换，不保留Reader或源资源字典
-// 入参: space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: *separationSpace 分色变换, error 定义或函数错误
-func (r *Reader) compileSeparationSpace(space Array, effective bool, depth int) (*separationSpace, error) {
+// 入参: ctx 取消上下文, space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: *separationSpace 分色变换, error 定义、函数或取消错误
+func (r *Reader) compileSeparationSpace(ctx context.Context, space Array, effective bool, depth int) (*separationSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if depth >= 64 {
 		return nil, fmt.Errorf("color space recursion limit exceeded")
 	}
@@ -80,7 +91,7 @@ func (r *Reader) compileSeparationSpace(space Array, effective bool, depth int) 
 		var transform *gradientFunction
 		if name == "All" {
 			model = "DeviceCMYK"
-			transform, err = r.readGradientFunction(Dictionary{"FunctionType": Integer(2), "Domain": Array{Integer(0), Integer(1)}, "C0": Array{Integer(0), Integer(0), Integer(0), Integer(0)}, "C1": Array{Integer(1), Integer(1), Integer(1), Integer(1)}, "N": Integer(1)}, 4, 0)
+			transform, err = r.readGradientFunctionContext(ctx, Dictionary{"FunctionType": Integer(2), "Domain": Array{Integer(0), Integer(1)}, "C0": Array{Integer(0), Integer(0), Integer(0), Integer(0)}, "C1": Array{Integer(1), Integer(1), Integer(1), Integer(1)}, "N": Integer(1)}, 4, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -92,11 +103,11 @@ func (r *Reader) compileSeparationSpace(space Array, effective bool, depth int) 
 		return nil, err
 	}
 	if family := colorSpaceFamily(object); family == "Separation" || family == "DeviceN" {
-		nested, err := r.readTintAlternate(object, effective, depth+1)
+		nested, err := r.readTintAlternateContext(ctx, object, effective, depth+1)
 		if err != nil {
 			return nil, err
 		}
-		transform, err := r.readGradientFunction(space[3], nested.components, 0)
+		transform, err := r.readGradientFunctionContext(ctx, space[3], nested.components, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -123,7 +134,7 @@ func (r *Reader) compileSeparationSpace(space Array, effective bool, depth int) 
 			lab, err = r.readLab(array)
 			alternate = "Lab"
 		case Name("ICCBased"):
-			icc, err = r.readICCSourceSpace(array, effective)
+			icc, err = r.readICCSourceSpaceContext(ctx, array, effective)
 			alternate = "ICCBased"
 		case Name("CalRGB"):
 			alternate = "CalRGB"
@@ -151,11 +162,11 @@ func (r *Reader) compileSeparationSpace(space Array, effective bool, depth int) 
 	default:
 		return nil, &UnsupportedError{Feature: "Separation alternate color space"}
 	}
-	transform, err := r.readGradientFunction(space[3], channels, 0)
+	transform, err := r.readGradientFunctionContext(ctx, space[3], channels, 0)
 	if err != nil {
 		return nil, err
 	}
-	source, _, err := r.readDeviceNAlternateSpace(object, effective)
+	source, _, err := r.readDeviceNAlternateSpaceContext(ctx, object, effective)
 	if err != nil {
 		return nil, err
 	}
@@ -163,9 +174,12 @@ func (r *Reader) compileSeparationSpace(space Array, effective bool, depth int) 
 }
 
 // readTintFunction 读取一维采样或指数着色函数
-// 入参: object 函数对象, channels 输出分量数
+// 入参: ctx 取消上下文, object 函数对象, channels 输出分量数
 // 返回: *tintFunction 函数定义, error 错误信息
-func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, error) {
+func (r *Reader) readTintFunction(ctx context.Context, object Object, channels int) (*tintFunction, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -194,7 +208,7 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 		if stream == nil {
 			return nil, fmt.Errorf("missing sampled tint data")
 		}
-		sampled, err := r.readSampledFunction(stream, 1, channels)
+		sampled, err := r.readSampledFunctionContext(ctx, stream, 1, channels)
 		if err != nil {
 			return nil, err
 		}
@@ -247,15 +261,6 @@ func (r *Reader) readTintFunction(object Object, channels int) (*tintFunction, e
 		return nil, &UnsupportedError{Feature: "tint function type"}
 	}
 	return f, nil
-}
-
-// color 计算指定浓度在备用空间中的颜色分量
-// 入参: tint 分色浓度
-// 返回: []float64 备用空间分量
-func (f *tintFunction) color(tint float64) []float64 {
-	out := make([]float64, f.channels)
-	f.colorInto(tint, out)
-	return out
 }
 
 // colorInto 将着色函数结果写入已有分量缓冲区
@@ -321,11 +326,7 @@ func (f *tintFunction) sample(index int) float64 {
 	case 32:
 		return float64(binary.BigEndian.Uint32(data))
 	}
-	var value uint32
-	for n := 0; n < f.bits; n++ {
-		value = value<<1 | uint32(f.samples[(bit+n)/8]>>(7-(bit+n)%8)&1)
-	}
-	return float64(value)
+	return 0
 }
 
 // paint 将分色浓度映射到替代颜色空间

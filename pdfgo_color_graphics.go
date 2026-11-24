@@ -38,7 +38,7 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 		}
 	case "Pattern":
 		if len(array) == 2 {
-			patternBase, err = p.reader.readPatternColorSpace(array[1], true)
+			patternBase, err = p.reader.readPatternColorSpaceContext(p.ctx, array[1], true)
 		} else if array != nil && len(array) != 1 {
 			return fmt.Errorf("invalid Pattern color space")
 		}
@@ -57,11 +57,11 @@ func (p *pageInterpreter) selectColorSpace(object Object, fill bool) error {
 			calibrated.palette, err = image.palette()
 		}
 	case "DeviceN":
-		deviceN, err = p.reader.readDeviceNSpace(array, true, 0)
+		deviceN, err = p.reader.readDeviceNSpaceContext(p.ctx, array, true, 0)
 	case "Separation":
-		separation, err = p.reader.readSeparationSpace(array, true, 0)
+		separation, err = p.reader.readSeparationSpaceContext(p.ctx, array, true, 0)
 	case "ICCBased":
-		profile, err = p.reader.readICCSourceSpace(array, true)
+		profile, err = p.reader.readICCSourceSpaceContext(p.ctx, array, true)
 	default:
 		return &UnsupportedError{Feature: "color space " + string(name)}
 	}

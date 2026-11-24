@@ -48,9 +48,14 @@ func annotationTextLayout(matrix Matrix, x, y, width, height float64) (Matrix, f
 	return matrix, w, h, nil
 }
 
-// writeAnnotationTextMatrix 将排版位置映射到注解坐标，写入文字矩阵
+// writeAnnotationTextMatrix 将排版位置映射到注解坐标，写入文字矩阵并校验坐标有限性
 // 入参: content 内容, matrix 定位矩阵, x 排版横坐标, y 排版基线
-func writeAnnotationTextMatrix(content *strings.Builder, matrix Matrix, x, y float64) {
+// 返回: error 坐标溢出错误
+func writeAnnotationTextMatrix(content *strings.Builder, matrix Matrix, x, y float64) error {
 	point := matrix.Apply(Point{X: x, Y: y})
+	if math.IsNaN(point.X) || math.IsInf(point.X, 0) || math.IsNaN(point.Y) || math.IsInf(point.Y, 0) {
+		return fmt.Errorf("text position exceeds coordinate range")
+	}
 	writeAnnotationOperation(content, "Tm", matrix[0], matrix[1], matrix[2], matrix[3], point.X, point.Y)
+	return nil
 }

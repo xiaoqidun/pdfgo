@@ -331,7 +331,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 	}
 	if value != nil {
 		result.OnInstantiate, ok = value.(*Stream)
-		if !ok {
+		if !ok || result.OnInstantiate == nil {
 			return result, fmt.Errorf("invalid 3D initialization script")
 		}
 	}
@@ -441,11 +441,7 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 	if err != nil {
 		return result, err
 	}
-	objects, err := r.Resolve(dict["Configurations"])
-	if err != nil {
-		return result, err
-	}
-	configs, err := r.mediaDictionaries(objects)
+	configs, configRefs, err := r.mediaDictionariesWithRefs(dict["Configurations"])
 	if err != nil {
 		return result, err
 	}
@@ -464,8 +460,7 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 		if value != nil && (!ok || kind == "") {
 			return result, fmt.Errorf("invalid rich media configuration subtype")
 		}
-		converted := MediaConfiguration{Subtype: kind, Dictionary: config}
-		converted.Reference, _ = objects.(Array)[index].(Reference)
+		converted := MediaConfiguration{Reference: configRefs[index], Subtype: kind, Dictionary: config}
 		instances, err := r.mediaDictionaries(config["Instances"])
 		if err != nil {
 			return result, err
@@ -522,8 +517,11 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 		return result, err
 	}
 	if selected != nil {
-		ref, ok := result.Activation["Configuration"].(Reference)
-		if !ok {
+		ref, err := r.resolveIndirectReference(result.Activation["Configuration"])
+		if err != nil {
+			return result, err
+		}
+		if ref == (Reference{}) {
 			return result, fmt.Errorf("rich media activation configuration requires an indirect reference")
 		}
 		result.ActiveConfiguration = -1

@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -51,7 +52,7 @@ type iccColorSpace struct {
 	rgb                *iccRGBSpace
 	gray               *iccGraySpace
 	lut                *iccLUTSpace
-	toFloat, fromFloat [4]*iccProcessElements
+	toFloat            [4]*iccProcessElements
 	processPCS         string
 	absoluteScale      [3]float64
 	ranges             *[8]float64
@@ -453,13 +454,30 @@ func (r *Reader) iccProfileStream(object Array) (*Stream, Integer, error) {
 // 入参: object ICCBased颜色空间数组
 // 返回: *iccColorSpace 颜色变换, error 解析错误
 func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
-	return r.readICCSourceSpace(object, false)
+	return r.readICCSourceSpaceContext(context.Background(), object, false)
+}
+
+// readICCColorSpaceContext 在取消上下文内读取内容流使用的ICC颜色空间
+// 入参: ctx 取消上下文, object ICCBased颜色空间数组
+// 返回: *iccColorSpace 颜色变换, error 解析或取消错误
+func (r *Reader) readICCColorSpaceContext(ctx context.Context, object Array) (*iccColorSpace, error) {
+	return r.readICCSourceSpaceContext(ctx, object, false)
 }
 
 // readICCSourceSpace 读取原始或已按资源校验的ICC源空间，后来版本使用标准备用空间
 // 入参: object ICCBased数组, effective 是否已按资源校验并替换
 // 返回: *iccColorSpace 源颜色变换, error 配置或备用定义错误
 func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpace, error) {
+	return r.readICCSourceSpaceContext(context.Background(), object, effective)
+}
+
+// readICCSourceSpaceContext 在取消上下文内读取原始或已按资源校验的ICC源空间
+// 入参: ctx 取消上下文, object ICCBased数组, effective 是否已按资源校验并替换
+// 返回: *iccColorSpace 源颜色变换, error 配置、备用定义或取消错误
+func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, effective bool) (*iccColorSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if r.colorProfileDepth >= 64 {
 		return nil, fmt.Errorf("color space recursion limit exceeded")
 	}
@@ -473,16 +491,19 @@ func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpac
 	if err != nil {
 		return nil, err
 	}
-	data, err := r.decodeStream(stream)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
-		return r.recoverICCAlternate(stream, int(count), ranges, effective, err)
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		return r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
 	}
 	space, err := r.readICCProfileData(data, int(count))
 	if err != nil {
-		return r.recoverICCAlternate(stream, int(count), ranges, effective, err)
+		return r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
 	}
 	if space == nil {
-		return r.readICCAlternate(stream, int(count), ranges, effective)
+		return r.readICCAlternate(ctx, stream, int(count), ranges, effective)
 	}
 	return space.withRanges(ranges), nil
 }
@@ -643,11 +664,11 @@ func (s *iccColorSpace) color(values []float64, intent Name) ([3]float64, error)
 	return iccXYZRGB(xyz), err
 }
 
-// validateRGBGroupSpace 检查混合空间与sRGB的偏差是否在8位量化精度内
-// 入参: object 组颜色空间
-// 返回: error 不支持的混合空间或解析错误
-func (r *Reader) validateRGBGroupSpace(object Object) error {
-	s, err := r.readBlendingSpace(object)
+// validateRGBGroupSpaceContext 在取消上下文内检查混合空间与sRGB的偏差是否在8位量化精度内
+// 入参: ctx 取消上下文, object 组颜色空间
+// 返回: error 不支持的混合空间、解析或取消错误
+func (r *Reader) validateRGBGroupSpaceContext(ctx context.Context, object Object) error {
+	s, err := r.readBlendingSpaceContext(ctx, object)
 	if err != nil {
 		return err
 	}
@@ -693,9 +714,21 @@ func (c iccToneCurve) parametric(x float64) float64 {
 // 入参: value 编码分量
 // 返回: float64 线性分量
 func (c iccToneCurve) evaluate(value float64) float64 {
-	v := math.Max(0, math.Min(1, value))
+	v := value
+	if !(v > 0) {
+		v = 0
+	} else if v > 1 {
+		v = 1
+	}
 	if len(c.parameters) > 0 {
-		return math.Max(0, math.Min(1, c.parametric(v)))
+		result := c.parametric(v)
+		if !(result > 0) {
+			return 0
+		}
+		if result > 1 {
+			return 1
+		}
+		return result
 	}
 	if len(c.samples) > 1 {
 		position := v * float64(len(c.samples)-1)
@@ -703,19 +736,4 @@ func (c iccToneCurve) evaluate(value float64) float64 {
 		return (float64(c.samples[index]) + (position-float64(index))*(float64(c.samples[index+1])-float64(c.samples[index]))) / 65535
 	}
 	return v
-}
-
-// color 将ICC编码分量变换到sRGB，矩阵配置文件使用同一色度变换
-// 入参: values RGB编码分量, intent 渲染意图
-// 返回: [3]float64 sRGB分量, error 错误信息
-func (s *iccRGBSpace) color(values []float64, intent Name) ([3]float64, error) {
-	if intent == "AbsoluteColorimetric" {
-		return [3]float64{}, &UnsupportedError{Feature: "ICC absolute colorimetric conversion"}
-	}
-	linear := [3]float64{}
-	for i, curve := range s.curves {
-		linear[i] = curve.evaluate(values[i])
-	}
-	c := s.matrix.color(linear[0], linear[1], linear[2])
-	return [3]float64{float64(c.R) / 65535, float64(c.G) / 65535, float64(c.B) / 65535}, nil
 }

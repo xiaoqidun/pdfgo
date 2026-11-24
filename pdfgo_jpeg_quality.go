@@ -25,8 +25,7 @@ import (
 // jpegQualityComponent 关联顺序JPEG分量与量化表
 type jpegQualityComponent struct{ id, table byte }
 
-// jpegQualitySufficient 判断现有量化是否已达到目标，避免重复有损编码
-// 仅识别单扫描灰度及标准分量编号的YCbCr，不推断自定义颜色分量
+// jpegQualitySufficient 判断单扫描灰度或标准YCbCr的JPEG量化是否已达目标以避免重复有损编码
 // 入参: ctx 取消上下文, data JPEG数据, quality 目标画质
 // 返回: bool 无需继续量化, error 扫描头或取消错误
 func jpegQualitySufficient(ctx context.Context, data []byte, quality int) (bool, error) {

@@ -205,7 +205,7 @@ func (f *Font) glyphResourceMapping(ctx context.Context) ([]uint16, Dictionary, 
 		return nil, nil, "", &UnsupportedError{Feature: "glyph resource font program " + string(f.ProgramType)}
 	}
 	if len(cff) == 0 {
-		if f.glyphCount == 0 || f.glyphCount > 65535 {
+		if f.glyphCount == 0 {
 			return nil, nil, "", fmt.Errorf("invalid glyph resource TrueType count")
 		}
 		ids := make([]uint16, int(f.glyphCount))

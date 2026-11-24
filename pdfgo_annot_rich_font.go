@@ -288,7 +288,11 @@ func (r *Reader) annotationRichResourceFamily(ctx context.Context, object Object
 	if !ok {
 		return "", fmt.Errorf("invalid rich text font dictionary")
 	}
-	name, _ := dict["BaseFont"].(Name)
+	baseFont, err := r.Resolve(dict["BaseFont"])
+	if err != nil {
+		return "", err
+	}
+	name, _ := baseFont.(Name)
 	family, _, _ := annotationRichStandardFace(string(name))
 	if family == "" {
 		family = string(name)
@@ -296,7 +300,11 @@ func (r *Reader) annotationRichResourceFamily(ctx context.Context, object Object
 			family = family[7:]
 		}
 	}
-	if dict["Subtype"] == Name("Type0") {
+	subtype, err := r.Resolve(dict["Subtype"])
+	if err != nil {
+		return "", err
+	}
+	if subtype == Name("Type0") {
 		value, err = r.Resolve(dict["DescendantFonts"])
 		if err != nil {
 			return "", err
@@ -319,7 +327,7 @@ func (r *Reader) annotationRichResourceFamily(ctx context.Context, object Object
 		return "", err
 	}
 	if descriptor, ok := value.(Dictionary); ok && descriptor["FontFamily"] != nil {
-		return r.ReadAnnotationTextContext(ctx, Annotation{Dictionary: descriptor}, "FontFamily", nil)
+		return r.readAnnotationText(ctx, Annotation{Dictionary: descriptor}, "FontFamily", nil)
 	}
 	return family, ctx.Err()
 }
@@ -382,7 +390,7 @@ func (s *annotationRichFonts) add(name Name, font *Font) (*annotationRichFont, e
 			}
 		}
 		if descriptor["FontFamily"] != nil {
-			family, err = s.reader.ReadAnnotationTextContext(s.ctx, Annotation{Dictionary: descriptor}, "FontFamily", nil)
+			family, err = s.reader.readAnnotationText(s.ctx, Annotation{Dictionary: descriptor}, "FontFamily", nil)
 			if err != nil {
 				return nil, err
 			}

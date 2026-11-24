@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"slices"
@@ -27,16 +28,34 @@ type gradientVector struct {
 	parts     []*gradientFunction
 }
 
-// projectedTintStops 提取单个输出分量的精确断点，不缩减函数输出数量
+// projectedTintStops 提取单个输出分量的精确断点，不缩减函数输出数量，超限时返回nil退回按需求值
 // 入参: f 着色函数, channel 输出分量
 // 返回: []GradientStop 定义域中的线性分段
 func projectedTintStops(f *tintFunction, channel int) []GradientStop {
 	positions := []float64{f.domain[0], f.domain[1]}
 	if f.sampled && f.encoded[0] != f.encoded[1] {
-		for i := 0; i < f.size; i++ {
+		start, end := 0, f.size-1
+		if lo := min(f.encoded[0], f.encoded[1]); lo > 0 {
+			if lo >= float64(f.size) {
+				start = f.size
+			} else {
+				start = int(math.Floor(lo))
+			}
+		}
+		if hi := max(f.encoded[0], f.encoded[1]); hi < float64(end) {
+			if hi < 0 {
+				end = -1
+			} else {
+				end = int(math.Ceil(hi))
+			}
+		}
+		for i := start; i <= end; i++ {
 			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
 			if x > f.domain[0] && x < f.domain[1] {
 				positions = append(positions, x)
+				if len(positions) > maxGradientLinearStops {
+					return nil
+				}
 			}
 		}
 	}
@@ -62,6 +81,9 @@ func projectedTintStops(f *tintFunction, channel int) []GradientStop {
 	if limits != nil {
 		stops = clipGradientValues(stops, limits[2*channel:2*channel+2])
 	}
+	if len(stops) > maxGradientLinearStops {
+		return nil
+	}
 	return stops
 }
 
@@ -69,11 +91,21 @@ func projectedTintStops(f *tintFunction, channel int) []GradientStop {
 // 入参: object 函数对象, channels 输出数量, depth 嵌套深度
 // 返回: *gradientVector 分量函数, error 格式或求值错误
 func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradientVector, error) {
+	return r.readGradientVectorContext(context.Background(), object, channels, depth)
+}
+
+// readGradientVectorContext 在取消上下文内解析多分量采样、指数、拼接及计算器函数
+// 入参: ctx 取消上下文, object 函数对象, channels 输出数量, depth 嵌套深度
+// 返回: *gradientVector 分量函数, error 格式、求值或取消错误
+func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, channels, depth int) (*gradientVector, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if channels < 1 || depth >= 32 {
 		return nil, fmt.Errorf("invalid gradient vector dimensions or recursion")
 	}
 	if channels <= 4 {
-		function, err := r.readGradientFunction(object, channels, depth)
+		function, err := r.readGradientFunctionContext(ctx, object, channels, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -93,7 +125,7 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 			return nil, fmt.Errorf("invalid gradient function count")
 		}
 		for c, item := range array {
-			f.parts[c], err = r.readGradientFunction(item, 1, depth+1)
+			f.parts[c], err = r.readGradientFunctionContext(ctx, item, 1, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -144,7 +176,7 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 	var evaluate func(float64, []float64) error
 	switch kind {
 	case Integer(0), Integer(2):
-		tint, err := r.readTintFunction(value, channels)
+		tint, err := r.readTintFunction(ctx, value, channels)
 		if err != nil {
 			return nil, err
 		}
@@ -161,7 +193,7 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 		if !streamOK {
 			return nil, fmt.Errorf("missing calculator function stream")
 		}
-		data, err := r.decodeStream(stream)
+		data, err := r.DecodeStreamContext(ctx, stream)
 		if err != nil {
 			return nil, err
 		}
@@ -210,7 +242,7 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 			if points[i] > points[i+1] {
 				return nil, fmt.Errorf("invalid gradient stitching bounds")
 			}
-			parts[i], err = r.readGradientVector(item, channels, depth+1)
+			parts[i], err = r.readGradientVectorContext(ctx, item, channels, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -237,10 +269,6 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 				if points[i] == points[i+1] {
 					if i == len(parts)-1 {
 						partStops := part.parts[c].linear([2]float64{encode[2*i], encode[2*i]})
-						if len(partStops) == 0 {
-							linear = false
-							break
-						}
 						for _, stop := range partStops {
 							stop.Position = 1
 							stops = append(stops, stop)
@@ -249,17 +277,10 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 					continue
 				}
 				partStops := part.parts[c].linear([2]float64{encode[2*i], encode[2*i+1]})
-				if len(partStops) == 0 {
-					linear = false
-					break
-				}
 				for _, stop := range partStops {
 					stop.Position = functionPosition(gradientPosition(points[i], points[i+1], stop.Position), domain[0], domain[1])
 					stops = append(stops, stop)
 				}
-			}
-			if !linear {
-				continue
 			}
 			if limits != nil {
 				stops = clipGradientValues(stops, limits[2*c:2*c+2])
@@ -298,11 +319,11 @@ func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradie
 	return f, nil
 }
 
-// deviceNWideGradient 组合多分量渐变与备用空间映射，保留精确分段
-// 入参: function 渐变函数, tint 专色变换, domain 输入区间
-// 返回: []GradientStop 备用空间分段, *ColorSpace 输出空间, *gradientFunction 求值函数, error 解析错误
-func (r *Reader) deviceNWideGradient(function Object, tint *deviceNSpace, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
-	source, err := r.readGradientVector(function, tint.components, 0)
+// deviceNWideGradientContext 在取消上下文内组合多分量渐变与备用空间映射，保留精确分段
+// 入参: ctx 取消上下文, function 渐变函数, tint 专色变换, domain 输入区间
+// 返回: []GradientStop 备用空间分段, *ColorSpace 输出空间, *gradientFunction 求值函数, error 解析或取消错误
+func (r *Reader) deviceNWideGradientContext(ctx context.Context, function Object, tint *deviceNSpace, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
+	source, err := r.readGradientVectorContext(ctx, function, tint.components, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}

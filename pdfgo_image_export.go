@@ -22,18 +22,11 @@ import (
 	"os"
 )
 
-// EncodePNG 按原始尺寸无损导出图像，颜色、遮罩及精度与DecodeImage一致
-// 入参: writer PNG输出流
-// 返回: error 参数、解码、颜色或写入错误
-func (i *Image) EncodePNG(writer io.Writer) error {
-	return i.EncodePNGContext(context.Background(), writer)
-}
-
-// EncodePNGContext 按原始尺寸无损导出图像，颜色、遮罩及精度与DecodeImageContext一致
+// EncodePNG 按原始尺寸无损导出图像，颜色、遮罩及精度与DecodeImageContext一致
 // JPEG2000按行带解码，校准色逐行转换，不分配整幅显示缓冲；取消或失败时输出可能不完整
 // 入参: ctx 取消上下文, writer PNG输出流
 // 返回: error 参数、解码、颜色或写入错误
-func (i *Image) EncodePNGContext(ctx context.Context, writer io.Writer) error {
+func (i *Image) EncodePNG(ctx context.Context, writer io.Writer) error {
 	if ctx == nil || writer == nil || i == nil || i.Stream == nil || i.reader == nil {
 		return fmt.Errorf("missing image export context, writer or source")
 	}

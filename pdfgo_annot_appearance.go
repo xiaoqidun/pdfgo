@@ -739,8 +739,12 @@ func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Ann
 // 返回: Rectangle 内部区域, error 差值或边界错误
 func (r *Reader) annotationContentBounds(annotation Annotation) (Rectangle, error) {
 	box := annotation.Rect
-	if annotation.Dictionary["RD"] != nil {
-		inset, err := r.numberArray(annotation.Dictionary["RD"], 4)
+	rd, err := r.Resolve(annotation.Dictionary["RD"])
+	if err != nil {
+		return Rectangle{}, err
+	}
+	if rd != nil {
+		inset, err := r.numberArray(rd, 4)
 		if err != nil {
 			return Rectangle{}, err
 		}
@@ -750,9 +754,9 @@ func (r *Reader) annotationContentBounds(annotation Annotation) (Rectangle, erro
 			}
 		}
 		box.XMin += inset[0]
-		box.YMax -= inset[1]
+		box.YMin += inset[1]
 		box.XMax -= inset[2]
-		box.YMin += inset[3]
+		box.YMax -= inset[3]
 	}
 	if box.XMin >= box.XMax || box.YMin >= box.YMax {
 		return Rectangle{}, fmt.Errorf("empty annotation content bounds")

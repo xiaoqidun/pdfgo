@@ -14,7 +14,10 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // deviceNColorants 读取色料名称，允许DeviceN重复None，禁止NChannel包含None
 // 入参: space 多色颜色空间
@@ -103,6 +106,16 @@ func (r *Reader) ignoredTintSpace(space Array) error {
 // 入参: object 颜色空间, effective 是否已按资源校验并替换
 // 返回: bool 是否不产生输出, error 色料或变换错误
 func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
+	return r.colorSpaceNoneContext(context.Background(), object, effective)
+}
+
+// colorSpaceNoneContext 在取消上下文内判断原始或已按资源校验的空间是否完全不绘制
+// 入参: ctx 取消上下文, object 颜色空间, effective 是否已按资源校验并替换
+// 返回: bool 是否不产生输出, error 色料、变换或取消错误
+func (r *Reader) colorSpaceNoneContext(ctx context.Context, object Object, effective bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	object, err := r.resolveColorSpace(object)
 	if err != nil {
 		return false, err
@@ -135,7 +148,7 @@ func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 		if alternate == nil || family == "DeviceGray" || family == "DeviceRGB" || family == "DeviceCMYK" || family == "CalGray" || family == "CalRGB" || family == "Lab" {
 			return false, nil
 		}
-		space, err := r.readICCSourceSpace(array, effective)
+		space, err := r.readICCSourceSpaceContext(ctx, array, effective)
 		if err != nil {
 			return false, err
 		}
@@ -156,7 +169,7 @@ func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 			return false, err
 		}
 		if family := colorSpaceFamily(alternate); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
-			space, err := r.readSeparationSpace(array, effective, 0)
+			space, err := r.readSeparationSpaceContext(ctx, array, effective, 0)
 			if err != nil {
 				return false, err
 			}
@@ -175,7 +188,7 @@ func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
 			return false, err
 		}
 		if family := colorSpaceFamily(alternate); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
-			space, err := r.readDeviceNSpace(array, effective, 0)
+			space, err := r.readDeviceNSpaceContext(ctx, array, effective, 0)
 			if err != nil {
 				return false, err
 			}

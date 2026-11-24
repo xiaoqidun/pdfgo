@@ -141,7 +141,11 @@ func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (ann
 				}
 				field = strings.ToLower(field)
 				if strings.HasSuffix(field, "pt") || field == "0" {
-					style, err = annotationRichCSS(style, "font-size:"+field+";font-family:"+strings.Join(fields[i+1:], " "))
+					family := strings.TrimSpace(strings.Join(fields[i+1:], " "))
+					if family == "" {
+						return style, fmt.Errorf("invalid rich text font shorthand")
+					}
+					style, err = annotationRichCSSStyle(parent, style, "font-size:"+field+";font-family:"+family)
 					found = true
 					break
 				}

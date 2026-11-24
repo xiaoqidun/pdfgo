@@ -92,12 +92,7 @@ func (r *Reader) soundReplacements(ctx context.Context, options RewriteOptions, 
 			if sounds == nil {
 				sounds = make(map[*SoundAction]Reference)
 				streams = make(map[Sound]Reference)
-				for id := range r.xref {
-					number = max(number, id)
-				}
-				for ref := range result {
-					number = max(number, ref.Number)
-				}
+				number = r.maxRewriteObjectID(result)
 			}
 			volume := action.Sound.Volume
 			if math.IsNaN(volume) || math.IsInf(volume, 0) || volume < -1 || volume > 1 {

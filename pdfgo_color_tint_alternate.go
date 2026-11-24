@@ -14,7 +14,10 @@
 
 package pdfgo
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // tintAlternate 保存默认设备色替换后的输入分量和最终备用空间
 type tintAlternate struct {
@@ -26,10 +29,13 @@ type tintAlternate struct {
 	none       bool
 }
 
-// readTintAlternate 读取备用空间，特殊嵌套只允许已校验的默认设备色替换
-// 入参: object 备用空间, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: *tintAlternate 输入与输出定义, error 格式或变换错误
-func (r *Reader) readTintAlternate(object Object, effective bool, depth int) (*tintAlternate, error) {
+// readTintAlternateContext 在取消上下文内读取备用空间，特殊嵌套只允许已校验的默认设备色替换
+// 入参: ctx 取消上下文, object 备用空间, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: *tintAlternate 输入与输出定义, error 格式、变换或取消错误
+func (r *Reader) readTintAlternateContext(ctx context.Context, object Object, effective bool, depth int) (*tintAlternate, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if depth >= 64 {
 		return nil, fmt.Errorf("color space recursion limit exceeded")
 	}
@@ -43,13 +49,13 @@ func (r *Reader) readTintAlternate(object Object, effective bool, depth int) (*t
 			return nil, fmt.Errorf("invalid alternate color space")
 		}
 		if array[0] == Name("Separation") {
-			result.separation, err = r.readSeparationSpace(array, true, depth+1)
+			result.separation, err = r.readSeparationSpaceContext(ctx, array, true, depth+1)
 			if err == nil {
 				result.space, result.components = result.separation.space, 1
 				result.none = result.separation.none || result.separation.name == "None"
 			}
 		} else {
-			result.deviceN, err = r.readDeviceNSpace(array, true, depth+1)
+			result.deviceN, err = r.readDeviceNSpaceContext(ctx, array, true, depth+1)
 			if err == nil {
 				result.space, result.components, result.none = result.deviceN.alternate, result.deviceN.components, result.deviceN.none
 			}
@@ -59,7 +65,7 @@ func (r *Reader) readTintAlternate(object Object, effective bool, depth int) (*t
 		}
 		return result, err
 	}
-	result.space, result.lab, err = r.readDeviceNAlternateSpace(object, effective)
+	result.space, result.lab, err = r.readDeviceNAlternateSpaceContext(ctx, object, effective)
 	if err != nil {
 		return nil, err
 	}

@@ -15,8 +15,10 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"slices"
 )
 
 // ColorantSpace 保存不可变分色定义，Names与Process切片只读，不持有Reader
@@ -39,11 +41,11 @@ type ColorantPaint struct {
 	values [4]float64
 }
 
-// ColorantDevice 保存输出设备的原生过程空间与额外色料，公开字段只读
+// ColorantDevice 保存输出设备的原生过程空间与额外色料
 // 原生过程空间仅接受设备色，额外色料仅用于减色设备，不代表屏幕备用颜色
 type ColorantDevice struct {
-	Space *ColorSpace
-	Spots []Name
+	space *ColorSpace
+	spots []Name
 	index map[Name]int
 }
 
@@ -68,7 +70,7 @@ func NewColorantDevice(space *ColorSpace, spots []Name) (*ColorantDevice, error)
 	if !space.Device() || len(spots) != 0 && space.Model != "DeviceCMYK" {
 		return nil, fmt.Errorf("invalid native colorant device")
 	}
-	device := &ColorantDevice{Space: space, Spots: append([]Name(nil), spots...), index: make(map[Name]int, len(spots))}
+	device := &ColorantDevice{space: space, spots: append([]Name(nil), spots...), index: make(map[Name]int, len(spots))}
 	for i, name := range spots {
 		if _, exists := device.index[name]; exists || name == "" || name == "All" || name == "None" || nChannelCMYKComponent(name) >= 0 {
 			return nil, fmt.Errorf("invalid device spot colorant %q", name)
@@ -76,6 +78,24 @@ func NewColorantDevice(space *ColorSpace, spots []Name) (*ColorantDevice, error)
 		device.index[name] = i
 	}
 	return device, nil
+}
+
+// Space 返回输出设备的原生过程空间
+// 返回: *ColorSpace 原生过程空间，空设备返回nil
+func (d *ColorantDevice) Space() *ColorSpace {
+	if d == nil {
+		return nil
+	}
+	return d.space
+}
+
+// Spots 返回输出设备的额外色料列表副本
+// 返回: []Name 额外色料副本，空设备返回nil
+func (d *ColorantDevice) Spots() []Name {
+	if d == nil {
+		return nil
+	}
+	return slices.Clone(d.spots)
 }
 
 // colorantProcessPaint 建立原生过程画刷，保留单位分量与设备四色
@@ -124,7 +144,7 @@ func (d *ColorantDevice) CompositeOpaque(out, backdrop []float64, source Coloran
 		copy(out, backdrop)
 	} else {
 		clear(out)
-		if d.Space.Model != "DeviceCMYK" {
+		if d.space.Model != "DeviceCMYK" {
 			for c := 0; c < components; c++ {
 				out[c] = 1
 			}
@@ -161,10 +181,10 @@ func (d *ColorantDevice) CompositeOverprint(out, backdrop []float64, source Colo
 // 入参: out 输出缓冲, backdrop 背景分量, source 原生源色料, backdropAlpha 背景透明度, sourceAlpha 源透明度, mode 混合模式, overprint 是否兼容套印
 // 返回: float64 结果透明度, error 定义或数值错误
 func (d *ColorantDevice) composite(out, backdrop []float64, source ColorantResult, backdropAlpha, sourceAlpha float64, mode Name, overprint bool) (float64, error) {
-	if d == nil || d.Space == nil || !d.Space.Device() {
+	if d == nil || d.space == nil || !d.space.Device() {
 		return 0, fmt.Errorf("invalid native colorant device")
 	}
-	group := ColorantGroup{Space: d.Space, Device: d}
+	group := ColorantGroup{Space: d.space, Device: d}
 	return group.composite(out, backdrop, source, backdropAlpha, sourceAlpha, mode, overprint)
 }
 
@@ -172,10 +192,10 @@ func (d *ColorantDevice) composite(out, backdrop []float64, source ColorantResul
 // 入参: out 输出缓冲, backdrop 背景分量, source 源色料, backdropAlpha 背景透明度, sourceAlpha 源透明度, overprint 是否忽略未标记源分量
 // 返回: int 过程分量数, bool 是否指定色料, error 定义或数值错误
 func (d *ColorantDevice) validateComposite(out, backdrop []float64, source ColorantResult, backdropAlpha, sourceAlpha float64, overprint bool) (int, bool, error) {
-	if d == nil || d.Space == nil || !d.Space.Device() {
+	if d == nil || d.space == nil || !d.space.Device() {
 		return 0, false, fmt.Errorf("invalid native colorant device")
 	}
-	group := ColorantGroup{Space: d.Space, Device: d}
+	group := ColorantGroup{Space: d.space, Device: d}
 	return group.validateComposite(out, backdrop, source, backdropAlpha, sourceAlpha, overprint)
 }
 
@@ -194,13 +214,23 @@ func (r *Reader) ReadColorantSpace(object Object, resources Dictionary) (*Colora
 // 入参: object 颜色空间, effective 是否已按资源校验并替换
 // 返回: *ColorantSpace 色料定义，非色料空间为nil, error 定义错误
 func (r *Reader) readColorantSpace(object Object, effective bool) (*ColorantSpace, error) {
-	return r.readColorantDefinition(object, effective, 0)
+	return r.readColorantDefinition(context.Background(), object, effective, 0)
+}
+
+// readColorantSpaceContext 在取消上下文内编译已解析的色料或索引基础空间
+// 入参: ctx 取消上下文, object 颜色空间, effective 是否已按资源校验并替换
+// 返回: *ColorantSpace 色料定义，非色料空间为nil, error 定义或取消错误
+func (r *Reader) readColorantSpaceContext(ctx context.Context, object Object, effective bool) (*ColorantSpace, error) {
+	return r.readColorantDefinition(ctx, object, effective, 0)
 }
 
 // readColorantDefinition 限制索引基础空间的递归深度，不重复展开源定义
-// 入参: object 颜色空间, effective 是否已按资源校验并替换, depth 索引嵌套深度
-// 返回: *ColorantSpace 色料定义，非色料空间为nil, error 定义错误
-func (r *Reader) readColorantDefinition(object Object, effective bool, depth int) (*ColorantSpace, error) {
+// 入参: ctx 取消上下文, object 颜色空间, effective 是否已按资源校验并替换, depth 索引嵌套深度
+// 返回: *ColorantSpace 色料定义，非色料空间为nil, error 定义或取消错误
+func (r *Reader) readColorantDefinition(ctx context.Context, object Object, effective bool, depth int) (*ColorantSpace, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if depth >= 64 {
 		return nil, fmt.Errorf("color space recursion limit exceeded")
 	}
@@ -213,17 +243,17 @@ func (r *Reader) readColorantDefinition(object Object, effective bool, depth int
 		return nil, nil
 	}
 	if array[0] == Name("Indexed") && len(array) == 4 {
-		return r.readColorantDefinition(array[1], effective, depth+1)
+		return r.readColorantDefinition(ctx, array[1], effective, depth+1)
 	}
 	if array[0] == Name("Separation") {
-		separation, err := r.readSeparationSpace(array, effective, depth)
+		separation, err := r.readSeparationSpaceContext(ctx, array, effective, depth)
 		if err != nil {
 			return nil, err
 		}
 		return separation.colorants, nil
 	}
 	if array[0] == Name("DeviceN") {
-		tint, err := r.readDeviceNSpace(array, effective, depth)
+		tint, err := r.readDeviceNSpaceContext(ctx, array, effective, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -253,12 +283,12 @@ func (s *ColorantSpace) ResolveInGroup(tints []float64, device *ColorantDevice, 
 		}
 	}
 	if device == nil {
-		device = &ColorantDevice{Space: &ColorSpace{Model: "DeviceRGB"}}
+		device = &ColorantDevice{space: &ColorSpace{Model: "DeviceRGB"}}
 	}
-	if device.Space == nil || !device.Space.Device() {
+	if device.space == nil || !device.space.Device() {
 		return result, fmt.Errorf("invalid native colorant device")
 	}
-	output := device.Space
+	output := device.space
 	if group != nil {
 		definition := ColorantGroup{Space: group, Device: device}
 		if err := definition.validate("Normal"); err != nil {
@@ -266,7 +296,7 @@ func (s *ColorantSpace) ResolveInGroup(tints []float64, device *ColorantDevice, 
 		}
 		output = group
 	}
-	process := output.Device() && output.Equal(device.Space)
+	process := output.Device() && output.Equal(device.space)
 	if s.separation != nil {
 		name := s.Names[0]
 		if name == "None" {
@@ -294,7 +324,7 @@ func (s *ColorantSpace) ResolveInGroup(tints []float64, device *ColorantDevice, 
 			}
 			result.Process = &paint
 			if !softMask {
-				result.Spots, result.SpotMask = make([]float64, len(device.Spots)), make([]bool, len(device.Spots))
+				result.Spots, result.SpotMask = make([]float64, len(device.spots)), make([]bool, len(device.spots))
 				for i := range result.Spots {
 					result.Spots[i], result.SpotMask[i] = value, true
 				}
@@ -347,10 +377,8 @@ func (s *ColorantSpace) ResolveInGroup(tints []float64, device *ColorantDevice, 
 		if mask != ([4]bool{}) {
 			space := s.Process.Space
 			if s.lab != nil {
-				color := s.lab.color(values[0], values[1], values[2])
+				color := s.lab.color(functionValue(values[0], 0, 100), functionValue(values[1], s.lab.rangeAB[0], s.lab.rangeAB[1]), functionValue(values[2], s.lab.rangeAB[2], s.lab.rangeAB[3]))
 				values = [4]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}
-			} else if space.profile != nil && space.profile.ranges != nil {
-				values = space.profile.normalize(values[:space.Components()])
 			}
 			converted, err := output.Convert(values[:space.Components()], space, intent)
 			if err != nil {
@@ -375,7 +403,7 @@ func (s *ColorantSpace) ResolveInGroup(tints []float64, device *ColorantDevice, 
 		}
 		if !softMask && device.available(name, process) {
 			if result.Spots == nil {
-				result.Spots, result.SpotMask = make([]float64, len(device.Spots)), make([]bool, len(device.Spots))
+				result.Spots, result.SpotMask = make([]float64, len(device.spots)), make([]bool, len(device.spots))
 			}
 			index := device.index[name]
 			result.Spots[index], result.SpotMask[index] = math.Max(0, math.Min(1, tints[i])), true
@@ -398,7 +426,7 @@ func (s *ColorantSpace) ResolveInGroup(tints []float64, device *ColorantDevice, 
 // 返回: bool 是否可直接绘制
 func (d *ColorantDevice) available(name Name, process bool) bool {
 	if nChannelCMYKComponent(name) >= 0 {
-		return process && d.Space.Model == "DeviceCMYK"
+		return process && d.space.Model == "DeviceCMYK"
 	}
 	_, ok := d.index[name]
 	return ok
@@ -408,10 +436,10 @@ func (d *ColorantDevice) available(name Name, process bool) bool {
 // 入参: device 输出设备, group 组混合空间
 // 返回: bool 是否仍有原生输出
 func (s *ColorantSpace) nativeAvailable(device *ColorantDevice, group *ColorSpace) bool {
-	if s == nil || s.none || device == nil || device.Space == nil || !device.Space.Device() {
+	if s == nil || s.none || device == nil || device.space == nil || !device.space.Device() {
 		return false
 	}
-	process := group == nil || group.Device() && group.Equal(device.Space)
+	process := group == nil || group.Device() && group.Equal(device.space)
 	if s.separation != nil {
 		return s.Names[0] == "All" || device.available(s.Names[0], process)
 	}
@@ -446,14 +474,14 @@ func (s *ColorantSpace) nativeAvailable(device *ColorantDevice, group *ColorSpac
 // 入参: object 已按资源映射的颜色空间
 // 返回: bool 是否有输出, error 空间定义错误
 func (p *pageInterpreter) colorSpaceVisible(object Object) (bool, error) {
-	none, err := p.reader.colorSpaceNone(object, true)
+	none, err := p.reader.colorSpaceNoneContext(p.ctx, object, true)
 	if err != nil || !none {
 		return !none, err
 	}
 	if p.visitor.ColorantDevice == nil || p.maskGroup != nil {
 		return false, nil
 	}
-	space, err := p.reader.readColorantSpace(object, true)
+	space, err := p.reader.readColorantSpaceContext(p.ctx, object, true)
 	return space.nativeAvailable(p.visitor.ColorantDevice, p.blendingSpace), err
 }
 
@@ -478,14 +506,14 @@ func (d *ColorantDevice) native(names []Name, tints []float64, intent Name) (Col
 			values[channel], result.ProcessMask[channel] = value, true
 		} else {
 			if result.Spots == nil {
-				result.Spots, result.SpotMask = make([]float64, len(d.Spots)), make([]bool, len(d.Spots))
+				result.Spots, result.SpotMask = make([]float64, len(d.spots)), make([]bool, len(d.spots))
 			}
 			index := d.index[name]
 			result.Spots[index], result.SpotMask[index] = value, true
 		}
 	}
 	if result.ProcessMask != ([4]bool{}) {
-		paint, err := colorantProcessPaint(values, d.Space, intent)
+		paint, err := colorantProcessPaint(values, d.space, intent)
 		if err != nil {
 			return ColorantResult{}, err
 		}

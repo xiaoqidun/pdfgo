@@ -138,7 +138,8 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 			}
 			matrix[i] = value
 		}
-		if scanner.next() != close || matrix[0]*matrix[3]-matrix[1]*matrix[2] == 0 {
+		determinant := matrix[0]*matrix[3] - matrix[1]*matrix[2]
+		if scanner.next() != close || math.IsInf(determinant, 0) || math.IsNaN(determinant) || determinant == 0 {
 			return nil, fmt.Errorf("invalid Type1 metric matrix")
 		}
 		matrixFound = true

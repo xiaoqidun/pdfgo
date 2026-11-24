@@ -50,7 +50,7 @@ func NewColorantGroup(space *ColorSpace, device *ColorantDevice) (*ColorantGroup
 	if space == nil {
 		space = &ColorSpace{Model: "DeviceRGB"}
 		if device != nil {
-			space = device.Space
+			space = device.space
 		}
 	}
 	group := &ColorantGroup{Space: space, Device: device}
@@ -340,7 +340,7 @@ func (g *ColorantGroup) composite(out, backdrop []float64, source ColorantResult
 // 入参: out 输出缓冲, backdrop 背景分量, source 源色料, backdropAlpha 背景透明度, sourceAlpha 源透明度, overprint 是否忽略未标记源分量
 // 返回: int 过程分量数, bool 是否指定色料, error 定义或数值错误
 func (g *ColorantGroup) validateComposite(out, backdrop []float64, source ColorantResult, backdropAlpha, sourceAlpha float64, overprint bool) (int, bool, error) {
-	if g == nil || g.Space == nil || g.Device != nil && (g.Device.Space == nil || !g.Device.Space.Device() || len(g.Device.Spots) != 0 && g.Device.Space.Model != "DeviceCMYK") {
+	if g == nil || g.Space == nil || g.Device != nil && (g.Device.space == nil || !g.Device.space.Device() || len(g.Device.spots) != 0 && g.Device.space.Model != "DeviceCMYK") {
 		return 0, false, fmt.Errorf("invalid colorant group")
 	}
 	components := g.Space.Components()
@@ -403,7 +403,7 @@ func (g *ColorantGroup) validateComposite(out, backdrop []float64, source Colora
 // 入参: mode 混合模式
 // 返回: error 定义错误
 func (g *ColorantGroup) validate(mode Name) error {
-	if g == nil || g.Device != nil && (g.Device.Space == nil || !g.Device.Space.Device() || len(g.Device.Spots) != 0 && g.Device.Space.Model != "DeviceCMYK") {
+	if g == nil || g.Device != nil && (g.Device.space == nil || !g.Device.space.Device() || len(g.Device.spots) != 0 && g.Device.space.Model != "DeviceCMYK") {
 		return fmt.Errorf("invalid colorant group")
 	}
 	return g.Space.validateBlend(mode)
@@ -442,7 +442,7 @@ func (g *ColorantGroup) spots() []Name {
 	if g.Device == nil {
 		return nil
 	}
-	return g.Device.Spots
+	return g.Device.spots
 }
 
 // sameDevice 检查跨组专色身份和顺序，允许没有专色的独立过程空间
@@ -456,7 +456,7 @@ func (g *ColorantGroup) sameDevice(source *ColorantGroup) bool {
 	if len(names) == 0 || g.Device == source.Device {
 		return true
 	}
-	if !g.Device.Space.Equal(source.Device.Space) {
+	if !g.Device.space.Equal(source.Device.space) {
 		return false
 	}
 	for c, name := range names {

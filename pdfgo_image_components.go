@@ -21,13 +21,10 @@ import (
 	"os"
 )
 
-// ImageComponents 保存应用Decode、索引映射及遮罩后的16位非预乘颜色分量
-// Pix逐行交错保存Space.Components()个颜色分量和一个透明度分量
-// DecodeComponentsView的设备色缓冲可为空，使用ValuesAt读取只读分量
-// 模板图像保留灰度样本，填充颜色及反向覆盖由调用方应用
-// Colorants和Tints保留专色名称及逐像素浓度，供支持相应色料的输出设备使用
-// Process保留原生过程通道，ValuesAt返回对应过程空间的颜色分量
-// ColorantAlpha仅在备用色None时保存源遮罩，nil时复用Pix透明度，避免重复缓冲
+// ImageComponents 保存经Decode、索引映射及遮罩处理后的16位非预乘颜色分量，Pix交错保存各通道分量与透明度
+// DecodeComponentsView的设备色Pix可为空，请通过ValuesAt读取只读分量；模板图像保留灰度样本，由调用方应用填充色
+// Process保留原生过程通道并由ValuesAt返回；Colorants与Tints保留专色名称与逐像素浓度
+// ColorantAlpha仅在备用色None时保存源遮罩，为nil时复用Pix透明度
 type ImageComponents struct {
 	Space         *ColorSpace
 	Process       *ProcessColorants
@@ -159,9 +156,9 @@ func (i *Image) ColorSpaceComponents() (int, error) {
 // 返回: ColorantResult 原生和备用色料, float64 源透明度, error 色料或变换错误
 func (i *ImageComponents) ResolveColorantsAt(x, y int, device *ColorantDevice, intent Name, softMask bool) (ColorantResult, float64, error) {
 	if device == nil {
-		device = &ColorantDevice{Space: &ColorSpace{Model: "DeviceRGB"}}
+		device = &ColorantDevice{space: &ColorSpace{Model: "DeviceRGB"}}
 	}
-	group := ColorantGroup{Space: device.Space, Device: device}
+	group := ColorantGroup{Space: device.space, Device: device}
 	return i.ResolveColorantsInGroupAt(x, y, &group, intent, softMask)
 }
 
@@ -298,12 +295,22 @@ func (i *ImageComponents) TintsAt(x, y int) []uint16 {
 	if i == nil || len(i.Colorants) == 0 || !(image.Point{X: x, Y: y}).In(i.Rect) {
 		return nil
 	}
-	width, count := i.Rect.Dx(), len(i.Colorants)
-	pixel := (y-i.Rect.Min.Y)*width + x - i.Rect.Min.X
-	if pixel < 0 || pixel > (len(i.Tints)-count)/count || len(i.Tints) < count {
+	count := len(i.Colorants)
+	if len(i.Tints) < count {
 		return nil
 	}
-	offset := pixel * count
+	width := int64(i.Rect.Dx())
+	maxPixel := int64((len(i.Tints) - count) / count)
+	dy := int64(y) - int64(i.Rect.Min.Y)
+	dx := int64(x) - int64(i.Rect.Min.X)
+	if width <= 0 || dy < 0 || dx < 0 || dy > maxPixel/width {
+		return nil
+	}
+	pixel := dy*width + dx
+	if pixel < 0 || pixel > maxPixel {
+		return nil
+	}
+	offset := int(pixel) * count
 	return i.Tints[offset : offset+count]
 }
 
@@ -323,11 +330,21 @@ func (i *ImageComponents) ValuesAt(x, y int) ([4]float64, float64) {
 		return values, 0
 	}
 	stride := channels + 1
-	pixel := (y-i.Rect.Min.Y)*i.Rect.Dx() + x - i.Rect.Min.X
-	if pixel < 0 || len(i.Pix) < stride || pixel > (len(i.Pix)-stride)/stride {
+	if len(i.Pix) < stride {
 		return values, 0
 	}
-	offset := pixel * stride
+	width := int64(i.Rect.Dx())
+	maxPixel := int64((len(i.Pix) - stride) / stride)
+	dy := int64(y) - int64(i.Rect.Min.Y)
+	dx := int64(x) - int64(i.Rect.Min.X)
+	if width <= 0 || dy < 0 || dx < 0 || dy > maxPixel/width {
+		return values, 0
+	}
+	pixel := dy*width + dx
+	if pixel < 0 || pixel > maxPixel {
+		return values, 0
+	}
+	offset := int(pixel) * stride
 	for c := 0; c < channels; c++ {
 		values[c] = float64(i.Pix[offset+c]) / 65535
 	}

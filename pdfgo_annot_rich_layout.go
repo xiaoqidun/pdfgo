@@ -161,11 +161,9 @@ func writeAnnotationRichCodes(ctx context.Context, content *strings.Builder, gly
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	point := matrix.Apply(Point{x, y})
-	if math.IsNaN(point.X) || math.IsInf(point.X, 0) || math.IsNaN(point.Y) || math.IsInf(point.Y, 0) {
-		return fmt.Errorf("rich text position overflow")
+	if err := writeAnnotationTextMatrix(content, matrix, x, y); err != nil {
+		return err
 	}
-	writeAnnotationTextMatrix(content, matrix, x, y)
 	content.WriteByte('<')
 	for _, current := range glyphs {
 		if err := ctx.Err(); err != nil {

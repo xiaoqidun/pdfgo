@@ -62,9 +62,9 @@ func compactGrayPixels(ctx context.Context, pixels []byte, width, height int) ([
 }
 
 // encodeLosslessPixels 编码降采样后的线稿，避免JPEG引入边缘振铃
-// 入参: ctx 取消上下文, source 原始流, img 图片, channels 通道数
+// 入参: ctx 取消上下文, source 待编码属性流, cryptSource 原始加密策略流, img 图片, channels 通道数
 // 返回: *Stream 输出流, error 编码错误
-func (r *Reader) encodeLosslessPixels(ctx context.Context, source *Stream, img image.Image, channels int) (*Stream, error) {
+func (r *Reader) encodeLosslessPixels(ctx context.Context, source, cryptSource *Stream, img image.Image, channels int) (*Stream, error) {
 	b := img.Bounds()
 	pixels := make([]byte, b.Dx()*b.Dy()*channels)
 	for y := 0; y < b.Dy(); y++ {
@@ -79,6 +79,9 @@ func (r *Reader) encodeLosslessPixels(ctx context.Context, source *Stream, img i
 				pixels[i+1], pixels[i+2] = c.G, c.B
 			}
 		}
+	}
+	if cryptSource == nil {
+		cryptSource = source
 	}
 	result := *source
 	result.Dictionary = maps.Clone(source.Dictionary)
@@ -99,10 +102,10 @@ func (r *Reader) encodeLosslessPixels(ctx context.Context, source *Stream, img i
 		result.Data = encoded
 		result.Dictionary["Filter"] = Name("FlateDecode")
 	}
-	if err := r.applyExplicitCryptFilter(source, best); err != nil {
+	if err := r.applyExplicitCryptFilter(cryptSource, best); err != nil {
 		return nil, err
 	}
-	if source.decrypted && r.security != nil {
+	if cryptSource.decrypted && r.security != nil {
 		best.decrypted = true
 	}
 	return best, nil
@@ -159,7 +162,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		if err != nil {
 			return stream, nil
 		}
-		pixels, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1), estimateFlateCapacity(stream.Dictionary, len(pixels), optimizationBufferLimit))
+		pixels, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1), estimateFlateCapacity(len(pixels), optimizationBufferLimit))
 		input.Close()
 		releaseZlibReader(input)
 		if err != nil || len(pixels) > optimizationBufferLimit {
