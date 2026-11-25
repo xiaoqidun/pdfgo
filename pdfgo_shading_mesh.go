@@ -149,11 +149,34 @@ func (g *MeshGradient) LinearColors(index int) ([3][4]float64, error) {
 // 返回: Point 网格坐标
 func (p MeshPatch) PointAt(u, v float64) Point {
 	a, b := meshBernstein(u), meshBernstein(v)
+	scaled := false
+	for i := range p.Points {
+		for j := range p.Points[i] {
+			if math.Abs(p.Points[i][j].X) > math.MaxFloat64/16 || math.Abs(p.Points[i][j].Y) > math.MaxFloat64/16 {
+				scaled = true
+				break
+			}
+		}
+		if scaled {
+			break
+		}
+	}
 	var point Point
+	if scaled {
+		for i := range a {
+			for j := range b {
+				w := a[i] * b[j]
+				point.X += p.Points[i][j].X * 0.0625 * w
+				point.Y += p.Points[i][j].Y * 0.0625 * w
+			}
+		}
+		return Point{X: point.X * 16, Y: point.Y * 16}
+	}
 	for i := range a {
 		for j := range b {
-			point.X += p.Points[i][j].X * a[i] * b[j]
-			point.Y += p.Points[i][j].Y * a[i] * b[j]
+			w := a[i] * b[j]
+			point.X += p.Points[i][j].X * w
+			point.Y += p.Points[i][j].Y * w
 		}
 	}
 	return point
@@ -398,6 +421,13 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		if kind == 6 {
 			patch.completeCoons()
 		}
+		for i := range patch.Points {
+			for j := range patch.Points[i] {
+				if !pointFinite(patch.Points[i][j]) {
+					return Paint{}, fmt.Errorf("nonfinite mesh patch coordinate")
+				}
+			}
+		}
 		g.Patches = append(g.Patches, patch)
 		previous = points
 	}
@@ -564,17 +594,35 @@ func (g *MeshGradient) decodeColorBounds(components int) []float64 {
 	return bounds
 }
 
+// coonsBlend 计算双线性边界混合值，大坐标采用二次幂缩放避免可避免的中间溢出
+// 入参: ru 沿u方向线性插值, rv 沿v方向线性插值, rb 角点双线性插值
+// 返回: float64 混合坐标
+func coonsBlend(ru, rv, rb float64) float64 {
+	if math.Max(math.Abs(ru), math.Max(math.Abs(rv), math.Abs(rb))) > math.MaxFloat64/4 {
+		return (0.25*ru + 0.25*rv - 0.25*rb) * 4
+	}
+	return ru + rv - rb
+}
+
 // completeCoons 按双线性边界混合补齐Coons曲面的内部控制点
 func (p *MeshPatch) completeCoons() {
 	for i := 1; i < 3; i++ {
+		u0, u1 := 2.0/3, 1.0/3
+		if i == 2 {
+			u0, u1 = 1.0/3, 2.0/3
+		}
 		for j := 1; j < 3; j++ {
-			u, v := float64(i)/3, float64(j)/3
-			weights := [8]float64{1 - v, v, 1 - u, u, -(1 - u) * (1 - v), -(1 - u) * v, -u * v, -u * (1 - v)}
-			points := [8]Point{p.Points[i][0], p.Points[i][3], p.Points[0][j], p.Points[3][j], p.Points[0][0], p.Points[0][3], p.Points[3][3], p.Points[3][0]}
-			for k, point := range points {
-				p.Points[i][j].X += point.X * weights[k]
-				p.Points[i][j].Y += point.Y * weights[k]
+			v0, v1 := 2.0/3, 1.0/3
+			if j == 2 {
+				v0, v1 = 1.0/3, 2.0/3
 			}
+			ruX := u0*p.Points[0][j].X + u1*p.Points[3][j].X
+			rvX := v0*p.Points[i][0].X + v1*p.Points[i][3].X
+			rbX := u0*(v0*p.Points[0][0].X+v1*p.Points[0][3].X) + u1*(v0*p.Points[3][0].X+v1*p.Points[3][3].X)
+			ruY := u0*p.Points[0][j].Y + u1*p.Points[3][j].Y
+			rvY := v0*p.Points[i][0].Y + v1*p.Points[i][3].Y
+			rbY := u0*(v0*p.Points[0][0].Y+v1*p.Points[0][3].Y) + u1*(v0*p.Points[3][0].Y+v1*p.Points[3][3].Y)
+			p.Points[i][j] = Point{X: coonsBlend(ruX, rvX, rbX), Y: coonsBlend(ruY, rvY, rbY)}
 		}
 	}
 }

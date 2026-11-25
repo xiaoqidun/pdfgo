@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -91,7 +92,17 @@ type ThreeDPresentation struct {
 // 入参: object 视图字典或引用
 // 返回: ThreeDPresentation 呈现参数, error 类型或引用错误
 func (r *Reader) ReadThreeDPresentation(object Object) (ThreeDPresentation, error) {
+	return r.readThreeDPresentation(context.Background(), object)
+}
+
+// readThreeDPresentation 按取消上下文与PDF标准表304及表308读取生效的视图内容，不执行脚本
+// 入参: ctx 取消上下文, object 视图字典或引用
+// 返回: ThreeDPresentation 呈现参数, error 类型、引用或取消错误
+func (r *Reader) readThreeDPresentation(ctx context.Context, object Object) (ThreeDPresentation, error) {
 	result := ThreeDPresentation{}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	dict, err := r.mediaDictionary(object, true)
 	if err != nil {
 		return result, err
@@ -100,13 +111,16 @@ func (r *Reader) ReadThreeDPresentation(object Object) (ThreeDPresentation, erro
 	if err != nil {
 		return result, err
 	}
-	sections, err := r.mediaDictionaries(dict["SA"])
+	sections, err := r.mediaDictionariesContext(ctx, dict["SA"])
 	if err != nil {
 		return result, err
 	}
 	if len(sections) != 0 {
 		result.CrossSections = make([]ThreeDCrossSection, len(sections))
 		for i, section := range sections {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
 			result.CrossSections[i], err = r.ReadThreeDCrossSection(section)
 			if err != nil {
 				return result, err
@@ -124,13 +138,16 @@ func (r *Reader) ReadThreeDPresentation(object Object) (ThreeDPresentation, erro
 		}
 		result.ResetNodes = bool(flag)
 	}
-	nodes, err := r.mediaDictionaries(dict["NA"])
+	nodes, err := r.mediaDictionariesContext(ctx, dict["NA"])
 	if err != nil {
 		return result, err
 	}
 	if len(nodes) != 0 {
 		result.Nodes = make([]ThreeDNode, len(nodes))
 		for i, node := range nodes {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
 			result.Nodes[i], err = r.ReadThreeDNode(node)
 			if err != nil {
 				return result, err
@@ -165,7 +182,7 @@ func (r *Reader) ReadThreeDPresentation(object Object) (ThreeDPresentation, erro
 			result.Overlay = stream
 		}
 	}
-	return result, nil
+	return result, ctx.Err()
 }
 
 // ReadThreeDLighting 按PDF标准表309及表310解析灯光，未知方案忽略并沿用模型灯光
@@ -232,7 +249,17 @@ func (r *Reader) ReadThreeDLighting(object Object) (ThreeDLighting, error) {
 // 入参: object 视图字典或引用
 // 返回: ThreeDCamera 相机参数, error 类型、数值、路径或引用错误
 func (r *Reader) ReadThreeDCamera(object Object) (ThreeDCamera, error) {
+	return r.readThreeDCamera(context.Background(), object)
+}
+
+// readThreeDCamera 按取消上下文与PDF标准表304解析相机来源，仅读取该来源生效的参数
+// 入参: ctx 取消上下文, object 视图字典或引用
+// 返回: ThreeDCamera 相机参数, error 类型、数值、路径、引用或取消错误
+func (r *Reader) readThreeDCamera(ctx context.Context, object Object) (ThreeDCamera, error) {
 	result := ThreeDCamera{}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	dict, err := r.mediaDictionary(object, true)
 	if err != nil {
 		return result, err
@@ -241,7 +268,7 @@ func (r *Reader) ReadThreeDCamera(object Object) (ThreeDCamera, error) {
 		return result, err
 	}
 	if result.Source == "" {
-		return result, nil
+		return result, ctx.Err()
 	}
 	if result.Source == "M" {
 		values, err := r.numberArray(dict["C2W"], 12)
@@ -269,6 +296,9 @@ func (r *Reader) ReadThreeDCamera(object Object) (ThreeDCamera, error) {
 		}
 		result.Path = make([]string, len(path))
 		for i, item := range path {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
 			value, err := r.Resolve(item)
 			if err != nil {
 				return result, err
@@ -284,8 +314,11 @@ func (r *Reader) ReadThreeDCamera(object Object) (ThreeDCamera, error) {
 		}
 	}
 	value, err := r.Resolve(dict["CO"])
-	if err != nil || value == nil {
+	if err != nil {
 		return result, err
+	}
+	if value == nil {
+		return result, ctx.Err()
 	}
 	number := 0.0
 	if err := r.threeDNumber(dict, "CO", &number); err != nil {
@@ -295,7 +328,7 @@ func (r *Reader) ReadThreeDCamera(object Object) (ThreeDCamera, error) {
 		return result, fmt.Errorf("invalid 3D center of orbit")
 	}
 	result.CenterOfOrbit = &number
-	return result, nil
+	return result, ctx.Err()
 }
 
 // ReadThreeDBackground 按PDF标准表306解析背景，缺省使用白色且仅覆盖3D视口

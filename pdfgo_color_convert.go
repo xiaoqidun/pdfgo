@@ -116,6 +116,9 @@ func (s *iccColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 	device := s.deviceValues(values)
 	values = device[:len(values)]
 	if xyz, used, err := s.processXYZ(values, intent); used || err != nil {
+		if err == nil && !finiteFloats(xyz[:]) {
+			return [3]float64{}, fmt.Errorf("nonfinite ICC tristimulus value")
+		}
 		return xyz, err
 	}
 	legacy := intent
@@ -166,6 +169,9 @@ func (s *iccColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 			}
 		}
 	}
+	if !finiteFloats(xyz[:]) {
+		return [3]float64{}, fmt.Errorf("nonfinite ICC tristimulus value")
+	}
 	if intent == "AbsoluteColorimetric" {
 		return s.absoluteXYZ(xyz, false)
 	}
@@ -185,6 +191,9 @@ func (s *iccColorSpace) absoluteXYZ(xyz [3]float64, inverse bool) ([3]float64, e
 		} else {
 			xyz[i] *= scale
 		}
+		if !finiteFloat(xyz[i]) {
+			return [3]float64{}, fmt.Errorf("nonfinite ICC tristimulus value")
+		}
 	}
 	return xyz, nil
 }
@@ -193,6 +202,9 @@ func (s *iccColorSpace) absoluteXYZ(xyz [3]float64, inverse bool) ([3]float64, e
 // 入参: xyz D50色度, intent 渲染意图
 // 返回: [4]float64 合成分量, error 不可逆或未支持的变换
 func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error) {
+	if !finiteFloats(xyz[:]) {
+		return [4]float64{}, fmt.Errorf("nonfinite ICC tristimulus value")
+	}
 	if s.alternate != nil {
 		return s.alternateFromXYZ(xyz, intent)
 	}
@@ -200,7 +212,15 @@ func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error)
 	if err != nil {
 		return values, err
 	}
-	return s.normalize(values[:s.components()]), nil
+	count := s.components()
+	if !finiteFloats(values[:count]) {
+		return [4]float64{}, fmt.Errorf("nonfinite ICC converted color")
+	}
+	normalized := s.normalize(values[:count])
+	if !finiteFloats(normalized[:count]) {
+		return [4]float64{}, fmt.Errorf("nonfinite ICC converted color")
+	}
+	return normalized, nil
 }
 
 // fromDeviceXYZ 将连接空间转换为ICC设备单位，不混淆Lab设备值与PCS编码
@@ -262,13 +282,20 @@ func (s *iccColorSpace) fromDeviceXYZ(xyz [3]float64, intent Name) ([4]float64, 
 		if scale == 0 {
 			return result, fmt.Errorf("singular ICC gray matrix")
 		}
-		value, err := s.gray.curve.inverse((xyz[1] - m.offset[1]) / scale)
+		linear := (xyz[1] - m.offset[1]) / scale
+		if !finiteFloat(linear) {
+			return result, fmt.Errorf("nonfinite ICC converted color")
+		}
+		value, err := s.gray.curve.inverse(linear)
 		result[0] = value
 		return result, err
 	}
 	m := s.rgb.matrix.matrix
 	for n := range xyz {
 		xyz[n] -= s.rgb.matrix.offset[n]
+		if !finiteFloat(xyz[n]) {
+			return result, fmt.Errorf("nonfinite ICC converted color")
+		}
 	}
 	inverse := s.rgb.inverse
 	if inverse == ([9]float64{}) {
@@ -279,6 +306,9 @@ func (s *iccColorSpace) fromDeviceXYZ(xyz [3]float64, intent Name) ([4]float64, 
 	}
 	for i, curve := range s.rgb.curves {
 		linear := inverse[3*i]*xyz[0] + inverse[3*i+1]*xyz[1] + inverse[3*i+2]*xyz[2]
+		if !finiteFloat(linear) {
+			return result, fmt.Errorf("nonfinite ICC converted color")
+		}
 		v, err := curve.inverse(linear)
 		if err != nil {
 			return result, err
@@ -319,10 +349,13 @@ func (s *iccColorSpace) processXYZ(values []float64, intent Name) ([3]float64, b
 	return xyz, true, nil
 }
 
-// inverse 反求单调ICC曲线，对超出曲线范围的值使用端点
+// inverse 反求单调ICC曲线，对超出曲线范围的有限值使用端点
 // 入参: value 线性分量
-// 返回: float64 编码分量, error 不可逆的参数曲线
+// 返回: float64 编码分量, error 非有限值或不可逆的参数曲线
 func (c iccToneCurve) inverse(value float64) (float64, error) {
+	if !finiteFloat(value) {
+		return 0, fmt.Errorf("nonfinite ICC tone curve input")
+	}
 	if len(c.parameters) > 0 {
 		if c.direction == 2 || c.direction == 0 && c.evaluate(0) == c.evaluate(1) {
 			return 0, fmt.Errorf("noninvertible ICC constant curve")
@@ -333,13 +366,25 @@ func (c iccToneCurve) inverse(value float64) (float64, error) {
 		}
 		v := value
 		if c.function == 0 {
-			return math.Pow(math.Max(0, math.Min(1, v)), 1/p[0]), nil
+			if !(v > 0) {
+				v = 0
+			} else if v > 1 {
+				v = 1
+			}
+			result := math.Pow(v, 1/p[0])
+			if !finiteFloat(result) {
+				return 0, fmt.Errorf("nonfinite ICC tone curve result")
+			}
+			return result, nil
 		}
 		if c.function <= 2 {
 			if c.function == 2 {
 				v -= p[3]
 			}
-			v = (math.Pow(math.Max(0, v), 1/p[0]) - p[2]) / p[1]
+			if !(v > 0) {
+				v = 0
+			}
+			v = (math.Pow(v, 1/p[0]) - p[2]) / p[1]
 		} else {
 			offset, lowOffset := 0.0, 0.0
 			if c.function == 4 {
@@ -360,10 +405,23 @@ func (c iccToneCurve) inverse(value float64) (float64, error) {
 					v = math.Min(p[4], (v-lowOffset)/p[3])
 				}
 			} else {
-				v = (math.Pow(math.Max(0, v-offset), 1/p[0]) - p[2]) / p[1]
+				base := v - offset
+				if !(base > 0) {
+					base = 0
+				}
+				v = (math.Pow(base, 1/p[0]) - p[2]) / p[1]
 			}
 		}
-		return math.Max(0, math.Min(1, v)), nil
+		if math.IsNaN(v) {
+			return 0, fmt.Errorf("nonfinite ICC tone curve result")
+		}
+		if !(v > 0) {
+			return 0, nil
+		}
+		if v > 1 {
+			return 1, nil
+		}
+		return v, nil
 	}
 	if len(c.samples) > 1 {
 		direction := c.direction
@@ -389,5 +447,11 @@ func (c iccToneCurve) inverse(value float64) (float64, error) {
 		fraction := (v - float64(c.samples[i-1])*sign) / ((float64(c.samples[i]) - float64(c.samples[i-1])) * sign)
 		return (float64(i-1) + fraction) / float64(len(c.samples)-1), nil
 	}
-	return math.Max(0, math.Min(1, value)), nil
+	if !(value > 0) {
+		return 0, nil
+	}
+	if value > 1 {
+		return 1, nil
+	}
+	return value, nil
 }

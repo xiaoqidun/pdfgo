@@ -102,13 +102,6 @@ func (r *Reader) ignoredTintSpace(space Array) error {
 	}
 }
 
-// colorSpaceNone 判断原始或已按资源校验的空间是否完全不绘制
-// 入参: object 颜色空间, effective 是否已按资源校验并替换
-// 返回: bool 是否不产生输出, error 色料或变换错误
-func (r *Reader) colorSpaceNone(object Object, effective bool) (bool, error) {
-	return r.colorSpaceNoneContext(context.Background(), object, effective)
-}
-
 // colorSpaceNoneContext 在取消上下文内判断原始或已按资源校验的空间是否完全不绘制
 // 入参: ctx 取消上下文, object 颜色空间, effective 是否已按资源校验并替换
 // 返回: bool 是否不产生输出, error 色料、变换或取消错误

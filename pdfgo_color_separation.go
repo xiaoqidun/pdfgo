@@ -43,13 +43,6 @@ type tintFunction struct {
 	sampled                             bool
 }
 
-// readSeparationSpace 读取原始分色或已校验的默认空间替换，限制嵌套深度
-// 入参: space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: *separationSpace 分色变换, error 定义或函数错误
-func (r *Reader) readSeparationSpace(space Array, effective bool, depth int) (*separationSpace, error) {
-	return r.readSeparationSpaceContext(context.Background(), space, effective, depth)
-}
-
 // readSeparationSpaceContext 在取消上下文内读取原始分色或已校验的默认空间替换
 // 入参: ctx 取消上下文, space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
 // 返回: *separationSpace 分色变换, error 定义、函数或取消错误
@@ -64,9 +57,10 @@ func (r *Reader) readSeparationSpaceContext(ctx context.Context, space Array, ef
 
 // compileSeparationSpace 编译分色备用变换，不保留Reader或源资源字典
 // 入参: ctx 取消上下文, space 分色数组, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: *separationSpace 分色变换, error 定义、函数或取消错误
+// 返回: *separationSpace 分色变换, error 定义、函数、预算或取消错误
 func (r *Reader) compileSeparationSpace(ctx context.Context, space Array, effective bool, depth int) (*separationSpace, error) {
-	if err := ctx.Err(); err != nil {
+	ctx, _, err := consumeColorParseNode(ctx)
+	if err != nil {
 		return nil, err
 	}
 	if depth >= 64 {
@@ -166,9 +160,20 @@ func (r *Reader) compileSeparationSpace(ctx context.Context, space Array, effect
 	if err != nil {
 		return nil, err
 	}
-	source, _, err := r.readDeviceNAlternateSpaceContext(ctx, object, effective)
-	if err != nil {
-		return nil, err
+	var source *ColorSpace
+	switch alternate {
+	case "DeviceGray", "DeviceRGB", "DeviceCMYK":
+		source = &ColorSpace{Model: alternate}
+	case "Lab":
+		source = &ColorSpace{Model: "DeviceRGB", mapped: true}
+	case "ICCBased":
+		model := map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[channels]
+		source = &ColorSpace{Model: model, profile: icc}
+	default:
+		source, _, err = r.readDeviceNAlternateSpaceContext(ctx, object, effective)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &separationSpace{name: name, space: source, lab: lab, icc: icc, transform: transform, none: icc != nil && icc.alternate != nil && icc.alternate.invisible}, nil
 }

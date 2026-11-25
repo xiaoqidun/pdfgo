@@ -693,9 +693,12 @@ func (r *Reader) ReadDestination(ctx context.Context, object Object) (Destinatio
 	if !ok || len(array) < 2 {
 		return Destination{}, fmt.Errorf("%w: missing array", ErrInvalidDestination)
 	}
-	page, ok := array[0].(Reference)
-	if !ok {
+	if _, ok := array[0].(Reference); !ok {
 		return Destination{}, fmt.Errorf("%w: page reference", ErrInvalidDestination)
+	}
+	page, err := r.resolveIndirectReference(array[0])
+	if err != nil {
+		return Destination{}, err
 	}
 	mode, parameters, err := r.destinationParameters(array)
 	if err != nil {

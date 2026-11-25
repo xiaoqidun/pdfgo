@@ -24,6 +24,50 @@ import (
 	"math"
 )
 
+// maxColorSpaceParseNodes 限制单次颜色空间解析允许访问的最大节点数，防止共享DAG指数展开
+const maxColorSpaceParseNodes = 4096
+
+// colorParseStateKey 作为上下文键传递单次颜色空间解析状态
+type colorParseStateKey struct{}
+
+// iccStreamKey 标识单次解析或重映射中按配置流与声明分量数组合的缓存条目
+type iccStreamKey struct {
+	stream *Stream
+	count  int
+}
+
+// separationCacheKey 标识单次解析中可复用的间接分色对象引用及替换标志
+type separationCacheKey struct {
+	ref       Reference
+	effective bool
+}
+
+// colorParseState 保存单次颜色空间解析的节点预算及高版本配置流与分色缓存
+type colorParseState struct {
+	nodes       int
+	iccV5       map[iccStreamKey]bool
+	separations map[separationCacheKey]*separationSpace
+}
+
+// consumeColorParseNode 复用或建立单次颜色空间解析状态并扣减节点预算
+// 入参: ctx 取消上下文
+// 返回: context.Context 携带解析状态的上下文, *colorParseState 解析状态, error 取消或预算超限错误
+func consumeColorParseNode(ctx context.Context) (context.Context, *colorParseState, error) {
+	if err := ctx.Err(); err != nil {
+		return ctx, nil, err
+	}
+	state, _ := ctx.Value(colorParseStateKey{}).(*colorParseState)
+	if state == nil {
+		state = &colorParseState{}
+		ctx = context.WithValue(ctx, colorParseStateKey{}, state)
+	}
+	state.nodes++
+	if state.nodes > maxColorSpaceParseNodes {
+		return ctx, state, fmt.Errorf("%w: color space parse limit exceeded", ErrStreamLimitExceeded)
+	}
+	return ctx, state, nil
+}
+
 // iccRGBSpace 保存RGB矩阵曲线配置文件到sRGB的变换
 type iccRGBSpace struct {
 	matrix  calRGBSpace
@@ -457,28 +501,15 @@ func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
 	return r.readICCSourceSpaceContext(context.Background(), object, false)
 }
 
-// readICCColorSpaceContext 在取消上下文内读取内容流使用的ICC颜色空间
-// 入参: ctx 取消上下文, object ICCBased颜色空间数组
-// 返回: *iccColorSpace 颜色变换, error 解析或取消错误
-func (r *Reader) readICCColorSpaceContext(ctx context.Context, object Array) (*iccColorSpace, error) {
-	return r.readICCSourceSpaceContext(ctx, object, false)
-}
-
-// readICCSourceSpace 读取原始或已按资源校验的ICC源空间，后来版本使用标准备用空间
-// 入参: object ICCBased数组, effective 是否已按资源校验并替换
-// 返回: *iccColorSpace 源颜色变换, error 配置或备用定义错误
-func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpace, error) {
-	return r.readICCSourceSpaceContext(context.Background(), object, effective)
-}
-
 // readICCSourceSpaceContext 在取消上下文内读取原始或已按资源校验的ICC源空间
 // 入参: ctx 取消上下文, object ICCBased数组, effective 是否已按资源校验并替换
-// 返回: *iccColorSpace 源颜色变换, error 配置、备用定义或取消错误
+// 返回: *iccColorSpace 源颜色变换, error 配置、备用定义、预算或取消错误
 func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, effective bool) (*iccColorSpace, error) {
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
-	if err := ctx.Err(); err != nil {
+	ctx, state, err := consumeColorParseNode(ctx)
+	if err != nil {
 		return nil, err
 	}
 	if r.colorProfileDepth >= 64 {
@@ -494,6 +525,10 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 	if err != nil {
 		return nil, err
 	}
+	streamKey := iccStreamKey{stream: stream, count: int(count)}
+	if state.iccV5[streamKey] {
+		return r.readICCAlternate(ctx, stream, int(count), ranges, effective)
+	}
 	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -506,6 +541,10 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 		return r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
 	}
 	if space == nil {
+		if state.iccV5 == nil {
+			state.iccV5 = make(map[iccStreamKey]bool)
+		}
+		state.iccV5[streamKey] = true
 		return r.readICCAlternate(ctx, stream, int(count), ranges, effective)
 	}
 	return space.withRanges(ranges), nil
@@ -598,7 +637,12 @@ func (s *iccColorSpace) normalize(values []float64) [4]float64 {
 	for i, value := range values {
 		low, high := ranges[2*i], ranges[2*i+1]
 		if low != high {
-			result[i] = functionPosition(math.Max(low, math.Min(high, value)), low, high)
+			if !(value > low) {
+				value = low
+			} else if value > high {
+				value = high
+			}
+			result[i] = functionPosition(value, low, high)
 		}
 	}
 	return result
@@ -646,6 +690,9 @@ func (s *iccColorSpace) paint(values []float64, intent Name) (Paint, error) {
 		copy(input[:], values)
 		return s.alternatePaint(input, intent)
 	}
+	if len(values) != s.components() || !finiteFloats(values) {
+		return Paint{}, fmt.Errorf("invalid ICC color input")
+	}
 	model := map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[s.components()]
 	paint := Paint{SourceSpace: "ICCBased", Space: &ColorSpace{Model: model, profile: s}}
 	paint.Values = s.normalize(values)
@@ -664,7 +711,14 @@ func (s *iccColorSpace) color(values []float64, intent Name) ([3]float64, error)
 		return s.alternateColor(input, intent)
 	}
 	xyz, err := s.xyz(values, intent)
-	return iccXYZRGB(xyz), err
+	if err != nil {
+		return [3]float64{}, err
+	}
+	m := iccD50ToLinearSRGB
+	if !finiteFloat(m[0]*xyz[0]+m[1]*xyz[1]+m[2]*xyz[2]) || !finiteFloat(m[3]*xyz[0]+m[4]*xyz[1]+m[5]*xyz[2]) || !finiteFloat(m[6]*xyz[0]+m[7]*xyz[1]+m[8]*xyz[2]) {
+		return [3]float64{}, fmt.Errorf("nonfinite ICC RGB value")
+	}
+	return iccXYZRGB(xyz), nil
 }
 
 // validateRGBGroupSpaceContext 在取消上下文内检查混合空间与sRGB的偏差是否在8位量化精度内

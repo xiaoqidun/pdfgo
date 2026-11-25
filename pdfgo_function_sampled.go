@@ -26,7 +26,7 @@ const maxSampledEvalPoints = 4096
 // sampledFunction 保存多输入采样函数及高位优先的数据表
 type sampledFunction struct {
 	domain, encode, decode, bounds []float64
-	sizes, strides                 []int
+	sizes, strides, activeDims     []int
 	table                          tintFunction
 	order                          int
 }
@@ -142,6 +142,7 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 				return nil, fmt.Errorf("sampled function interpolation complexity exceeds limit")
 			}
 			evalPoints *= branch
+			f.activeDims = append(f.activeDims, i)
 		}
 	}
 	value, err := r.Resolve(dict["Encode"])
@@ -184,14 +185,20 @@ func (f *sampledFunction) evaluate(inputs, outputs []float64) {
 		f.evaluateCubic(inputs, outputs)
 		return
 	}
-	var lowerBuffer, upperBuffer [32]int
-	var weightBuffer [32]float64
-	lower, upper, weights := lowerBuffer[:min(len(inputs), 32)], upperBuffer[:min(len(inputs), 32)], weightBuffer[:min(len(inputs), 32)]
-	if len(inputs) > 32 {
-		lower, upper, weights = make([]int, len(inputs)), make([]int, len(inputs)), make([]float64, len(inputs))
+	for _, v := range inputs {
+		if math.IsNaN(v) {
+			for c := range outputs {
+				outputs[c] = math.NaN()
+			}
+			return
+		}
 	}
-	for i, value := range inputs {
-		value = math.Max(f.domain[2*i], math.Min(f.domain[2*i+1], value))
+	active := f.activeDims
+	var lowerBuffer, upperBuffer [12]int
+	var weightBuffer [12]float64
+	lower, upper, weights := lowerBuffer[:len(active)], upperBuffer[:len(active)], weightBuffer[:len(active)]
+	for k, i := range active {
+		value := math.Max(f.domain[2*i], math.Min(f.domain[2*i+1], inputs[i]))
 		value = functionValue(functionPosition(value, f.domain[2*i], f.domain[2*i+1]), f.encode[2*i], f.encode[2*i+1])
 		value = math.Max(0, math.Min(float64(f.sizes[i]-1), value))
 		if math.IsNaN(value) {
@@ -200,9 +207,9 @@ func (f *sampledFunction) evaluate(inputs, outputs []float64) {
 			}
 			return
 		}
-		lower[i] = int(value)
-		upper[i] = min(lower[i]+1, f.sizes[i]-1)
-		weights[i] = value - float64(lower[i])
+		lower[k] = int(value)
+		upper[k] = min(lower[k]+1, f.sizes[i]-1)
+		weights[k] = value - float64(lower[k])
 	}
 	clear(outputs)
 	steps := 0
@@ -211,22 +218,23 @@ func (f *sampledFunction) evaluate(inputs, outputs []float64) {
 		if steps >= maxSampledEvalPoints {
 			return
 		}
-		if dimension == len(inputs) {
+		if dimension == len(active) {
 			steps++
 			for c := range outputs {
 				outputs[c] += weight * f.table.sample(index+c)
 			}
 			return
 		}
+		stride := f.strides[active[dimension]]
 		if lower[dimension] == upper[dimension] {
-			accumulate(dimension+1, index+lower[dimension]*f.strides[dimension], weight)
+			accumulate(dimension+1, index+lower[dimension]*stride, weight)
 			return
 		}
 		if weights[dimension] != 1 {
-			accumulate(dimension+1, index+lower[dimension]*f.strides[dimension], weight*(1-weights[dimension]))
+			accumulate(dimension+1, index+lower[dimension]*stride, weight*(1-weights[dimension]))
 		}
 		if weights[dimension] != 0 {
-			accumulate(dimension+1, index+upper[dimension]*f.strides[dimension], weight*weights[dimension])
+			accumulate(dimension+1, index+upper[dimension]*stride, weight*weights[dimension])
 		}
 	}
 	accumulate(0, 0, 1)
@@ -240,14 +248,20 @@ func (f *sampledFunction) evaluate(inputs, outputs []float64) {
 // evaluateCubic 使用张量积三次样条，少于四个样本的维度使用线性插值
 // 入参: inputs 输入分量, outputs 输出缓冲区
 func (f *sampledFunction) evaluateCubic(inputs, outputs []float64) {
-	var indexBuffer [32][4]int
-	var weightBuffer [32][4]float64
-	indices, weights := indexBuffer[:min(len(inputs), 32)], weightBuffer[:min(len(inputs), 32)]
-	if len(inputs) > 32 {
-		indices, weights = make([][4]int, len(inputs)), make([][4]float64, len(inputs))
+	for _, v := range inputs {
+		if math.IsNaN(v) {
+			for c := range outputs {
+				outputs[c] = math.NaN()
+			}
+			return
+		}
 	}
-	for i, value := range inputs {
-		value = math.Max(f.domain[2*i], math.Min(f.domain[2*i+1], value))
+	active := f.activeDims
+	var indexBuffer [12][4]int
+	var weightBuffer [12][4]float64
+	indices, weights := indexBuffer[:len(active)], weightBuffer[:len(active)]
+	for k, i := range active {
+		value := math.Max(f.domain[2*i], math.Min(f.domain[2*i+1], inputs[i]))
 		value = functionValue(functionPosition(value, f.domain[2*i], f.domain[2*i+1]), f.encode[2*i], f.encode[2*i+1])
 		if math.IsNaN(value) {
 			for c := range outputs {
@@ -255,7 +269,7 @@ func (f *sampledFunction) evaluateCubic(inputs, outputs []float64) {
 			}
 			return
 		}
-		indices[i], weights[i] = sampledSplineSpan(value, f.sizes[i])
+		indices[k], weights[k] = sampledSplineSpan(value, f.sizes[i])
 	}
 	clear(outputs)
 	steps := 0
@@ -264,16 +278,17 @@ func (f *sampledFunction) evaluateCubic(inputs, outputs []float64) {
 		if steps >= maxSampledEvalPoints {
 			return
 		}
-		if dimension == len(inputs) {
+		if dimension == len(active) {
 			steps++
 			for c := range outputs {
 				outputs[c] += weight * f.table.sample(index+c)
 			}
 			return
 		}
+		stride := f.strides[active[dimension]]
 		for i, factor := range weights[dimension] {
 			if factor != 0 {
-				accumulate(dimension+1, index+indices[dimension][i]*f.strides[dimension], weight*factor)
+				accumulate(dimension+1, index+indices[dimension][i]*stride, weight*factor)
 			}
 		}
 	}

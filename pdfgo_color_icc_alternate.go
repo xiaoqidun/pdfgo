@@ -52,9 +52,9 @@ func validateICCSourceHeader(data []byte, count int) error {
 }
 
 // remapICCAlternate 仅重映射实际使用的备用设备色，保留原流与源范围
-// 入参: ctx 取消上下文, object ICCBased数组, resources 当前资源, remap 是否替换设备色, depth 嵌套深度
-// 返回: Object 有效ICC定义, error 配置、资源或取消错误
-func (r *Reader) remapICCAlternate(ctx context.Context, object Array, resources Dictionary, remap bool, depth int) (Object, error) {
+// 入参: ctx 取消上下文, object ICCBased数组, resources 当前资源, remap 是否替换设备色, depth 嵌套深度, state 重映射状态
+// 返回: Object 有效ICC定义, error 配置、资源、预算或取消错误
+func (r *Reader) remapICCAlternate(ctx context.Context, object Array, resources Dictionary, remap bool, depth int, state *colorRemapState) (Object, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -78,38 +78,96 @@ func (r *Reader) remapICCAlternate(ctx context.Context, object Array, resources 
 		}
 		return nil, err
 	}
-	data, cause := r.DecodeStreamContext(ctx, stream)
-	if cause == nil {
-		var profile *iccColorSpace
-		profile, cause = r.readICCProfileData(data, int(count))
-		if cause == nil && profile != nil {
-			return object, nil
+	streamKey := iccStreamKey{stream: stream, count: int(count)}
+	if state.iccValid[streamKey] {
+		return object, nil
+	}
+	var cause error
+	if !state.iccV5[streamKey] {
+		var data []byte
+		data, cause = r.DecodeStreamContext(ctx, stream)
+		if cause == nil {
+			var profile *iccColorSpace
+			profile, cause = r.readICCProfileData(data, int(count))
+			if cause == nil && profile != nil {
+				if state.iccValid == nil {
+					state.iccValid = make(map[iccStreamKey]bool)
+				}
+				state.iccValid[streamKey] = true
+				return object, nil
+			}
+			if cause == nil && profile == nil {
+				if state.iccV5 == nil {
+					state.iccV5 = make(map[iccStreamKey]bool)
+				}
+				state.iccV5[streamKey] = true
+			}
 		}
 	}
 	if cause != nil && (ctx.Err() != nil || r.warning == nil || errors.Is(cause, errICCSourceProfileClass)) {
 		return nil, cause
 	}
-	alternate, err := r.iccAlternateObject(stream, int(count))
+	if remap {
+		if _, err := r.iccRanges(stream.Dictionary["Range"], int(count)); err != nil {
+			return nil, err
+		}
+	}
+	rawAlt := stream.Dictionary["Alternate"]
+	resolvedAlt, err := r.Resolve(rawAlt)
 	if err != nil {
 		return nil, err
 	}
-	alternate, err = r.remapColorSpaceContext(ctx, alternate, resources, false, depth+1)
+	if resolvedAlt == nil {
+		rawAlt = map[int]Name{1: "DeviceGray", 3: "DeviceRGB", 4: "DeviceCMYK"}[int(count)]
+	}
+	alternate, err := r.remapColorSpaceState(ctx, rawAlt, resources, remap, depth+1, state)
 	if err != nil {
 		return nil, err
+	}
+	if remap {
+		switch colorSpaceFamily(alternate) {
+		case "DeviceGray", "CalGray", "Separation", "Indexed":
+			if count != 1 {
+				return nil, fmt.Errorf("invalid ICC alternate component count")
+			}
+		case "DeviceRGB", "CalRGB", "Lab":
+			if count != 3 {
+				return nil, fmt.Errorf("invalid ICC alternate component count")
+			}
+		case "DeviceCMYK":
+			if count != 4 {
+				return nil, fmt.Errorf("invalid ICC alternate component count")
+			}
+		case "ICCBased":
+			array, ok := alternate.(Array)
+			if !ok {
+				return nil, fmt.Errorf("invalid ICC alternate color space")
+			}
+			_, altCount, err := r.iccProfileStream(array)
+			if err != nil {
+				return nil, err
+			}
+			if altCount != count {
+				return nil, fmt.Errorf("invalid ICC alternate component count")
+			}
+		case "DeviceN":
+			array, ok := alternate.(Array)
+			if !ok {
+				return nil, fmt.Errorf("invalid ICC alternate color space")
+			}
+			names, _, err := r.deviceNColorants(array)
+			if err != nil {
+				return nil, err
+			}
+			if len(names) != int(count) {
+				return nil, fmt.Errorf("invalid ICC alternate component count")
+			}
+		default:
+			return nil, fmt.Errorf("invalid ICC alternate color space")
+		}
 	}
 	copy := *stream
 	copy.Dictionary = maps.Clone(stream.Dictionary)
-	copy.Dictionary["Alternate"] = alternate
-	if !remap {
-		return Array{Name("ICCBased"), &copy}, nil
-	}
-	if _, err := r.readICCColorSpaceContext(ctx, Array{Name("ICCBased"), &copy}); err != nil {
-		return nil, err
-	}
-	alternate, err = r.remapColorSpaceContext(ctx, alternate, resources, remap, depth+1)
-	if err != nil {
-		return nil, err
-	}
 	copy.Dictionary["Alternate"] = alternate
 	return Array{Name("ICCBased"), &copy}, nil
 }

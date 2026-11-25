@@ -100,16 +100,19 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 		}
 		object, inherited := current.kids[0], current.attrs
 		current.kids = current.kids[1:]
-		ref, ok := object.(Reference)
-		if !ok && r.warning == nil {
+		var ref Reference
+		resolved := object
+		if _, ok := object.(Reference); ok {
+			var err error
+			ref, resolved, err = r.resolveIndirect(object)
+			if err != nil {
+				return err
+			}
+			if active[ref] || (seen[ref] && r.warning == nil) {
+				return fmt.Errorf("repeated page tree node")
+			}
+		} else if r.warning == nil {
 			return fmt.Errorf("page tree node is not indirect")
-		}
-		if ok && (active[ref] || (seen[ref] && r.warning == nil)) {
-			return fmt.Errorf("repeated page tree node")
-		}
-		resolved, err := r.Resolve(object)
-		if err != nil {
-			return err
 		}
 		dict, ok := resolved.(Dictionary)
 		if !ok {

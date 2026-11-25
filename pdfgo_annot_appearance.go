@@ -266,7 +266,7 @@ func (r *Reader) writeAnnotationColor(content *strings.Builder, values Array, st
 // 返回: *Stream 外观流, error 属性或未支持的边框错误
 func (r *Reader) linkAppearance(annotation Annotation) (*Stream, error) {
 	w, h := annotation.Rect.XMax-annotation.Rect.XMin, annotation.Rect.YMax-annotation.Rect.YMin
-	if w <= 0 || h <= 0 {
+	if w <= 0 || h <= 0 || math.IsNaN(w) || math.IsInf(w, 0) || math.IsNaN(h) || math.IsInf(h, 0) {
 		return nil, fmt.Errorf("invalid link bounds")
 	}
 	border, err := r.readAnnotationBorder(annotation)
@@ -444,7 +444,13 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 		}
 		writeAnnotationOperation(&content, "w", width)
 		if annotation.Subtype == "StrikeOut" {
-			a, b = Point{(a.X + d.X) / 2, (a.Y + d.Y) / 2}, Point{(b.X + c.X) / 2, (b.Y + c.Y) / 2}
+			adx, ady, bcx, bcy := d.X-a.X, d.Y-a.Y, c.X-b.X, c.Y-b.Y
+			a, b = Point{a.X + adx/2, a.Y + ady/2}, Point{b.X + bcx/2, b.Y + bcy/2}
+			for _, n := range [8]float64{adx, ady, bcx, bcy, a.X, a.Y, b.X, b.Y} {
+				if math.IsNaN(n) || math.IsInf(n, 0) {
+					return nil, fmt.Errorf("invalid text markup dimensions")
+				}
+			}
 		}
 		writeAnnotationOperation(&content, "m", a.X, a.Y)
 		if annotation.Subtype == "Squiggly" {
@@ -578,15 +584,26 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 			return nil, err
 		}
 	} else if annotation.Subtype == "Square" {
-		writeAnnotationOperation(&content, "re", x0, y0, x1-x0, y1-y0)
+		sw, sh := x1-x0, y1-y0
+		if math.IsNaN(sw) || math.IsInf(sw, 0) || math.IsNaN(sh) || math.IsInf(sh, 0) {
+			return nil, fmt.Errorf("invalid annotation shape dimensions")
+		}
+		writeAnnotationOperation(&content, "re", x0, y0, sw, sh)
 	} else {
-		cx, cy, rx, ry := (x0+x1)/2, (y0+y1)/2, (x1-x0)/2, (y1-y0)/2
+		rx, ry := (x1-x0)/2, (y1-y0)/2
+		cx, cy := x0+rx, y0+ry
 		k := 4 * (math.Sqrt2 - 1) / 3
+		krx, kry := k*rx, k*ry
+		for _, n := range [10]float64{rx, ry, cx, cy, krx, kry, cx + krx, cx - krx, cy + kry, cy - kry} {
+			if math.IsNaN(n) || math.IsInf(n, 0) {
+				return nil, fmt.Errorf("invalid annotation shape dimensions")
+			}
+		}
 		writeAnnotationOperation(&content, "m", x1, cy)
-		writeAnnotationOperation(&content, "c", x1, cy+k*ry, cx+k*rx, y1, cx, y1)
-		writeAnnotationOperation(&content, "c", cx-k*rx, y1, x0, cy+k*ry, x0, cy)
-		writeAnnotationOperation(&content, "c", x0, cy-k*ry, cx-k*rx, y0, cx, y0)
-		writeAnnotationOperation(&content, "c h", cx+k*rx, y0, x1, cy-k*ry, x1, cy)
+		writeAnnotationOperation(&content, "c", x1, cy+kry, cx+krx, y1, cx, y1)
+		writeAnnotationOperation(&content, "c", cx-krx, y1, x0, cy+kry, x0, cy)
+		writeAnnotationOperation(&content, "c", x0, cy-kry, cx-krx, y0, cx, y0)
+		writeAnnotationOperation(&content, "c h", cx+krx, y0, x1, cy-kry, x1, cy)
 	}
 	switch {
 	case fill && stroke:
@@ -793,7 +810,7 @@ func (r *Reader) annotationContentBounds(annotation Annotation) (Rectangle, erro
 		box.XMax -= inset[2]
 		box.YMax -= inset[3]
 	}
-	if box.XMin >= box.XMax || box.YMin >= box.YMax {
+	if box.XMin >= box.XMax || box.YMin >= box.YMax || math.IsNaN(box.XMin) || math.IsInf(box.XMin, 0) || math.IsNaN(box.YMin) || math.IsInf(box.YMin, 0) || math.IsNaN(box.XMax) || math.IsInf(box.XMax, 0) || math.IsNaN(box.YMax) || math.IsInf(box.YMax, 0) {
 		return Rectangle{}, fmt.Errorf("empty annotation content bounds")
 	}
 	return box, nil

@@ -25,6 +25,7 @@ import (
 // SpotFunction 保存预定义或自定义的二维网点函数，编译后不依赖阅读器
 type SpotFunction struct {
 	value func(float64, float64) (float64, error)
+	cost  int
 }
 
 // predefinedSpot 按ISO32000-1表128定义预置网点，不引入资源文件
@@ -129,7 +130,7 @@ func (r *Reader) readSpotFunctionContext(ctx context.Context, object Object) (*S
 		if err != nil {
 			return nil, err
 		}
-		return &SpotFunction{value: func(x, y float64) (float64, error) { return function(x, y), nil }}, nil
+		return &SpotFunction{value: func(x, y float64) (float64, error) { return function(x, y), nil }, cost: 1}, nil
 	}
 	stream, ok := value.(*Stream)
 	if !ok || stream == nil {
@@ -148,7 +149,7 @@ func (r *Reader) readSpotFunctionContext(ctx context.Context, object Object) (*S
 			var result [1]float64
 			function.evaluate([]float64{x, y}, result[:])
 			return result[0], nil
-		}}, nil
+		}, cost: 16}, nil
 	}
 	if kind != Integer(4) {
 		return nil, fmt.Errorf("invalid two-input spot function type")
@@ -179,7 +180,7 @@ func (r *Reader) readSpotFunctionContext(ctx context.Context, object Object) (*S
 			return 0, err
 		}
 		return math.Max(rangeValues[0], math.Min(rangeValues[1], output[0])), nil
-	}}, nil
+	}, cost: max(len(data), 16)}, nil
 }
 
 // Evaluate 求值网点函数，输入及输出限制到标准网点区间
@@ -239,12 +240,20 @@ func (r *Reader) spotThresholds(ctx context.Context, s *HalftoneScreen, h *Halft
 		index int
 		value float64
 	}, 0, count)
+	stepCost := max(function.cost, 1)
+	work := 0
 	for _, rect := range [][3]int{{s.width, s.height, 0}, {s.width2, s.height2, s.height}} {
 		for y := 0; y < rect[1]; y++ {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			for x := 0; x < rect[0]; x++ {
+				if work >= 256 {
+					work = 0
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				px, py := float64(x)+0.5, float64(y+rect[2])+0.5
 				u := (float64(s.width)*px - float64(s.width2)*py) / float64(count) * factor
 				v := (float64(s.width2)*px + float64(s.width)*py) / float64(count) * factor * float64(s.xsign*s.ysign)
@@ -257,6 +266,7 @@ func (r *Reader) spotThresholds(ctx context.Context, s *HalftoneScreen, h *Halft
 					index int
 					value float64
 				}{len(samples), value})
+				work += stepCost
 			}
 		}
 	}

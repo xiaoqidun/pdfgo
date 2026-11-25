@@ -64,9 +64,10 @@ func (p *ProcessColorants) CMYKMask() ([4]bool, bool) {
 
 // applyNChannelProcess 按过程字典映射可直接输出的过程分量，保留备用着色函数校验
 // 入参: ctx 取消上下文, space 多色定义, tint 已解析的备用变换, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: error 过程定义或取消错误
+// 返回: error 过程定义、预算或取消错误
 func (r *Reader) applyNChannelProcess(ctx context.Context, space Array, tint *deviceNSpace, effective bool, depth int) error {
-	if err := ctx.Err(); err != nil {
+	ctx, _, err := consumeColorParseNode(ctx)
+	if err != nil {
 		return err
 	}
 	if len(space) != 5 {
@@ -220,9 +221,10 @@ func (r *Reader) applyNChannelProcess(ctx context.Context, space Array, tint *de
 
 // readNChannelSpots 编译所用专色的独立分色定义，忽略过程分量的同名定义
 // 入参: ctx 取消上下文, attrs 属性字典, names 色料名称, process 过程分量映射, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: []*separationSpace 按源分量保存的专色变换, error 专色定义或取消错误
+// 返回: []*separationSpace 按源分量保存的专色变换, error 专色定义、预算或取消错误
 func (r *Reader) readNChannelSpots(ctx context.Context, attrs Dictionary, names []Name, process map[Name]int, effective bool, depth int) ([]*separationSpace, error) {
-	if err := ctx.Err(); err != nil {
+	ctx, state, err := consumeColorParseNode(ctx)
+	if err != nil {
 		return nil, err
 	}
 	var colorants Dictionary
@@ -245,7 +247,19 @@ func (r *Reader) readNChannelSpots(ctx context.Context, attrs Dictionary, names 
 			loaded = true
 			spots = make([]*separationSpace, len(names))
 		}
-		value, err := r.resolveColorSpace(colorants[name])
+		raw := colorants[name]
+		ref, isRef := raw.(Reference)
+		key := separationCacheKey{ref: ref, effective: effective}
+		if isRef && state.separations != nil {
+			if cached := state.separations[key]; cached != nil {
+				if cached.name != name {
+					return nil, fmt.Errorf("mismatched NChannel spot colorant %q", name)
+				}
+				spots[i] = cached
+				continue
+			}
+		}
+		value, err := r.resolveColorSpace(raw)
 		if err != nil {
 			return nil, err
 		}
@@ -263,6 +277,12 @@ func (r *Reader) readNChannelSpots(ctx context.Context, attrs Dictionary, names 
 		spots[i], err = r.readSeparationSpaceContext(ctx, definition, effective, depth)
 		if err != nil {
 			return nil, fmt.Errorf("NChannel spot colorant %q: %w", name, err)
+		}
+		if isRef {
+			if state.separations == nil {
+				state.separations = make(map[separationCacheKey]*separationSpace)
+			}
+			state.separations[key] = spots[i]
 		}
 	}
 	return spots, nil

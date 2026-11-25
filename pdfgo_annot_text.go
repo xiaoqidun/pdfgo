@@ -791,7 +791,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if !free {
 		content.WriteString("/Tx BMC\n")
 	}
-	fmt.Fprintf(content, "BT\n%s\n/%s ", stateContent, escapeAnnotationName(fontName))
+	fmt.Fprintf(content, "BT\n0 g 0 G 1 w [] 0 d\n%s\n/%s ", stateContent, escapeAnnotationName(fontName))
 	writeAnnotationOperation(content, "Tf", size)
 	if content.Len() > contentLimit {
 		return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)

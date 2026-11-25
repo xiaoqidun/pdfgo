@@ -347,7 +347,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	var noDownsampleRefs []Reference
 	var dataRoots []Object
 	var dataRefs []Reference
-	var efRoots []Object
+	var efRoots []Dictionary
 	lossless := make(map[Reference]bool)
 	noDownsample := make(map[Reference]bool)
 	exactData := make(map[Reference]bool)
@@ -413,7 +413,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 					}
 				}
 				if trackEmbedded && v["EF"] != nil {
-					efRoots = append(efRoots, v["EF"])
+					if t, direct := v["Type"].(Name); !direct || t == Name("Filespec") {
+						efRoots = append(efRoots, v)
+					}
 				}
 			}
 			if !protecting && !protectingScale && !preservingData && options.Compression.Mode == CompressionLossy {
@@ -452,42 +454,68 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	var deferredOrder []Reference
 	var reprocess []Reference
 	queuedReprocess := make(map[Reference]bool)
-	markEmbeddedFromEF := func(ef Object) error {
-		efChain := make(map[Reference]bool)
-		cur := ef
+	finishSigned := func() error {
+		if len(replacements) != 0 || len(lazyImages) != 0 || len(information) != 0 {
+			return ErrSignedDocument
+		}
+		return copySource()
+	}
+	resolveOptValue := func(val Object) (Object, error) {
+		cur := val
+		var chain map[Reference]bool
 		for {
 			if err := ctx.Err(); err != nil {
-				return err
+				return nil, err
 			}
 			ref, isRef := cur.(Reference)
 			if !isRef {
-				break
+				return cur, nil
 			}
-			if efChain[ref] || !isLiveRef(ref) {
-				return nil
+			if chain[ref] || !isLiveRef(ref) {
+				return nil, nil
 			}
-			efChain[ref] = true
+			if chain == nil {
+				chain = make(map[Reference]bool)
+			}
+			chain[ref] = true
 			if rep, ok := replacements[ref]; ok {
 				cur = rep
 				continue
 			}
 			if lazyImages[ref] != nil {
-				return nil
+				return nil, nil
 			}
 			resolved, readErr := r.Object(ref)
 			if !originalCache[ref] {
 				r.cache.delete(ref)
 			}
 			if readErr != nil {
-				return readErr
+				return nil, readErr
 			}
 			cur = resolved
+		}
+	}
+	markEmbeddedFromEF := func(host Dictionary) error {
+		isSpec, specErr := isFileSpecDictionary(ctx, host, resolveOptValue)
+		if specErr != nil || !isSpec {
+			return specErr
+		}
+		cur, efErr := resolveOptValue(host["EF"])
+		if efErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			var secErr *objectSecurityError
+			if errors.As(efErr, &secErr) {
+				return nil
+			}
+			return efErr
 		}
 		efDict, ok := cur.(Dictionary)
 		if !ok {
 			return nil
 		}
-		for _, key := range slices.Sorted(maps.Keys(efDict)) {
+		for _, key := range embeddedFileSpecKeys {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -516,6 +544,29 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 						r.cache.delete(entryRef)
 					}
 					if readErr != nil {
+						var secErr *objectSecurityError
+						if errors.As(readErr, &secErr) {
+							alt, altErr := r.object(entryRef, false)
+							if !originalCache[entryRef] {
+								r.cache.delete(entryRef)
+							}
+							if altErr == nil {
+								if altStream, ok := alt.(*Stream); ok {
+									isEF, efCheckErr := isEmbeddedFileStream(ctx, altStream, resolveOptValue)
+									if efCheckErr != nil {
+										return efCheckErr
+									}
+									if !isEF {
+										break
+									}
+								}
+							}
+							if _, exists := deferredSecurity[entryRef]; !exists {
+								deferredOrder = append(deferredOrder, entryRef)
+							}
+							deferredSecurity[entryRef] = readErr
+							break
+						}
 						return readErr
 					}
 				}
@@ -523,7 +574,14 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 					entryRef = next
 					continue
 				}
-				if _, isStreamObj := resolved.(*Stream); isStreamObj {
+				if stream, isStreamObj := resolved.(*Stream); isStreamObj {
+					isEF, efCheckErr := isEmbeddedFileStream(ctx, stream, resolveOptValue)
+					if efCheckErr != nil {
+						return efCheckErr
+					}
+					if !isEF {
+						break
+					}
 					embeddedFiles[entryRef] = true
 					if _, deferred := deferredSecurity[entryRef]; deferred {
 						delete(deferredSecurity, entryRef)
@@ -553,6 +611,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			}
 		}
 		return nil
+	}
+	if signed {
+		return report, finishSigned()
 	}
 	if err := drainEF(); err != nil {
 		return report, err
@@ -596,6 +657,12 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if err = collect(value, 0); err != nil {
 			return report, err
 		}
+		if signed {
+			if !originalCache[ref] {
+				r.cache.delete(ref)
+			}
+			return report, finishSigned()
+		}
 		if err = drainEF(); err != nil {
 			return report, err
 		}
@@ -615,12 +682,6 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		if !originalCache[ref] {
 			r.cache.delete(ref)
-		}
-		if signed {
-			if len(replacements) != 0 || len(lazyImages) != 0 || len(information) != 0 {
-				return report, ErrSignedDocument
-			}
-			return report, copySource()
 		}
 	}
 	for _, ref := range deferredOrder {
@@ -1082,49 +1143,71 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	}
 	lookupSMaskInfo := func(smaskVal Object) (smaskOptInfo, error) {
 		var info smaskOptInfo
-		if sRef, isRef := smaskVal.(Reference); isRef {
+		var seenMask map[Reference]bool
+		var chainRefs []Reference
+		cur := smaskVal
+		for {
+			if err := ctx.Err(); err != nil {
+				return info, err
+			}
+			sRef, isRef := cur.(Reference)
+			if !isRef {
+				break
+			}
 			if canonical, aliased := out.aliases[sRef]; aliased {
 				sRef = canonical
 			}
 			if cachedInfo, ok := smaskCache[sRef]; ok {
+				for _, rRef := range chainRefs {
+					smaskCache[rRef] = cachedInfo
+				}
 				return cachedInfo, nil
 			}
-			if sObj, sErr := object(sRef); sErr == nil {
-				if sStream, ok := sObj.(*Stream); ok {
-					var sCheckErr error
-					info.opaque, sCheckErr = r.isSMaskOpaque(ctx, sStream)
-					if sCheckErr != nil {
-						if !originalCache[sRef] {
-							r.cache.delete(sRef)
-						}
-						return info, sCheckErr
-					}
-					if !info.opaque {
-						if matteVal, _ := r.optimizationValue(sStream.Dictionary["Matte"]); matteVal != nil {
-							info.hasMatte = true
-						}
-					}
-					smaskCache[sRef] = info
-				}
+			if seenMask[sRef] {
+				info.hasMatte = true
+				return info, nil
 			}
+			if seenMask == nil {
+				seenMask = make(map[Reference]bool)
+			}
+			seenMask[sRef] = true
+			chainRefs = append(chainRefs, sRef)
+			sObj, sErr := object(sRef)
 			if !originalCache[sRef] {
 				r.cache.delete(sRef)
 			}
+			if sErr != nil {
+				if isFatalOptimizationReadError(ctx, sErr) {
+					return info, sErr
+				}
+				info.hasMatte = true
+				return info, nil
+			}
+			cur = sObj
+		}
+		sStream, ok := cur.(*Stream)
+		if !ok || sStream == nil {
+			info.hasMatte = true
 			return info, nil
 		}
-		if sObj, sErr := r.optimizationValue(smaskVal); sErr == nil {
-			if sStream, ok := sObj.(*Stream); ok {
-				var sCheckErr error
-				info.opaque, sCheckErr = r.isSMaskOpaque(ctx, sStream)
-				if sCheckErr != nil {
-					return info, sCheckErr
+		opaque, sCheckErr := r.isSMaskOpaque(ctx, sStream)
+		if sCheckErr != nil {
+			return info, sCheckErr
+		}
+		info.opaque = opaque
+		if !info.opaque {
+			matteVal, matteErr := r.optimizationValue(sStream.Dictionary["Matte"])
+			if matteErr != nil {
+				if isFatalOptimizationReadError(ctx, matteErr) {
+					return info, matteErr
 				}
-				if !info.opaque {
-					if matteVal, _ := r.optimizationValue(sStream.Dictionary["Matte"]); matteVal != nil {
-						info.hasMatte = true
-					}
-				}
+				info.hasMatte = true
+			} else if matteVal != nil {
+				info.hasMatte = true
 			}
+		}
+		for _, rRef := range chainRefs {
+			smaskCache[rRef] = info
 		}
 		return info, nil
 	}
@@ -2302,4 +2385,95 @@ func (s *standardSecurity) encryptBytes(data []byte, ref Reference, name Name) (
 	}
 	cipher.NewCBCEncrypter(c, result[:aes.BlockSize]).CryptBlocks(result[aes.BlockSize:], result[aes.BlockSize:])
 	return result, nil
+}
+
+// embeddedFileSpecKeys 定义文件说明及EF字典中的规范文件键顺序
+var embeddedFileSpecKeys = [5]Name{"UF", "F", "DOS", "Mac", "Unix"}
+
+// fatalFilespecResolveError 过滤文件说明探测中可容忍的安全与非致命解析错误，保留致命读取与取消错误
+// 入参: ctx 取消上下文, err 非空解析错误
+// 返回: error 应向上传播的致命读取或取消错误，可容忍时返回空值
+func fatalFilespecResolveError(ctx context.Context, err error) error {
+	if cErr := ctx.Err(); cErr != nil {
+		return cErr
+	}
+	var secErr *objectSecurityError
+	if errors.As(err, &secErr) {
+		return nil
+	}
+	if isFatalOptimizationReadError(ctx, err) {
+		return err
+	}
+	return nil
+}
+
+// isFileSpecDictionary 判断宿主字典是否为合法文件说明字典，排除明确非Filespec类型及其他命名空间字典
+// 入参: ctx 取消上下文, dict 候选字典, resolve 安全对象解析函数
+// 返回: bool 是否为文件说明字典, error 致命读取或取消错误
+func isFileSpecDictionary(ctx context.Context, dict Dictionary, resolve func(Object) (Object, error)) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if dict["EF"] == nil {
+		return false, nil
+	}
+	if dict["Type"] != nil {
+		typeVal, err := resolve(dict["Type"])
+		if err != nil {
+			return false, fatalFilespecResolveError(ctx, err)
+		}
+		if typeVal != nil {
+			return typeVal == Name("Filespec"), nil
+		}
+	}
+	for _, key := range embeddedFileSpecKeys {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if dict[key] == nil {
+			continue
+		}
+		val, err := resolve(dict[key])
+		if err != nil {
+			if fatalErr := fatalFilespecResolveError(ctx, err); fatalErr != nil {
+				return false, fatalErr
+			}
+			continue
+		}
+		if _, ok := val.(String); ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// isEmbeddedFileStream 判断候选流是否满足内嵌文件流特征，排除明确非附件的类型与子类型
+// 入参: ctx 取消上下文, stream 候选流对象, resolve 安全对象解析函数
+// 返回: bool 是否可按内嵌文件流处理, error 致命读取或取消错误
+func isEmbeddedFileStream(ctx context.Context, stream *Stream, resolve func(Object) (Object, error)) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if stream.Dictionary["Type"] != nil {
+		typeVal, err := resolve(stream.Dictionary["Type"])
+		if err != nil {
+			return false, fatalFilespecResolveError(ctx, err)
+		}
+		if typeName, ok := typeVal.(Name); ok && typeName != Name("EmbeddedFile") {
+			return false, nil
+		}
+	}
+	if stream.Dictionary["Subtype"] != nil {
+		subVal, err := resolve(stream.Dictionary["Subtype"])
+		if err != nil {
+			return false, fatalFilespecResolveError(ctx, err)
+		}
+		if subName, ok := subVal.(Name); ok {
+			switch subName {
+			case Name("Image"), Name("Form"), Name("PS"), Name("Type1C"), Name("CIDFontType0C"), Name("OpenType"), Name("XML"):
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }

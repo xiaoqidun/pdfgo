@@ -21,6 +21,9 @@ import (
 	"reflect"
 )
 
+// maxStructureAttributes 限制单个结构元素属性展开的最大数量与迭代步数
+const maxStructureAttributes = 65536
+
 // StructureTree 保存逻辑结构根、角色映射和属性类，树索引及扩展信息保留在原始字典中
 type StructureTree struct {
 	Reference  Reference
@@ -360,7 +363,7 @@ func (r *Reader) WalkStructure(ctx context.Context, visit func(int, StructureIte
 // StructureAttributes 展开结构元素的属性类和直接属性，类属性在前，直接属性在后
 // 同名属性以直接声明为准，修订号不匹配的属性仍保留，不修改共享属性对象
 // 入参: ctx 取消上下文, item 结构元素
-// 返回: []StructureAttribute 属性列表, error 解析、结构或取消错误
+// 返回: []StructureAttribute 属性列表, error 解析、结构、上限或取消错误
 func (r *Reader) StructureAttributes(ctx context.Context, item StructureItem) ([]StructureAttribute, error) {
 	if r == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid structure context")
@@ -375,9 +378,14 @@ func (r *Reader) StructureAttributes(ctx context.Context, item StructureItem) ([
 		return nil, fmt.Errorf("structure attributes require an element")
 	}
 	var result []StructureAttribute
+	steps := 0
 	appendAttribute := func(object Object, class *Name, revision int64) error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		steps++
+		if steps > maxStructureAttributes {
+			return fmt.Errorf("%w: structure attribute limit exceeded", ErrStreamLimitExceeded)
 		}
 		value, err := r.Resolve(object)
 		if err != nil {
@@ -434,6 +442,13 @@ func (r *Reader) StructureAttributes(ctx context.Context, item StructureItem) ([
 				return err
 			}
 			if objects, ok := value.(Array); ok {
+				if len(objects) == 0 {
+					steps++
+					if steps > maxStructureAttributes {
+						return fmt.Errorf("%w: structure attribute limit exceeded", ErrStreamLimitExceeded)
+					}
+					return nil
+				}
 				for _, object := range objects {
 					if err := appendAttribute(object, &class, revision); err != nil {
 						return err

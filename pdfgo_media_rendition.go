@@ -268,7 +268,7 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 		if err != nil {
 			return nil, err
 		}
-		if kind != Name("Filespec") {
+		if kind != nil && kind != Name("Filespec") {
 			return nil, fmt.Errorf("invalid media clip file type")
 		}
 		file, err := r.ReadFileSpecification(fileDict)

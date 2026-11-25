@@ -181,7 +181,7 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 		writeAnnotationOperation(&content, "cm", ux, uy, -uy, ux, cx, cy)
 		if caption.rich != nil {
 			resources = caption.resources
-			if err := writeRichLineCaption(ctx, &content, caption); err != nil {
+			if err := writeRichLineCaption(ctx, &content, caption, annotationRichContentLimit(r)); err != nil {
 				return nil, err
 			}
 		} else {

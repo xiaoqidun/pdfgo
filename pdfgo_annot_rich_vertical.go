@@ -197,11 +197,8 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 			if math.IsNaN(point.X) || math.IsInf(point.X, 0) || math.IsNaN(point.Y) || math.IsInf(point.Y, 0) {
 				return fmt.Errorf("vertical rich text position overflow")
 			}
-			if err := writeAnnotationRichRun(ctx, content, column.glyphs[i:end], v.state, v.defaults, v.matrix, size, x+offset.X, baseline+offset.Y); err != nil {
+			if err := writeAnnotationRichRun(ctx, content, column.glyphs[i:end], v.state, v.defaults, v.matrix, size, x+offset.X, baseline+offset.Y, v.maxBytes); err != nil {
 				return err
-			}
-			if content.Len() > v.maxBytes {
-				return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
 			}
 			if decorated {
 				start := len(decorations)

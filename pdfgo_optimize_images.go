@@ -1425,32 +1425,11 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		}
 		return nil
 	}
-	var walkMediaClip func(Object, Dictionary, map[Reference]bool, int) error
-	walkMediaClip = func(clipObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
-		if clipObj == nil || depth > 32 {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		obj, ref, err := resolveObjectRef(clipObj)
-		if err != nil {
-			if isFatalOptimizationReadError(ctx, err) {
-				return err
-			}
-			return nil
-		}
-		if visited == nil {
-			visited = map[Reference]bool{}
-		}
-		if ref.Number > 0 {
-			if visited[ref] {
-				return nil
-			}
-			visited[ref] = true
-		}
-		switch v := obj.(type) {
-		case *Stream:
+	mediaWalker := mediaActionWalker{
+		reader:           r,
+		ctx:              ctx,
+		resolveObjectRef: resolveObjectRef,
+		onStream: func(v *Stream, ref Reference, pageRes Dictionary) error {
 			sub, err := r.Resolve(v.Dictionary["Subtype"])
 			if err != nil {
 				if isFatalOptimizationReadError(ctx, err) {
@@ -1475,152 +1454,8 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 					return errUnsafe
 				}
 			}
-		case Dictionary:
-			return walkMediaClip(v["D"], pageRes, visited, depth+1)
-		}
-		return nil
-	}
-	var walkRendition func(Object, Dictionary, map[Reference]bool, int) error
-	walkRendition = func(rendObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
-		if rendObj == nil || depth > 32 {
 			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		obj, ref, err := resolveObjectRef(rendObj)
-		if err != nil {
-			if isFatalOptimizationReadError(ctx, err) {
-				return err
-			}
-			return nil
-		}
-		if ref.Number > 0 {
-			if visited[ref] {
-				return nil
-			}
-			visited[ref] = true
-		}
-		dict, ok := obj.(Dictionary)
-		if !ok {
-			return nil
-		}
-		if err := walkMediaClip(dict["C"], pageRes, nil, 0); err != nil {
-			return err
-		}
-		if dict["R"] != nil {
-			arrVal, err := r.Resolve(dict["R"])
-			if err != nil {
-				if isFatalOptimizationReadError(ctx, err) {
-					return err
-				}
-				return nil
-			}
-			if arr, ok := arrVal.(Array); ok {
-				for _, item := range arr {
-					if err := walkRendition(item, pageRes, visited, depth+1); err != nil {
-						return err
-					}
-				}
-			}
-		}
-		return nil
-	}
-	var walkAction func(Object, Dictionary, map[Reference]bool, int) error
-	walkAction = func(actionObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
-		if actionObj == nil || depth > 32 {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		obj, ref, err := resolveObjectRef(actionObj)
-		if err != nil {
-			if isFatalOptimizationReadError(ctx, err) {
-				return err
-			}
-			return nil
-		}
-		if ref.Number > 0 {
-			if visited[ref] {
-				return nil
-			}
-			visited[ref] = true
-		}
-		switch v := obj.(type) {
-		case Array:
-			for _, item := range v {
-				if err := walkAction(item, pageRes, visited, depth+1); err != nil {
-					return err
-				}
-			}
-		case Dictionary:
-			s, err := r.Resolve(v["S"])
-			if err != nil {
-				if isFatalOptimizationReadError(ctx, err) {
-					return err
-				}
-				return nil
-			}
-			if s == Name("Rendition") && v["R"] != nil {
-				fallbackRes := pageRes
-				if fallbackRes == nil && v["AN"] != nil {
-					if anVal, anErr := r.Resolve(v["AN"]); anErr == nil {
-						if anDict, ok := anVal.(Dictionary); ok && anDict["P"] != nil {
-							nodeObj := anDict["P"]
-							for step := 0; step < 32 && nodeObj != nil && fallbackRes == nil; step++ {
-								pVal, pErr := r.Resolve(nodeObj)
-								if pErr != nil {
-									break
-								}
-								pDict, ok := pVal.(Dictionary)
-								if !ok {
-									break
-								}
-								if pDict["Resources"] != nil {
-									if rVal, rErr := r.Resolve(pDict["Resources"]); rErr == nil {
-										fallbackRes, _ = rVal.(Dictionary)
-									}
-									break
-								}
-								nodeObj = pDict["Parent"]
-							}
-						}
-					}
-				}
-				if err := walkRendition(v["R"], fallbackRes, map[Reference]bool{}, 0); err != nil {
-					return err
-				}
-			}
-			if v["Next"] != nil {
-				if err := walkAction(v["Next"], pageRes, visited, depth+1); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	walkAdditionalActions := func(aaObj Object, pageRes Dictionary) error {
-		if aaObj == nil {
-			return nil
-		}
-		aaVal, err := r.Resolve(aaObj)
-		if err != nil {
-			if isFatalOptimizationReadError(ctx, err) {
-				return err
-			}
-			return nil
-		}
-		aaDict, ok := aaVal.(Dictionary)
-		if !ok {
-			return nil
-		}
-		for _, entry := range aaDict {
-			if err := walkAction(entry, pageRes, map[Reference]bool{}, 0); err != nil {
-				return err
-			}
-		}
-		return nil
+		},
 	}
 	resolveOptionalInt := func(obj Object) (int64, error) {
 		if obj == nil {
@@ -1778,11 +1613,11 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				}
 			}
 			if annotDict["A"] != nil {
-				if err := walkAction(annotDict["A"], page.Resources, map[Reference]bool{}, 0); err != nil {
+				if err := mediaWalker.walkAction(annotDict["A"], page.Resources, map[Reference]bool{}, 0); err != nil {
 					return err
 				}
 			}
-			if err := walkAdditionalActions(annotDict["AA"], page.Resources); err != nil {
+			if err := mediaWalker.walkAdditionalActions(annotDict["AA"], page.Resources); err != nil {
 				return err
 			}
 		}
@@ -1794,7 +1629,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		if err := walkPageAnnotations(page, unit); err != nil {
 			return err
 		}
-		if err := walkAdditionalActions(page.Dictionary["AA"], page.Resources); err != nil {
+		if err := mediaWalker.walkAdditionalActions(page.Dictionary["AA"], page.Resources); err != nil {
 			return err
 		}
 		var content bytes.Buffer
@@ -1825,114 +1660,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				err = rootErr
 			}
 		} else if catalog, ok := rootVal.(Dictionary); ok {
-			if catalog["OpenAction"] != nil {
-				err = walkAction(catalog["OpenAction"], nil, map[Reference]bool{}, 0)
-			}
-			if err == nil {
-				err = walkAdditionalActions(catalog["AA"], nil)
-			}
-			if err == nil && catalog["Names"] != nil {
-				if namesVal, namesErr := r.Resolve(catalog["Names"]); namesErr != nil {
-					if isFatalOptimizationReadError(ctx, namesErr) {
-						err = namesErr
-					}
-				} else if namesDict, ok := namesVal.(Dictionary); ok && namesDict["Renditions"] != nil {
-					var walkRenditionTree func(Object, map[Reference]bool, int) error
-					walkRenditionTree = func(nodeObj Object, seen map[Reference]bool, depth int) error {
-						if nodeObj == nil || depth > 32 {
-							return nil
-						}
-						if err := ctx.Err(); err != nil {
-							return err
-						}
-						obj, ref, nodeErr := resolveObjectRef(nodeObj)
-						if nodeErr != nil {
-							if isFatalOptimizationReadError(ctx, nodeErr) {
-								return nodeErr
-							}
-							return nil
-						}
-						if ref.Number > 0 {
-							if seen[ref] {
-								return nil
-							}
-							seen[ref] = true
-						}
-						dict, ok := obj.(Dictionary)
-						if !ok {
-							return nil
-						}
-						if dict["Names"] != nil {
-							if pairsVal, pairErr := r.Resolve(dict["Names"]); pairErr != nil {
-								if isFatalOptimizationReadError(ctx, pairErr) {
-									return pairErr
-								}
-							} else if pairs, ok := pairsVal.(Array); ok {
-								for i := 1; i < len(pairs); i += 2 {
-									if rErr := walkRendition(pairs[i], nil, map[Reference]bool{}, 0); rErr != nil {
-										return rErr
-									}
-								}
-							}
-						}
-						if dict["Kids"] != nil {
-							if kidsVal, kidErr := r.Resolve(dict["Kids"]); kidErr != nil {
-								if isFatalOptimizationReadError(ctx, kidErr) {
-									return kidErr
-								}
-							} else if kids, ok := kidsVal.(Array); ok {
-								for _, kid := range kids {
-									if kErr := walkRenditionTree(kid, seen, depth+1); kErr != nil {
-										return kErr
-									}
-								}
-							}
-						}
-						return nil
-					}
-					err = walkRenditionTree(namesDict["Renditions"], map[Reference]bool{}, 0)
-				}
-			}
-			if err == nil && catalog["Outlines"] != nil {
-				outlineSeen := map[Reference]bool{}
-				outlineQueue := []Object{catalog["Outlines"]}
-				for i := 0; i < len(outlineQueue) && i < 100000; i++ {
-					if cErr := ctx.Err(); cErr != nil {
-						err = cErr
-						break
-					}
-					obj, ref, oErr := resolveObjectRef(outlineQueue[i])
-					if oErr != nil {
-						if isFatalOptimizationReadError(ctx, oErr) {
-							err = oErr
-							break
-						}
-						continue
-					}
-					if ref.Number > 0 {
-						if outlineSeen[ref] {
-							continue
-						}
-						outlineSeen[ref] = true
-					}
-					dict, ok := obj.(Dictionary)
-					if !ok {
-						continue
-					}
-					if dict["A"] != nil {
-						if aErr := walkAction(dict["A"], nil, map[Reference]bool{}, 0); aErr != nil {
-							err = aErr
-							break
-						}
-					}
-					if dict["First"] != nil {
-						outlineQueue = append(outlineQueue, dict["First"])
-					}
-					if dict["Next"] != nil {
-						outlineQueue = append(outlineQueue, dict["Next"])
-					}
-				}
-			}
+			err = mediaWalker.walkCatalog(catalog)
 		}
 	}
 	if err != nil {
@@ -1947,9 +1675,367 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 	return sizes, ctx.Err()
 }
 
+// resolveAnnotationPageResources 解析注解所属页面及其父节点链上可继承的资源字典
+// 入参: ctx 取消上下文, anObj 注解对象或引用
+// 返回: Dictionary 可继承的资源字典，不可解析时为空, error 致命读取或取消错误
+func (r *Reader) resolveAnnotationPageResources(ctx context.Context, anObj Object) (Dictionary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	anVal, anErr := r.Resolve(anObj)
+	if anErr != nil {
+		if cErr := ctx.Err(); cErr != nil {
+			return nil, cErr
+		}
+		if isFatalOptimizationReadError(ctx, anErr) {
+			return nil, anErr
+		}
+		return nil, nil
+	}
+	anDict, ok := anVal.(Dictionary)
+	if !ok || anDict["P"] == nil {
+		return nil, ctx.Err()
+	}
+	nodeObj := anDict["P"]
+	for step := 0; step < 32 && nodeObj != nil; step++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pVal, pErr := r.Resolve(nodeObj)
+		if pErr != nil {
+			if cErr := ctx.Err(); cErr != nil {
+				return nil, cErr
+			}
+			if isFatalOptimizationReadError(ctx, pErr) {
+				return nil, pErr
+			}
+			break
+		}
+		pDict, ok := pVal.(Dictionary)
+		if !ok {
+			break
+		}
+		if pDict["Resources"] != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			rVal, rErr := r.Resolve(pDict["Resources"])
+			if rErr != nil {
+				if cErr := ctx.Err(); cErr != nil {
+					return nil, cErr
+				}
+				if isFatalOptimizationReadError(ctx, rErr) {
+					return nil, rErr
+				}
+				break
+			}
+			if res, ok := rVal.(Dictionary); ok {
+				return res, ctx.Err()
+			}
+			break
+		}
+		nodeObj = pDict["Parent"]
+	}
+	return nil, ctx.Err()
+}
+
+// mediaActionWalker 遍历媒体片段、渲染方案、动作链及目录入口并向回调交付可达流对象
+type mediaActionWalker struct {
+	reader           *Reader
+	ctx              context.Context
+	resolveObjectRef func(Object) (Object, Reference, error)
+	onStream         func(*Stream, Reference, Dictionary) error
+}
+
+// walkMediaClip 递归展开媒体片段字典链并回调底层流对象
+// 入参: clipObj 媒体片段或流对象, pageRes 宿主页面资源, visited 已访问引用集合, depth 递归深度
+// 返回: error 回调、致命读取或取消错误
+func (w mediaActionWalker) walkMediaClip(clipObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
+	if clipObj == nil || depth > 32 {
+		return nil
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	obj, ref, err := w.resolveObjectRef(clipObj)
+	if err != nil {
+		if isFatalOptimizationReadError(w.ctx, err) {
+			return err
+		}
+		return nil
+	}
+	if visited == nil {
+		visited = map[Reference]bool{}
+	}
+	if ref.Number > 0 {
+		if visited[ref] {
+			return nil
+		}
+		visited[ref] = true
+	}
+	switch v := obj.(type) {
+	case *Stream:
+		return w.onStream(v, ref, pageRes)
+	case Dictionary:
+		return w.walkMediaClip(v["D"], pageRes, visited, depth+1)
+	}
+	return nil
+}
+
+// walkRendition 递归展开渲染方案及其子渲染数组，遍历关联媒体片段
+// 入参: rendObj 渲染对象, pageRes 宿主页面资源, visited 已访问引用集合, depth 递归深度
+// 返回: error 回调、致命读取或取消错误
+func (w mediaActionWalker) walkRendition(rendObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
+	if rendObj == nil || depth > 32 {
+		return nil
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	obj, ref, err := w.resolveObjectRef(rendObj)
+	if err != nil {
+		if isFatalOptimizationReadError(w.ctx, err) {
+			return err
+		}
+		return nil
+	}
+	if ref.Number > 0 {
+		if visited[ref] {
+			return nil
+		}
+		visited[ref] = true
+	}
+	dict, ok := obj.(Dictionary)
+	if !ok {
+		return nil
+	}
+	if err := w.walkMediaClip(dict["C"], pageRes, nil, 0); err != nil {
+		return err
+	}
+	if dict["R"] != nil {
+		arrVal, err := w.reader.Resolve(dict["R"])
+		if err != nil {
+			if isFatalOptimizationReadError(w.ctx, err) {
+				return err
+			}
+			return nil
+		}
+		if arr, ok := arrVal.(Array); ok {
+			for _, item := range arr {
+				if err := w.walkRendition(item, pageRes, visited, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// walkAction 遍历动作及Next链，提取Rendition动作关联的媒体片段并回溯注解页面资源
+// 入参: actionObj 动作对象或数组, pageRes 宿主页面资源, visited 已访问引用集合, depth 递归深度
+// 返回: error 回调、致命读取或取消错误
+func (w mediaActionWalker) walkAction(actionObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
+	if actionObj == nil || depth > 32 {
+		return nil
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	obj, ref, err := w.resolveObjectRef(actionObj)
+	if err != nil {
+		if isFatalOptimizationReadError(w.ctx, err) {
+			return err
+		}
+		return nil
+	}
+	if ref.Number > 0 {
+		if visited[ref] {
+			return nil
+		}
+		visited[ref] = true
+	}
+	switch v := obj.(type) {
+	case Array:
+		for _, item := range v {
+			if err := w.walkAction(item, pageRes, visited, depth+1); err != nil {
+				return err
+			}
+		}
+	case Dictionary:
+		s, err := w.reader.Resolve(v["S"])
+		if err != nil {
+			if isFatalOptimizationReadError(w.ctx, err) {
+				return err
+			}
+			return nil
+		}
+		if s == Name("Rendition") && v["R"] != nil {
+			fallbackRes := pageRes
+			if fallbackRes == nil && v["AN"] != nil {
+				var resErr error
+				fallbackRes, resErr = w.reader.resolveAnnotationPageResources(w.ctx, v["AN"])
+				if resErr != nil {
+					return resErr
+				}
+			}
+			if err := w.walkRendition(v["R"], fallbackRes, map[Reference]bool{}, 0); err != nil {
+				return err
+			}
+		}
+		if v["Next"] != nil {
+			if err := w.walkAction(v["Next"], pageRes, visited, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// walkAdditionalActions 遍历附加动作字典中的全部触发动作
+// 入参: aaObj 附加动作字典或引用, pageRes 宿主页面资源
+// 返回: error 回调、致命读取或取消错误
+func (w mediaActionWalker) walkAdditionalActions(aaObj Object, pageRes Dictionary) error {
+	if aaObj == nil {
+		return nil
+	}
+	aaVal, err := w.reader.Resolve(aaObj)
+	if err != nil {
+		if isFatalOptimizationReadError(w.ctx, err) {
+			return err
+		}
+		return nil
+	}
+	aaDict, ok := aaVal.(Dictionary)
+	if !ok {
+		return nil
+	}
+	for _, entry := range aaDict {
+		if err := w.walkAction(entry, pageRes, map[Reference]bool{}, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// walkCatalog 遍历目录字典中的OpenAction、AA、Names/Renditions名称树及Outlines书签动作
+// 入参: catalog 文档目录字典
+// 返回: error 回调、致命读取或取消错误
+func (w mediaActionWalker) walkCatalog(catalog Dictionary) error {
+	if catalog["OpenAction"] != nil {
+		if err := w.walkAction(catalog["OpenAction"], nil, map[Reference]bool{}, 0); err != nil {
+			return err
+		}
+	}
+	if err := w.walkAdditionalActions(catalog["AA"], nil); err != nil {
+		return err
+	}
+	if catalog["Names"] != nil {
+		if namesVal, namesErr := w.reader.Resolve(catalog["Names"]); namesErr != nil {
+			if isFatalOptimizationReadError(w.ctx, namesErr) {
+				return namesErr
+			}
+		} else if namesDict, ok := namesVal.(Dictionary); ok && namesDict["Renditions"] != nil {
+			var walkRenditionTree func(Object, map[Reference]bool, int) error
+			walkRenditionTree = func(nodeObj Object, seen map[Reference]bool, depth int) error {
+				if nodeObj == nil || depth > 32 {
+					return nil
+				}
+				if err := w.ctx.Err(); err != nil {
+					return err
+				}
+				obj, ref, nodeErr := w.resolveObjectRef(nodeObj)
+				if nodeErr != nil {
+					if isFatalOptimizationReadError(w.ctx, nodeErr) {
+						return nodeErr
+					}
+					return nil
+				}
+				if ref.Number > 0 {
+					if seen[ref] {
+						return nil
+					}
+					seen[ref] = true
+				}
+				dict, ok := obj.(Dictionary)
+				if !ok {
+					return nil
+				}
+				if dict["Names"] != nil {
+					if pairsVal, pairErr := w.reader.Resolve(dict["Names"]); pairErr != nil {
+						if isFatalOptimizationReadError(w.ctx, pairErr) {
+							return pairErr
+						}
+					} else if pairs, ok := pairsVal.(Array); ok {
+						for i := 1; i < len(pairs); i += 2 {
+							if rErr := w.walkRendition(pairs[i], nil, map[Reference]bool{}, 0); rErr != nil {
+								return rErr
+							}
+						}
+					}
+				}
+				if dict["Kids"] != nil {
+					if kidsVal, kidErr := w.reader.Resolve(dict["Kids"]); kidErr != nil {
+						if isFatalOptimizationReadError(w.ctx, kidErr) {
+							return kidErr
+						}
+					} else if kids, ok := kidsVal.(Array); ok {
+						for _, kid := range kids {
+							if kErr := walkRenditionTree(kid, seen, depth+1); kErr != nil {
+								return kErr
+							}
+						}
+					}
+				}
+				return nil
+			}
+			if err := walkRenditionTree(namesDict["Renditions"], map[Reference]bool{}, 0); err != nil {
+				return err
+			}
+		}
+	}
+	if catalog["Outlines"] != nil {
+		outlineSeen := map[Reference]bool{}
+		outlineQueue := []Object{catalog["Outlines"]}
+		for i := 0; i < len(outlineQueue) && i < 100000; i++ {
+			if cErr := w.ctx.Err(); cErr != nil {
+				return cErr
+			}
+			obj, ref, oErr := w.resolveObjectRef(outlineQueue[i])
+			if oErr != nil {
+				if isFatalOptimizationReadError(w.ctx, oErr) {
+					return oErr
+				}
+				continue
+			}
+			if ref.Number > 0 {
+				if outlineSeen[ref] {
+					continue
+				}
+				outlineSeen[ref] = true
+			}
+			dict, ok := obj.(Dictionary)
+			if !ok {
+				continue
+			}
+			if dict["A"] != nil {
+				if aErr := w.walkAction(dict["A"], nil, map[Reference]bool{}, 0); aErr != nil {
+					return aErr
+				}
+			}
+			if dict["First"] != nil {
+				outlineQueue = append(outlineQueue, dict["First"])
+			}
+			if dict["Next"] != nil {
+				outlineQueue = append(outlineQueue, dict["Next"])
+			}
+		}
+	}
+	return nil
+}
+
 // imageDefaultColorResources 在文档存在Default设备色资源时映射各图像引用的默认色空间，多页冲突时拒绝转换
 // 入参: ctx 取消上下文, refs 可达对象, metadata 对象元数据快照, aliases 对象别名映射
-// 返回: map[Reference]Dictionary 图像到默认色空间资源的映射, map[Reference]bool 存在默认色空间冲突的图像集合, error 取消错误
+// 返回: map[Reference]Dictionary 图像到默认色空间资源的映射, map[Reference]bool 存在默认色空间冲突的图像集合, error 取消或致命读取错误
 func (r *Reader) imageDefaultColorResources(ctx context.Context, refs []Reference, metadata map[Reference]Object, aliases map[Reference]Reference) (map[Reference]Dictionary, map[Reference]bool, error) {
 	hasDefault := false
 	var scanDict func(Object, int)
@@ -2169,58 +2255,180 @@ func (r *Reader) imageDefaultColorResources(ctx context.Context, refs []Referenc
 		}
 		walkRes(apRes, map[Reference]bool{}, 0)
 	}
-	_ = r.WalkPages(ctx, func(_ int, page *Page) error {
+	walkMediaStream := func(stream *Stream, ref Reference, pageRes Dictionary) error {
+		sub, err := r.Resolve(stream.Dictionary["Subtype"])
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
+			return nil
+		}
+		switch sub {
+		case Name("Image"):
+			record(ref, extractDefaults(pageRes))
+		case Name("Form"):
+			if canonical, aliased := aliases[ref]; aliased {
+				ref = canonical
+			}
+			visited := map[Reference]bool{}
+			if ref.Number > 0 {
+				visited[ref] = true
+			}
+			formRes := pageRes
+			if stream.Dictionary["Resources"] != nil {
+				if rVal, rErr := r.Resolve(stream.Dictionary["Resources"]); rErr == nil {
+					if rDict, ok := rVal.(Dictionary); ok {
+						formRes = rDict
+					}
+				} else if isFatalOptimizationReadError(ctx, rErr) {
+					return rErr
+				}
+			}
+			walkRes(formRes, visited, 0)
+		}
+		return nil
+	}
+	walkMediaObject := func(mediaObj Object, pageRes Dictionary) error {
+		if mediaObj == nil {
+			return nil
+		}
+		obj, ref, err := resolveObjectRef(mediaObj)
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
+			return nil
+		}
+		stream, ok := obj.(*Stream)
+		if !ok {
+			return nil
+		}
+		return walkMediaStream(stream, ref, pageRes)
+	}
+	mediaWalker := mediaActionWalker{
+		reader:           r,
+		ctx:              ctx,
+		resolveObjectRef: resolveObjectRef,
+		onStream:         walkMediaStream,
+	}
+	err := r.WalkPages(ctx, func(_ int, page *Page) error {
 		defer r.cache.prune(cached)
 		walkRes(page.Resources, map[Reference]bool{}, 0)
 		if page.Dictionary["Annots"] != nil {
-			if val, err := r.Resolve(page.Dictionary["Annots"]); err == nil {
-				if annots, ok := val.(Array); ok {
-					for _, item := range annots {
-						if err := ctx.Err(); err != nil {
+			if val, err := r.Resolve(page.Dictionary["Annots"]); err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
+				}
+			} else if annots, ok := val.(Array); ok {
+				for _, item := range annots {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					annotObj, _, err := resolveObjectRef(item)
+					if err != nil {
+						if isFatalOptimizationReadError(ctx, err) {
 							return err
 						}
-						annotObj, _, err := resolveObjectRef(item)
-						if err != nil {
-							continue
-						}
-						annotDict, ok := annotObj.(Dictionary)
-						if !ok || annotDict["AP"] == nil {
-							continue
-						}
-						apVal, err := r.Resolve(annotDict["AP"])
-						if err != nil {
-							continue
-						}
-						apDict, ok := apVal.(Dictionary)
-						if !ok {
-							continue
-						}
-						for _, apKey := range []Name{"N", "R", "D"} {
-							entryVal, err := r.Resolve(apDict[apKey])
-							if err != nil || entryVal == nil {
-								continue
+						continue
+					}
+					annotDict, ok := annotObj.(Dictionary)
+					if !ok {
+						continue
+					}
+					if annotDict["AP"] != nil {
+						if apVal, err := r.Resolve(annotDict["AP"]); err != nil {
+							if isFatalOptimizationReadError(ctx, err) {
+								return err
 							}
-							switch v := entryVal.(type) {
-							case *Stream:
-								walkAPStream(page.Resources, v)
-							case Dictionary:
-								for _, stateEntry := range v {
-									stateObj, _, err := resolveObjectRef(stateEntry)
-									if err != nil {
-										continue
+						} else if apDict, ok := apVal.(Dictionary); ok {
+							for _, apKey := range []Name{"N", "R", "D"} {
+								entryVal, err := r.Resolve(apDict[apKey])
+								if err != nil {
+									if isFatalOptimizationReadError(ctx, err) {
+										return err
 									}
-									if stateStream, ok := stateObj.(*Stream); ok {
-										walkAPStream(page.Resources, stateStream)
+									continue
+								}
+								if entryVal == nil {
+									continue
+								}
+								switch v := entryVal.(type) {
+								case *Stream:
+									walkAPStream(page.Resources, v)
+								case Dictionary:
+									for _, stateEntry := range v {
+										stateObj, _, err := resolveObjectRef(stateEntry)
+										if err != nil {
+											if isFatalOptimizationReadError(ctx, err) {
+												return err
+											}
+											continue
+										}
+										if stateStream, ok := stateObj.(*Stream); ok {
+											walkAPStream(page.Resources, stateStream)
+										}
 									}
 								}
 							}
 						}
 					}
+					if err := walkMediaObject(annotDict["Poster"], page.Resources); err != nil {
+						return err
+					}
+					if annotDict["Movie"] != nil {
+						if movieVal, err := r.Resolve(annotDict["Movie"]); err != nil {
+							if isFatalOptimizationReadError(ctx, err) {
+								return err
+							}
+						} else if movieDict, ok := movieVal.(Dictionary); ok && movieDict["Poster"] != nil {
+							if err := walkMediaObject(movieDict["Poster"], page.Resources); err != nil {
+								return err
+							}
+						}
+					}
+					if annotDict["MK"] != nil {
+						if mkVal, err := r.Resolve(annotDict["MK"]); err != nil {
+							if isFatalOptimizationReadError(ctx, err) {
+								return err
+							}
+						} else if mkDict, ok := mkVal.(Dictionary); ok {
+							for _, mkKey := range []Name{"I", "RI", "IX"} {
+								if err := walkMediaObject(mkDict[mkKey], page.Resources); err != nil {
+									return err
+								}
+							}
+						}
+					}
+					if annotDict["A"] != nil {
+						if err := mediaWalker.walkAction(annotDict["A"], page.Resources, map[Reference]bool{}, 0); err != nil {
+							return err
+						}
+					}
+					if err := mediaWalker.walkAdditionalActions(annotDict["AA"], page.Resources); err != nil {
+						return err
+					}
 				}
 			}
 		}
+		if err := mediaWalker.walkAdditionalActions(page.Dictionary["AA"], page.Resources); err != nil {
+			return err
+		}
 		return ctx.Err()
 	})
+	if err != nil && isFatalOptimizationReadError(ctx, err) {
+		return nil, nil, err
+	}
+	if r.Trailer["Root"] != nil {
+		if rootVal, rootErr := r.Resolve(r.Trailer["Root"]); rootErr != nil {
+			if isFatalOptimizationReadError(ctx, rootErr) {
+				return nil, nil, rootErr
+			}
+		} else if catalog, ok := rootVal.(Dictionary); ok {
+			if catErr := mediaWalker.walkCatalog(catalog); catErr != nil && isFatalOptimizationReadError(ctx, catErr) {
+				return nil, nil, catErr
+			}
+		}
+	}
 	return result, conflict, ctx.Err()
 }
 

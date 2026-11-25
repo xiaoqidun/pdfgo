@@ -32,16 +32,24 @@ type CIDMap map[string]uint16
 
 // cidCodeRange 保存逐字节判定的字符码范围
 type cidCodeRange struct {
-	first String
-	last  String
+	first [4]byte
+	last  [4]byte
+	size  uint8
 }
 
 // cidNotdefRange 保存未定义字符到单个替代CID的映射
 type cidNotdefRange struct {
 	first uint64
 	last  uint64
-	size  int
 	cid   uint16
+	order int
+}
+
+// cidCMapBudget 跟踪单条CID CMap继承链的累计条目预算
+type cidCMapBudget struct {
+	spaces uint64
+	notdef uint64
+	ranges uint64
 }
 
 // cidMappedRange 保留连续CID区间及定义顺序，避免展开大量逐字符映射
@@ -55,16 +63,44 @@ type cidMappedRange struct {
 
 // cidCMap 保存编码范围、字形选择和只读继承关系
 type cidCMap struct {
-	ranges    []cidMappedRange
-	spaces    []cidCodeRange
-	notdef    []cidNotdefRange
-	registry  string
-	ordering  string
-	vertical  bool
-	modeSet   bool
-	use       Name
-	base      *cidCMap
-	recovered bool
+	ranges     []cidMappedRange
+	spaces     []cidCodeRange
+	spaceMask  [4]uint64
+	minSpace   uint8
+	notdef     []cidNotdefRange
+	notdefFlat bool
+	registry   string
+	ordering   string
+	vertical   bool
+	modeSet    bool
+	use        Name
+	base       *cidCMap
+	recovered  bool
+}
+
+// makeCIDCodeRange 将原始编码范围压缩为固定字节值类型以便去重和比较
+// 入参: first 起始字节序列, last 结束字节序列
+// 返回: cidCodeRange 压缩后的编码范围
+func makeCIDCodeRange(first, last String) cidCodeRange {
+	var entry cidCodeRange
+	entry.size = uint8(len(first))
+	copy(entry.first[:], first)
+	copy(entry.last[:], last)
+	return entry
+}
+
+// buildSpaceIndex 重建首字节位图与最小编码长度索引，加速无效首字节快速判定
+func (c *cidCMap) buildSpaceIndex() {
+	c.spaceMask = [4]uint64{}
+	c.minSpace = 0
+	for _, space := range c.spaces {
+		if c.minSpace == 0 || space.size < c.minSpace {
+			c.minSpace = space.size
+		}
+		for b := int(space.first[0]); b <= int(space.last[0]); b++ {
+			c.spaceMask[b>>6] |= 1 << (uint(b) & 63)
+		}
+	}
 }
 
 // ParseCIDMap 读取CMap中的字符码到CID的直接映射及连续范围
@@ -130,15 +166,19 @@ func ParseCIDMapContext(ctx context.Context, data []byte) (CIDMap, error) {
 // 入参: ctx 取消上下文, data CMap数据
 // 返回: *cidCMap 本层映射, error 格式、超限或取消错误
 func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
-	return parseCIDCMapRecoveryContext(ctx, data, nil)
+	return parseCIDCMapBudgetContext(ctx, data, nil, nil)
 }
 
-// parseCIDCMapRecoveryContext 按诊断策略读取可确定的CID条目，无效目标保留到使用时拒绝
-// 入参: ctx 取消上下文, data CMap数据, warning 恢复诊断，空值严格校验
+// parseCIDCMapBudgetContext 在共享条目预算内解析单层CID映射，并对编码范围去重
+// 入参: ctx 取消上下文, data CMap数据, warning 恢复诊断，空值严格校验, budget 跨继承链条目预算
 // 返回: *cidCMap 本层映射, error 格式、超限或取消错误
-func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(Diagnostic)) (*cidCMap, error) {
+func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Diagnostic), budget *cidCMapBudget) (*cidCMap, error) {
+	if budget == nil {
+		budget = &cidCMapBudget{}
+	}
 	p := objectParser{data: data}
 	result := &cidCMap{}
+	seenSpaces := make(map[cidCodeRange]struct{})
 	previous := ""
 	var name Name
 	for {
@@ -152,6 +192,12 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 				return nil, err
 			}
 			result.ranges = ranges
+			notdef, err := normalizeCIDNotdefRanges(ctx, result.notdef)
+			if err != nil {
+				return nil, err
+			}
+			result.notdef = notdef
+			result.buildSpaceIndex()
 			return result, nil
 		}
 		if b := p.data[p.pos]; b == '/' || b == '(' || b == '<' || b == '[' {
@@ -268,10 +314,15 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 						return nil, p.fail("invalid CMap codespace range")
 					}
 				}
-				if uint64(len(result.spaces)) >= maxCMapEntries {
+				if budget.spaces >= maxCMapEntries {
 					return nil, fmt.Errorf("%w: CID CMap codespace limit exceeded", ErrStreamLimitExceeded)
 				}
-				result.spaces = append(result.spaces, cidCodeRange{first, last})
+				budget.spaces++
+				entry := makeCIDCodeRange(first, last)
+				if _, exists := seenSpaces[entry]; !exists {
+					seenSpaces[entry] = struct{}{}
+					result.spaces = append(result.spaces, entry)
+				}
 				continue
 			}
 			value, err := p.object()
@@ -294,10 +345,12 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 				if invalid {
 					return nil, p.fail("invalid CMap CID")
 				}
-				if uint64(len(result.notdef)) >= maxCMapEntries {
+				if budget.notdef >= maxCMapEntries {
 					return nil, fmt.Errorf("%w: CID CMap notdef limit exceeded", ErrStreamLimitExceeded)
 				}
-				result.notdef = append(result.notdef, cidNotdefRange{start, end, len(first), uint16(cid)})
+				budget.notdef++
+				size := uint64(len(first)) << 32
+				result.notdef = append(result.notdef, cidNotdefRange{first: size | start, last: size | end, cid: uint16(cid), order: len(result.notdef)})
 				continue
 			}
 			invalid = invalid || uint64(cid)+end-start > 65535
@@ -308,9 +361,10 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 				result.recovered = true
 				warning(Diagnostic{Offset: int64(p.pos), Message: "out-of-range CMap CID destination retained as invalid; use is rejected"})
 			}
-			if uint64(len(result.ranges)) >= maxCMapEntries {
+			if budget.ranges >= maxCMapEntries {
 				return nil, fmt.Errorf("%w: CID CMap range limit exceeded", ErrStreamLimitExceeded)
 			}
+			budget.ranges++
 			size := uint64(len(first)) << 32
 			result.ranges = append(result.ranges, cidMappedRange{first: size | start, last: size | end, cid: uint16(cid), order: len(result.ranges), invalid: invalid})
 		}
@@ -320,6 +374,92 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 		}
 		previous = ""
 	}
+}
+
+// normalizeCIDNotdefRanges 将可能重叠的未定义字符区间按后定义覆盖先定义规范化为有序互不相交区间
+// 入参: ctx 取消上下文, ranges 原始未定义区间列表
+// 返回: []cidNotdefRange 规范化区间列表, error 取消错误
+func normalizeCIDNotdefRanges(ctx context.Context, ranges []cidNotdefRange) ([]cidNotdefRange, error) {
+	if len(ranges) <= 1 {
+		return ranges, ctx.Err()
+	}
+	slices.SortFunc(ranges, func(a, b cidNotdefRange) int {
+		if d := cmp.Compare(a.first, b.first); d != 0 {
+			return d
+		}
+		return cmp.Compare(b.order, a.order)
+	})
+	var heap []cidNotdefRange
+	push := func(entry cidNotdefRange) {
+		heap = append(heap, entry)
+		for idx := len(heap) - 1; idx > 0; {
+			parent := (idx - 1) / 2
+			if heap[parent].order >= heap[idx].order {
+				break
+			}
+			heap[parent], heap[idx] = heap[idx], heap[parent]
+			idx = parent
+		}
+	}
+	pop := func() {
+		last := len(heap) - 1
+		heap[0] = heap[last]
+		heap = heap[:last]
+		for idx := 0; ; {
+			left := idx*2 + 1
+			if left >= len(heap) {
+				break
+			}
+			best := left
+			if right := left + 1; right < len(heap) && heap[right].order > heap[left].order {
+				best = right
+			}
+			if heap[idx].order >= heap[best].order {
+				break
+			}
+			heap[idx], heap[best] = heap[best], heap[idx]
+			idx = best
+		}
+	}
+	out := make([]cidNotdefRange, 0, len(ranges))
+	var pos uint64
+	i, steps := 0, 0
+	for i < len(ranges) || len(heap) > 0 {
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		steps++
+		if len(heap) == 0 {
+			pos = ranges[i].first
+		}
+		for i < len(ranges) && ranges[i].first == pos {
+			push(ranges[i])
+			i++
+		}
+		for len(heap) > 0 && heap[0].last < pos {
+			pop()
+		}
+		if len(heap) == 0 {
+			continue
+		}
+		top := heap[0]
+		segEnd := top.last
+		if i < len(ranges) && ranges[i].first <= segEnd {
+			segEnd = ranges[i].first - 1
+		}
+		if n := len(out); n > 0 && out[n-1].first>>32 == pos>>32 && out[n-1].last+1 == pos && out[n-1].cid == top.cid {
+			out[n-1].last = segEnd
+		} else {
+			out = append(out, cidNotdefRange{first: pos, last: segEnd, cid: top.cid})
+		}
+		if segEnd == top.last {
+			pop()
+		}
+		pos = segEnd + 1
+	}
+	return out, ctx.Err()
 }
 
 // normalizeCIDMappedRanges 将可能重叠的CID区间按后定义覆盖先定义规范化为有序互不相交区间
@@ -462,11 +602,23 @@ func (c *cidCMap) inherit() {
 		if len(c.spaces) == 0 {
 			c.spaces = c.base.spaces
 		} else {
+			seen := make(map[cidCodeRange]struct{}, len(c.spaces)+len(c.base.spaces))
 			merged := make([]cidCodeRange, 0, len(c.spaces)+len(c.base.spaces))
-			merged = append(merged, c.spaces...)
-			merged = append(merged, c.base.spaces...)
+			for _, space := range c.spaces {
+				if _, exists := seen[space]; !exists {
+					seen[space] = struct{}{}
+					merged = append(merged, space)
+				}
+			}
+			for _, space := range c.base.spaces {
+				if _, exists := seen[space]; !exists {
+					seen[space] = struct{}{}
+					merged = append(merged, space)
+				}
+			}
 			c.spaces = merged
 		}
+		c.buildSpaceIndex()
 	}
 	if c.registry == "" {
 		c.registry = c.base.registry
@@ -483,20 +635,59 @@ func (c *cidCMap) inherit() {
 // 入参: data 剩余字符串
 // 返回: int 字节数, bool 是否有效字符码
 func (c *cidCMap) next(data []byte) (int, bool) {
+	if len(data) == 0 {
+		return 0, false
+	}
+	if c.minSpace != 0 && c.spaceMask[data[0]>>6]&(1<<(uint(data[0])&63)) == 0 {
+		return min(int(c.minSpace), len(data)), false
+	}
 	length, longest := 5, -1
 	for _, space := range c.spaces {
+		size := int(space.size)
 		matched := 0
-		for matched < len(space.first) && matched < len(data) && data[matched] >= space.first[matched] && data[matched] <= space.last[matched] {
+		for matched < size && matched < len(data) && data[matched] >= space.first[matched] && data[matched] <= space.last[matched] {
 			matched++
 		}
-		if matched == len(space.first) {
+		if matched == size {
 			return matched, true
 		}
-		if matched > longest || matched == longest && len(space.first) < length {
-			length, longest = len(space.first), matched
+		if matched > longest || matched == longest && size < length {
+			length, longest = size, matched
 		}
 	}
 	return min(length, len(data)), false
+}
+
+// nextContext 按编码范围取出字符并周期性检查取消，防止大编码表长时间阻塞
+// 入参: ctx 取消上下文, data 剩余字符串
+// 返回: int 字节数, bool 是否有效字符码, error 取消错误
+func (c *cidCMap) nextContext(ctx context.Context, data []byte) (int, bool, error) {
+	if len(data) == 0 {
+		return 0, false, ctx.Err()
+	}
+	if c.minSpace != 0 && c.spaceMask[data[0]>>6]&(1<<(uint(data[0])&63)) == 0 {
+		return min(int(c.minSpace), len(data)), false, nil
+	}
+	length, longest := 5, -1
+	for i, space := range c.spaces {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, false, err
+			}
+		}
+		size := int(space.size)
+		matched := 0
+		for matched < size && matched < len(data) && data[matched] >= space.first[matched] && data[matched] <= space.last[matched] {
+			matched++
+		}
+		if matched == size {
+			return matched, true, nil
+		}
+		if matched > longest || matched == longest && size < length {
+			length, longest = size, matched
+		}
+	}
+	return min(length, len(data)), false, nil
 }
 
 // lookup 按派生优先规则查找CID，未定义字符使用notdef或CID零
@@ -594,7 +785,11 @@ func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, 
 					continue
 				}
 				seen[key] = true
-				if n, valid := c.next(data); valid && n == size && c.validateCode(data, true) == nil && c.lookup(data, true) == cid {
+				n, valid, err := c.nextContext(ctx, data)
+				if err != nil {
+					return nil, err
+				}
+				if valid && n == size && c.validateCode(data, true) == nil && c.lookup(data, true) == cid {
 					codes = append(codes, key)
 				}
 			}
@@ -606,52 +801,177 @@ func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, 
 	return codes, nil
 }
 
-// undefined 查找未定义字符的替代标识
+// undefined 二分查找未定义字符的替代标识，合并链仅查询一次
 // 入参: raw 字符码
 // 返回: uint16 替代标识，未提供时为零
 func (c *cidCMap) undefined(raw []byte) uint16 {
-	code := codeNumber(raw)
+	code := uint64(len(raw))<<32 | codeNumber(raw)
 	for current := c; current != nil; current = current.base {
-		for i := len(current.notdef) - 1; i >= 0; i-- {
-			entry := current.notdef[i]
-			if len(raw) == entry.size && code >= entry.first && code <= entry.last {
-				return entry.cid
-			}
+		index := sort.Search(len(current.notdef), func(i int) bool { return current.notdef[i].last >= code })
+		if index < len(current.notdef) && current.notdef[index].first <= code {
+			return current.notdef[index].cid
+		}
+		if current.notdefFlat {
+			break
 		}
 	}
 	return 0
 }
 
+// addCIDCMapBudget 将预定义基础映射的编码范围、未定义区间与映射区间计入继承链总预算
+// 入参: mapping 预定义映射, budget 继承链条目预算
+// 返回: error 超限错误
+func addCIDCMapBudget(mapping *cidCMap, budget *cidCMapBudget) error {
+	if uint64(len(mapping.spaces)) > maxCMapEntries-budget.spaces {
+		return fmt.Errorf("%w: CID CMap codespace limit exceeded", ErrStreamLimitExceeded)
+	}
+	budget.spaces += uint64(len(mapping.spaces))
+	for current := mapping; current != nil; current = current.base {
+		if uint64(len(current.notdef)) > maxCMapEntries-budget.notdef {
+			return fmt.Errorf("%w: CID CMap notdef limit exceeded", ErrStreamLimitExceeded)
+		}
+		budget.notdef += uint64(len(current.notdef))
+		if uint64(len(current.ranges)) > maxCMapEntries-budget.ranges {
+			return fmt.Errorf("%w: CID CMap range limit exceeded", ErrStreamLimitExceeded)
+		}
+		budget.ranges += uint64(len(current.ranges))
+	}
+	return nil
+}
+
+// finalizeCIDCMapChain 一次性按派生优先去重合并继承链的编码范围并规范化未定义区间，释放中间层冗余拷贝
+// 入参: ctx 取消上下文, mapping 顶层映射, owned 本次流解析新建的节点列表
+// 返回: error 超限或取消错误
+func finalizeCIDCMapChain(ctx context.Context, mapping *cidCMap, owned []*cidCMap) error {
+	ownedSet := make(map[*cidCMap]bool, len(owned))
+	for _, node := range owned {
+		ownedSet[node] = true
+	}
+	var chain []*cidCMap
+	for current := mapping; current != nil; current = current.base {
+		chain = append(chain, current)
+	}
+	seenSpaces := make(map[cidCodeRange]struct{})
+	var mergedSpaces []cidCodeRange
+	for _, node := range chain {
+		for i, space := range node.spaces {
+			if i&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			if _, exists := seenSpaces[space]; !exists {
+				if uint64(len(mergedSpaces)) >= maxCMapEntries {
+					return fmt.Errorf("%w: CID CMap codespace limit exceeded", ErrStreamLimitExceeded)
+				}
+				seenSpaces[space] = struct{}{}
+				mergedSpaces = append(mergedSpaces, space)
+			}
+		}
+		if !ownedSet[node] {
+			break
+		}
+	}
+	var totalNotdef uint64
+	notdefLimit := len(chain)
+	for i, node := range chain {
+		if uint64(len(node.notdef)) > maxCMapEntries-totalNotdef {
+			return fmt.Errorf("%w: CID CMap notdef limit exceeded", ErrStreamLimitExceeded)
+		}
+		totalNotdef += uint64(len(node.notdef))
+		if node.notdefFlat {
+			notdefLimit = i + 1
+			break
+		}
+	}
+	if notdefLimit > 1 && totalNotdef > 0 {
+		allNotdef := make([]cidNotdefRange, 0, totalNotdef)
+		for i := notdefLimit - 1; i >= 0; i-- {
+			for j, entry := range chain[i].notdef {
+				if j&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				entry.order = len(allNotdef)
+				allNotdef = append(allNotdef, entry)
+			}
+		}
+		normalized, err := normalizeCIDNotdefRanges(ctx, allNotdef)
+		if err != nil {
+			return err
+		}
+		mapping.notdef = normalized
+	}
+	mapping.spaces = mergedSpaces
+	mapping.notdefFlat = true
+	mapping.buildSpaceIndex()
+	for _, node := range owned {
+		if node != mapping {
+			node.spaces = nil
+			node.notdef = nil
+		}
+	}
+	return ctx.Err()
+}
+
 // readCIDCMapContext 读取文档编码并沿用本次上下文解析继承流
-// 入参: ctx 取消上下文, object 编码对象, activeRefs 当前流引用继承链, activeStreams 当前流指针继承链, depth 当前流继承深度
+// 入参: ctx 取消上下文, object 编码对象
 // 返回: *cidCMap 完整映射, error 解析、环路、超限或取消错误
-func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, activeRefs map[Reference]bool, activeStreams map[*Stream]bool, depth int) (*cidCMap, error) {
+func (r *Reader) readCIDCMapContext(ctx context.Context, object Object) (*cidCMap, error) {
+	var owned []*cidCMap
+	mapping, _, err := r.readCIDCMapChainContext(ctx, object, nil, nil, 0, &cidCMapBudget{}, &owned)
+	if err != nil {
+		return nil, err
+	}
+	if len(owned) != 0 {
+		if err := finalizeCIDCMapChain(ctx, mapping, owned); err != nil {
+			return nil, err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	return mapping, nil
+}
+
+// readCIDCMapChainContext 在共享预算内递归解析CID CMap流继承链，不在中间层重复拼接编码范围
+// 入参: ctx 取消上下文, object 编码对象, activeRefs 当前流引用继承链, activeStreams 当前流指针继承链, depth 当前流继承深度, budget 跨继承链条目预算, owned 本次新建流节点列表
+// 返回: *cidCMap 当前层映射, bool 当前层或基底是否含编码范围, error 解析、环路、超限或取消错误
+func (r *Reader) readCIDCMapChainContext(ctx context.Context, object Object, activeRefs map[Reference]bool, activeStreams map[*Stream]bool, depth int, budget *cidCMapBudget, owned *[]*cidCMap) (*cidCMap, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	ref, err := r.resolveIndirectReference(object)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if ref != (Reference{}) && activeRefs[ref] {
-		return nil, fmt.Errorf("cyclic CMap stream inheritance")
+		return nil, false, fmt.Errorf("cyclic CMap stream inheritance")
 	}
 	value, err := r.Resolve(object)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if name, ok := value.(Name); ok {
-		return loadCIDCMapContext(ctx, name, nil)
+		loaded, err := loadCIDCMapContext(ctx, name, nil)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := addCIDCMapBudget(loaded, budget); err != nil {
+			return nil, false, err
+		}
+		return loaded, len(loaded.spaces) > 0, nil
 	}
 	stream, ok := value.(*Stream)
 	if !ok || stream == nil {
-		return nil, fmt.Errorf("invalid composite font encoding")
+		return nil, false, fmt.Errorf("invalid composite font encoding")
 	}
 	if activeStreams[stream] {
-		return nil, fmt.Errorf("cyclic CMap stream inheritance")
+		return nil, false, fmt.Errorf("cyclic CMap stream inheritance")
 	}
 	if depth >= maxCMapStreamDepth {
-		return nil, fmt.Errorf("%w: CMap stream inheritance depth limit exceeded", ErrStreamLimitExceeded)
+		return nil, false, fmt.Errorf("%w: CMap stream inheritance depth limit exceeded", ErrStreamLimitExceeded)
 	}
 	if activeRefs == nil {
 		activeRefs = map[Reference]bool{}
@@ -667,16 +987,16 @@ func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, activeRe
 	defer delete(activeStreams, stream)
 	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	mapping, err := parseCIDCMapRecoveryContext(ctx, data, r.warning)
+	mapping, err := parseCIDCMapBudgetContext(ctx, data, r.warning, budget)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	useRaw := stream.Dictionary["UseCMap"]
 	base, err := r.Resolve(useRaw)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var next Object
 	if base != nil {
@@ -684,28 +1004,42 @@ func (r *Reader) readCIDCMapContext(ctx context.Context, object Object, activeRe
 	} else if mapping.use != "" {
 		next = mapping.use
 	}
+	baseHasSpace := false
 	if next != nil {
-		mapping.base, err = r.readCIDCMapContext(ctx, next, activeRefs, activeStreams, depth+1)
+		mapping.base, baseHasSpace, err = r.readCIDCMapChainContext(ctx, next, activeRefs, activeStreams, depth+1, budget, owned)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	if mode, err := r.Resolve(stream.Dictionary["WMode"]); err != nil {
-		return nil, err
+		return nil, false, err
 	} else if mode != nil {
 		if mode != Integer(0) && mode != Integer(1) {
-			return nil, fmt.Errorf("invalid CMap writing mode")
+			return nil, false, fmt.Errorf("invalid CMap writing mode")
 		}
 		mapping.vertical, mapping.modeSet = mode == Integer(1), true
 	}
-	mapping.inherit()
-	if len(mapping.spaces) == 0 {
-		return nil, fmt.Errorf("missing CMap codespace")
+	if mapping.base != nil {
+		mapping.recovered = mapping.recovered || mapping.base.recovered
+		if mapping.registry == "" {
+			mapping.registry = mapping.base.registry
+		}
+		if mapping.ordering == "" {
+			mapping.ordering = mapping.base.ordering
+		}
+		if !mapping.modeSet {
+			mapping.vertical = mapping.base.vertical
+		}
 	}
+	hasSpace := len(mapping.spaces) > 0 || baseHasSpace
+	if !hasSpace {
+		return nil, false, fmt.Errorf("missing CMap codespace")
+	}
+	*owned = append(*owned, mapping)
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return mapping, nil
+	return mapping, true, nil
 }
 
 // readUnicodeCMapContext 读取独立Unicode映射，流继承及合并均检查取消与安全上限

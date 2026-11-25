@@ -25,6 +25,9 @@ import (
 	"slices"
 )
 
+// maxClipPaths 限制单个图形状态允许累计的最大裁剪路径数量
+const maxClipPaths = 4096
+
 // Matrix 表示PDF二维仿射矩阵，使用列向量坐标约定
 type Matrix [6]float64
 
@@ -357,6 +360,24 @@ func pathFinite(path Path) bool {
 		}
 	}
 	return true
+}
+
+// sealClips 锁定当前裁剪路径切片容量，防止后续追加覆写已保存或已交付的历史前缀
+func (p *pageInterpreter) sealClips() {
+	if n := len(p.state.style.Clips); n != 0 {
+		p.state.style.Clips = p.state.style.Clips[:n:n]
+	}
+}
+
+// appendClip 追加单条裁剪路径并限制单个图形状态的裁剪路径总数
+// 入参: clip 待追加的裁剪路径
+// 返回: error 超出裁剪路径上限时返回包装ErrStreamLimitExceeded的错误
+func (p *pageInterpreter) appendClip(clip Path) error {
+	if len(p.state.style.Clips) >= maxClipPaths {
+		return fmt.Errorf("%w: clip path limit exceeded", ErrStreamLimitExceeded)
+	}
+	p.state.style.Clips = append(p.state.style.Clips, clip)
+	return nil
 }
 
 // resetTransient 清理拷贝自外层解释器的瞬时解析状态，不改变图形状态与递归链路
@@ -902,6 +923,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 		}
 		interpreter.state = graphicsState{matrix: matrix, hscale: 1, fillSpace: fillSpace, strokeSpace: strokeSpace, style: mark.Style}
 	}
+	interpreter.sealClips()
 	interpreter.state.nonKnockout = mark.Object != nil && !mark.Object.Knockout
 	if font.type3Bounds != nil {
 		bounds := transformedBounds(*font.type3Bounds, interpreter.state.matrix)
@@ -921,6 +943,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 func (p *pageInterpreter) run(data []byte) error {
 	p.tilingPatterns = nil
 	if p.patternState == nil && p.resources["Pattern"] != nil {
+		p.sealClips()
 		initial := p.state
 		p.patternState = &initial
 	}
@@ -1157,6 +1180,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if len(p.stack) >= 256 {
 			return fmt.Errorf("graphics stack limit exceeded")
 		}
+		p.sealClips()
 		p.stack = append(p.stack, p.state)
 	case "Q":
 		if len(p.stack) == 0 {
@@ -1338,6 +1362,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if err := p.validatePaint(fill, stroke); err != nil {
 				return err
 			}
+			p.sealClips()
 			style := p.state.style
 			var strokeMatrix Matrix
 			if stroke {
@@ -1400,7 +1425,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if p.pendingClip {
 			clip := p.path
 			clip.EvenOdd = p.clipEvenOdd
-			p.state.style.Clips = append(append([]Path(nil), p.state.style.Clips...), clip)
+			if err := p.appendClip(clip); err != nil {
+				return err
+			}
 		}
 		p.path = Path{}
 		p.pathPoints = nil
@@ -1442,7 +1469,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if !ok {
 			return fmt.Errorf("invalid color space name")
 		}
-		original, err := p.reader.remapColorSpaceContext(p.ctx, name, p.resources, false, 0)
+		original, err := p.reader.remapColorSpaceContext(p.ctx, name, p.resources, false)
 		if err != nil {
 			return err
 		}
@@ -1657,7 +1684,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.implicitText = false
 		p.textObject = nil
 		if len(p.textClips) != 0 {
-			p.state.style.Clips = append(append([]Path(nil), p.state.style.Clips...), Path{Text: p.textClips})
+			if err := p.appendClip(Path{Text: p.textClips}); err != nil {
+				return err
+			}
 			p.textClips = nil
 		}
 	case "Tf":
@@ -1778,6 +1807,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 		}
 	case "sh":
+		p.sealClips()
 		return p.shadingFill(a, op.Offset)
 	case "Do":
 		return p.xobject(a)
@@ -1945,6 +1975,7 @@ func (p *pageInterpreter) showText(data []byte) error {
 				return p.operationWarning(Operation{Operator: "Tj"}, "nonfinite text position")
 			}
 		}
+		p.sealClips()
 		mark := TextMark{Object: p.textObject, Replacement: p.replacement, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: combined, StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
 		mark.Sequence = p.sequence
 		if mark.Font.Subtype == "Type3" {
@@ -2098,8 +2129,17 @@ func (p *pageInterpreter) image(stream *Stream) error {
 			return err
 		}
 	}
-	if p.opaqueGroup && (image.Mask != nil || image.SoftMask != nil || image.ImageMask) {
-		return &UnsupportedError{Feature: "masked image in isolated group"}
+	if p.opaqueGroup {
+		if image.Mask != nil || image.SoftMask != nil || image.ImageMask {
+			return &UnsupportedError{Feature: "masked image in isolated group"}
+		}
+		soft, err := image.HasSoftMask()
+		if err != nil {
+			return err
+		}
+		if soft {
+			return &UnsupportedError{Feature: "masked image in isolated group"}
+		}
 	}
 	if image.ImageMask {
 		if fill, _ := p.visiblePaint(true, false); !fill {
@@ -2112,6 +2152,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 	if p.visitor.Image == nil {
 		return fmt.Errorf("image visitor missing")
 	}
+	p.sealClips()
 	style := p.state.style
 	if style.SoftMask != nil {
 		soft, err := image.HasSoftMask()
@@ -2242,6 +2283,7 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 			}
 		}
 	}
+	p.sealClips()
 	child := *p
 	child.resetTransient()
 	child.sequence = p.sequence
@@ -2383,7 +2425,10 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 	}
 	outerClips := len(child.state.style.Clips)
 	clip := Path{Segments: []Segment{{"M", []Point{m.Apply(Point{box.XMin, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMin})}}, {"L", []Point{m.Apply(Point{box.XMax, box.YMax})}}, {"L", []Point{m.Apply(Point{box.XMin, box.YMax})}}, {"C", nil}}}
-	child.state.style.Clips = append(append([]Path(nil), child.state.style.Clips...), clip)
+	if err := child.appendClip(clip); err != nil {
+		return err
+	}
+	child.sealClips()
 	child.patternMatrix = child.state.matrix
 	child.patternState = nil
 	var data []byte

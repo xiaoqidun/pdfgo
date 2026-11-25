@@ -24,6 +24,9 @@ import (
 // maxGradientLinearStops 限制一维采样渐变展开为线性分段的最大断点数，超限时退回按需函数求值
 const maxGradientLinearStops = 65536
 
+// maxGradientTotalStops 限制单次渐变函数解析跨全部子节点累计保留的最大线性断点数
+const maxGradientTotalStops = maxGradientLinearStops * 4
+
 // maxGradientFunctionNodes 限制单次渐变函数解析允许访问的最大节点数，防止共享DAG指数展开
 const maxGradientFunctionNodes = 4096
 
@@ -33,12 +36,32 @@ type gradientFunctionKey struct {
 	channels int
 }
 
-// gradientParseState 保存单次渐变函数解析的节点与跨通道总断点预算及间接引用记忆表
+// gradientParseState 保存单次渐变函数解析的节点与跨节点总断点预算及间接引用记忆表
 type gradientParseState struct {
-	nodes       int
-	vectorStops int
-	functions   map[gradientFunctionKey]*gradientFunction
-	vectors     map[gradientFunctionKey]*gradientVector
+	nodes     int
+	stops     int
+	functions map[gradientFunctionKey]*gradientFunction
+	vectors   map[gradientFunctionKey]*gradientVector
+}
+
+// remainingStops 返回单次解析剩余允许保留的累计线性停点数
+// 返回: int 剩余停点预算
+func (s *gradientParseState) remainingStops() int {
+	if s.stops >= maxGradientTotalStops {
+		return 0
+	}
+	return maxGradientTotalStops - s.stops
+}
+
+// reserveStops 从单次解析总预算中扣减指定数量的线性停点
+// 入参: count 新增停点数
+// 返回: bool 是否在预算内并已扣减
+func (s *gradientParseState) reserveStops(count int) bool {
+	if count <= 0 || count > maxGradientTotalStops-s.stops {
+		return false
+	}
+	s.stops += count
+	return true
 }
 
 // gradientFunction 保存已解析的一维颜色函数及可精确展开的线性分段
@@ -270,9 +293,12 @@ func mergeGradientFunctions(functions []*gradientFunction, interval [2]float64) 
 }
 
 // sampledGradientPositions 提取采样函数定义域内的精确样本位置，超限、坍缩或取消时返回nil
-// 入参: ctx 取消上下文, f 已解析采样函数
+// 入参: ctx 取消上下文, f 已解析采样函数, limit 最大断点数上限
 // 返回: []float64 升序样本位置
-func sampledGradientPositions(ctx context.Context, f *tintFunction) []float64 {
+func sampledGradientPositions(ctx context.Context, f *tintFunction, limit int) []float64 {
+	if limit < 2 {
+		return nil
+	}
 	positions := []float64{f.domain[0], f.domain[1]}
 	if f.encoded[0] != f.encoded[1] {
 		lo, hi := min(f.encoded[0], f.encoded[1]), max(f.encoded[0], f.encoded[1])
@@ -291,7 +317,7 @@ func sampledGradientPositions(ctx context.Context, f *tintFunction) []float64 {
 				end = int(math.Ceil(hi)) - 1
 			}
 		}
-		if end >= start && int64(end)-int64(start)+3 > maxGradientLinearStops {
+		if end >= start && int64(end)-int64(start)+3 > int64(limit) {
 			return nil
 		}
 		var previous float64
@@ -312,10 +338,10 @@ func sampledGradientPositions(ctx context.Context, f *tintFunction) []float64 {
 }
 
 // sampledGradientStops 展开采样函数的精确断点及范围截断，超限时返回nil退回按需求值
-// 入参: ctx 取消上下文, f 已解析采样函数
+// 入参: ctx 取消上下文, f 已解析采样函数, limit 最大断点数上限
 // 返回: []GradientStop 定义域中的线性分段
-func sampledGradientStops(ctx context.Context, f *tintFunction) []GradientStop {
-	positions := sampledGradientPositions(ctx, f)
+func sampledGradientStops(ctx context.Context, f *tintFunction, limit int) []GradientStop {
+	positions := sampledGradientPositions(ctx, f, limit)
 	if len(positions) == 0 {
 		return nil
 	}
@@ -333,7 +359,7 @@ func sampledGradientStops(ctx context.Context, f *tintFunction) []GradientStop {
 		raw.colorInto(x, stops[i].Values[:f.channels])
 	}
 	stops = clipGradientValues(stops, f.values)
-	if len(stops) > maxGradientLinearStops {
+	if len(stops) > limit {
 		return nil
 	}
 	return stops
@@ -457,11 +483,13 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			return constantGradientFunction(values), nil
 		}
 		if tint.sampled && (tint.order != 3 || tint.size < 4) {
-			stops := sampledGradientStops(ctx, tint)
-			if len(stops) > 0 {
-				f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, tint.domain, interval) }
+			if budget := min(maxGradientLinearStops, state.remainingStops()); budget > 0 {
+				stops := sampledGradientStops(ctx, tint, budget)
+				if state.reserveStops(len(stops)) {
+					f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, tint.domain, interval) }
+				}
 			}
-		} else if !tint.sampled && (tint.exponent == 0 || tint.exponent == 1) {
+		} else if !tint.sampled && (tint.exponent == 0 || tint.exponent == 1) && state.remainingStops() > 0 {
 			if tint.exponent == 1 {
 				for c := 0; c < channels; c++ {
 					if math.IsInf(tint.values[2*c+1]-tint.values[2*c], 0) {
@@ -480,7 +508,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 				}
 			}
 			stops = clipGradientValues(stops, tint.outputRange)
-			if len(stops) > 0 {
+			if state.reserveStops(len(stops)) {
 				f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, tint.domain, interval) }
 			}
 		}
@@ -551,7 +579,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			}
 		}
 		stops = clipGradientValues(stops, limits)
-		if len(stops) == 0 {
+		if !state.reserveStops(len(stops)) {
 			return &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
 				x = math.Max(domain[0], math.Min(domain[1], x))
 				err = program.evaluate([]float64{x}, values[:channels])
@@ -622,13 +650,19 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		}
 		return constantGradientFunction(values), nil
 	}
-	if linear {
+	budget := min(maxGradientLinearStops, state.remainingStops())
+	if linear && budget > 0 {
 		var stops []GradientStop
 		for i, part := range parts {
+			if i&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			if points[i] == points[i+1] {
 				if i == len(parts)-1 {
 					partStops := part.linear([2]float64{encode[2*i], encode[2*i]})
-					if len(partStops) == 0 || len(partStops) > maxGradientLinearStops-len(stops) {
+					if len(partStops) == 0 || len(partStops) > budget-len(stops) {
 						stops = nil
 						break
 					}
@@ -640,7 +674,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 				continue
 			}
 			partStops := part.linear([2]float64{encode[2*i], encode[2*i+1]})
-			if len(partStops) == 0 || len(partStops) > maxGradientLinearStops-len(stops) {
+			if len(partStops) == 0 || len(partStops) > budget-len(stops) {
 				stops = nil
 				break
 			}
@@ -652,7 +686,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		}
 		if len(stops) > 0 {
 			stops = clipGradientValues(stops, limits)
-			if len(stops) > 0 {
+			if len(stops) <= budget && state.reserveStops(len(stops)) {
 				f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
 			}
 		}

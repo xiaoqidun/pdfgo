@@ -26,8 +26,34 @@ import (
 	"slices"
 )
 
+// maxHalftoneThresholdBytes 限制单次半色调解析展开为16位阈值表的累计总字节上限
+const maxHalftoneThresholdBytes int64 = 64 << 20
+
 // errMissingHalftoneThreshold 标识缺失阈值流，不混淆引用、网屏类型或解码错误
 var errMissingHalftoneThreshold = errors.New("missing halftone threshold stream")
+
+// halftoneCacheEntry 保存单次Type 5解析中按间接引用复用的子网屏结果
+type halftoneCacheEntry struct {
+	halftone *Halftone
+	used     bool
+}
+
+// halftoneReadState 保存单次半色调解析的累计阈值内存预算与子网屏去重表
+type halftoneReadState struct {
+	limit  int64
+	bytes  int64
+	cached map[Reference]halftoneCacheEntry
+}
+
+// newHalftoneReadState 创建受生效流限制约束的单次半色调解析状态
+// 返回: *halftoneReadState 解析状态
+func (r *Reader) newHalftoneReadState() *halftoneReadState {
+	limit := maxHalftoneThresholdBytes
+	if maxBytes, _ := effectiveStreamLimits(r, nil); maxBytes > 0 && maxBytes < limit {
+		limit = maxBytes
+	}
+	return &halftoneReadState{limit: limit}
+}
 
 // Halftone 保存设备空间半色调定义，连续色调显示不需要网屏化
 // Thresholds保持标准中的数组顺序，类型16使用高位优先的16位阈值
@@ -49,7 +75,7 @@ type Halftone struct {
 
 // ReadHalftone 读取类型1、5、6、10和16的网屏定义，Default返回空值
 // 入参: ctx 取消上下文, object 半色调字典、数据流、Default或间接引用
-// 返回: *Halftone 网屏参数, error 类型、尺寸、阈值数据或取消错误
+// 返回: *Halftone 网屏参数, error 类型、尺寸、阈值数据、预算或取消错误
 func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("invalid halftone context")
@@ -69,7 +95,7 @@ func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, er
 			return cloneHalftone(cached), nil
 		}
 	}
-	h, err := r.readHalftone(ctx, object, false, nil, nil)
+	h, err := r.readHalftone(ctx, object, false, nil, nil, r.newHalftoneReadState())
 	if err == nil && indirect {
 		if r.halftones == nil {
 			r.halftones = make(map[Reference]*Halftone)
@@ -82,7 +108,7 @@ func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, er
 
 // ReadHalftoneForDevice 优先选择设备命名网屏，未匹配时解析文件中的备用定义
 // 入参: ctx 取消上下文, object 网屏对象, named 只读设备网屏，匹配后不解析其他字段或阈值流
-// 返回: *Halftone 有效网屏, error 名称、备用定义或取消错误
+// 返回: *Halftone 有效网屏, error 名称、备用定义、预算或取消错误
 func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named map[string]*Halftone) (*Halftone, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("invalid halftone context")
@@ -106,7 +132,7 @@ func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named
 		}
 	}
 	used := false
-	h, err := r.readHalftone(ctx, object, false, named, &used)
+	h, err := r.readHalftone(ctx, object, false, named, &used, r.newHalftoneReadState())
 	if err == nil && indirect && !used {
 		if r.halftones == nil {
 			r.halftones = make(map[Reference]*Halftone)
@@ -207,9 +233,9 @@ func (p *pageInterpreter) displayHalftone(object Object) (*Halftone, error) {
 }
 
 // readHalftone 读取单色或分量网屏，禁止嵌套类型5
-// 入参: ctx 取消上下文, object 网屏对象, component 是否为分量网屏, named 只读设备命名网屏, used 记录名称匹配
-// 返回: *Halftone 网屏参数, error 定义或取消错误
-func (r *Reader) readHalftone(ctx context.Context, object Object, component bool, named map[string]*Halftone, used *bool) (*Halftone, error) {
+// 入参: ctx 取消上下文, object 网屏对象, component 是否为分量网屏, named 只读设备命名网屏, used 记录名称匹配, state 解析预算与去重状态
+// 返回: *Halftone 网屏参数, error 定义、预算或取消错误
+func (r *Reader) readHalftone(ctx context.Context, object Object, component bool, named map[string]*Halftone, used *bool, state *halftoneReadState) (*Halftone, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -272,13 +298,48 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 			return nil, fmt.Errorf("invalid component halftone type")
 		}
 		h.Components = make(map[Name]*Halftone)
-		for key, object := range dict {
+		for _, key := range slices.Sorted(maps.Keys(dict)) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if key == "Type" || key == "HalftoneType" || key == "HalftoneName" {
 				continue
 			}
-			part, err := r.readHalftone(ctx, object, true, named, used)
+			item := dict[key]
+			ref, isRef := item.(Reference)
+			if isRef {
+				if cached, hit := state.cached[ref]; hit {
+					if cached.used {
+						*used = true
+						h.Components[key] = cached.halftone
+						continue
+					}
+					cost := int64(len(cached.halftone.Thresholds)) * 2
+					if cost > state.limit-state.bytes {
+						return nil, fmt.Errorf("%w: halftone threshold memory limit exceeded", ErrStreamLimitExceeded)
+					}
+					state.bytes += cost
+					h.Components[key] = cloneHalftone(cached.halftone)
+					continue
+				}
+			}
+			partUsed := false
+			var usedPtr *bool
+			if used != nil {
+				usedPtr = &partUsed
+			}
+			part, err := r.readHalftone(ctx, item, true, named, usedPtr, state)
 			if err != nil {
 				return nil, err
+			}
+			if partUsed {
+				*used = true
+			}
+			if isRef {
+				if state.cached == nil {
+					state.cached = make(map[Reference]halftoneCacheEntry)
+				}
+				state.cached[ref] = halftoneCacheEntry{halftone: part, used: partUsed}
 			}
 			h.Components[key] = part
 		}
@@ -371,6 +432,25 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 		}
 		*field.target = int(n)
 	}
+	pairs := [][2]int{{h.Width, h.Height}, {h.Width2, h.Height2}}
+	if kind == 10 {
+		pairs = [][2]int{{h.Xsquare, h.Xsquare}, {h.Ysquare, h.Ysquare}}
+	}
+	var count uint64
+	remainingPixels := uint64((state.limit - state.bytes) / 2)
+	for _, pair := range pairs {
+		if pair[0] == 0 {
+			continue
+		}
+		if uint64(pair[1]) > remainingPixels/uint64(pair[0]) {
+			return nil, fmt.Errorf("%w: halftone threshold memory limit exceeded", ErrStreamLimitExceeded)
+		}
+		area := uint64(pair[0]) * uint64(pair[1])
+		if area > remainingPixels-count {
+			return nil, fmt.Errorf("%w: halftone threshold memory limit exceeded", ErrStreamLimitExceeded)
+		}
+		count += area
+	}
 	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
@@ -379,19 +459,14 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 	if kind == 16 {
 		width = 2
 	}
-	count := uint64(h.Width)*uint64(h.Height) + uint64(h.Width2)*uint64(h.Height2)
-	if kind == 10 {
-		count = uint64(h.Xsquare)*uint64(h.Xsquare) + uint64(h.Ysquare)*uint64(h.Ysquare)
-	}
 	limit := uint64(len(data)) / width
-	for _, pair := range [][2]int{{h.Width, h.Height}, {h.Width2, h.Height2}, {h.Xsquare, h.Xsquare}, {h.Ysquare, h.Ysquare}} {
-		if pair[0] != 0 && uint64(pair[1]) > limit/uint64(pair[0]) {
-			return nil, fmt.Errorf("truncated halftone thresholds")
-		}
+	if count > limit {
+		return nil, fmt.Errorf("truncated halftone thresholds")
 	}
 	if count != limit || uint64(len(data))%width != 0 {
 		return nil, fmt.Errorf("invalid halftone threshold length")
 	}
+	state.bytes += int64(count) * 2
 	h.Thresholds = make([]uint16, int(count))
 	for i := range h.Thresholds {
 		if kind == 16 {

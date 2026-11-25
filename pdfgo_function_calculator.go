@@ -26,6 +26,12 @@ import (
 // calculatorStackSize 采用PDF要求至少支持的百项操作数栈容量
 const calculatorStackSize = 100
 
+// maxCalculatorInstructions 限制单个计算器函数允许编译的最大指令条数
+const maxCalculatorInstructions = 65536
+
+// maxCalculatorSteps 限制单次计算器函数求值允许执行的最大步数
+const maxCalculatorSteps = 65536
+
 // 计算器操作数类型
 const (
 	_ uint8 = iota
@@ -55,7 +61,7 @@ type calculatorFunction struct {
 
 // newCalculatorFunction 编译函数并绑定本次阅读器的兼容策略
 // 入参: data 函数字节, warning 兼容诊断，空值保持严格校验
-// 返回: *calculatorFunction 函数, error 语法错误
+// 返回: *calculatorFunction 函数, error 语法或指令上限错误
 func newCalculatorFunction(data []byte, warning func(Diagnostic)) (*calculatorFunction, error) {
 	program, err := compileCalculator(data)
 	if err != nil {
@@ -66,7 +72,7 @@ func newCalculatorFunction(data []byte, warning func(Diagnostic)) (*calculatorFu
 
 // compileCalculator 按PDF语法编译计算器函数，不将条件代码块作为可操作对象
 // 入参: data 函数字节
-// 返回: []calculatorInstruction 指令序列, error 语法错误
+// 返回: []calculatorInstruction 指令序列, error 语法或指令上限错误
 func compileCalculator(data []byte) ([]calculatorInstruction, error) {
 	p := objectParser{data: data}
 	p.skipSpace()
@@ -75,6 +81,7 @@ func compileCalculator(data []byte) ([]calculatorInstruction, error) {
 	}
 	p.pos++
 	frames := [][]calculatorInstruction{nil}
+	instructions := 0
 	for len(frames) != 0 {
 		p.skipSpace()
 		if p.pos == len(data) {
@@ -83,6 +90,10 @@ func compileCalculator(data []byte) ([]calculatorInstruction, error) {
 		index := len(frames) - 1
 		switch data[p.pos] {
 		case '{':
+			instructions++
+			if instructions > maxCalculatorInstructions {
+				return nil, fmt.Errorf("%w: calculator instruction limit exceeded", ErrStreamLimitExceeded)
+			}
 			p.pos++
 			frames = append(frames, nil)
 			continue
@@ -104,6 +115,10 @@ func compileCalculator(data []byte) ([]calculatorInstruction, error) {
 			}
 			frames[index-1] = append(frames[index-1], calculatorInstruction{op: "{}", branches: [][]calculatorInstruction{body}})
 			continue
+		}
+		instructions++
+		if instructions > maxCalculatorInstructions {
+			return nil, fmt.Errorf("%w: calculator instruction limit exceeded", ErrStreamLimitExceeded)
 		}
 		token := p.token()
 		instruction := calculatorInstruction{op: token}
@@ -147,14 +162,14 @@ func compileCalculator(data []byte) ([]calculatorInstruction, error) {
 
 // evaluateCalculator 执行已编译函数，保持整数、实数及布尔类型
 // 入参: program 指令序列, input 输入值, output 输出缓冲区
-// 返回: error 类型、算术或栈错误
+// 返回: error 类型、算术、栈或步数上限错误
 func evaluateCalculator(program []calculatorInstruction, input, output []float64) error {
 	return evaluateCalculatorRecovery(program, input, output, false, nil)
 }
 
 // evaluateCalculatorRecovery 执行计算器，兼容时仅接纳范围内整数值及多余的底层栈项
 // 入参: program 指令, input 输入, output 输出, compatible 是否兼容, recovered 恢复诊断
-// 返回: error 类型、算术或栈错误
+// 返回: error 类型、算术、栈或步数上限错误
 func evaluateCalculatorRecovery(program []calculatorInstruction, input, output []float64, compatible bool, recovered func()) error {
 	if len(input) > calculatorStackSize {
 		return fmt.Errorf("calculator stack overflow")
@@ -170,11 +185,16 @@ func evaluateCalculatorRecovery(program []calculatorInstruction, input, output [
 	var execution [16][]calculatorInstruction
 	pending := execution[:1]
 	pending[0] = program
+	steps := 0
 	for len(pending) != 0 {
 		last := len(pending) - 1
 		if len(pending[last]) == 0 {
 			pending = pending[:last]
 			continue
+		}
+		steps++
+		if steps > maxCalculatorSteps {
+			return fmt.Errorf("%w: calculator step limit exceeded", ErrStreamLimitExceeded)
 		}
 		instruction := pending[last][0]
 		pending[last] = pending[last][1:]

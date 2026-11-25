@@ -132,12 +132,12 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 	return glyphs, nil
 }
 
-// writeAnnotationRichHorizontalRun 在横排行内定位文字，竖排字体按原点向量逐字补偿
-// 入参: ctx 取消上下文, content 内容, glyphs 字符, state 默认状态, defaults 默认操作, matrix 定位矩阵, size 默认字号, x 横坐标, y 基线
-// 返回: error 度量或取消错误
-func writeAnnotationRichHorizontalRun(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, state graphicsState, defaults string, matrix Matrix, size, x, y float64) error {
+// writeAnnotationRichHorizontalRun 在横排行内定位文字，竖排字体按原点向量逐字补偿并检查内容流上限
+// 入参: ctx 取消上下文, content 内容, glyphs 字符, state 默认状态, defaults 默认操作, matrix 定位矩阵, size 默认字号, x 横坐标, y 基线, contentLimit 内容流字节上限
+// 返回: error 度量、超限或取消错误
+func writeAnnotationRichHorizontalRun(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, state graphicsState, defaults string, matrix Matrix, size, x, y float64, contentLimit int) error {
 	if !glyphs[0].font.font.Vertical {
-		return writeAnnotationRichRun(ctx, content, glyphs, state, defaults, matrix, size, x, y)
+		return writeAnnotationRichRun(ctx, content, glyphs, state, defaults, matrix, size, x, y, contentLimit)
 	}
 	for i, glyph := range glyphs {
 		if err := ctx.Err(); err != nil {
@@ -150,9 +150,9 @@ func writeAnnotationRichHorizontalRun(ctx context.Context, content *strings.Buil
 		origin := glyph.letter.vertical.Origin
 		var err error
 		if i == 0 {
-			err = writeAnnotationRichRun(ctx, content, glyphs[i:i+1], state, defaults, matrix, size, x+origin.X*n*state.hscale, y+origin.Y*n)
+			err = writeAnnotationRichRun(ctx, content, glyphs[i:i+1], state, defaults, matrix, size, x+origin.X*n*state.hscale, y+origin.Y*n, contentLimit)
 		} else {
-			err = writeAnnotationRichCodes(ctx, content, glyphs[i:i+1], matrix, x+origin.X*n*state.hscale, y+origin.Y*n)
+			err = writeAnnotationRichCodesLimited(ctx, content, glyphs[i:i+1], matrix, x+origin.X*n*state.hscale, y+origin.Y*n, contentLimit)
 		}
 		if err != nil {
 			return err
@@ -162,10 +162,10 @@ func writeAnnotationRichHorizontalRun(ctx context.Context, content *strings.Buil
 	return ctx.Err()
 }
 
-// writeAnnotationRichRun 写入同一字体及样式的字符，保留原始编码和默认外观状态
-// 入参: ctx 取消上下文, content 内容, glyphs 字符, state 默认状态, defaults 默认操作, matrix 定位矩阵, size 默认字号, x 横坐标, y 基线
-// 返回: error 定位或取消错误
-func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, state graphicsState, defaults string, matrix Matrix, size, x, y float64) error {
+// writeAnnotationRichRun 在内容流字节上限内写入同一字体及样式的字符，保留原始编码和默认外观状态
+// 入参: ctx 取消上下文, content 内容, glyphs 字符, state 默认状态, defaults 默认操作, matrix 定位矩阵, size 默认字号, x 横坐标, y 基线, contentLimit 内容流字节上限
+// 返回: error 定位、超限或取消错误
+func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, state graphicsState, defaults string, matrix Matrix, size, x, y float64, contentLimit int) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -178,13 +178,16 @@ func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyph
 		color := glyph.style.color
 		writeAnnotationOperation(content, "rg", color[0], color[1], color[2])
 	}
-	return writeAnnotationRichCodes(ctx, content, glyphs, matrix, x, y)
+	if contentLimit > 0 && content.Len() > contentLimit {
+		return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
+	return writeAnnotationRichCodesLimited(ctx, content, glyphs, matrix, x, y, contentLimit)
 }
 
-// writeAnnotationRichCodes 写入文字位置和原始编码，连续定位复用已设置的文字状态
-// 入参: ctx 取消上下文, content 内容, glyphs 字符, matrix 定位矩阵, x 横坐标, y 基线
-// 返回: error 定位或取消错误
-func writeAnnotationRichCodes(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, matrix Matrix, x, y float64) error {
+// writeAnnotationRichCodesLimited 在内容流字节上限内写入文字位置和原始编码
+// 入参: ctx 取消上下文, content 内容, glyphs 字符, matrix 定位矩阵, x 横坐标, y 基线, contentLimit 内容流字节上限
+// 返回: error 定位、超限或取消错误
+func writeAnnotationRichCodesLimited(ctx context.Context, content *strings.Builder, glyphs []annotationRichGlyph, matrix Matrix, x, y float64, contentLimit int) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -192,13 +195,21 @@ func writeAnnotationRichCodes(ctx context.Context, content *strings.Builder, gly
 		return err
 	}
 	content.WriteByte('<')
-	for _, current := range glyphs {
-		if err := ctx.Err(); err != nil {
-			return err
+	for i, current := range glyphs {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if contentLimit > 0 && content.Len() > contentLimit {
+				return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 		}
 		fmt.Fprintf(content, "%x", current.letter.code)
 	}
 	content.WriteString("> Tj\n")
+	if contentLimit > 0 && content.Len() > contentLimit {
+		return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	return nil
 }
 
@@ -505,11 +516,8 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 					continue
 				}
 			}
-			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], p.state, stateContent, matrix, size, left, baseline); err != nil {
+			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], p.state, stateContent, matrix, size, left, baseline, contentLimit); err != nil {
 				return err
-			}
-			if content.Len() > contentLimit {
-				return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
 			}
 			runLeft := left
 			for i := start; i < end; i++ {

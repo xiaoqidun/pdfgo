@@ -125,13 +125,21 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 	if deferCompress {
 		pending = make(map[Reference][]byte, len(changes))
 	}
-	visited, changed := 0, false
+	seen := make(map[Reference]bool)
+	matched := make(map[Reference]bool, len(changes))
+	changed := false
 	err := r.WalkPages(ctx, func(_ int, source *Page) error {
+		if source.Reference != (Reference{}) {
+			if seen[source.Reference] {
+				return nil
+			}
+			seen[source.Reference] = true
+		}
 		spans, exists := changes[source.Reference]
 		if !exists {
 			return nil
 		}
-		visited++
+		matched[source.Reference] = true
 		if len(spans) == 0 {
 			return nil
 		}
@@ -168,7 +176,7 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 	if err != nil {
 		return nil, false, err
 	}
-	if visited != len(changes) {
+	if len(matched) != len(changes) {
 		return nil, false, fmt.Errorf("PDF text replacement page is not in the page tree")
 	}
 	return pending, changed, ctx.Err()
@@ -298,7 +306,14 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 // 返回: error 读取、变换或写出错误
 func (r *Reader) transformPageContent(ctx context.Context, transform func(context.Context, *Page, []byte) ([]byte, error), pending map[Reference][]byte, result map[Reference]Object, compressLevel int) error {
 	number := r.maxRewriteObjectID(result)
+	seen := make(map[Reference]bool)
 	return r.rewriteReader(result).WalkPages(ctx, func(_ int, page *Page) error {
+		if page.Reference != (Reference{}) {
+			if seen[page.Reference] {
+				return nil
+			}
+			seen[page.Reference] = true
+		}
 		raw, hasPending := pending[page.Reference]
 		var input []byte
 		if hasPending {

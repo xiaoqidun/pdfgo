@@ -490,7 +490,7 @@ func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pa
 	if !v.free {
 		content.WriteString("/Tx BMC\n")
 	}
-	fmt.Fprintf(content, "/Span << /ActualText <%x> >> BDC\nBT\n%s\n/%s ", []byte(actual), v.defaults, escapeAnnotationName(v.font))
+	fmt.Fprintf(content, "/Span << /ActualText <%x> >> BDC\nBT\n0 g 0 G 1 w [] 0 d\n%s\n/%s ", []byte(actual), v.defaults, escapeAnnotationName(v.font))
 	writeAnnotationOperation(content, "Tf", size)
 	if content.Len() > limit {
 		return fmt.Errorf("%w: shaped text appearance content limit exceeded", ErrStreamLimitExceeded)

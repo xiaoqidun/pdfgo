@@ -107,11 +107,38 @@ func imageNativeAlpha(ctx context.Context, source image.Image) (bool, bool, erro
 	return true, true, ctx.Err()
 }
 
-// validatePalettedImage 校验调色板图像的有效颜色条目、像素缓冲及索引边界
+// validatePalettedImage 沿解包链逐层校验调色板图像的有效颜色条目、像素缓冲及索引边界
 // 入参: ctx 取消上下文, source 待校验图像
 // 返回: error 调色板非法、越界或取消错误
 func validatePalettedImage(ctx context.Context, source image.Image) error {
-	img := unwrapImage(source)
+	img := source
+	for step := 0; ; step++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := validatePalettedLayer(ctx, img); err != nil {
+			return err
+		}
+		if step >= 16 {
+			break
+		}
+		wrapper, ok := img.(imageUnwrapper)
+		if !ok {
+			break
+		}
+		inner := wrapper.Unwrap()
+		if inner == nil {
+			break
+		}
+		img = inner
+	}
+	return ctx.Err()
+}
+
+// validatePalettedLayer 校验单层图像的调色板颜色条目以及原生索引图像的像素缓冲与索引边界
+// 入参: ctx 取消上下文, img 单层图像
+// 返回: error 调色板非法、越界或取消错误
+func validatePalettedLayer(ctx context.Context, img image.Image) error {
 	p, isPaletted := img.(*image.Paletted)
 	var palette color.Palette
 	hasPalette := isPaletted

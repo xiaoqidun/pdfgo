@@ -103,8 +103,14 @@ func (r *Reader) iconAppearance(annotation Annotation) (*Stream, error) {
 	var content strings.Builder
 	writeAnnotationOperation(&content, "cm", width/16, 0, 0, height/16, x, y)
 	content.WriteString("1 w 1 J 1 j 0 G\n")
-	if annotation.Subtype == "Text" && annotation.Dictionary["C"] == nil {
-		border.color = Array{Integer(1), Integer(1), Integer(0)}
+	if annotation.Subtype == "Text" {
+		color, err := r.Resolve(annotation.Dictionary["C"])
+		if err != nil {
+			return nil, err
+		}
+		if color == nil {
+			border.color = Array{Integer(1), Integer(1), Integer(0)}
+		}
 	}
 	visible, err := r.writeAnnotationColor(&content, border.color, false)
 	if err != nil {

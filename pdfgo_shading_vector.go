@@ -40,7 +40,7 @@ func projectedTintStops(ctx context.Context, f *tintFunction, limit int) ([][]Gr
 	}
 	var positions []float64
 	if f.sampled {
-		positions = sampledGradientPositions(ctx, f)
+		positions = sampledGradientPositions(ctx, f, min(maxGradientLinearStops, limit/f.channels))
 		if err := ctx.Err(); err != nil {
 			return nil, 0, err
 		}
@@ -235,7 +235,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 	for c := range f.parts {
 		f.parts[c] = &gradientFunction{}
 	}
-	budget := min(maxGradientVectorTotalStops, maxGradientVectorTotalStops*4-state.vectorStops)
+	budget := min(maxGradientVectorTotalStops, state.remainingStops())
 	var evaluate func(float64, []float64) error
 	switch kind {
 	case Integer(0), Integer(2):
@@ -249,8 +249,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 			if err != nil {
 				return nil, err
 			}
-			if len(allStops) == channels {
-				state.vectorStops += total
+			if len(allStops) == channels && state.reserveStops(total) {
 				for c, stops := range allStops {
 					f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
 				}
@@ -304,8 +303,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 				allStops[c] = stops
 				total += len(stops)
 			}
-			if !exceeded {
-				state.vectorStops += total
+			if !exceeded && state.reserveStops(total) {
 				for c, stops := range allStops {
 					f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
 				}
@@ -351,7 +349,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 			}
 			return nil
 		}
-		budget = min(maxGradientVectorTotalStops, maxGradientVectorTotalStops*4-state.vectorStops)
+		budget = min(maxGradientVectorTotalStops, state.remainingStops())
 		if domain[0] < domain[1] && budget > 0 {
 			allStops := make([][]GradientStop, channels)
 			total := 0
@@ -425,8 +423,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 					total += len(stops)
 				}
 			}
-			if !exceeded {
-				state.vectorStops += total
+			if !exceeded && state.reserveStops(total) {
 				for c, stops := range allStops {
 					if len(stops) > 0 {
 						f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }

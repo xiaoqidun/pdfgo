@@ -371,11 +371,12 @@ func encodePDFPaletted(ctx context.Context, img *image.Paletted, options ImageWr
 			copy(row, src)
 		} else {
 			clear(row)
+			perByte := 8 / bits
 			for x, idx := range src {
 				if int(idx) >= count {
 					return nil, nil, fmt.Errorf("palette index out of range")
 				}
-				row[x*bits/8] |= idx << uint(8-bits-x*bits%8)
+				row[x/perByte] |= idx << uint(8-bits-(x%perByte)*bits)
 			}
 		}
 		for x, idx := range src {
@@ -489,11 +490,12 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 			return nil, nil, err
 		}
 		if bits < 8 {
+			perByte := 8 / bits
 			stream, err := encodePDFPackedGray(ctx, width, height, bits, func(y int, dst []byte) {
 				start := source.PixOffset(bounds.Min.X, bounds.Min.Y+y)
 				src := source.Pix[start : start+width]
 				for x, v := range src {
-					dst[x*bits/8] |= (v / step) << uint(8-bits-x*bits%8)
+					dst[x/perByte] |= (v / step) << uint(8-bits-(x%perByte)*bits)
 				}
 			})
 			return stream, nil, err

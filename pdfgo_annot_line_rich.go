@@ -22,16 +22,19 @@ import (
 	"strings"
 )
 
-// writeRichLineCaption 在标题局部坐标写入段落，保留样式和行内基线偏移
-// 入参: ctx 取消上下文, content 内容, caption 富文本标题
+// writeRichLineCaption 在标题局部坐标写入段落，保留样式、行内基线偏移与字节上限检查
+// 入参: ctx 取消上下文, content 内容, caption 富文本标题, contentLimit 内容流字节上限
 // 返回: error 取消、超限或范围溢出错误
-func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption *annotationLineCaption) error {
+func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption *annotationLineCaption, contentLimit int) error {
 	decorated := annotationRichDecorated(caption.rich)
 	var decorations annotationRichDecorations
 	if decorated {
 		content.WriteString("q\n")
 	}
 	content.WriteString("BT\n")
+	if contentLimit > 0 && content.Len() > contentLimit {
+		return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	state := graphicsState{hscale: 1}
 	top := caption.height / 2
 	for _, line := range caption.rich {
@@ -41,19 +44,29 @@ func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption
 		left := -caption.width/2 + float64(line.style.align)*(caption.width-line.width)/2
 		baseline := top - line.ascent
 		for start := 0; start < len(line.glyphs); {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			glyph := line.glyphs[start]
 			end := start + 1
 			for end < len(line.glyphs) && line.glyphs[end].font == glyph.font && line.glyphs[end].style == glyph.style {
-				if err := ctx.Err(); err != nil {
-					return err
+				if end&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
 				}
 				end++
 			}
-			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], state, "", Identity(), annotationCaptionSize, left, baseline); err != nil {
+			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], state, "", Identity(), annotationCaptionSize, left, baseline, contentLimit); err != nil {
 				return err
 			}
 			runLeft := left
-			for _, current := range line.glyphs[start:end] {
+			for i, current := range line.glyphs[start:end] {
+				if i&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				left += annotationRichAdvance(current, state, annotationCaptionSize, false)
 			}
 			if err := decorations.add(ctx, glyph, state, annotationCaptionSize, runLeft, baseline, left-runLeft); err != nil {
@@ -66,9 +79,15 @@ func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption
 	content.WriteString("ET\n")
 	if decorated {
 		content.WriteString("Q\n")
-		return writeAnnotationRichDecorations(ctx, content, decorations.spans, "0 g\n", Identity(), maxAnnotationRichContentBytes)
+		if contentLimit > 0 && content.Len() > contentLimit {
+			return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+		}
+		return writeAnnotationRichDecorations(ctx, content, decorations.spans, "0 g\n", Identity(), contentLimit)
 	}
-	return nil
+	if contentLimit > 0 && content.Len() > contentLimit {
+		return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
+	return ctx.Err()
 }
 
 // readRichLineCaption 读取直线富文本标题，共用字符编码及混合字体排版

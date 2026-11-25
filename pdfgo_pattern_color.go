@@ -38,17 +38,18 @@ func (r *Reader) readPatternBaseContext(ctx context.Context, object Object) (*pa
 // 入参: ctx 取消上下文, object 基础空间, effective 是否已按资源校验并替换
 // 返回: *patternColorSpace 分量数及颜色变换, error 颜色空间或取消错误
 func (r *Reader) readPatternColorSpaceContext(ctx context.Context, object Object, effective bool) (*patternColorSpace, error) {
-	if err := ctx.Err(); err != nil {
+	ctx, _, err := consumeColorParseNode(ctx)
+	if err != nil {
 		return nil, err
 	}
-	object, err := r.resolveColorSpace(object)
+	object, err = r.resolveColorSpace(object)
 	if err != nil {
 		return nil, err
 	}
 	if array, ok := object.(Array); ok && len(array) > 0 {
 		switch array[0] {
 		case Name("Separation"):
-			space, err := r.readSeparationSpaceContext(ctx, array, effective, 0)
+			space, err := r.readSeparationSpaceContext(ctx, array, effective, r.colorProfileDepth)
 			if err != nil {
 				return nil, err
 			}
@@ -58,7 +59,7 @@ func (r *Reader) readPatternColorSpaceContext(ctx context.Context, object Object
 				return paint, err
 			}, space.name == "None" || space.none, nil}, nil
 		case Name("DeviceN"):
-			space, err := r.readDeviceNSpaceContext(ctx, array, effective, 0)
+			space, err := r.readDeviceNSpaceContext(ctx, array, effective, r.colorProfileDepth)
 			if err != nil {
 				return nil, err
 			}
@@ -80,7 +81,7 @@ func (r *Reader) readPatternColorSpaceContext(ctx context.Context, object Object
 			}, false, nil}, nil
 		case Name("Indexed"):
 			image := &Image{reader: r, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{}}, Warning: r.warning, effectiveColorSpace: effective}
-			palette, err := image.palette()
+			palette, err := image.paletteContext(ctx)
 			if err != nil {
 				return nil, err
 			}

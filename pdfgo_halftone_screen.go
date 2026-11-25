@@ -195,6 +195,11 @@ func (r *Reader) compileHalftone(ctx context.Context, h *Halftone, options Halft
 					return nil, err
 				}
 				for x := 0; x < rect[0]; x++ {
+					if index&255 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					s.tiled[s.tileKey(x, y+rect[2])] = s.thresholds[index]
 					index++
 				}
@@ -274,14 +279,12 @@ func (r *Reader) compileHalftone(ctx context.Context, h *Halftone, options Halft
 	if function != nil {
 		s.transfer = make([]uint16, 1<<16)
 		for i := range s.transfer {
-			if i%256 == 0 {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
 			value, err := function.Evaluate(float64(i)/65535, 0)
 			if err != nil {
-				return nil, fmt.Errorf("invalid halftone transfer result: %v", err)
+				return nil, fmt.Errorf("invalid halftone transfer result: %w", err)
 			}
 			s.transfer[i] = uint16(math.Round(value * 65535))
 		}

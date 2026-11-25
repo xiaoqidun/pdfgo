@@ -68,7 +68,7 @@ func compactPNGGray(ctx context.Context, img image.Image, depth int, alpha bool,
 				continue
 			}
 			c := imageNRGBA64At(img, x, y)
-			offset := (x - bounds.Min.X) * channels * depth / 8
+			offset := (x - bounds.Min.X) * encoder.pixelBytes
 			if depth == 8 {
 				encoder.row[offset] = byte(c.R >> 8)
 				if alpha {

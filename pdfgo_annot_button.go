@@ -143,7 +143,19 @@ func (r *Reader) writeAnnotationToggleButton(ctx context.Context, annotation Ann
 	}
 	w, h := frame.XMax-frame.XMin, frame.YMax-frame.YMin
 	radio := flags&(1<<15) != 0
-	defaultBorder := mk["BC"] == nil && field["BS"] == nil && field["Border"] == nil
+	bc, err := r.Resolve(mk["BC"])
+	if err != nil {
+		return err
+	}
+	bs, err := r.Resolve(field["BS"])
+	if err != nil {
+		return err
+	}
+	rawBorder, err := r.Resolve(field["Border"])
+	if err != nil {
+		return err
+	}
+	defaultBorder := bc == nil && bs == nil && rawBorder == nil
 	radius := math.Max(0, math.Min(w, h)/2-1)
 	if radio && (bordered || defaultBorder) {
 		if defaultBorder {
@@ -236,27 +248,29 @@ func (r *Reader) annotationButtonState(ctx context.Context, annotation Annotatio
 				return "", err
 			}
 		}
-		widgets := field["Kids"]
-		if widgets == nil && field["Parent"] != nil {
-			value, err := r.Resolve(field["Parent"])
-			if err != nil {
-				return "", err
-			}
-			parent, ok := value.(Dictionary)
-			if !ok {
-				return "", fmt.Errorf("invalid button parent")
-			}
-			widgets = parent["Kids"]
-		}
-		value, err := r.Resolve(widgets)
+		widgets, err := r.Resolve(field["Kids"])
 		if err != nil {
 			return "", err
 		}
+		parentValue, err := r.Resolve(field["Parent"])
+		if err != nil {
+			return "", err
+		}
+		if widgets == nil && parentValue != nil {
+			parent, ok := parentValue.(Dictionary)
+			if !ok {
+				return "", fmt.Errorf("invalid button parent")
+			}
+			widgets, err = r.Resolve(parent["Kids"])
+			if err != nil {
+				return "", err
+			}
+		}
 		index := -1
-		if value == nil && field["Parent"] == nil && len(options) == 1 {
+		if widgets == nil && parentValue == nil && len(options) == 1 {
 			index = 0
 		} else {
-			kids, ok := value.(Array)
+			kids, ok := widgets.(Array)
 			if !ok || len(kids) != len(options) {
 				return "", fmt.Errorf("invalid button option widgets")
 			}
@@ -284,8 +298,14 @@ func (r *Reader) annotationButtonState(ctx context.Context, annotation Annotatio
 		}
 		return state, nil
 	}
-	if flags&(1<<15) != 0 && field["Parent"] != nil {
-		return "", &UnsupportedError{Feature: "radio widget without appearance state"}
+	if flags&(1<<15) != 0 {
+		parentValue, err := r.Resolve(field["Parent"])
+		if err != nil {
+			return "", err
+		}
+		if parentValue != nil {
+			return "", &UnsupportedError{Feature: "radio widget without appearance state"}
+		}
 	}
 	return state, nil
 }

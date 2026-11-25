@@ -100,13 +100,6 @@ func (r *Reader) mediaDictionary(object Object, optional bool) (Dictionary, erro
 	return dict, nil
 }
 
-// mediaDictionaries 读取媒体字典数组，不预先解析字典内的脚本或数据流
-// 入参: object 数组或引用
-// 返回: []Dictionary 字典列表, error 数组、字典或引用错误
-func (r *Reader) mediaDictionaries(object Object) ([]Dictionary, error) {
-	return r.mediaDictionariesContext(context.Background(), object)
-}
-
 // mediaDictionariesContext 按取消上下文读取媒体字典数组，不预先解析字典内的脚本或数据流
 // 入参: ctx 取消上下文, object 数组或引用
 // 返回: []Dictionary 字典列表, error 数组、字典、引用或取消错误
@@ -422,7 +415,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 		}
 		result.Projection = &projection
 	}
-	result.Camera, err = r.ReadThreeDCamera(result.SelectedView)
+	result.Camera, err = r.readThreeDCamera(ctx, result.SelectedView)
 	if err != nil {
 		return result, err
 	}
@@ -434,7 +427,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 	if err != nil {
 		return result, err
 	}
-	result.Presentation, err = r.ReadThreeDPresentation(result.SelectedView)
+	result.Presentation, err = r.readThreeDPresentation(ctx, result.SelectedView)
 	if err != nil {
 		return result, err
 	}

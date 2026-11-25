@@ -207,7 +207,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			return nil, err
 		}
 		font.encoding, _ = encoding.(Name)
-		font.cidMap, err = r.readCIDCMapContext(ctx, dict["Encoding"], nil, nil, 0)
+		font.cidMap, err = r.readCIDCMapContext(ctx, dict["Encoding"])
 		if err != nil {
 			return nil, err
 		}
@@ -671,8 +671,11 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			return nil, &UnsupportedError{Feature: "OpenType font without CFF table"}
 		}
 	}
-	if !font.composite && font.Subtype == Name("TrueType") && len(font.Program) > 0 && cffProgram == nil {
-		font.symbolic = font.symbolic || noEncoding
+	trueTypeContainer := font.Subtype == Name("TrueType") || font.ProgramType == Name("FontFile2") || font.ProgramType == Name("OpenType") && len(font.Program) >= 12 && (string(font.Program[:4]) == "\x00\x01\x00\x00" || string(font.Program[:4]) == "true")
+	if !font.composite && font.Subtype != Name("Type3") && len(font.Program) > 0 && cffProgram == nil && trueTypeContainer {
+		if font.Subtype == Name("TrueType") {
+			font.symbolic = font.symbolic || noEncoding
+		}
 		cmapWarning := r.warning
 		if cmapWarning != nil {
 			cmapWarning = func(d Diagnostic) {
@@ -690,6 +693,14 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			if len(glyphs) != 0 {
 				font.post = &fontPostMapping{program: font.Program, glyphs: glyphs, ready: true}
 				err = nil
+			} else if noEncoding {
+				symCmap, symEnc, symErr := fontCmapContext(ctx, font.Program, true, cmapWarning)
+				if symErr == nil {
+					font.symbolic = true
+					font.simpleCmap, font.cmapEncoding, err = symCmap, symEnc, nil
+				} else if cause := ctx.Err(); cause != nil {
+					return nil, cause
+				}
 			}
 		}
 		if err != nil {
@@ -937,7 +948,11 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		}
 		valid := true
 		if f.cidMap != nil {
-			step, valid = f.cidMap.next(data[n:])
+			var err error
+			step, valid, err = f.cidMap.nextContext(ctx, data[n:])
+			if err != nil {
+				return nil, err
+			}
 		}
 		raw := data[n : n+step]
 		code := uint32(codeNumber(raw))

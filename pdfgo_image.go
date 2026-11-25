@@ -802,6 +802,23 @@ func (i *Image) encodedFileContext(ctx context.Context, terminal Name) ([]byte, 
 // 入参: object 图像对象或引用
 // 返回: *Image 图像描述, error 错误信息
 func (r *Reader) ReadImage(object Object) (*Image, error) {
+	return r.readImage(object, nil)
+}
+
+// ReadImageWithResources 读取图像并按当前资源解析颜色空间及默认设备色
+// 入参: object 图像对象或引用, resources 当前资源字典
+// 返回: *Image 图像描述, error 图像或颜色空间错误
+func (r *Reader) ReadImageWithResources(object Object, resources Dictionary) (*Image, error) {
+	if resources == nil {
+		resources = Dictionary{}
+	}
+	return r.readImage(object, resources)
+}
+
+// readImage 读取图像XObject描述，并在给定资源时先解析颜色空间再推导JPX默认位深
+// 入参: object 图像对象或引用, resources 可选当前资源字典
+// 返回: *Image 图像描述, error 图像或颜色空间错误
+func (r *Reader) readImage(object Object, resources Dictionary) (*Image, error) {
 	resolved, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -861,6 +878,7 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		mask = bool(b)
 	}
 	var space Object
+	effectiveColorSpace := false
 	imageMask := dict["Mask"]
 	if mask {
 		imageMask = nil
@@ -870,6 +888,14 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 			return nil, err
 		}
 		space = normalizeDeviceColorSpace(space)
+		if resources != nil && space != nil {
+			space, err = r.resourceColorSpace(space, resources)
+			if err != nil {
+				return nil, err
+			}
+			space = normalizeDeviceColorSpace(space)
+			effectiveColorSpace = true
+		}
 	}
 	bits := int64(1)
 	var embeddedSpace Object
@@ -884,6 +910,14 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		}
 		if space == nil {
 			space = embeddedSpace
+			if resources != nil {
+				space, err = r.resourceColorSpace(space, resources)
+				if err != nil {
+					return nil, err
+				}
+				space = normalizeDeviceColorSpace(space)
+				effectiveColorSpace = true
+			}
 		}
 	}
 	if jpxDepth == 0 && (dict["BitsPerComponent"] != nil || !mask) {
@@ -933,24 +967,7 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		}
 		intent = normalizeRenderingIntent(intent)
 	}
-	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Intent: intent, Decode: decode, ImageMask: mask, Interpolate: interpolate == Boolean(true), Mask: imageMask, SoftMask: dict["SMask"], Stream: stream, reader: r}, nil
-}
-
-// ReadImageWithResources 读取图像并按当前资源解析颜色空间及默认设备色
-// 入参: object 图像对象或引用, resources 当前资源字典
-// 返回: *Image 图像描述, error 图像或颜色空间错误
-func (r *Reader) ReadImageWithResources(object Object, resources Dictionary) (*Image, error) {
-	image, err := r.ReadImage(object)
-	if err != nil || image.ImageMask {
-		return image, err
-	}
-	image.ColorSpace, err = r.resourceColorSpace(image.ColorSpace, resources)
-	if err != nil {
-		return nil, err
-	}
-	image.ColorSpace = normalizeDeviceColorSpace(image.ColorSpace)
-	image.effectiveColorSpace = true
-	return image, nil
+	return &Image{Width: int(w), Height: int(h), BitsPerComponent: int(bits), ColorSpace: space, Intent: intent, Decode: decode, ImageMask: mask, Interpolate: interpolate == Boolean(true), Mask: imageMask, SoftMask: dict["SMask"], Stream: stream, reader: r, effectiveColorSpace: effectiveColorSpace}, nil
 }
 
 // renderingIntent 取得图像有效渲染意图，支持直接构造的图像及间接字典值
@@ -1788,7 +1805,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		i = &normalized
 	}
 	if target == nil && !i.ImageMask && i.reader != nil {
-		none, err := i.reader.colorSpaceNone(i.ColorSpace, i.effectiveColorSpace)
+		none, err := i.reader.colorSpaceNoneContext(ctx, i.ColorSpace, i.effectiveColorSpace)
 		if err != nil {
 			return nil, err
 		}
@@ -1796,7 +1813,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			return &emptySampleImage{rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 		}
 	}
-	palette, err := i.palette()
+	palette, err := i.paletteContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1836,14 +1853,14 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-		profile, err = i.reader.readICCSourceSpace(space, i.effectiveColorSpace)
+		profile, err = i.reader.readICCSourceSpaceContext(ctx, space, i.effectiveColorSpace)
 		if err != nil {
 			return nil, err
 		}
 		components = profile.components()
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Separation") {
-		separation, err = i.reader.readSeparationSpace(space, i.effectiveColorSpace, 0)
+		separation, err = i.reader.readSeparationSpaceContext(ctx, space, i.effectiveColorSpace, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -1853,7 +1870,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
-		deviceN, err = i.reader.readDeviceNSpace(space, i.effectiveColorSpace, 0)
+		deviceN, err = i.reader.readDeviceNSpaceContext(ctx, space, i.effectiveColorSpace, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -2492,9 +2509,13 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	return out, nil
 }
 
-// palette 解析索引色查找表，保留原始索引样本供Decode和色键遮罩使用
-// 返回: *imagePalette 调色板，非索引色时为空, error 错误信息
-func (i *Image) palette() (*imagePalette, error) {
+// paletteContext 在取消上下文内解析索引色查找表，保留原始索引样本供Decode和色键遮罩使用
+// 入参: ctx 取消上下文
+// 返回: *imagePalette 调色板，非索引色时为空, error 解析或取消错误
+func (i *Image) paletteContext(ctx context.Context) (*imagePalette, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	array, ok := normalizeDeviceColorSpace(i.ColorSpace).(Array)
 	if !ok {
 		return nil, nil
@@ -2528,19 +2549,19 @@ func (i *Image) palette() (*imagePalette, error) {
 		components = 4
 	default:
 		if space, ok := base.(Array); ok && len(space) > 0 && space[0] == Name("Separation") {
-			separation, err = i.reader.readSeparationSpace(space, i.effectiveColorSpace, 0)
+			separation, err = i.reader.readSeparationSpaceContext(ctx, space, i.effectiveColorSpace, 0)
 			if err != nil {
 				return nil, err
 			}
 			components = 1
 		} else if space, ok := base.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
-			deviceN, err = i.reader.readDeviceNSpace(space, i.effectiveColorSpace, 0)
+			deviceN, err = i.reader.readDeviceNSpaceContext(ctx, space, i.effectiveColorSpace, 0)
 			if err != nil {
 				return nil, err
 			}
 			components = deviceN.components
 		} else if space, ok := base.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-			profile, err = i.reader.readICCSourceSpace(space, i.effectiveColorSpace)
+			profile, err = i.reader.readICCSourceSpaceContext(ctx, space, i.effectiveColorSpace)
 			if err != nil {
 				return nil, err
 			}
@@ -2583,9 +2604,9 @@ func (i *Image) palette() (*imagePalette, error) {
 		data = value
 	case *Stream:
 		if i.reader != nil {
-			data, err = i.reader.decodeStream(value)
+			data, err = i.reader.DecodeStreamContext(ctx, value)
 		} else {
-			data, err = value.decodeWith(context.Background(), nil, i.Warning, 0)
+			data, err = value.decodeWith(ctx, nil, i.Warning, 0)
 		}
 		if err != nil {
 			return nil, err
@@ -2630,6 +2651,9 @@ func (i *Image) palette() (*imagePalette, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if profile != nil && profile.alternate != nil {
 		paint, err := profile.paint(make([]float64, components), intent)
 		if err != nil {
@@ -2641,6 +2665,9 @@ func (i *Image) palette() (*imagePalette, error) {
 		}
 	}
 	for index := range palette {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		v := data[index*components:]
 		for c := 0; c < min(components, 4); c++ {
 			result.values[index][c] = float64(v[c]) / 255
@@ -2722,7 +2749,7 @@ func (i *Image) palette() (*imagePalette, error) {
 		}
 		palette[index] = color.NRGBA64{R: uint16(math.Round(rgb[0] * 65535)), G: uint16(math.Round(rgb[1] * 65535)), B: uint16(math.Round(rgb[2] * 65535)), A: 65535}
 	}
-	return result, nil
+	return result, ctx.Err()
 }
 
 // prepareMask 解析有效外部遮罩描述、色键和预混合底色，不提前解码遮罩像素
