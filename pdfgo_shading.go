@@ -502,23 +502,6 @@ func (p *pageInterpreter) shadingPatternPaint(v Object, m Matrix) (Paint, error)
 	}
 	var bounds *Rectangle
 	if backgroundValue != nil {
-		object, err := p.shadingColorSpace(shading["ColorSpace"])
-		if err != nil {
-			return Paint{}, err
-		}
-		base, err := p.reader.readPatternColorSpaceContext(p.ctx, object, true)
-		if err != nil {
-			return Paint{}, err
-		}
-		values, err := p.reader.numberArray(backgroundValue, base.components)
-		if err != nil {
-			return Paint{}, err
-		}
-		color, err := base.convert(values, p.state.style.RenderingIntent)
-		if err != nil {
-			return Paint{}, err
-		}
-		source := color.Space
 		var destination *ColorSpace
 		if paint.Axial != nil {
 			destination = paint.Axial.Space
@@ -527,17 +510,22 @@ func (p *pageInterpreter) shadingPatternPaint(v Object, m Matrix) (Paint, error)
 		} else {
 			destination = paint.Function.Space
 		}
-		if source == nil {
-			if color.CMYK != nil {
-				source = &ColorSpace{Model: "DeviceCMYK"}
-				color.Values = *color.CMYK
-			} else {
-				source = &ColorSpace{Model: "DeviceRGB"}
-				copy(color.Values[:], color.RGB[:])
-			}
-		}
-		converted, err := destination.Convert(color.Values[:source.Components()], source, p.state.style.RenderingIntent)
+		_, tint, lab, components, err := p.reader.readShadingColorSpaceContext(p.ctx, space, true)
 		if err != nil {
+			return Paint{}, err
+		}
+		values, err := p.reader.numberArray(backgroundValue, components)
+		if err != nil {
+			return Paint{}, err
+		}
+		if !finiteFloats(values) {
+			return Paint{}, fmt.Errorf("invalid shading background")
+		}
+		converted, err := shadingColorValues(destination, tint, lab, values)
+		if err != nil {
+			return Paint{}, err
+		}
+		if _, err := destination.SRGB(converted[:destination.Components()], p.state.style.RenderingIntent); err != nil {
 			return Paint{}, err
 		}
 		background = &converted

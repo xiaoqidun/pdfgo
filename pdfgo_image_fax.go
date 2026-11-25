@@ -436,11 +436,11 @@ func (r *faxReader) rowMode() (bool, error) {
 		r.done = true
 		return false, io.EOF
 	}
-	marked, err := r.marker(r.eol || r.mixed)
+	marked, err := r.marker(r.eol)
 	if err != nil {
 		return false, err
 	}
-	if !marked && !r.eol && !r.mixed {
+	if !marked && !r.eol {
 		for count := uint(1); count < 12; count++ {
 			value, err := r.peek(count)
 			if err == io.EOF || err == io.ErrUnexpectedEOF {

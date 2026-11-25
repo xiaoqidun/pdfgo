@@ -349,8 +349,15 @@ func (c *cidCMap) inherit() {
 		return
 	}
 	c.recovered = c.recovered || c.base.recovered
-	if len(c.spaces) == 0 {
-		c.spaces = c.base.spaces
+	if len(c.base.spaces) != 0 {
+		if len(c.spaces) == 0 {
+			c.spaces = c.base.spaces
+		} else {
+			merged := make([]cidCodeRange, 0, len(c.spaces)+len(c.base.spaces))
+			merged = append(merged, c.spaces...)
+			merged = append(merged, c.base.spaces...)
+			c.spaces = merged
+		}
 	}
 	if c.registry == "" {
 		c.registry = c.base.registry

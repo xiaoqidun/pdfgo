@@ -19,30 +19,37 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 )
 
 // affineValue 保存常数项及各输入分量的系数
 type affineValue []float64
 
+// affineStackItem 保存符号执行栈上的仿射表达式及整型标记
+type affineStackItem struct {
+	value   affineValue
+	integer bool
+}
+
 // affineCalculator 符号执行计算器函数，保留多输入仿射关系
 // 入参: data 函数内容, inputs 输入分量数, outputs 输出分量数
 // 返回: []affineValue 输出表达式, error 格式或非仿射运算错误
 func affineCalculator(data []byte, inputs, outputs int) ([]affineValue, error) {
+	if inputs > calculatorStackSize {
+		return nil, fmt.Errorf("calculator stack overflow")
+	}
 	p := objectParser{data: data}
 	p.skipSpace()
 	if p.pos == len(data) || data[p.pos] != '{' {
 		return nil, fmt.Errorf("invalid calculator procedure")
 	}
 	p.pos++
-	stack := make([]affineValue, inputs)
+	stack := make([]affineStackItem, inputs)
 	for i := range stack {
-		stack[i] = make(affineValue, inputs+1)
-		stack[i][i+1] = 1
+		stack[i].value = make(affineValue, inputs+1)
+		stack[i].value[i+1] = 1
 	}
 	for {
-		if len(stack) > calculatorStackSize {
-			return nil, fmt.Errorf("calculator stack overflow")
-		}
 		p.skipSpace()
 		if p.pos == len(data) {
 			return nil, fmt.Errorf("unterminated calculator procedure")
@@ -52,11 +59,17 @@ func affineCalculator(data []byte, inputs, outputs int) ([]affineValue, error) {
 			break
 		}
 		token := p.token()
-		if value, err := strconv.ParseFloat(token, 64); err == nil && !math.IsNaN(value) && !math.IsInf(value, 0) {
-			v := make(affineValue, inputs+1)
-			v[0] = value
-			stack = append(stack, v)
-			continue
+		if token != "" && strings.IndexFunc(token, func(c rune) bool { return c != '+' && c != '-' && c != '.' && (c < '0' || c > '9') }) < 0 {
+			if value, err := strconv.ParseFloat(token, 64); err == nil {
+				if len(stack) == calculatorStackSize {
+					return nil, fmt.Errorf("calculator stack overflow")
+				}
+				v := make(affineValue, inputs+1)
+				v[0] = value
+				integer := !strings.Contains(token, ".") && value >= math.MinInt32 && value <= math.MaxInt32
+				stack = append(stack, affineStackItem{value: v, integer: integer})
+				continue
+			}
 		}
 		n, required := len(stack), 2
 		switch token {
@@ -68,32 +81,43 @@ func affineCalculator(data []byte, inputs, outputs int) ([]affineValue, error) {
 		}
 		switch token {
 		case "dup":
+			if n == calculatorStackSize {
+				return nil, fmt.Errorf("calculator stack overflow")
+			}
 			stack = append(stack, stack[n-1])
 		case "pop":
 			stack = stack[:n-1]
 		case "exch":
 			stack[n-1], stack[n-2] = stack[n-2], stack[n-1]
 		case "cvr":
+			stack[n-1].integer = false
 		case "neg":
-			v := slices.Clone(stack[n-1])
+			v := slices.Clone(stack[n-1].value)
 			for i := range v {
 				v[i] = -v[i]
 			}
-			stack[n-1] = v
+			integer := stack[n-1].integer && v[0] >= math.MinInt32 && v[0] <= math.MaxInt32
+			stack[n-1] = affineStackItem{value: v, integer: integer}
 		case "index", "copy":
-			v := stack[n-1]
-			if !v.constant() || math.Trunc(v[0]) != v[0] || v[0] < 0 || v[0] > float64(n-1) || token == "index" && v[0] == float64(n-1) {
+			top := stack[n-1]
+			v := top.value
+			if !top.integer || v[0] < 0 || v[0] > float64(n-1) || token == "index" && v[0] == float64(n-1) {
 				return nil, fmt.Errorf("invalid calculator %s operand", token)
 			}
+			count := int(v[0])
 			stack = stack[:n-1]
 			if token == "index" {
-				stack = append(stack, stack[len(stack)-1-int(v[0])])
+				stack = append(stack, stack[len(stack)-1-count])
 			} else {
-				stack = append(stack, stack[len(stack)-int(v[0]):]...)
+				if count > calculatorStackSize-len(stack) {
+					return nil, fmt.Errorf("calculator stack overflow")
+				}
+				stack = append(stack, stack[len(stack)-count:]...)
 			}
 		case "roll":
-			count, shift := stack[n-2], stack[n-1]
-			if !count.constant() || !shift.constant() || math.Trunc(count[0]) != count[0] || math.Trunc(shift[0]) != shift[0] || count[0] < 0 || count[0] > float64(n-2) {
+			countItem, shiftItem := stack[n-2], stack[n-1]
+			count, shift := countItem.value, shiftItem.value
+			if !countItem.integer || !shiftItem.integer || count[0] < 0 || count[0] > float64(n-2) {
 				return nil, fmt.Errorf("invalid calculator roll operands")
 			}
 			stack = stack[:n-2]
@@ -106,7 +130,8 @@ func affineCalculator(data []byte, inputs, outputs int) ([]affineValue, error) {
 				}
 			}
 		case "add", "sub", "mul", "div":
-			a, b := stack[n-2], stack[n-1]
+			aItem, bItem := stack[n-2], stack[n-1]
+			a, b := aItem.value, bItem.value
 			if token == "mul" && !a.constant() && !b.constant() || token == "div" && !b.constant() {
 				return nil, &UnsupportedError{Feature: "nonlinear calculator function"}
 			}
@@ -133,7 +158,8 @@ func affineCalculator(data []byte, inputs, outputs int) ([]affineValue, error) {
 					return nil, fmt.Errorf("nonfinite calculator result")
 				}
 			}
-			stack[n-2] = v
+			integer := token != "div" && aItem.integer && bItem.integer && v[0] >= math.MinInt32 && v[0] <= math.MaxInt32
+			stack[n-2] = affineStackItem{value: v, integer: integer}
 			stack = stack[:n-1]
 		default:
 			return nil, &UnsupportedError{Feature: "calculator operator " + token}
@@ -143,7 +169,11 @@ func affineCalculator(data []byte, inputs, outputs int) ([]affineValue, error) {
 	if p.pos != len(data) || len(stack) != outputs {
 		return nil, fmt.Errorf("invalid calculator result")
 	}
-	return stack, nil
+	result := make([]affineValue, len(stack))
+	for i, item := range stack {
+		result[i] = item.value
+	}
+	return result, nil
 }
 
 // constant 判断表达式是否与输入无关

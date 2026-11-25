@@ -29,37 +29,18 @@ type gradientVector struct {
 }
 
 // projectedTintStops 提取单个输出分量的精确断点，不缩减函数输出数量，超限时返回nil退回按需求值
-// 入参: f 着色函数, channel 输出分量
+// 入参: ctx 取消上下文, f 着色函数, channel 输出分量
 // 返回: []GradientStop 定义域中的线性分段
-func projectedTintStops(f *tintFunction, channel int) []GradientStop {
-	positions := []float64{f.domain[0], f.domain[1]}
-	if f.sampled && f.encoded[0] != f.encoded[1] {
-		start, end := 0, f.size-1
-		if lo := min(f.encoded[0], f.encoded[1]); lo > 0 {
-			if lo >= float64(f.size) {
-				start = f.size
-			} else {
-				start = int(math.Floor(lo))
-			}
+func projectedTintStops(ctx context.Context, f *tintFunction, channel int) []GradientStop {
+	var positions []float64
+	if f.sampled {
+		positions = sampledGradientPositions(ctx, f)
+		if len(positions) == 0 {
+			return nil
 		}
-		if hi := max(f.encoded[0], f.encoded[1]); hi < float64(end) {
-			if hi < 0 {
-				end = -1
-			} else {
-				end = int(math.Ceil(hi))
-			}
-		}
-		for i := start; i <= end; i++ {
-			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
-			if x > f.domain[0] && x < f.domain[1] {
-				positions = append(positions, x)
-				if len(positions) > maxGradientLinearStops {
-					return nil
-				}
-			}
-		}
+	} else {
+		positions = []float64{f.domain[0], f.domain[1]}
 	}
-	slices.Sort(positions)
 	raw := *f
 	raw.values = slices.Clone(f.values)
 	raw.outputRange = nil
@@ -69,10 +50,14 @@ func projectedTintStops(f *tintFunction, channel int) []GradientStop {
 		}
 	}
 	values := make([]float64, f.channels)
-	var stops []GradientStop
-	for _, x := range slices.Compact(positions) {
+	stops := make([]GradientStop, len(positions))
+	for i, x := range positions {
+		pos := functionPosition(x, f.domain[0], f.domain[1])
+		if i > 0 && pos <= stops[i-1].Position {
+			return nil
+		}
 		raw.colorInto(x, values)
-		stops = append(stops, GradientStop{Position: functionPosition(x, f.domain[0], f.domain[1]), Values: [4]float64{values[channel]}})
+		stops[i] = GradientStop{Position: pos, Values: [4]float64{values[channel]}}
 	}
 	limits := f.outputRange
 	if f.sampled {
@@ -211,7 +196,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 		evaluate = func(x float64, out []float64) error { tint.colorInto(x, out); return nil }
 		if tint.sampled && (tint.order != 3 || tint.size < 4) || !tint.sampled && (tint.exponent == 0 || tint.exponent == 1) {
 			for c := range f.parts {
-				stops := projectedTintStops(tint, c)
+				stops := projectedTintStops(ctx, tint, c)
 				if len(stops) > 0 {
 					f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
 				}
@@ -231,6 +216,10 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 		}
 		evaluate = func(x float64, out []float64) error { return program.evaluate([]float64{x}, out) }
 		if expressions, err := affineCalculator(data, 1, channels); err == nil {
+			output := make([]float64, channels)
+			if err := program.evaluate(domain[:1], output); err != nil {
+				return nil, err
+			}
 			for c, expression := range expressions {
 				stops := []GradientStop{{Position: 0, Values: [4]float64{expression[0] + expression[1]*domain[0]}}, {Position: 1, Values: [4]float64{expression[0] + expression[1]*domain[1]}}}
 				for _, stop := range stops {

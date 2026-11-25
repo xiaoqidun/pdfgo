@@ -15,12 +15,15 @@
 package pdfgo
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"os"
+	"slices"
 )
 
 // errMissingHalftoneThreshold 标识缺失阈值流，不混淆引用、网屏类型或解码错误
@@ -57,10 +60,13 @@ func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	ref, indirect := object.(Reference)
-	if indirect && !r.closed {
+	if indirect {
 		if cached, ok := r.halftones[ref]; ok {
-			return cached, nil
+			return cloneHalftone(cached), nil
 		}
 	}
 	h, err := r.readHalftone(ctx, object, false, nil, nil)
@@ -69,6 +75,7 @@ func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, er
 			r.halftones = make(map[Reference]*Halftone)
 		}
 		r.halftones[ref] = h
+		return cloneHalftone(h), nil
 	}
 	return h, err
 }
@@ -86,13 +93,16 @@ func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	if len(named) == 0 {
 		return r.ReadHalftone(ctx, object)
 	}
 	ref, indirect := object.(Reference)
-	if indirect && !r.closed {
+	if indirect {
 		if cached, ok := r.halftones[ref]; ok && !cached.namedOverride(named) {
-			return cached, nil
+			return cloneHalftone(cached), nil
 		}
 	}
 	used := false
@@ -102,8 +112,29 @@ func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named
 			r.halftones = make(map[Reference]*Halftone)
 		}
 		r.halftones[ref] = h
+		return cloneHalftone(h), nil
 	}
 	return h, err
+}
+
+// cloneHalftone 深拷贝网屏的可变字段，隔离内部缓存与外部修改
+// 入参: h 源网屏定义
+// 返回: *Halftone 独立副本
+func cloneHalftone(h *Halftone) *Halftone {
+	if h == nil {
+		return nil
+	}
+	cloned := *h
+	cloned.Name = bytes.Clone(h.Name)
+	cloned.Dictionary = maps.Clone(h.Dictionary)
+	cloned.Thresholds = slices.Clone(h.Thresholds)
+	if h.Components != nil {
+		cloned.Components = make(map[Name]*Halftone, len(h.Components))
+		for key, part := range h.Components {
+			cloned.Components[key] = cloneHalftone(part)
+		}
+	}
+	return &cloned
 }
 
 // namedOverride 检查缓存定义及其单层分量是否被设备名称覆盖

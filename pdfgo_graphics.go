@@ -305,6 +305,7 @@ type pageInterpreter struct {
 	uncoloredPattern       bool
 	type3                  bool
 	uncoloredType3         bool
+	type3Metrics           bool
 	glyphStreams           []*Stream
 	formStreams            []*Stream
 	patternStreams         []*Stream
@@ -377,7 +378,7 @@ func (p *pageInterpreter) resetTransient() {
 	p.compatibility = 0
 	p.opaqueGroup = false
 	p.uncoloredPattern = false
-	p.type3, p.uncoloredType3 = false, false
+	p.type3, p.uncoloredType3, p.type3Metrics = false, false, false
 	p.patternState = nil
 	p.tilingPatterns = nil
 	p.forms, p.content = nil, nil
@@ -1140,6 +1141,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 		if !p.type3 {
 			return &UnsupportedError{Feature: "Type3 glyph metrics outside character procedure"}
 		}
+		if p.type3Metrics {
+			return nil
+		}
+		p.type3Metrics = true
 		p.uncoloredType3 = op.Operator == "d1"
 		if op.Operator == "d1" {
 			bounds := transformedBounds(Rectangle{v[2], v[3], v[4], v[5]}, p.state.matrix)
@@ -2225,23 +2230,25 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 		}
 	}
 	child := *p
+	child.resetTransient()
+	child.sequence = p.sequence
+	child.replacement = p.replacement
+	child.opaqueGroup = p.opaqueGroup
+	child.uncoloredPattern = p.uncoloredPattern
+	child.uncoloredType3 = p.uncoloredType3
 	child.formStreams = append(append([]*Stream(nil), p.formStreams...), source)
 	child.stream = source
-	child.content = nil
 	if target == nil {
 		resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
 		if err != nil {
 			return err
 		}
-		if resources != nil {
-			dict, ok := resources.(Dictionary)
-			if !ok {
-				if err := p.operationWarning(Operation{Operator: "Do"}, "invalid form resources; enclosing resources retained"); err != nil {
-					return err
-				}
-			} else {
-				child.resources = dict
-			}
+		if resources == nil {
+			child.resources = p.pageResources
+		} else if dict, ok := resources.(Dictionary); ok {
+			child.resources = dict
+		} else if err := p.operationWarning(Operation{Operator: "Do"}, "invalid form resources; enclosing resources retained"); err != nil {
+			return err
 		}
 	}
 	var groupMark *GroupMark
@@ -2327,17 +2334,6 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 		}
 	}
 	child.depth++
-	child.stack = nil
-	child.compatibility = 0
-	child.marked = nil
-	child.hidden = false
-	child.path = Path{}
-	child.pathPoints = nil
-	child.hasPoint = false
-	child.pendingClip = false
-	child.inText = false
-	child.implicitText = false
-	child.textObject = nil
 	value, err := p.reader.Resolve(stream.Dictionary["Matrix"])
 	if err != nil {
 		return err
@@ -2509,7 +2505,7 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 // 返回: error 参数或资源错误
 func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 	if p.uncoloredPattern || p.uncoloredType3 {
-		for _, key := range []Name{"TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT"} {
+		for _, key := range []Name{"RI", "TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT"} {
 			value, err := p.reader.Resolve(dict[key])
 			if err != nil {
 				return err

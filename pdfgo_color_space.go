@@ -592,6 +592,9 @@ func (r *Reader) readCalibratedSpace(array Array) (*ColorSpace, error) {
 		cone[i] *= calibrated.adapt[i] * d50[i] / d65[i]
 	}
 	matrix.offset = [3]float64{.9869929*cone[0] - .1470543*cone[1] + .1599627*cone[2], .4323053*cone[0] + .5183603*cone[1] + .0492912*cone[2], -.0085287*cone[0] + .0400428*cone[1] + .9684867*cone[2]}
+	if !finiteFloats(matrix.matrix[:]) || !finiteFloats(matrix.offset[:]) {
+		return nil, fmt.Errorf("invalid calibrated color space matrix")
+	}
 	profile := &iccColorSpace{absoluteScale: [3]float64{1, 1, 1}}
 	model := Name("DeviceRGB")
 	if gray {

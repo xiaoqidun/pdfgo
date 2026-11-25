@@ -493,48 +493,95 @@ func (s *standardSecurity) decryptBytes(data []byte, ref Reference, name Name) (
 	return out[:len(out)-padding], nil
 }
 
+// resolveObjectType 安全解析字典Type字段的直接或间接名称，避免自引用循环
+// 入参: r 阅读器, value Type字段值, ref 当前对象引用
+// 返回: Name 对象类型名称, error 引用读取错误
+func resolveObjectType(r *Reader, value Object, ref Reference) (Name, error) {
+	if name, ok := value.(Name); ok {
+		return name, nil
+	}
+	target, ok := value.(Reference)
+	if !ok {
+		return "", nil
+	}
+	seen := map[Reference]bool{ref: true}
+	for {
+		if seen[target] || r.loading[target] {
+			return "", nil
+		}
+		seen[target] = true
+		resolved, err := r.Object(target)
+		if err != nil {
+			return "", err
+		}
+		if name, ok := resolved.(Name); ok {
+			return name, nil
+		}
+		target, ok = resolved.(Reference)
+		if !ok {
+			return "", nil
+		}
+	}
+}
+
 // decryptObject 解密直接字符串与流，保留签名值和交叉引用流
-// 入参: value 对象, ref 所属间接引用
+// 入参: r 阅读器, value 对象, ref 所属间接引用, embedded 是否按内嵌文件流过滤器解密
 // 返回: Object 解密对象, error 解密错误
-func (s *standardSecurity) decryptObject(value Object, ref Reference) (Object, error) {
+func (s *standardSecurity) decryptObject(r *Reader, value Object, ref Reference, embedded bool) (Object, error) {
 	switch v := value.(type) {
 	case String:
 		data, err := s.decryptBytes(v, ref, s.stringFilter)
 		return String(data), err
 	case Array:
 		for i, item := range v {
-			decoded, err := s.decryptObject(item, ref)
+			decoded, err := s.decryptObject(r, item, ref, false)
 			if err != nil {
 				return nil, err
 			}
 			v[i] = decoded
 		}
 	case Dictionary:
+		skipContents := false
+		if v["Contents"] != nil {
+			if v["ByteRange"] != nil && v["Filter"] != nil {
+				skipContents = true
+			} else if v["Type"] != nil {
+				dictType, err := resolveObjectType(r, v["Type"], ref)
+				if err != nil {
+					return nil, fmt.Errorf("decrypt object %d %d /Type: %w", ref.Number, ref.Generation, err)
+				}
+				skipContents = dictType == Name("Sig") || dictType == Name("DocTimeStamp")
+			}
+		}
 		for name, item := range v {
-			if name == "Contents" && (v["Type"] == Name("Sig") || v["Type"] == Name("DocTimeStamp") || v["ByteRange"] != nil && v["Filter"] != nil) {
+			if name == "Contents" && skipContents {
 				continue
 			}
-			decoded, err := s.decryptObject(item, ref)
+			decoded, err := s.decryptObject(r, item, ref, false)
 			if err != nil {
 				return nil, fmt.Errorf("decrypt object %d %d /%s: %w", ref.Number, ref.Generation, name, err)
 			}
 			v[name] = decoded
 		}
 	case *Stream:
-		if v.Dictionary["Type"] == Name("XRef") {
+		streamType, err := resolveObjectType(r, v.Dictionary["Type"], ref)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt stream %d %d /Type: %w", ref.Number, ref.Generation, err)
+		}
+		if streamType == Name("XRef") {
 			return v, nil
 		}
-		if _, err := s.decryptObject(v.Dictionary, ref); err != nil {
+		if _, err := s.decryptObject(r, v.Dictionary, ref, false); err != nil {
 			return nil, err
 		}
 		name := s.streamFilter
-		if v.Dictionary["Type"] == Name("EmbeddedFile") {
+		if embedded || streamType == Name("EmbeddedFile") {
 			name = s.embeddedFilter
 		}
-		if v.Dictionary["Type"] == Name("Metadata") && !s.encryptMetadata {
+		if streamType == Name("Metadata") && !s.encryptMetadata {
 			name = "Identity"
 		}
-		filters, params, err := v.filterChain(v.reader)
+		filters, params, err := v.filterChain(r)
 		if err != nil {
 			return nil, err
 		}
@@ -559,13 +606,13 @@ func (s *standardSecurity) decryptObject(value Object, ref Reference) (Object, e
 		if v.Dictionary["F"] != nil {
 			name = "Identity"
 		}
-		if len(v.Data) == aes.BlockSize && v.reader != nil && v.reader.warning != nil {
+		if len(v.Data) == aes.BlockSize && r.warning != nil {
 			method, err := s.cryptMethod(name)
 			if err != nil {
 				return nil, fmt.Errorf("decrypt stream %d %d: %w", ref.Number, ref.Generation, err)
 			}
 			if method == "AESV2" || method == "AESV3" {
-				v.reader.warning(Diagnostic{Message: fmt.Sprintf("authenticated IV-only AES stream %d %d decoded as empty without changing source bytes", ref.Number, ref.Generation)})
+				r.warning(Diagnostic{Message: fmt.Sprintf("authenticated IV-only AES stream %d %d decoded as empty without changing source bytes", ref.Number, ref.Generation)})
 				v.Data = nil
 				v.decrypted = true
 				return v, nil

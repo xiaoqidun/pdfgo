@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"slices"
 	"strings"
 )
 
@@ -39,13 +40,13 @@ type inlineByteReader struct {
 }
 
 // inlineCCITTLength 按声明行数或块结束标记解码并确定内联数据边界
-// 入参: ctx 取消上下文, data 内容流余下数据, dict 图像字典, params 解码参数, maxBytes 最大解码字节上限
+// 入参: ctx 取消上下文, data 内容流余下数据, dict 图像字典, params 解码参数, resolve 颜色空间解析器, maxBytes 最大解码字节上限
 // 返回: int 编码字节数, error 图像、超限、取消或编码错误
-func inlineCCITTLength(ctx context.Context, data []byte, dict Dictionary, params Object, maxBytes int64) (int, error) {
+func inlineCCITTLength(ctx context.Context, data []byte, dict Dictionary, params Object, resolve func(Object) (Object, error), maxBytes int64) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	length, err := inlineSampleLength(dict, maxBytes)
+	length, err := inlineSampleLength(dict, resolve, maxBytes)
 	if err != nil {
 		return 0, err
 	}
@@ -76,14 +77,15 @@ func inlineCCITTLength(ctx context.Context, data []byte, dict Dictionary, params
 }
 
 // inlineSampleLength 计算未压缩图像逐行字节对齐后的数据长度
-// 入参: dict 内联图像字典, maxBytes 最大字节上限，非正数表示不限
+// 入参: dict 内联图像字典, resolve 颜色空间解析器, maxBytes 最大字节上限，非正数表示不限
 // 返回: int 字节数, error 无效尺寸、色空间、超限或整数溢出
-func inlineSampleLength(dict Dictionary, maxBytes int64) (int, error) {
+func inlineSampleLength(dict Dictionary, resolve func(Object) (Object, error), maxBytes int64) (int, error) {
 	w, wok := dict["Width"].(Integer)
 	h, hok := dict["Height"].(Integer)
 	b, bok := dict["BitsPerComponent"].(Integer)
 	components := 0
-	switch dict["ColorSpace"] {
+	space := dict["ColorSpace"]
+	switch space {
 	case Name("DeviceGray"):
 		components = 1
 	case Name("DeviceRGB"):
@@ -91,7 +93,7 @@ func inlineSampleLength(dict Dictionary, maxBytes int64) (int, error) {
 	case Name("DeviceCMYK"):
 		components = 4
 	}
-	if array, ok := dict["ColorSpace"].(Array); ok && len(array) > 0 {
+	if array, ok := space.(Array); ok && len(array) > 0 {
 		switch array[0] {
 		case Name("DeviceGray"):
 			if len(array) == 1 {
@@ -111,8 +113,16 @@ func inlineSampleLength(dict Dictionary, maxBytes int64) (int, error) {
 			components = 3
 		case Name("ICCBased"):
 			if len(array) == 2 {
-				if s, ok := array[1].(*Stream); ok {
-					if n, ok := s.Dictionary["N"].(Integer); ok && (n == 1 || n == 3 || n == 4) {
+				if s, ok := array[1].(*Stream); ok && s != nil {
+					nValue := s.Dictionary["N"]
+					if _, ok := nValue.(Reference); ok && resolve != nil {
+						var err error
+						nValue, err = resolve(nValue)
+						if err != nil {
+							return 0, err
+						}
+					}
+					if n, ok := nValue.(Integer); ok && (n == 1 || n == 3 || n == 4) {
 						components = int(n)
 					}
 				}
@@ -147,7 +157,7 @@ func inlineSampleLength(dict Dictionary, maxBytes int64) (int, error) {
 	}
 	total := row * uint64(h)
 	if maxBytes > 0 && total > uint64(maxBytes) {
-		return 0, fmt.Errorf("inline image decode limit exceeded")
+		return 0, fmt.Errorf("inline image %w", ErrStreamLimitExceeded)
 	}
 	return int(total), nil
 }
@@ -174,7 +184,7 @@ func inlineFilterLength(ctx context.Context, data []byte, filter Name, params Ob
 			return 0, canceled
 		}
 		if maxBytes > 0 && written > maxBytes {
-			return 0, fmt.Errorf("inline image decode limit exceeded")
+			return 0, fmt.Errorf("inline image %w", ErrStreamLimitExceeded)
 		}
 		if errors.Is(err, zlib.ErrChecksum) && warning != nil {
 			warning(Diagnostic{Message: "inline Flate checksum mismatch; complete compressed data retained"})
@@ -198,7 +208,7 @@ func inlineFilterLength(ctx context.Context, data []byte, filter Name, params Ob
 		}
 		_, n, err := decodeLZWBytesLimitContext(ctx, data, early, maxBytes)
 		if errors.Is(err, io.ErrShortBuffer) {
-			return 0, fmt.Errorf("inline image decode limit exceeded")
+			return 0, fmt.Errorf("inline image %w", ErrStreamLimitExceeded)
 		}
 		return n, err
 	case "ASCIIHexDecode":
@@ -209,7 +219,7 @@ func inlineFilterLength(ctx context.Context, data []byte, filter Name, params Ob
 					return 0, err
 				}
 				if int64(size) > maxBytes {
-					return 0, fmt.Errorf("inline image decode limit exceeded")
+					return 0, fmt.Errorf("inline image %w", ErrStreamLimitExceeded)
 				}
 			}
 			return n + 1, ctx.Err()
@@ -223,7 +233,7 @@ func inlineFilterLength(ctx context.Context, data []byte, filter Name, params Ob
 					return 0, err
 				}
 				if int64(size) > maxBytes {
-					return 0, fmt.Errorf("inline image decode limit exceeded")
+					return 0, fmt.Errorf("inline image %w", ErrStreamLimitExceeded)
 				}
 			}
 			return n + 2, ctx.Err()
@@ -250,7 +260,7 @@ func inlineFilterLength(ctx context.Context, data []byte, filter Name, params Ob
 				n++
 			}
 			if maxBytes > 0 && decoded > maxBytes {
-				return 0, fmt.Errorf("inline image decode limit exceeded")
+				return 0, fmt.Errorf("inline image %w", ErrStreamLimitExceeded)
 			}
 		}
 		return 0, io.ErrUnexpectedEOF
@@ -372,7 +382,7 @@ func (p *pageInterpreter) recoverLZWImage(image *Image) error {
 	maxBytes, _ := effectiveStreamLimits(p.reader, source)
 	data, _, decodeErr := decodeLZWBytesLimitContext(p.ctx, source.Data, early, maxBytes)
 	if errors.Is(decodeErr, io.ErrShortBuffer) {
-		return fmt.Errorf("LZW decode limit exceeded")
+		return fmt.Errorf("LZW %w", ErrStreamLimitExceeded)
 	}
 	if err := p.ctx.Err(); err != nil {
 		return err
@@ -391,7 +401,7 @@ func (p *pageInterpreter) recoverLZWImage(image *Image) error {
 			return err
 		}
 		if maxBytes > 0 && int64(len(data)) > maxBytes {
-			return fmt.Errorf("LZW decode limit exceeded")
+			return fmt.Errorf("LZW %w", ErrStreamLimitExceeded)
 		}
 		if !errors.Is(err, io.ErrUnexpectedEOF) || closeErr != nil {
 			return decodeErr
@@ -485,9 +495,7 @@ func (p *objectParser) inlineImage(ctx context.Context, resolve func(Object) (Ob
 	if p.pos == len(p.data) || !isSpace(p.data[p.pos]) {
 		return nil, p.fail("missing inline image data separator")
 	}
-	if p.data[p.pos] == '\r' && p.pos+1 < len(p.data) && p.data[p.pos+1] == '\n' {
-		p.pos++
-	}
+	sep := p.pos
 	p.pos++
 	colorSpaceAliases := map[Name]Name{"G": "DeviceGray", "RGB": "DeviceRGB", "CMYK": "DeviceCMYK", "I": "Indexed"}
 	expandWith := func(value Object, table map[Name]Name) Object {
@@ -537,14 +545,32 @@ func (p *objectParser) inlineImage(ctx context.Context, resolve func(Object) (Ob
 		if err != nil {
 			return nil, err
 		}
-		dict["ColorSpace"] = value
-		if array, ok := value.(Array); ok && len(array) == 2 && array[0] == Name("ICCBased") {
-			profile, err := resolve(array[1])
-			if err != nil {
-				return nil, err
+		if array, ok := value.(Array); ok && len(array) > 0 {
+			cloned := false
+			if _, ok := array[0].(Reference); ok {
+				head, err := resolve(array[0])
+				if err != nil {
+					return nil, err
+				}
+				array = slices.Clone(array)
+				array[0] = head
+				cloned = true
 			}
-			dict["ColorSpace"] = Array{array[0], profile}
+			if (array[0] == Name("ICCBased") && len(array) == 2) || (array[0] == Name("DeviceN") && len(array) >= 2) {
+				if _, ok := array[1].(Reference); ok {
+					item, err := resolve(array[1])
+					if err != nil {
+						return nil, err
+					}
+					if !cloned {
+						array = slices.Clone(array)
+					}
+					array[1] = item
+				}
+			}
+			value = array
 		}
+		dict["ColorSpace"] = value
 	}
 	stream := &Stream{Dictionary: dict, maxStreamBytes: maxBytes, maxFilterChain: maxChain}
 	if maxBytes == 0 {
@@ -557,12 +583,15 @@ func (p *objectParser) inlineImage(ctx context.Context, resolve func(Object) (Ob
 	if err != nil {
 		return nil, err
 	}
+	if len(filters) != 0 && (filters[0] == Name("ASCIIHexDecode") || filters[0] == Name("ASCII85Decode")) && p.data[sep] == '\r' && p.pos < len(p.data) && p.data[p.pos] == '\n' {
+		p.pos++
+	}
 	data := p.data[p.pos:]
 	length := 0
 	if len(filters) == 0 {
-		length, err = inlineSampleLength(dict, maxBytes)
+		length, err = inlineSampleLength(dict, resolve, maxBytes)
 	} else if filters[0] == Name("CCITTFaxDecode") {
-		length, err = inlineCCITTLength(ctx, data, dict, params[0], maxBytes)
+		length, err = inlineCCITTLength(ctx, data, dict, params[0], resolve, maxBytes)
 	} else {
 		length, err = inlineFilterLength(ctx, data, filters[0].(Name), params[0], p.warning, maxBytes)
 	}

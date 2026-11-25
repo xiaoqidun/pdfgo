@@ -45,6 +45,9 @@ func (i *Image) ColorantSpace() (*ColorantSpace, error) {
 	if err != nil {
 		return nil, err
 	}
+	if i.reader == nil {
+		return nil, nil
+	}
 	return i.reader.readColorantSpace(object, i.effectiveColorSpace)
 }
 
@@ -266,24 +269,33 @@ func (i *Image) ProcessColorants() (*ProcessColorants, error) {
 // colorantSpace 读取图像的源色料空间，索引图像使用基础空间
 // 返回: Object 色料定义, error 颜色空间引用错误
 func (i *Image) colorantSpace() (Object, error) {
-	if i == nil || i.reader == nil {
+	if i == nil {
 		return nil, fmt.Errorf("invalid image reader")
 	}
-	if i.reader.closed {
+	if i.reader != nil && i.reader.closed {
 		return nil, os.ErrClosed
 	}
 	if i.ImageMask {
 		return nil, nil
 	}
+	if i.reader == nil {
+		space := normalizeDeviceColorSpace(i.ColorSpace)
+		if space == Name("DeviceGray") || space == Name("DeviceRGB") || space == Name("DeviceCMYK") {
+			return space, nil
+		}
+		return nil, fmt.Errorf("invalid image reader")
+	}
 	object, err := i.reader.resolveColorSpace(i.ColorSpace)
 	if err != nil {
 		return nil, err
 	}
+	object = normalizeDeviceColorSpace(object)
 	if a, ok := object.(Array); ok && len(a) == 4 && a[0] == Name("Indexed") {
 		object, err = i.reader.resolveColorSpace(a[1])
 		if err != nil {
 			return nil, err
 		}
+		object = normalizeDeviceColorSpace(object)
 	}
 	return object, nil
 }

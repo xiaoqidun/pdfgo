@@ -402,7 +402,7 @@ func (r *Reader) optimizedFontNamesCOW(value Object, tags map[Reference]string, 
 		}
 		if v["BaseFont"] != nil || v["FontName"] != nil {
 			font := v
-			if v["Subtype"] == Name("Type0") {
+			if subtype, err := r.Resolve(v["Subtype"]); err == nil && subtype == Name("Type0") {
 				resolved, err := r.Resolve(v["DescendantFonts"])
 				if a, ok := resolved.(Array); err == nil && ok && len(a) == 1 {
 					resolved, err = r.Resolve(a[0])
@@ -425,7 +425,14 @@ func (r *Reader) optimizedFontNamesCOW(value Object, tags map[Reference]string, 
 			}
 			if tag := tags[ref]; tag != "" {
 				for _, key := range []Name{"BaseFont", "FontName"} {
-					if name, ok := v[key].(Name); ok {
+					if v[key] == nil {
+						continue
+					}
+					resolvedName, err := r.Resolve(v[key])
+					if err != nil {
+						continue
+					}
+					if name, ok := resolvedName.(Name); ok {
 						text := string(name)
 						if len(text) > 7 && text[6] == '+' && strings.Trim(text[:6], "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" {
 							text = text[7:]
@@ -578,8 +585,10 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 		case *Stream:
 			scanType0(v.Dictionary, depth+1)
 		case Dictionary:
-			if v["NeedAppearances"] == Boolean(true) {
-				needAppearances = true
+			if v["NeedAppearances"] != nil {
+				if na, err := resolve(v["NeedAppearances"], false); err != nil || na == Boolean(true) {
+					needAppearances = true
+				}
 			}
 			if v["DR"] != nil {
 				if drVal, err := resolve(v["DR"], false); err == nil {
@@ -807,8 +816,151 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 	visitedForms := make(map[Reference]bool)
 	visitedOwnForms := make(map[formVisitKey]bool)
 	visitedCharProcs := make(map[charProcVisitKey]bool)
+	visitedContextType3 := make(map[Reference]bool)
+	visitedContextProcs := make(map[Reference]bool)
+	activeProcs := make(map[Reference]bool)
 	budget := 100000
 	var scan func([]byte, Dictionary, int, fontState) error
+	var scanResourcesType3 func(Dictionary, int) error
+	var scanType3Dict func(Dictionary, Reference, Dictionary, int) error
+	scanType3Dict = func(dict Dictionary, fontRef Reference, fallbackRes Dictionary, depth int) error {
+		if depth > 32 {
+			return fmt.Errorf("type3 recursion limit exceeded")
+		}
+		procsVal, err := resolveMeta(dict["CharProcs"])
+		if err != nil {
+			return err
+		}
+		procs, ok := procsVal.(Dictionary)
+		if !ok {
+			return nil
+		}
+		resDict := fallbackRes
+		var resRef Reference
+		resInline := false
+		hasOwnRes := false
+		if dict["Resources"] != nil {
+			resVal, ref, err := r.resolveOptimizationObject(dict["Resources"], metadata, cached)
+			if err != nil {
+				return err
+			}
+			if resVal != nil {
+				ownRes, ok := resVal.(Dictionary)
+				if !ok {
+					return fmt.Errorf("invalid type3 resources")
+				}
+				resDict = ownRes
+				resRef = ref
+				resInline = ref.Number == 0
+				hasOwnRes = true
+			}
+		}
+		if !hasOwnRes {
+			if fallbackRes == nil && fontRef.Number != 0 && visitedContextType3[fontRef] {
+				return nil
+			}
+			if fallbackRes != nil && fontRef.Number != 0 {
+				visitedContextType3[fontRef] = true
+			}
+		}
+		seenLocal := make(map[Reference]bool)
+		for _, procObj := range procs {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			objVal, procRef, err := r.resolveOptimizationObject(procObj, nil, cached)
+			if err != nil {
+				return err
+			}
+			if procRef.Number != 0 {
+				if hasOwnRes {
+					if resInline {
+						if seenLocal[procRef] {
+							continue
+						}
+						seenLocal[procRef] = true
+					} else {
+						key := charProcVisitKey{proc: procRef, res: resRef}
+						if visitedCharProcs[key] {
+							continue
+						}
+						visitedCharProcs[key] = true
+					}
+				} else {
+					if fallbackRes == nil && fontRef.Number == 0 && visitedContextProcs[procRef] {
+						continue
+					}
+					if activeProcs[procRef] {
+						continue
+					}
+				}
+			}
+			stream, ok := objVal.(*Stream)
+			if !ok {
+				continue
+			}
+			content, err := r.optimizationContentData(ctx, stream, optimizationBufferLimit)
+			if err != nil {
+				return err
+			}
+			if !hasOwnRes && procRef.Number != 0 {
+				activeProcs[procRef] = true
+				if fallbackRes != nil {
+					visitedContextProcs[procRef] = true
+				}
+			}
+			scanErr := scan(content, resDict, depth+1, fontState{unknown: true})
+			if !hasOwnRes && procRef.Number != 0 {
+				delete(activeProcs, procRef)
+			}
+			if scanErr != nil {
+				return scanErr
+			}
+		}
+		if hasOwnRes {
+			return scanResourcesType3(resDict, depth+1)
+		}
+		return nil
+	}
+	scanResourcesType3 = func(res Dictionary, depth int) error {
+		if res == nil || res["Font"] == nil {
+			return nil
+		}
+		if depth > 32 {
+			return fmt.Errorf("type3 recursion limit exceeded")
+		}
+		fontsVal, err := resolveMeta(res["Font"])
+		if err != nil {
+			return err
+		}
+		fontsDict, ok := fontsVal.(Dictionary)
+		if !ok {
+			return nil
+		}
+		for _, fontObj := range fontsDict {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			objVal, fontRef, err := r.resolveOptimizationObject(fontObj, metadata, cached)
+			if err != nil {
+				return err
+			}
+			fontDict, ok := objVal.(Dictionary)
+			if !ok {
+				continue
+			}
+			subtype, err := resolveMeta(fontDict["Subtype"])
+			if err != nil {
+				return err
+			}
+			if subtype == Name("Type3") && fontDict["CharProcs"] != nil {
+				if err := scanType3Dict(fontDict, fontRef, res, depth); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	scan = func(data []byte, resources Dictionary, depth int, initial fontState) error {
 		if depth > 32 {
 			return fmt.Errorf("form recursion limit exceeded")
@@ -967,7 +1119,10 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 				if budget < 0 {
 					return fmt.Errorf("form operation limit exceeded")
 				}
-				if len(op.Operands) != 1 || resources == nil {
+				if resources == nil {
+					return fmt.Errorf("missing resources for form operation")
+				}
+				if len(op.Operands) != 1 {
 					return nil
 				}
 				name, ok := op.Operands[0].(Name)
@@ -999,24 +1154,27 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 					return err
 				}
 				childRes := resources
-				hasOwnRes := stream.Dictionary["Resources"] != nil
-				if hasOwnRes {
-					visitKey := formVisitKey{form: formRef, state: state}
-					if formRef.Number != 0 && visitedOwnForms[visitKey] {
-						return nil
-					}
+				hasOwnRes := false
+				if stream.Dictionary["Resources"] != nil {
 					resVal, err := resolveMeta(stream.Dictionary["Resources"])
 					if err != nil {
 						return err
 					}
-					if resDict, ok := resVal.(Dictionary); ok {
+					if resVal != nil {
+						resDict, ok := resVal.(Dictionary)
+						if !ok {
+							return fmt.Errorf("invalid form resources")
+						}
 						childRes = resDict
-					} else {
-						return fmt.Errorf("invalid form resources")
+						hasOwnRes = true
 					}
-					if formRef.Number != 0 {
-						visitedOwnForms[visitKey] = true
+				}
+				if hasOwnRes && formRef.Number != 0 {
+					visitKey := formVisitKey{form: formRef, state: state}
+					if visitedOwnForms[visitKey] {
+						return nil
 					}
+					visitedOwnForms[visitKey] = true
 				}
 				if formRef.Number != 0 {
 					visitedForms[formRef] = true
@@ -1025,13 +1183,58 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 				if err != nil {
 					return err
 				}
-				return scan(content, childRes, depth+1, state)
+				if err := scan(content, childRes, depth+1, state); err != nil {
+					return err
+				}
+				if hasOwnRes {
+					return scanResourcesType3(childRes, depth+1)
+				}
+				return nil
 			}
 			return nil
 		})
 	}
-	var scanType3 func(Object, int) error
-	scanType3 = func(value Object, depth int) error {
+	scanAPStream := func(pageRes Dictionary, stream *Stream, apRef Reference) error {
+		if apRef.Number != 0 {
+			visitedForms[apRef] = true
+		}
+		apRes := pageRes
+		hasOwnRes := false
+		if stream.Dictionary["Resources"] != nil {
+			resVal, err := resolveMeta(stream.Dictionary["Resources"])
+			if err != nil {
+				return err
+			}
+			if resVal != nil {
+				resDict, ok := resVal.(Dictionary)
+				if !ok {
+					return fmt.Errorf("invalid appearance resources")
+				}
+				apRes = resDict
+				hasOwnRes = true
+			}
+		}
+		if hasOwnRes && apRef.Number != 0 {
+			visitKey := formVisitKey{form: apRef, state: fontState{unknown: true}}
+			if visitedOwnForms[visitKey] {
+				return nil
+			}
+			visitedOwnForms[visitKey] = true
+		}
+		content, err := r.optimizationContentData(ctx, stream, optimizationBufferLimit)
+		if err != nil {
+			return err
+		}
+		if err := scan(content, apRes, 0, fontState{unknown: true}); err != nil {
+			return err
+		}
+		if hasOwnRes {
+			return scanResourcesType3(apRes, 0)
+		}
+		return nil
+	}
+	var scanType3 func(Object, Reference, int) error
+	scanType3 = func(value Object, objRef Reference, depth int) error {
 		if depth > 256 {
 			return fmt.Errorf("font metadata recursion limit exceeded")
 		}
@@ -1041,71 +1244,24 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		switch v := value.(type) {
 		case Array:
 			for _, item := range v {
-				if err := scanType3(item, depth+1); err != nil {
+				if err := scanType3(item, Reference{}, depth+1); err != nil {
 					return err
 				}
 			}
 		case *Stream:
-			return scanType3(v.Dictionary, depth+1)
+			return scanType3(v.Dictionary, Reference{}, depth+1)
 		case Dictionary:
 			subtype, err := resolveMeta(v["Subtype"])
 			if err != nil {
 				return err
 			}
 			if subtype == Name("Type3") && v["CharProcs"] != nil {
-				procsVal, err := resolveMeta(v["CharProcs"])
-				if err != nil {
+				if err := scanType3Dict(v, objRef, nil, 0); err != nil {
 					return err
-				}
-				if procs, ok := procsVal.(Dictionary); ok {
-					var resDict Dictionary
-					var resRef Reference
-					resInline := false
-					if v["Resources"] != nil {
-						resVal, ref, err := r.resolveOptimizationObject(v["Resources"], metadata, cached)
-						if err != nil {
-							return err
-						}
-						resDict, _ = resVal.(Dictionary)
-						resRef = ref
-						resInline = ref.Number == 0
-					}
-					seenLocal := make(map[Reference]bool)
-					for _, procObj := range procs {
-						objVal, procRef, err := r.resolveOptimizationObject(procObj, nil, cached)
-						if err != nil {
-							return err
-						}
-						if procRef.Number != 0 {
-							if resInline {
-								if seenLocal[procRef] {
-									continue
-								}
-								seenLocal[procRef] = true
-							} else {
-								key := charProcVisitKey{proc: procRef, res: resRef}
-								if visitedCharProcs[key] {
-									continue
-								}
-								visitedCharProcs[key] = true
-							}
-						}
-						stream, ok := objVal.(*Stream)
-						if !ok {
-							continue
-						}
-						content, err := r.optimizationContentData(ctx, stream, optimizationBufferLimit)
-						if err != nil {
-							return err
-						}
-						if err := scan(content, resDict, 0, fontState{unknown: true}); err != nil {
-							return err
-						}
-					}
 				}
 			}
 			for _, item := range v {
-				if err := scanType3(item, depth+1); err != nil {
+				if err := scanType3(item, Reference{}, depth+1); err != nil {
 					return err
 				}
 			}
@@ -1119,7 +1275,66 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 			if _, err := page.WriteContent(ctx, &optimizationBuffer{buffer: &content, limit: optimizationBufferLimit}); err != nil {
 				return err
 			}
-			return scan(content.Bytes(), page.Resources, 0, fontState{unknown: true})
+			if err := scan(content.Bytes(), page.Resources, 0, fontState{unknown: true}); err != nil {
+				return err
+			}
+			if err := scanResourcesType3(page.Resources, 0); err != nil {
+				return err
+			}
+			if page.Dictionary["Annots"] != nil {
+				annotsVal, err := resolveMeta(page.Dictionary["Annots"])
+				if err != nil {
+					return err
+				}
+				if annots, ok := annotsVal.(Array); ok {
+					for _, item := range annots {
+						annotVal, err := resolveMeta(item)
+						if err != nil {
+							return err
+						}
+						annotDict, ok := annotVal.(Dictionary)
+						if !ok || annotDict["AP"] == nil {
+							continue
+						}
+						apVal, err := resolveMeta(annotDict["AP"])
+						if err != nil {
+							return err
+						}
+						apDict, ok := apVal.(Dictionary)
+						if !ok {
+							continue
+						}
+						for _, apKey := range []Name{"N", "R", "D"} {
+							if apDict[apKey] == nil {
+								continue
+							}
+							entryVal, apRef, err := r.resolveOptimizationObject(apDict[apKey], nil, cached)
+							if err != nil {
+								return err
+							}
+							switch v := entryVal.(type) {
+							case *Stream:
+								if err := scanAPStream(page.Resources, v, apRef); err != nil {
+									return err
+								}
+							case Dictionary:
+								for _, stateEntry := range v {
+									stateObj, stateRef, err := r.resolveOptimizationObject(stateEntry, nil, cached)
+									if err != nil {
+										return err
+									}
+									if stateStream, ok := stateObj.(*Stream); ok {
+										if err := scanAPStream(page.Resources, stateStream, stateRef); err != nil {
+											return err
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			return nil
 		}); err != nil {
 			return err
 		}
@@ -1153,7 +1368,13 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 							if err != nil {
 								return err
 							}
-							resDict, _ = resVal.(Dictionary)
+							if resVal != nil {
+								var ok bool
+								resDict, ok = resVal.(Dictionary)
+								if !ok {
+									return fmt.Errorf("invalid form resources")
+								}
+							}
 						}
 						content, err := r.optimizationContentData(ctx, stream, optimizationBufferLimit)
 						if err != nil {
@@ -1162,10 +1383,13 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 						if err := scan(content, resDict, 0, fontState{unknown: true}); err != nil {
 							return err
 						}
+						if err := scanResourcesType3(resDict, 0); err != nil {
+							return err
+						}
 					}
 				}
 			}
-			if err := scanType3(value, 0); err != nil {
+			if err := scanType3(value, ref, 0); err != nil {
 				return err
 			}
 		}

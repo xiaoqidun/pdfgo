@@ -66,6 +66,9 @@ func compactGrayPixels(ctx context.Context, pixels []byte, width, height int) ([
 // 返回: *Stream 输出流, error 编码错误
 func (r *Reader) encodeLosslessPixels(ctx context.Context, source, cryptSource *Stream, img image.Image, channels int) (*Stream, error) {
 	b := img.Bounds()
+	if !pixelsWithinBudget(int64(b.Dx()), int64(b.Dy()), optimizationBufferLimit/int64(channels)) {
+		return nil, io.ErrShortBuffer
+	}
 	pixels := make([]byte, b.Dx()*b.Dy()*channels)
 	for y := 0; y < b.Dy(); y++ {
 		if err := ctx.Err(); err != nil {
@@ -149,7 +152,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 	}
 	w, _ := d["Width"].(Integer)
 	h, _ := d["Height"].(Integer)
-	if w <= 0 || h <= 0 || w > 1<<20 || h > 1<<20 || int64(w*h) > optimizationBufferLimit/int64(channels) {
+	if w > 1<<20 || h > 1<<20 || !pixelsWithinBudget(int64(w), int64(h), optimizationBufferLimit/int64(channels)) {
 		return stream, nil
 	}
 	filters, params, err := stream.filterChain(r)

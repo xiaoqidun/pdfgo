@@ -132,9 +132,9 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 			return nil, &UnsupportedError{Feature: "generated free text border style " + string(border.style)}
 		}
 	}
-	resources := maps.Clone(page.Resources)
-	if resources == nil {
-		resources = Dictionary{}
+	resources, err := r.freeTextResources(page.Resources)
+	if err != nil {
+		return nil, err
 	}
 	if err := r.writeAnnotationText(ctx, annotation, nil, 0, frame, border, resources, &content); err != nil {
 		return nil, err
@@ -142,6 +142,60 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 	local := annotation
 	local.Rect = Rectangle{0, 0, w, h}
 	return r.annotationAppearance(local, content.String(), resources)
+}
+
+// freeTextResources 合并表单默认资源与页面资源，深层子字典保留页面覆盖优先
+// 入参: pageResources 页面资源字典
+// 返回: Dictionary 合并后的资源字典, error 资源解析或类型错误
+func (r *Reader) freeTextResources(pageResources Dictionary) (Dictionary, error) {
+	var defaultResources Dictionary
+	defaults, err := r.formDefaults()
+	if err != nil {
+		return nil, err
+	}
+	if value, err := r.Resolve(defaults["DR"]); err != nil {
+		return nil, err
+	} else if value != nil {
+		var ok bool
+		defaultResources, ok = value.(Dictionary)
+		if !ok {
+			return nil, fmt.Errorf("invalid form default resources")
+		}
+	}
+	if len(defaultResources) == 0 {
+		resources := maps.Clone(pageResources)
+		if resources == nil {
+			return Dictionary{}, nil
+		}
+		return resources, nil
+	}
+	resources := maps.Clone(defaultResources)
+	for key, pageValue := range pageResources {
+		if resources[key] == nil {
+			resources[key] = pageValue
+			continue
+		}
+		defObj, err := r.Resolve(resources[key])
+		if err != nil {
+			return nil, err
+		}
+		pageObj, err := r.Resolve(pageValue)
+		if err != nil {
+			return nil, err
+		}
+		if defDict, ok := defObj.(Dictionary); ok {
+			if pageDict, ok := pageObj.(Dictionary); ok {
+				merged := maps.Clone(defDict)
+				maps.Copy(merged, pageDict)
+				resources[key] = merged
+				continue
+			}
+		}
+		if pageObj != nil {
+			resources[key] = pageValue
+		}
+	}
+	return resources, nil
 }
 
 // writeFreeTextCallout 按页面坐标绘制折线，端部样式只作用于起点

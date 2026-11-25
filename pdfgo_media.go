@@ -283,12 +283,12 @@ func (r *Reader) ReadFileSpecification(object Object) (FileSpecification, error)
 	if !ok {
 		return result, fmt.Errorf("invalid embedded file dictionary")
 	}
-	stream, err := r.Resolve(files[key])
+	stream, err := r.resolveEmbeddedFile(files[key])
 	if err != nil {
 		return result, err
 	}
 	if stream == nil && key == "UF" {
-		stream, err = r.Resolve(files["F"])
+		stream, err = r.resolveEmbeddedFile(files["F"])
 		if err != nil {
 			return result, err
 		}

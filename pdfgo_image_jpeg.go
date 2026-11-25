@@ -386,8 +386,9 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	if i.reader != nil && i.reader.closed {
 		return nil, os.ErrClosed
 	}
-	invertedCMYK := i.ColorSpace == Name("DeviceCMYK") && i.isInvertedCMYKDecode()
-	if i.ImageMask || !invertedCMYK && (len(i.Decode) != 0 || i.ColorSpace != Name("DeviceGray") && i.ColorSpace != Name("DeviceRGB")) {
+	colorSpace := normalizeDeviceColorSpace(i.ColorSpace)
+	invertedCMYK := colorSpace == Name("DeviceCMYK") && i.isInvertedCMYKDecode()
+	if i.ImageMask || !invertedCMYK && (len(i.Decode) != 0 || colorSpace != Name("DeviceGray") && colorSpace != Name("DeviceRGB")) {
 		return nil, nil
 	}
 	masked, err := i.HasMask()
@@ -425,7 +426,7 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if frame.components == 1 && i.ColorSpace == Name("DeviceGray") || frame.components == 3 && i.ColorSpace == Name("DeviceRGB") && transform == (config.ColorModel == color.YCbCrModel) {
+	if frame.components == 1 && colorSpace == Name("DeviceGray") || frame.components == 3 && colorSpace == Name("DeviceRGB") && transform == (config.ColorModel == color.YCbCrModel) {
 		if frame.displayMetadata {
 			return jpegDisplayFileContext(ctx, data)
 		}
@@ -457,8 +458,8 @@ func (i *Image) isInvertedCMYKDecode() bool {
 	if len(i.Decode) != 8 {
 		return false
 	}
-	values, err := i.reader.numberArray(i.Decode, 8)
-	if err != nil {
+	values, ok, err := i.optionalNumberArray(i.Decode, 8)
+	if err != nil || !ok {
 		return false
 	}
 	return values[0] == 1 && values[1] == 0 && values[2] == 1 && values[3] == 0 && values[4] == 1 && values[5] == 0 && values[6] == 1 && values[7] == 0
@@ -480,7 +481,7 @@ func (i *Image) jpegTransformContext(ctx context.Context, data []byte, params Di
 		}
 		transform = adobe != 0
 	} else if (components == 3 || components == 4) && params["ColorTransform"] != nil {
-		value, err := i.reader.Resolve(params["ColorTransform"])
+		value, err := i.reader.resolveOptional(params["ColorTransform"])
 		if err != nil {
 			return jpegFrame{}, false, false, err
 		}

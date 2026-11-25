@@ -34,6 +34,7 @@ type annotationRichVertical struct {
 	multiline  bool
 	comb       int
 	align      int
+	maxBytes   int
 }
 
 // annotationRichColumn 保存混合字体列及其占用范围
@@ -76,13 +77,16 @@ func annotationRichVerticalBounds(glyph annotationRichGlyph, state graphicsState
 
 // write 生成混合字体竖排外观，文字裁剪与装饰分别绘制
 // 入参: ctx 取消上下文, content 外观内容
-// 返回: error 布局、度量或取消错误
+// 返回: error 布局、度量、超限或取消错误
 func (v annotationRichVertical) write(ctx context.Context, content *strings.Builder) error {
 	width, height := v.frame.XMax-v.frame.XMin, v.frame.YMax-v.frame.YMin
 	size := v.state.fontSize
 	if size == 0 {
 		low, high := 0.0, height
 		for range 32 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			candidate := (low + high) / 2
 			columns, total, err := v.columns(ctx, candidate)
 			if err != nil {
@@ -149,6 +153,9 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 		lastDecoration = make(map[*annotationRichDecoration]int)
 	}
 	for _, column := range columns {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		ink := column.bounds.XMax - column.bounds.XMin
 		x := right - column.advance + float64(column.style.align)*(column.advance-ink)/2 - column.bounds.XMin
 		y := v.frame.YMax - column.bounds.YMax
@@ -193,6 +200,9 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 			if err := writeAnnotationRichRun(ctx, content, column.glyphs[i:end], v.state, v.defaults, v.matrix, size, x+offset.X, baseline+offset.Y); err != nil {
 				return err
 			}
+			if content.Len() > v.maxBytes {
+				return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 			if decorated {
 				start := len(decorations)
 				for origin := glyph.style.decorations; origin != nil; origin = origin.parent {
@@ -218,6 +228,9 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 							continue
 						}
 					}
+					if len(decorations) >= maxAnnotationRichDecorationSpans {
+						return fmt.Errorf("%w: rich text decoration span limit exceeded", ErrStreamLimitExceeded)
+					}
 					decorations = append(decorations, annotationRichVerticalDecoration{origin, x, top, length, n})
 				}
 				slices.Reverse(decorations[start:])
@@ -238,6 +251,9 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 		}
 	}
 	content.WriteString("Q\n")
+	if content.Len() > v.maxBytes {
+		return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	return ctx.Err()
 }
 
@@ -247,6 +263,9 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 func (v annotationRichVertical) columns(ctx context.Context, size float64) ([]annotationRichColumn, float64, error) {
 	var columns []annotationRichColumn
 	for p, glyphs := range v.glyphs {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
 		start, pen, largest := 0, 0.0, 0.0
 		var bounds Rectangle
 		have := false
@@ -308,7 +327,7 @@ func (v annotationRichVertical) columns(ctx context.Context, size float64) ([]an
 
 // decorate 绘制竖排右侧下划线和居中删除线，装饰颜色及字号取自声明元素
 // 入参: ctx 取消上下文, content 外观内容, spans 装饰片段, defaults 默认填充状态
-// 返回: error 范围或取消错误
+// 返回: error 范围、超限或取消错误
 func (v annotationRichVertical) decorate(ctx context.Context, content *strings.Builder, spans []annotationRichVerticalDecoration, defaults string) error {
 	for _, span := range spans {
 		if err := ctx.Err(); err != nil {
@@ -339,6 +358,9 @@ func (v annotationRichVertical) decorate(ctx context.Context, content *strings.B
 			writeAnnotationOperation(content, "re f", x, span.y, thickness, span.height)
 		}
 		content.WriteString("Q\n")
+		if content.Len() > v.maxBytes {
+			return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+		}
 	}
 	return ctx.Err()
 }

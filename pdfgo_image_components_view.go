@@ -32,6 +32,7 @@ type imageComponentView struct {
 	inverted bool
 	embedded bool
 	maximum  float64
+	maxima   []float64
 }
 
 // DecodeComponentsView 读取原生分量的只读视图，设备色和模板图像保持按需访问
@@ -90,13 +91,17 @@ func (s *imageComponentView) valuesAt(x, y int) ([4]float64, float64) {
 	transparent := len(s.keys) != 0
 	for c := 0; c < s.channels; c++ {
 		if transparent {
-			sample := math.Round(values[c] * s.maximum)
+			maxSample := s.maximum
+			if c < len(s.maxima) {
+				maxSample = s.maxima[c]
+			}
+			sample := math.Round(values[c] * maxSample)
 			transparent = sample >= s.keys[2*c] && sample <= s.keys[2*c+1]
 		}
 		value := math.Max(0, math.Min(1, functionValue(values[c], s.ranges[2*c], s.ranges[2*c+1])))
 		if len(s.matte) != 0 {
 			if alpha == 0 {
-				value = s.matte[c]
+				value = math.Max(0, math.Min(1, s.matte[c]))
 			} else {
 				value = math.Max(0, math.Min(1, s.matte[c]+(value-s.matte[c])*65535/float64(alpha)))
 			}

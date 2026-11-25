@@ -249,7 +249,9 @@ func (s *iccProcessElements) evaluate(values []float64) ([4]float64, error) {
 				output[n] = v
 			}
 		case "clut":
-			e.lookup(input, output)
+			if err := e.lookup(input, output); err != nil {
+				return result, err
+			}
 		default:
 			copy(output, input[:e.input])
 		}
@@ -266,11 +268,16 @@ func (s *iccProcessElements) evaluate(values []float64) ([4]float64, error) {
 
 // lookup 按独立网格插值，仅将输入限制在单位区间
 // 入参: input 输入分量, output 输出缓冲
-func (e *iccProcessElement) lookup(input, output []float64) {
+// 返回: error 非法输入错误
+func (e *iccProcessElement) lookup(input, output []float64) error {
 	var index [16]int
 	var fraction [16]float64
 	for n, size := range e.grid {
-		x := math.Max(0, math.Min(1, input[n])) * float64(size-1)
+		v := input[n]
+		if math.IsNaN(v) {
+			return fmt.Errorf("undefined ICC process input")
+		}
+		x := math.Max(0, math.Min(1, v)) * float64(size-1)
 		index[n] = min(int(x), size-2)
 		fraction[n] = x - float64(index[n])
 	}
@@ -293,4 +300,5 @@ func (e *iccProcessElement) lookup(input, output []float64) {
 			output[n] += weight * e.values[offset*e.output+n]
 		}
 	}
+	return nil
 }

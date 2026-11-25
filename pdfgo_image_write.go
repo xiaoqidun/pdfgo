@@ -261,7 +261,10 @@ func writePNGUpRow(writer io.Writer, row, prev, out []byte) error {
 // 入参: ctx 取消上下文, width 宽度, height 高度, bits 位深, fillRow 填充单行样本回调
 // 返回: *Stream 灰度图像流, error 编码或取消错误
 func encodePDFPackedGray(ctx context.Context, width, height, bits int, fillRow func(rowIndex int, dst []byte)) (*Stream, error) {
-	rowBytes := (width*bits + 7) / 8
+	rowBytes, _, err := imageSampleSize(width, height, 1, bits)
+	if err != nil || rowBytes >= imageBufferLimit() {
+		return nil, fmt.Errorf("invalid replacement image dimensions")
+	}
 	var pixels bytes.Buffer
 	colorWriter := imageCompressor(&pixels)
 	defer releaseImageCompressor(colorWriter)
@@ -305,7 +308,10 @@ func encodePDFPaletted(ctx context.Context, img *image.Paletted, options ImageWr
 	width, height := bounds.Dx(), bounds.Dy()
 	count := len(img.Palette)
 	bits := palettedBitDepth(count)
-	rowBytes := (width*bits + 7) / 8
+	rowBytes, _, err := imageSampleSize(width, height, 1, bits)
+	if err != nil || width >= imageBufferLimit() {
+		return nil, nil, fmt.Errorf("invalid replacement image dimensions")
+	}
 	table := make([]byte, count*3)
 	alphas := make([]byte, count)
 	for i, entry := range img.Palette {
@@ -469,9 +475,8 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 	switch source := img.(type) {
 	case *packedGrayImage:
 		if source.depth == 1 || source.depth == 2 || source.depth == 4 || source.depth == 8 {
-			rowBytes := (width*source.depth + 7) / 8
 			stream, err := encodePDFPackedGray(ctx, width, height, source.depth, func(y int, dst []byte) {
-				copy(dst, source.data[y*source.stride:y*source.stride+rowBytes])
+				copy(dst, source.data[y*source.stride:y*source.stride+len(dst)])
 			})
 			return stream, nil, err
 		}
@@ -504,7 +509,7 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 	if upgradeRGBA16 {
 		maxBytesPerPixel = channels * 2
 	}
-	if width > math.MaxInt/maxBytesPerPixel {
+	if width > (imageBufferLimit()-1)/maxBytesPerPixel {
 		return nil, nil, fmt.Errorf("invalid replacement image dimensions")
 	}
 	allowPreblend := options.PreblendBinary && channels == 3 && !alwaysOpaque

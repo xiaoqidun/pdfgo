@@ -356,6 +356,9 @@ func imageMaskOpaque(ctx context.Context, source image.Image, inverted bool) (bo
 				return false, err
 			}
 		}
+		if err := prepareImageRows(ctx, source, y, y+1); err != nil {
+			return false, err
+		}
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			if imageRGBA64At(source, x, y).R != want {
 				return false, nil
@@ -640,6 +643,51 @@ func (i *Image) validateJBIG2FileHeader(data []byte, hasGlobals bool) (bool, err
 	return true, nil
 }
 
+// normalizeDeviceColorSpace 将单元素设备颜色空间数组规约为对应名称
+// 入参: space 颜色空间对象
+// 返回: Object 规约后的颜色空间
+func normalizeDeviceColorSpace(space Object) Object {
+	if array, ok := space.(Array); ok && len(array) == 1 {
+		if name, ok := array[0].(Name); ok && (name == "DeviceGray" || name == "DeviceRGB" || name == "DeviceCMYK") {
+			return name
+		}
+	}
+	return space
+}
+
+// optionalNumberArray 解析可选定长有限数值数组，兼容未绑定阅读器的直构图像
+// 入参: object 数组或引用, count 期望长度
+// 返回: []float64 数值数组, bool 是否存在非空定义, error 解析、长度或非有限值错误
+func (i *Image) optionalNumberArray(object Object, count int) ([]float64, bool, error) {
+	value, err := i.reader.resolveOptional(object)
+	if err != nil || value == nil {
+		return nil, false, err
+	}
+	array, ok := value.(Array)
+	if !ok || len(array) != count {
+		return nil, false, fmt.Errorf("expected %d numbers", count)
+	}
+	values := make([]float64, count)
+	for n, item := range array {
+		resolved, err := i.reader.resolveOptional(item)
+		if err != nil {
+			return nil, false, err
+		}
+		switch num := resolved.(type) {
+		case Integer:
+			values[n] = float64(num)
+		case Real:
+			values[n] = float64(num)
+		default:
+			return nil, false, fmt.Errorf("expected number")
+		}
+		if math.IsNaN(values[n]) || math.IsInf(values[n], 0) {
+			return nil, false, fmt.Errorf("invalid numeric value")
+		}
+	}
+	return values, true, nil
+}
+
 // JBIG2FileContext 无损封装单页JBIG2，前置过滤器与全局段解码期间检查取消
 // 入参: ctx 取消上下文
 // 返回: []byte 完整JBIG2文件或空值, error 参数、编码或取消错误
@@ -653,7 +701,7 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 	if i.reader != nil && i.reader.closed {
 		return nil, os.ErrClosed
 	}
-	if i.ImageMask || i.BitsPerComponent != 1 || i.ColorSpace != Name("DeviceGray") || len(i.Decode) != 0 || i.Stream.Dictionary["Matte"] != nil {
+	if i.ImageMask || i.BitsPerComponent != 1 || normalizeDeviceColorSpace(i.ColorSpace) != Name("DeviceGray") || len(i.Decode) != 0 || i.Stream.Dictionary["Matte"] != nil {
 		return nil, nil
 	}
 	masked, err := i.HasMask()
@@ -809,30 +857,6 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		}
 		mask = bool(b)
 	}
-	bits := int64(1)
-	var embeddedSpace Object
-	var jpxDepth int
-	if !mask {
-		jpxDepth, embeddedSpace, err = r.jpxDefaults(stream)
-		if err != nil {
-			return nil, err
-		}
-		if jpxDepth != 0 {
-			bits = int64(jpxDepth)
-		}
-	}
-	if jpxDepth == 0 && (dict["BitsPerComponent"] != nil || !mask) {
-		bits, err = readInteger("BitsPerComponent")
-		if err != nil {
-			return nil, err
-		}
-	}
-	if bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16 {
-		return nil, fmt.Errorf("invalid image component depth")
-	}
-	if mask && bits != 1 {
-		return nil, fmt.Errorf("invalid stencil component depth")
-	}
 	var space Object
 	imageMask := dict["Mask"]
 	if mask {
@@ -842,9 +866,38 @@ func (r *Reader) ReadImage(object Object) (*Image, error) {
 		if err != nil {
 			return nil, err
 		}
+		space = normalizeDeviceColorSpace(space)
+	}
+	bits := int64(1)
+	var embeddedSpace Object
+	var jpxDepth int
+	if !mask {
+		jpxDepth, embeddedSpace, err = r.jpxDefaults(stream, space)
+		if err != nil {
+			return nil, err
+		}
+		if jpxDepth != 0 {
+			bits = int64(jpxDepth)
+		}
 		if space == nil {
 			space = embeddedSpace
 		}
+	}
+	if jpxDepth == 0 && (dict["BitsPerComponent"] != nil || !mask) {
+		bits, err = readInteger("BitsPerComponent")
+		if err != nil {
+			return nil, err
+		}
+	}
+	if jpxDepth == 0 {
+		if bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16 {
+			return nil, fmt.Errorf("invalid image component depth")
+		}
+	} else if bits < 1 || bits > 16 {
+		return nil, fmt.Errorf("invalid image component depth")
+	}
+	if mask && bits != 1 {
+		return nil, fmt.Errorf("invalid stencil component depth")
 	}
 	var decodeObject Object
 	if jpxDepth == 0 {
@@ -892,6 +945,7 @@ func (r *Reader) ReadImageWithResources(object Object, resources Dictionary) (*I
 	if err != nil {
 		return nil, err
 	}
+	image.ColorSpace = normalizeDeviceColorSpace(image.ColorSpace)
 	image.effectiveColorSpace = true
 	return image, nil
 }
@@ -1171,30 +1225,31 @@ func imageSampleMaximum(bits int) float64 {
 	return float64((uint64(1) << uint(bits)) - 1)
 }
 
-// jpxBitDepth 从JPEG2000码流头推导有效分量位深，供缺省位深的直构图像计算索引与色键范围
-// 入参: ctx 取消上下文, indexed 是否索引色图像
-// 返回: int 有效分量位深, error 编码、精度或取消错误
-func (i *Image) jpxBitDepth(ctx context.Context, indexed bool) (int, error) {
+// jpxChannelDepths 从JPEG2000容器与码流头推导各颜色通道真实位深，供索引与色键范围计算
+// 入参: ctx 取消上下文, components 期望颜色通道数, indexed 是否索引色图像
+// 返回: []int 各颜色通道真实位深, error 编码、精度或取消错误
+func (i *Image) jpxChannelDepths(ctx context.Context, components int, indexed bool) ([]int, error) {
 	data, _, err := i.encodedFileContext(ctx, "JPXDecode")
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	code, err := jpxCodestream(data)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	_, _, count, err := jpxSize(code)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if indexed {
-		depth := int(code[42]&127) + 1
-		if depth > 16 {
-			return 0, &UnsupportedError{Feature: "JPEG2000 component precision"}
-		}
-		return depth, nil
+	mode, err := i.jpxMaskMode()
+	if err != nil {
+		return nil, err
 	}
-	return jpxCodestreamDepth(code, count)
+	compBits, err := jpxCodestreamDepth(code, count)
+	if err != nil {
+		return nil, err
+	}
+	return jpxChannelPrecisions(data, compBits, components, i.Stream.Dictionary["ColorSpace"] != nil, indexed, mode != 0)
 }
 
 // DecodeSamples 解码原始图像样本，不应用Decode数组、遮罩或色彩管理
@@ -1356,7 +1411,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 			dimensionsRecovered = true
 		}
 	case "JPXDecode":
-		cmyk := i.ColorSpace == Name("DeviceCMYK")
+		cmyk := normalizeDeviceColorSpace(i.ColorSpace) == Name("DeviceCMYK")
 		result, err = i.jpxSamplesRowsContext(ctx, data, cmyk, size, rows)
 		downsampled = size.X > 0 && size.Y > 0
 	default:
@@ -1710,9 +1765,13 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	if err != nil {
 		return nil, err
 	}
-	if bits != i.BitsPerComponent {
+	normalizedSpace := normalizeDeviceColorSpace(i.ColorSpace)
+	_, wasArray := i.ColorSpace.(Array)
+	_, isName := normalizedSpace.(Name)
+	if bits != i.BitsPerComponent || wasArray && isName {
 		normalized := *i
 		normalized.BitsPerComponent = bits
+		normalized.ColorSpace = normalizedSpace
 		i = &normalized
 	}
 	if target == nil && !i.ImageMask && i.reader != nil {
@@ -1822,7 +1881,9 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		bounds := profile.sourceRanges()
 		copy(ranges, bounds[:components*2])
 	}
-	if isJPX && bits == 0 {
+	var channelDepths []int
+	var channelMaxima []float64
+	if isJPX {
 		needDepth := palette != nil
 		if !needDepth && embeddedMask == 0 && i.Mask != nil {
 			maskObj, err := i.reader.resolveOptional(i.Mask)
@@ -1832,14 +1893,23 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			_, needDepth = maskObj.(Array)
 		}
 		if needDepth {
-			bits, err = i.jpxBitDepth(ctx, palette != nil)
+			channelDepths, err = i.jpxChannelDepths(ctx, components, palette != nil)
 			if err != nil {
 				return nil, err
 			}
-			if bits != i.BitsPerComponent {
-				normalized := *i
-				normalized.BitsPerComponent = bits
-				i = &normalized
+			maxBits := 0
+			channelMaxima = make([]float64, len(channelDepths))
+			for c, depth := range channelDepths {
+				maxBits = max(maxBits, depth)
+				channelMaxima[c] = imageSampleMaximum(depth)
+			}
+			if maxBits != 0 {
+				bits = maxBits
+				if bits != i.BitsPerComponent {
+					normalized := *i
+					normalized.BitsPerComponent = bits
+					i = &normalized
+				}
 			}
 		}
 	}
@@ -1894,7 +1964,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	var inverted bool
 	if embeddedMask == 0 {
 		var soft bool
-		maskImage, keys, soft, matte, err = i.prepareMask(ctx, components)
+		maskImage, keys, soft, matte, err = i.prepareMask(ctx, components, channelDepths)
 		if err != nil {
 			return nil, err
 		}
@@ -1947,15 +2017,13 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	if err != nil {
 		return nil, err
 	}
-	if embeddedMask != 0 {
-		if embeddedMask == 2 {
+	if embeddedMask == 2 {
+		if parsed, ok, err := i.optionalNumberArray(i.Stream.Dictionary["Matte"], components); err != nil {
+			return nil, fmt.Errorf("invalid JPEG2000 Matte: %w", err)
+		} else if ok {
+			matte = parsed
+		} else {
 			matte = make([]float64, components)
-			if value := i.Stream.Dictionary["Matte"]; value != nil {
-				matte, err = i.reader.numberArray(value, components)
-				if err != nil {
-					return nil, fmt.Errorf("invalid JPEG2000 Matte: %w", err)
-				}
-			}
 		}
 	}
 	sampleHasAlpha := false
@@ -2117,7 +2185,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 					return nil, fmt.Errorf("invalid CMYK image samples")
 				}
 			}
-			target.view = &imageComponentView{source: samples, mask: mask, channels: components, ranges: ranges, keys: keys, matte: matte, inverted: inverted, embedded: embeddedMask != 0, maximum: imageSampleMaximum(bits)}
+			target.view = &imageComponentView{source: samples, mask: mask, channels: components, ranges: ranges, keys: keys, matte: matte, inverted: inverted, embedded: embeddedMask != 0, maximum: imageSampleMaximum(bits), maxima: channelMaxima}
 			return nil, nil
 		}
 		size := 0
@@ -2243,7 +2311,11 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			transparent := len(keys) != 0
 			for c := 0; c < components; c++ {
 				if transparent {
-					sample := math.Round(inputs[c] * maximum)
+					maxSample := maximum
+					if c < len(channelMaxima) {
+						maxSample = channelMaxima[c]
+					}
+					sample := math.Round(inputs[c] * maxSample)
 					transparent = sample >= keys[c*2] && sample <= keys[c*2+1]
 				}
 				inputs[c] = functionValue(inputs[c], ranges[c*2], ranges[c*2+1])
@@ -2252,7 +2324,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				}
 				if len(matte) != 0 {
 					if alpha == 0 {
-						inputs[c] = matte[c]
+						inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], matte[c]))
 					} else {
 						inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], matte[c]+(inputs[c]-matte[c])*65535/float64(alpha)))
 					}
@@ -2410,7 +2482,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 // palette 解析索引色查找表，保留原始索引样本供Decode和色键遮罩使用
 // 返回: *imagePalette 调色板，非索引色时为空, error 错误信息
 func (i *Image) palette() (*imagePalette, error) {
-	array, ok := i.ColorSpace.(Array)
+	array, ok := normalizeDeviceColorSpace(i.ColorSpace).(Array)
 	if !ok {
 		return nil, nil
 	}
@@ -2428,9 +2500,7 @@ func (i *Image) palette() (*imagePalette, error) {
 		return nil, err
 	}
 	components := 0
-	if a, ok := base.(Array); ok && len(a) == 1 {
-		base = a[0]
-	}
+	base = normalizeDeviceColorSpace(base)
 	var calibrated *calRGBSpace
 	var profile *iccColorSpace
 	var deviceN *deviceNSpace
@@ -2643,9 +2713,9 @@ func (i *Image) palette() (*imagePalette, error) {
 }
 
 // prepareMask 解析有效外部遮罩描述、色键和预混合底色，不提前解码遮罩像素
-// 入参: ctx 取消上下文, components 原始图像分量数
+// 入参: ctx 取消上下文, components 原始图像分量数, channelDepths 可选各通道位深
 // 返回: *Image 遮罩图像描述, []float64 色键范围, bool 是否软遮罩, []float64 预混合底色, error 错误信息
-func (i *Image) prepareMask(ctx context.Context, components int) (*Image, []float64, bool, []float64, error) {
+func (i *Image) prepareMask(ctx context.Context, components int, channelDepths []int) (*Image, []float64, bool, []float64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -2663,12 +2733,16 @@ func (i *Image) prepareMask(ctx context.Context, components int) (*Image, []floa
 		if len(keys) != components*2 {
 			return nil, nil, false, nil, fmt.Errorf("invalid color key mask")
 		}
-		if i.BitsPerComponent <= 0 || i.BitsPerComponent > 38 {
-			return nil, nil, false, nil, fmt.Errorf("invalid image component depth")
-		}
 		values := make([]float64, len(keys))
-		maximum := (int64(1) << uint(i.BitsPerComponent)) - 1
 		for n, key := range keys {
+			depth := i.BitsPerComponent
+			if n/2 < len(channelDepths) {
+				depth = channelDepths[n/2]
+			}
+			if depth <= 0 || depth > 38 {
+				return nil, nil, false, nil, fmt.Errorf("invalid image component depth")
+			}
+			maximum := (int64(1) << uint(depth)) - 1
 			value, err := i.reader.resolveOptional(key)
 			if err != nil {
 				return nil, nil, false, nil, err
@@ -2812,14 +2886,15 @@ func (i *Image) ccittSamplesContext(ctx context.Context, data []byte, params Dic
 // 返回: int 分量数, error 颜色空间错误
 func (i *Image) rawSampleComponents() (int, error) {
 	components := 0
-	if space, ok := i.ColorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
+	colorSpace := normalizeDeviceColorSpace(i.ColorSpace)
+	if space, ok := colorSpace.(Array); ok && len(space) > 0 && space[0] == Name("DeviceN") {
 		deviceN, err := i.reader.readDeviceNSpace(space, i.effectiveColorSpace, 0)
 		if err != nil {
 			return 0, err
 		}
 		components = deviceN.components
 	}
-	switch i.ColorSpace {
+	switch colorSpace {
 	case Name("DeviceGray"):
 		components = 1
 	case Name("DeviceRGB"):
@@ -2830,29 +2905,19 @@ func (i *Image) rawSampleComponents() (int, error) {
 	if i.ImageMask {
 		components = 1
 	}
-	if space, ok := i.ColorSpace.(Array); ok && len(space) == 1 {
-		switch space[0] {
-		case Name("DeviceGray"):
-			components = 1
-		case Name("DeviceRGB"):
-			components = 3
-		case Name("DeviceCMYK"):
-			components = 4
-		}
-	}
-	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Indexed") {
+	if space, ok := colorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Indexed") {
 		components = 1
 	}
-	if space, ok := i.ColorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Separation") {
+	if space, ok := colorSpace.(Array); ok && len(space) == 4 && space[0] == Name("Separation") {
 		components = 1
 	}
-	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && (space[0] == Name("CalRGB") || space[0] == Name("Lab")) {
+	if space, ok := colorSpace.(Array); ok && len(space) == 2 && (space[0] == Name("CalRGB") || space[0] == Name("Lab")) {
 		components = 3
 	}
-	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("CalGray") {
+	if space, ok := colorSpace.(Array); ok && len(space) == 2 && space[0] == Name("CalGray") {
 		components = 1
 	}
-	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
+	if space, ok := colorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
 		profile, err := i.reader.resolveOptional(space[1])
 		if err != nil {
 			return 0, err

@@ -384,11 +384,12 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 	if comb > 0 {
 		state.spacing, state.wordSpacing = 0, 0
 	}
+	contentLimit := annotationRichContentLimit(r)
 	if p.state.font.Vertical {
 		layout := annotationRichVertical{
 			glyphs: glyphs, paragraphs: paragraphs, state: state, defaults: stateContent, matrix: matrix,
 			frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
-			multiline: multiline, comb: comb, align: int(align),
+			multiline: multiline, comb: comb, align: int(align), maxBytes: contentLimit,
 		}
 		return layout.write(ctx, content)
 	}
@@ -480,11 +481,16 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 			if err := writeAnnotationRichHorizontalRun(ctx, content, line.glyphs[start:end], p.state, stateContent, matrix, size, left, baseline); err != nil {
 				return err
 			}
+			if content.Len() > contentLimit {
+				return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 			runLeft := left
 			for i := start; i < end; i++ {
 				left += annotationRichAdvance(line.glyphs[i], state, size, i+1 < len(line.glyphs))
 			}
-			decorations.add(glyph, p.state, size, runLeft, baseline, left-runLeft)
+			if err := decorations.add(ctx, glyph, p.state, size, runLeft, baseline, left-runLeft); err != nil {
+				return err
+			}
 			start = end
 		}
 		top -= line.advance
@@ -492,10 +498,13 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 	content.WriteString("ET\n")
 	if decorated {
 		content.WriteString("Q\n")
-		if err := writeAnnotationRichDecorations(ctx, content, decorations.spans, decorationDefaults, matrix); err != nil {
+		if err := writeAnnotationRichDecorations(ctx, content, decorations.spans, decorationDefaults, matrix, contentLimit); err != nil {
 			return err
 		}
 	}
 	content.WriteString("Q\n")
+	if content.Len() > contentLimit {
+		return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	return ctx.Err()
 }

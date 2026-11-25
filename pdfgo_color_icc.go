@@ -475,6 +475,9 @@ func (r *Reader) readICCSourceSpace(object Array, effective bool) (*iccColorSpac
 // 入参: ctx 取消上下文, object ICCBased数组, effective 是否已按资源校验并替换
 // 返回: *iccColorSpace 源颜色变换, error 配置、备用定义或取消错误
 func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, effective bool) (*iccColorSpace, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

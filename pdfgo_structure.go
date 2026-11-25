@@ -78,6 +78,12 @@ type StructureParent struct {
 // 入参: item 内容引用
 // 返回: StructureContent 内容容器, error 引用或父树键错误
 func (r *Reader) StructureContent(item StructureItem) (StructureContent, error) {
+	if r == nil {
+		return StructureContent{}, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return StructureContent{}, os.ErrClosed
+	}
 	var result StructureContent
 	ref, keyName, otherName := item.Target, Name("StructParent"), Name("StructParents")
 	switch item.Type {
@@ -361,6 +367,9 @@ func (r *Reader) StructureAttributes(ctx context.Context, item StructureItem) ([
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if r.closed {
+		return nil, os.ErrClosed
 	}
 	if item.Type != "StructElem" || item.Dictionary == nil {
 		return nil, fmt.Errorf("structure attributes require an element")

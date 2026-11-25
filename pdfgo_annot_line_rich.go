@@ -24,7 +24,7 @@ import (
 
 // writeRichLineCaption 在标题局部坐标写入段落，保留样式和行内基线偏移
 // 入参: ctx 取消上下文, content 内容, caption 富文本标题
-// 返回: error 取消错误
+// 返回: error 取消、超限或范围溢出错误
 func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption *annotationLineCaption) error {
 	decorated := annotationRichDecorated(caption.rich)
 	var decorations annotationRichDecorations
@@ -56,7 +56,9 @@ func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption
 			for _, current := range line.glyphs[start:end] {
 				left += annotationRichAdvance(current, state, annotationCaptionSize, false)
 			}
-			decorations.add(glyph, state, annotationCaptionSize, runLeft, baseline, left-runLeft)
+			if err := decorations.add(ctx, glyph, state, annotationCaptionSize, runLeft, baseline, left-runLeft); err != nil {
+				return err
+			}
 			start = end
 		}
 		top -= line.advance
@@ -64,7 +66,7 @@ func writeRichLineCaption(ctx context.Context, content *strings.Builder, caption
 	content.WriteString("ET\n")
 	if decorated {
 		content.WriteString("Q\n")
-		return writeAnnotationRichDecorations(ctx, content, decorations.spans, "0 g\n", Identity())
+		return writeAnnotationRichDecorations(ctx, content, decorations.spans, "0 g\n", Identity(), maxAnnotationRichContentBytes)
 	}
 	return nil
 }

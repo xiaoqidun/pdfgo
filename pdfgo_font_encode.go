@@ -299,7 +299,7 @@ func (f *Font) sequenceLookup(ctx context.Context, text string) (map[string]font
 		ch, n := utf8.DecodeRuneInString(value)
 		return len(value) <= len(text) && n < len(value) && wanted[ch] && utf8.ValidString(value)
 	}
-	codes, err := f.encodingCodes(ctx, accept, false)
+	codes, err := f.encodingCodes(ctx, accept, !f.composite)
 	if err != nil {
 		return nil, err
 	}

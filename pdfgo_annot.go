@@ -556,34 +556,22 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 	for key, value := range annotation.Dictionary {
 		result[key] = value
 	}
-	inherited := []Name{"FT", "Ff", "V", "DV", "DA", "Q", "MaxLen"}
-	merged := annotation.Dictionary["Parent"] == nil
-	for _, key := range []Name{"FT", "Ff", "V", "DV", "DA", "Q", "MaxLen", "T", "TU", "TM", "RV", "DS", "Opt", "I", "TI"} {
-		merged = merged || annotation.Dictionary[key] != nil
-	}
+	inherited := []Name{"FT", "Ff", "V", "DV", "DA", "Q", "MaxLen", "RV", "DS", "Opt", "I", "TI"}
 	for _, key := range inherited {
 		delete(result, key)
 	}
 	seen := map[Reference]bool{}
 	current := annotation.Dictionary
-	depth := 0
-	var options []Object
 	for current != nil {
-		if current["Opt"] != nil {
-			options = append(options, current["Opt"])
-		}
-		if !merged && depth == 1 {
-			for _, key := range []Name{"RV", "DS", "Opt", "I", "TI"} {
-				result[key] = current[key]
-			}
-		}
 		for _, key := range inherited {
 			if result[key] == nil {
 				value, err := r.Resolve(current[key])
 				if err != nil {
 					return nil, err
 				}
-				result[key] = value
+				if value != nil {
+					result[key] = value
+				}
 			}
 		}
 		parent := current["Parent"]
@@ -602,21 +590,6 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 		current, ok = value.(Dictionary)
 		if !ok {
 			return nil, fmt.Errorf("invalid field parent")
-		}
-		depth++
-	}
-	flags, validFlags := result["Ff"].(Integer)
-	if result["FT"] == Name("Btn") && (result["Ff"] == nil || validFlags && flags&(1<<16) == 0) {
-		delete(result, "Opt")
-		for _, object := range options {
-			value, err := r.Resolve(object)
-			if err != nil {
-				return nil, err
-			}
-			if value != nil {
-				result["Opt"] = value
-				break
-			}
 		}
 	}
 	defaults, err := r.formDefaults()

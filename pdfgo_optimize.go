@@ -68,6 +68,7 @@ type pdfOutput struct {
 	security    *standardSecurity
 	unencrypted map[Reference]bool
 	aliases     map[Reference]Reference
+	live        map[Reference]bool
 	count       int64
 }
 
@@ -334,6 +335,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	metadata := make(map[Reference]Object)
 	streamHashes := make(map[Reference][32]byte)
 	var refs []Reference
+	var danglingIDs []int64
 	var maskRoots []Object
 	var maskRefs []Reference
 	var noDownsampleRoots []Object
@@ -351,14 +353,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if _, ok := replacements[ref]; ok || lazyImages[ref] != nil {
 			return true
 		}
-		entry, ok := r.xref[ref.Number]
-		if !ok || entry.kind == 0 {
-			return false
-		}
-		if entry.kind == 2 {
-			return ref.Generation == 0
-		}
-		return entry.generation == ref.Generation
+		return r.isLiveXrefRef(ref)
 	}
 	var collect func(Object, int) error
 	collect = func(value Object, depth int) error {
@@ -374,6 +369,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 				return fmt.Errorf("invalid PDF reference")
 			}
 			if !isLiveRef(v) {
+				danglingIDs = append(danglingIDs, v.Number)
 				return nil
 			}
 			if !seen[v] {
@@ -734,8 +730,20 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	for _, ref := range refs {
 		maxID = max(maxID, ref.Number)
 	}
-	if maxID > math.MaxInt32-int64(len(lazyImages))-int64(len(refs)/32)-1024 {
+	limit := int64(math.MaxInt32) - int64(len(lazyImages)) - int64(len(refs)/32) - 1024
+	if maxID > limit {
 		return report, fmt.Errorf("PDF object number exceeds output limit")
+	}
+	for id := range r.xref {
+		if id > maxID && id <= limit {
+			maxID = id
+		}
+	}
+	slices.Sort(danglingIDs)
+	for _, id := range danglingIDs {
+		if id > maxID && id <= maxID+1<<20 && id <= limit {
+			maxID = id
+		}
 	}
 	var pageTreeOverrides map[Reference]Object
 	if balanced, treeErr := buildBalancedPageTree(ctx, trailer, refs, isStream, metadata, out.aliases, &maxID); treeErr != nil {
@@ -774,6 +782,10 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			report.Objects++
 			trailer["Info"] = infoRef
 		}
+	}
+	out.live = make(map[Reference]bool, len(refs)+len(lazyImages))
+	for _, ref := range refs {
+		out.live[ref] = true
 	}
 	version := r.Version
 	if newInfo != nil && version < "1.2" {
@@ -1139,6 +1151,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			ownedMaskOut = job.outOwnedMask
 			if job.ownedMaskRef.Number > 0 {
 				if job.droppedOwned {
+					delete(out.live, job.ownedMaskRef)
 					report.Objects--
 				} else {
 					ownedMaskRef = job.ownedMaskRef
@@ -1150,6 +1163,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			if maskStream != nil {
 				maxID++
 				maskRef = Reference{Number: maxID}
+				out.live[maskRef] = true
 				if mainStream, ok := value.(*Stream); ok {
 					updated := *mainStream
 					updated.Dictionary = maps.Clone(mainStream.Dictionary)
@@ -1453,6 +1467,10 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 	case Reference:
 		if canonical, ok := w.aliases[v]; ok {
 			v = canonical
+		}
+		if w.live != nil && !w.live[v] {
+			text = "null"
+			break
 		}
 		text = fmt.Sprintf("%d %d R", v.Number, v.Generation)
 	case Array:

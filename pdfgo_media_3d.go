@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"fmt"
 	"math"
+	"os"
 	"slices"
 )
 
@@ -550,6 +551,12 @@ func (r *Reader) ReadThreeDProjection(object Object) (ThreeDProjection, error) {
 // 入参: annotation 3D注解
 // 返回: Rectangle 显示区域, error 类型、范围或引用错误
 func (r *Reader) ReadThreeDViewBox(annotation Annotation) (Rectangle, error) {
+	if r == nil {
+		return Rectangle{}, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return Rectangle{}, os.ErrClosed
+	}
 	if annotation.Subtype != "3D" {
 		return Rectangle{}, fmt.Errorf("not a 3D annotation")
 	}

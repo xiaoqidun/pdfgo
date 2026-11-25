@@ -150,7 +150,7 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		return nil, err
 	}
 	if v != nil {
-		resources := p.resources
+		resources := p.pageResources
 		object, err := p.reader.Resolve(stream.Dictionary["Resources"])
 		if err != nil {
 			return nil, err

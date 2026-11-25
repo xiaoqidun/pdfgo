@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 )
 
@@ -154,6 +155,12 @@ func (r *Reader) ReadRedaction(ctx context.Context, annotation Annotation) (Reda
 // 入参: ctx 取消上下文, annotation 删改注解
 // 返回: [][4]Point 逆时针四边形, error 类型或几何错误
 func (r *Reader) ReadRedactionRegions(ctx context.Context, annotation Annotation) ([][4]Point, error) {
+	if r == nil {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return nil, os.ErrClosed
+	}
 	if ctx == nil {
 		return nil, fmt.Errorf("invalid redaction context")
 	}

@@ -60,7 +60,7 @@ func ResizeImage(ctx context.Context, src image.Image, size image.Point) (image.
 	if _, ok := src.(image.RGBA64Image); !ok {
 		src = imageScaleSource{Image: src}
 	}
-	if int64(width) > optimizationBufferLimit/32/int64(bounds.Dy()) {
+	if int64(width) > optimizationBufferLimit/32/int64(bounds.Dy()) || int64(bounds.Dx()) > optimizationBufferLimit/32 || int64(bounds.Dy()) > optimizationBufferLimit/32 {
 		rows := max(1, min(32, 65536/width))
 		for y := 0; y < height; y += rows {
 			if err := ctx.Err(); err != nil {

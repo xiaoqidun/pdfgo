@@ -61,6 +61,13 @@ type rewriteResources struct {
 	renditions  map[*RenditionAction]Dictionary
 }
 
+// rewriteMaxIDCache 缓存在单次RewriteTo周期内复用的原始可达图最大对象编号
+type rewriteMaxIDCache struct {
+	ready   bool
+	maxID   int64
+	xrefLen int
+}
+
 // AnnotationLocation 通过页面引用和从零开始的注解索引定位页面注解
 type AnnotationLocation struct {
 	Page  Reference
@@ -138,6 +145,9 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if err != nil {
 		return OptimizeReport{}, err
 	}
+	baseReader := r
+	baseReader.rewriteMaxID = &rewriteMaxIDCache{}
+	defer func() { baseReader.rewriteMaxID = nil }()
 	lazyImages, err := r.prepareImageReplacements(ctx, options.Images, options.ImageOptions)
 	if err != nil {
 		return OptimizeReport{}, err
@@ -238,13 +248,102 @@ func compareAnnotationLocation(a, b AnnotationLocation) int {
 	return 0
 }
 
-// maxRewriteObjectID 统计交叉引用表与替换对象表中的最大对象编号
-// 入参: replacements 已有替换对象
-// 返回: int64 最大对象编号
-func (r *Reader) maxRewriteObjectID(replacements map[Reference]Object) int64 {
+// isLiveXrefRef 判断间接引用是否对应交叉引用表中的有效对象
+// 入参: ref 间接引用
+// 返回: bool 是否为交叉引用表中的存活对象
+func (r *Reader) isLiveXrefRef(ref Reference) bool {
+	entry, ok := r.xref[ref.Number]
+	if !ok || entry.kind == 0 {
+		return false
+	}
+	if entry.kind == 2 {
+		return ref.Generation == 0
+	}
+	return entry.generation == ref.Generation
+}
+
+// baseRewriteObjectID 统计交叉引用表与原始可达对象图悬空引用中的最大对象编号
+// 返回: int64 原始文档最大对象编号
+func (r *Reader) baseRewriteObjectID() int64 {
 	maximum := int64(0)
 	for id := range r.xref {
 		maximum = max(maximum, id)
+	}
+	if r.Trailer == nil {
+		return maximum
+	}
+	originalCache := r.cache.snapshot()
+	defer r.cache.prune(originalCache)
+	originalObjectStreams := r.objectStreams
+	defer func() { r.objectStreams = originalObjectStreams }()
+	seen := make(map[Reference]bool)
+	var queue []Reference
+	var dangling []int64
+	var scan func(Object, int)
+	scan = func(value Object, depth int) {
+		if depth > 256 {
+			return
+		}
+		switch v := value.(type) {
+		case Reference:
+			if v.Number <= 0 || v.Generation < 0 || v.Generation > 65535 {
+				return
+			}
+			if !r.isLiveXrefRef(v) {
+				dangling = append(dangling, v.Number)
+				return
+			}
+			if !seen[v] {
+				seen[v] = true
+				queue = append(queue, v)
+			}
+		case Array:
+			for _, item := range v {
+				scan(item, depth+1)
+			}
+		case Dictionary:
+			for _, item := range v {
+				scan(item, depth+1)
+			}
+		case *Stream:
+			scan(v.Dictionary, depth+1)
+		}
+	}
+	scan(r.Trailer, 0)
+	for i := 0; i < len(queue); i++ {
+		ref := queue[i]
+		value, err := r.Object(ref)
+		if !originalCache[ref] {
+			r.cache.delete(ref)
+		}
+		if err != nil {
+			continue
+		}
+		scan(value, 0)
+	}
+	slices.Sort(dangling)
+	for _, id := range dangling {
+		if id > maximum && id <= maximum+1<<20 && id < math.MaxInt32-1024 {
+			maximum = id
+		}
+	}
+	return maximum
+}
+
+// maxRewriteObjectID 统计交叉引用表、替换对象表与原始可达对象图悬空引用中的最大对象编号，并复用单次写出周期的基准扫描结果
+// 入参: replacements 已有替换对象
+// 返回: int64 最大对象编号
+func (r *Reader) maxRewriteObjectID(replacements map[Reference]Object) int64 {
+	var maximum int64
+	if cache := r.rewriteMaxID; cache != nil {
+		if !cache.ready || cache.xrefLen != len(r.xref) {
+			cache.maxID = r.baseRewriteObjectID()
+			cache.xrefLen = len(r.xref)
+			cache.ready = true
+		}
+		maximum = cache.maxID
+	} else {
+		maximum = r.baseRewriteObjectID()
 	}
 	for ref := range replacements {
 		maximum = max(maximum, ref.Number)

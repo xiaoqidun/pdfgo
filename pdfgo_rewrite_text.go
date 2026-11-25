@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"slices"
 )
 
@@ -32,46 +33,73 @@ type TextReplacement struct {
 	Text  string
 }
 
-// CompactText 合并相邻且显式重设文字矩阵的文字对象，不跨越内容标记及图形状态边界
+// CompactText 合并相邻且显式重设文字矩阵的文字对象，不跨越内容标记、裁剪模式及外部图形状态边界
 // 入参: ctx 取消上下文, data 解码页面内容
 // 返回: []byte 精简内容，未变化时为nil, error 解析或取消错误
 func CompactText(ctx context.Context, data []byte) ([]byte, error) {
+	type textCompactState struct {
+		clipMode bool
+		gsDirty  bool
+	}
 	var output bytes.Buffer
 	position, endText, beginText := 0, -1, -1
-	mode, clipped := int64(0), false
-	var stack []int64
+	pendingEnd, pendingBegin := -1, -1
+	var state textCompactState
+	var stack []textCompactState
+	inText, blocked := false, false
 	err := walkOperationsBorrowed(ctx, data, func(op Operation) error {
 		switch op.Operator {
 		case "q":
-			stack = append(stack, mode)
+			stack = append(stack, state)
 		case "Q":
 			if len(stack) > 0 {
-				mode, stack = stack[len(stack)-1], stack[:len(stack)-1]
+				state, stack = stack[len(stack)-1], stack[:len(stack)-1]
 			}
+		case "gs":
+			state.gsDirty = true
 		case "Tr":
+			state.clipMode = true
 			if len(op.Operands) == 1 {
-				value, ok := op.Operands[0].(Integer)
-				if ok {
-					mode = int64(value)
+				switch v := op.Operands[0].(type) {
+				case Integer:
+					state.clipMode = v < 0 || v >= 4
+				case Real:
+					f := float64(v)
+					state.clipMode = math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f || f < 0 || f >= 4
 				}
 			}
 		}
-		clipped = clipped || mode >= 4
+		if op.Operator == "BT" {
+			if inText {
+				pendingEnd, pendingBegin = -1, -1
+			}
+			inText = true
+			blocked = state.clipMode || state.gsDirty
+		} else if inText {
+			blocked = blocked || state.clipMode || state.gsDirty
+		}
 		if op.Operator == "Tm" && len(op.Operands) == 6 && beginText >= 0 {
-			output.Write(data[position:endText])
-			position = beginText + 2
+			pendingEnd, pendingBegin = endText, beginText
 		}
 		if op.Operator == "BT" && endText >= 0 && len(op.Operands) == 0 {
 			beginText = int(op.Offset)
 		} else {
 			beginText = -1
 			endText = -1
-			if op.Operator == "ET" && len(op.Operands) == 0 && !clipped {
-				endText = int(op.Offset)
+			if op.Operator == "ET" && len(op.Operands) == 0 {
+				if !blocked {
+					if pendingEnd >= 0 {
+						output.Write(data[position:pendingEnd])
+						position = pendingBegin + 2
+					}
+					endText = int(op.Offset)
+				}
 			}
 		}
 		if op.Operator == "ET" {
-			clipped = false
+			inText = false
+			blocked = false
+			pendingEnd, pendingBegin = -1, -1
 		}
 		return nil
 	})

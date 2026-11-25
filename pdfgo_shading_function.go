@@ -268,39 +268,56 @@ func mergeGradientFunctions(functions []*gradientFunction, interval [2]float64) 
 	return stops
 }
 
-// sampledGradientStops 展开采样函数的精确断点及范围截断，超限时返回nil退回按需求值
-// 入参: f 已解析采样函数
-// 返回: []GradientStop 定义域中的线性分段
-func sampledGradientStops(f *tintFunction) []GradientStop {
+// sampledGradientPositions 提取采样函数定义域内的精确样本位置，超限、坍缩或取消时返回nil
+// 入参: ctx 取消上下文, f 已解析采样函数
+// 返回: []float64 升序样本位置
+func sampledGradientPositions(ctx context.Context, f *tintFunction) []float64 {
 	positions := []float64{f.domain[0], f.domain[1]}
 	if f.encoded[0] != f.encoded[1] {
+		lo, hi := min(f.encoded[0], f.encoded[1]), max(f.encoded[0], f.encoded[1])
 		start, end := 0, f.size-1
-		if lo := min(f.encoded[0], f.encoded[1]); lo > 0 {
-			if lo >= float64(f.size) {
+		if lo >= 0 {
+			if lo >= float64(f.size-1) {
 				start = f.size
 			} else {
-				start = int(math.Floor(lo))
+				start = int(math.Floor(lo)) + 1
 			}
 		}
-		if hi := max(f.encoded[0], f.encoded[1]); hi < float64(end) {
-			if hi < 0 {
+		if hi <= float64(end) {
+			if hi <= 0 {
 				end = -1
 			} else {
-				end = int(math.Ceil(hi))
+				end = int(math.Ceil(hi)) - 1
 			}
 		}
+		if end >= start && int64(end)-int64(start)+3 > maxGradientLinearStops {
+			return nil
+		}
+		var previous float64
 		for i := start; i <= end; i++ {
-			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
-			if x > f.domain[0] && x < f.domain[1] {
-				positions = append(positions, x)
-				if len(positions) > maxGradientLinearStops {
-					return nil
-				}
+			if i&255 == 0 && ctx.Err() != nil {
+				return nil
 			}
+			x := functionValue(functionPosition(float64(i), f.encoded[0], f.encoded[1]), f.domain[0], f.domain[1])
+			if !(x > f.domain[0] && x < f.domain[1]) || i > start && x == previous {
+				return nil
+			}
+			previous = x
+			positions = append(positions, x)
 		}
 	}
 	slices.Sort(positions)
-	positions = slices.Compact(positions)
+	return slices.Compact(positions)
+}
+
+// sampledGradientStops 展开采样函数的精确断点及范围截断，超限时返回nil退回按需求值
+// 入参: ctx 取消上下文, f 已解析采样函数
+// 返回: []GradientStop 定义域中的线性分段
+func sampledGradientStops(ctx context.Context, f *tintFunction) []GradientStop {
+	positions := sampledGradientPositions(ctx, f)
+	if len(positions) == 0 {
+		return nil
+	}
 	raw := *f
 	raw.values = make([]float64, 2*f.channels)
 	for i := 0; i < f.channels; i++ {
@@ -309,6 +326,9 @@ func sampledGradientStops(f *tintFunction) []GradientStop {
 	stops := make([]GradientStop, len(positions))
 	for i, x := range positions {
 		stops[i].Position = functionPosition(x, f.domain[0], f.domain[1])
+		if i > 0 && stops[i].Position <= stops[i-1].Position {
+			return nil
+		}
 		raw.colorInto(x, stops[i].Values[:f.channels])
 	}
 	stops = clipGradientValues(stops, f.values)
@@ -432,7 +452,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			return constantGradientFunction(f.value(tint.domain[0])), nil
 		}
 		if tint.sampled && (tint.order != 3 || tint.size < 4) {
-			stops := sampledGradientStops(tint)
+			stops := sampledGradientStops(ctx, tint)
 			if len(stops) > 0 {
 				f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, tint.domain, interval) }
 			}

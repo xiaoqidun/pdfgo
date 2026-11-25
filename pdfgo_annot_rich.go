@@ -105,6 +105,9 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 			if closed {
 				return nil, fmt.Errorf("invalid rich text document structure")
 			}
+			if len(stack) >= maxAnnotationRichDepth {
+				return nil, fmt.Errorf("%w: rich text nesting depth limit exceeded", ErrStreamLimitExceeded)
+			}
 			if token.Name.Space != "http://www.w3.org/1999/xhtml" {
 				return nil, fmt.Errorf("invalid rich text element namespace")
 			}
@@ -151,7 +154,14 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 				}
 			}
 			if current.decoration != 0 {
-				current.decorations = &annotationRichDecoration{parent: current.decorations, kind: current.decoration, size: current.size, color: current.color, rise: current.rise}
+				depth := 1
+				if current.decorations != nil {
+					depth = current.decorations.depth + 1
+				}
+				if depth > maxAnnotationRichDecorations {
+					return nil, fmt.Errorf("%w: rich text decoration depth limit exceeded", ErrStreamLimitExceeded)
+				}
+				current.decorations = &annotationRichDecoration{parent: current.decorations, kind: current.decoration, size: current.size, color: current.color, rise: current.rise, depth: depth}
 			}
 			if token.Name.Local == "p" {
 				paragraphs = append(paragraphs, annotationRichParagraph{style: current})

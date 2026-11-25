@@ -45,6 +45,25 @@ type graphicsColorSpace struct {
 	displaySpace ColorSpace
 }
 
+// finiteFloat 判断浮点数是否为有限数值
+// 入参: v 浮点数
+// 返回: bool 是否有限
+func finiteFloat(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+// finiteFloats 判断浮点数切片中的每个元素是否全部有限
+// 入参: values 浮点数切片
+// 返回: bool 是否全部有限
+func finiteFloats(values []float64) bool {
+	for _, v := range values {
+		if !finiteFloat(v) {
+			return false
+		}
+	}
+	return true
+}
+
 // normalizeRenderingIntent 将未识别的渲染意图按PDF规则映射为相对色度
 // 入参: intent 渲染意图名称
 // 返回: Name 有效渲染意图
@@ -191,7 +210,7 @@ func (r *Reader) readLab(object Object) (*labSpace, error) {
 			return nil, fmt.Errorf("invalid Lab black point")
 		}
 		for n, value := range values {
-			if value < 0 || value == s.white[n] {
+			if !finiteFloat(value) || value < 0 || value == s.white[n] {
 				return nil, fmt.Errorf("invalid Lab black point")
 			}
 			s.black[n] = value
@@ -200,10 +219,13 @@ func (r *Reader) readLab(object Object) (*labSpace, error) {
 	source := bradford(s.white)
 	target := bradford([3]float64{0.95047, 1, 1.08883})
 	for n := range s.adapt {
-		if source[n] <= 0 {
+		if !finiteFloat(source[n]) || source[n] <= 0 {
 			return nil, fmt.Errorf("invalid Lab white point")
 		}
 		s.adapt[n] = target[n] / source[n]
+		if !finiteFloat(s.adapt[n]) {
+			return nil, fmt.Errorf("invalid Lab white point")
+		}
 	}
 	return s, nil
 }
@@ -256,7 +278,7 @@ func (r *Reader) readCalGray(object Object) (*calRGBSpace, error) {
 		return nil, fmt.Errorf("invalid CalGray dictionary")
 	}
 	white, err := r.numberArray(dict["WhitePoint"], 3)
-	if err != nil || white[0] <= 0 || white[1] != 1 || white[2] <= 0 {
+	if err != nil || !finiteFloats(white) || white[0] <= 0 || white[1] != 1 || white[2] <= 0 {
 		return nil, fmt.Errorf("invalid CalGray white point")
 	}
 	gamma := 1.0
@@ -266,7 +288,7 @@ func (r *Reader) readCalGray(object Object) (*calRGBSpace, error) {
 	}
 	if value != nil {
 		gamma, err = r.number(value)
-		if err != nil || gamma <= 0 || math.IsNaN(gamma) || math.IsInf(gamma, 0) {
+		if err != nil || gamma <= 0 || !finiteFloat(gamma) {
 			return nil, fmt.Errorf("invalid CalGray gamma")
 		}
 	}
@@ -280,7 +302,7 @@ func (r *Reader) readCalGray(object Object) (*calRGBSpace, error) {
 			return nil, fmt.Errorf("invalid CalGray black point")
 		}
 		for _, v := range values {
-			if v < 0 {
+			if !finiteFloat(v) || v < 0 {
 				return nil, fmt.Errorf("invalid CalGray black point")
 			}
 		}
@@ -357,6 +379,9 @@ func (r *Reader) readCalRGB(object Object) (*calRGBSpace, error) {
 		}
 		if value != 0 {
 			scale := white[n] / (white[n] - value)
+			if !finiteFloat(scale) {
+				return nil, fmt.Errorf("invalid CalRGB black point")
+			}
 			for column := 0; column < 3; column++ {
 				s.matrix[3*column+n] *= scale
 			}
@@ -366,10 +391,13 @@ func (r *Reader) readCalRGB(object Object) (*calRGBSpace, error) {
 	source := bradford(white)
 	target := bradford([3]float64{0.95047, 1, 1.08883})
 	for n := range s.adapt {
-		if source[n] <= 0 {
+		if !finiteFloat(source[n]) || source[n] <= 0 {
 			return nil, fmt.Errorf("invalid CalRGB white point")
 		}
 		s.adapt[n] = target[n] / source[n]
+	}
+	if !finiteFloats(s.matrix[:]) || !finiteFloats(s.offset[:]) || !finiteFloats(s.adapt[:]) {
+		return nil, fmt.Errorf("invalid CalRGB transform")
 	}
 	return s, nil
 }
@@ -383,7 +411,7 @@ func (s *calRGBSpace) compatibleBlackPoint(white, black [3]float64) error {
 	target := bradford(d65)
 	var normalize, restore, scale, offset [3]float64
 	for i, value := range black {
-		if cone[i] <= 0 {
+		if !finiteFloat(cone[i]) || cone[i] <= 0 {
 			return fmt.Errorf("invalid CalRGB white point")
 		}
 		normalize[i] = 1 / white[i]

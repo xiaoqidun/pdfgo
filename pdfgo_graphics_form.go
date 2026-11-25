@@ -145,16 +145,35 @@ func (p *pageInterpreter) walkContent(data []byte) ([]Operation, int, error) {
 	return operations, size, err
 }
 
-// contentColorSpace 在当前资源作用域解析内联图像的颜色空间
+// contentColorSpace 在当前资源作用域解析内联图像的颜色空间并循环展开资源别名链
 // 入参: value 颜色空间对象
-// 返回: Object 解析结果, error 资源或引用错误
+// 返回: Object 解析结果, error 资源、循环或引用错误
 func (p *pageInterpreter) contentColorSpace(value Object) (Object, error) {
-	if name, ok := value.(Name); ok && name != "DeviceGray" && name != "DeviceRGB" && name != "DeviceCMYK" {
+	var seen map[Name]bool
+	for {
 		var err error
+		value, err = p.reader.Resolve(value)
+		if err != nil {
+			return nil, err
+		}
+		name, ok := value.(Name)
+		if !ok {
+			return value, nil
+		}
+		switch name {
+		case "DeviceGray", "DeviceRGB", "DeviceCMYK", "CalGray", "CalRGB", "Lab", "ICCBased", "Indexed", "Separation", "DeviceN", "Pattern":
+			return name, nil
+		}
+		if seen == nil {
+			seen = make(map[Name]bool)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("cyclic ColorSpace resource %s", name)
+		}
+		seen[name] = true
 		value, err = p.resource("ColorSpace", name)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return p.reader.Resolve(value)
 }

@@ -76,6 +76,7 @@ type Reader struct {
 	closed             bool
 	recoveryIndex      map[int64]xrefEntry
 	recoveryTried      bool
+	rewriteMaxID       *rewriteMaxIDCache
 }
 
 // ReaderOptions 配置密码编码、结构诊断、文字整形、默认设备色ICC、解码并发及流解压预算
@@ -115,9 +116,15 @@ type objectSecurityError struct {
 	err error
 }
 
+// streamCacheKey 区分普通流与按内嵌文件过滤器解密的流缓存条目
+type streamCacheKey struct {
+	ref      Reference
+	embedded bool
+}
+
 // objectCacheEntry 保存受字节预算控制的流缓存链表节点
 type objectCacheEntry struct {
-	ref   Reference
+	key   streamCacheKey
 	value *Stream
 	size  int64
 	prev  *objectCacheEntry
@@ -132,7 +139,7 @@ type objectCache struct {
 	origin  *objectCache
 	objects map[Reference]Object
 	pinned  map[Reference]Object
-	streams map[Reference]*objectCacheEntry
+	streams map[streamCacheKey]*objectCacheEntry
 	head    *objectCacheEntry
 	tail    *objectCacheEntry
 	used    int64
@@ -146,7 +153,7 @@ func newObjectCache(budget int64) *objectCache {
 	if budget <= 0 {
 		budget = streamCacheBudget
 	}
-	cache := &objectCache{objects: make(map[Reference]Object), streams: make(map[Reference]*objectCacheEntry), budget: budget}
+	cache := &objectCache{objects: make(map[Reference]Object), streams: make(map[streamCacheKey]*objectCacheEntry), budget: budget}
 	cache.origin = cache
 	return cache
 }
@@ -390,10 +397,10 @@ func streamEndTypo(token string) bool {
 	return false
 }
 
-// get 查询缓存对象，命中流缓存时更新最近使用顺序
-// 入参: ref 对象引用
+// get 按流解密模式查询缓存对象，隔离普通流与内嵌文件流缓存
+// 入参: ref 对象引用, embedded 是否按内嵌文件流模式查询
 // 返回: Object 缓存对象, bool 是否命中
-func (c *objectCache) get(ref Reference) (Object, bool) {
+func (c *objectCache) get(ref Reference, embedded bool) (Object, bool) {
 	if c == nil {
 		return nil, false
 	}
@@ -407,7 +414,7 @@ func (c *objectCache) get(ref Reference) (Object, bool) {
 	if value, ok := c.objects[ref]; ok {
 		return value, true
 	}
-	if entry, ok := c.streams[ref]; ok {
+	if entry, ok := c.streams[streamCacheKey{ref: ref, embedded: embedded}]; ok {
 		c.unlinkLocked(entry)
 		c.pushFrontLocked(entry)
 		return entry.value, true
@@ -415,9 +422,9 @@ func (c *objectCache) get(ref Reference) (Object, bool) {
 	return nil, false
 }
 
-// set 写入对象缓存，流对象按字节预算淘汰最久未使用条目
-// 入参: ref 对象引用, value 对象值
-func (c *objectCache) set(ref Reference, value Object) {
+// set 按流解密模式写入对象缓存，隔离普通流与内嵌文件流缓存
+// 入参: ref 对象引用, value 对象值, embedded 是否为内嵌文件流解密结果
+func (c *objectCache) set(ref Reference, value Object, embedded bool) {
 	if c == nil {
 		return
 	}
@@ -431,26 +438,30 @@ func (c *objectCache) set(ref Reference, value Object) {
 	}
 	stream, isStream := value.(*Stream)
 	if !isStream {
-		if entry, ok := c.streams[ref]; ok {
-			c.unlinkLocked(entry)
-			delete(c.streams, ref)
-			c.used -= entry.size
+		for _, mode := range [2]bool{false, true} {
+			key := streamCacheKey{ref: ref, embedded: mode}
+			if entry, ok := c.streams[key]; ok {
+				c.unlinkLocked(entry)
+				delete(c.streams, key)
+				c.used -= entry.size
+			}
 		}
 		c.objects[ref] = value
 		return
 	}
 	delete(c.objects, ref)
+	key := streamCacheKey{ref: ref, embedded: embedded}
 	size := int64(len(stream.Data)) + 256
-	if entry, ok := c.streams[ref]; ok {
+	if entry, ok := c.streams[key]; ok {
 		c.unlinkLocked(entry)
-		delete(c.streams, ref)
+		delete(c.streams, key)
 		c.used -= entry.size
 	}
 	if size > c.budget {
 		return
 	}
-	entry := &objectCacheEntry{ref: ref, value: stream, size: size}
-	c.streams[ref] = entry
+	entry := &objectCacheEntry{key: key, value: stream, size: size}
+	c.streams[key] = entry
 	c.pushFrontLocked(entry)
 	c.used += size
 	c.evictLocked()
@@ -473,7 +484,10 @@ func (c *objectCache) has(ref Reference) bool {
 	if _, ok := c.objects[ref]; ok {
 		return true
 	}
-	_, ok := c.streams[ref]
+	if _, ok := c.streams[streamCacheKey{ref: ref, embedded: false}]; ok {
+		return true
+	}
+	_, ok := c.streams[streamCacheKey{ref: ref, embedded: true}]
 	return ok
 }
 
@@ -486,10 +500,13 @@ func (c *objectCache) delete(ref Reference) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.objects, ref)
-	if entry, ok := c.streams[ref]; ok {
-		c.unlinkLocked(entry)
-		delete(c.streams, ref)
-		c.used -= entry.size
+	for _, mode := range [2]bool{false, true} {
+		key := streamCacheKey{ref: ref, embedded: mode}
+		if entry, ok := c.streams[key]; ok {
+			c.unlinkLocked(entry)
+			delete(c.streams, key)
+			c.used -= entry.size
+		}
 	}
 }
 
@@ -508,8 +525,8 @@ func (c *objectCache) snapshot() map[Reference]bool {
 	for ref := range c.objects {
 		result[ref] = true
 	}
-	for ref := range c.streams {
-		result[ref] = true
+	for key := range c.streams {
+		result[key.ref] = true
 	}
 	return result
 }
@@ -545,10 +562,10 @@ func (c *objectCache) prune(keep map[Reference]bool) {
 			delete(c.objects, ref)
 		}
 	}
-	for ref, entry := range c.streams {
-		if !keep[ref] {
+	for key, entry := range c.streams {
+		if !keep[key.ref] {
 			c.unlinkLocked(entry)
-			delete(c.streams, ref)
+			delete(c.streams, key)
 			c.used -= entry.size
 		}
 	}
@@ -591,11 +608,11 @@ func (c *objectCache) cloneWithPinned(pinned map[Reference]Object) *objectCache 
 		}
 	}
 	for entry := c.tail; entry != nil; entry = entry.prev {
-		if _, overridden := clone.pinned[entry.ref]; overridden {
+		if _, overridden := clone.pinned[entry.key.ref]; overridden {
 			continue
 		}
-		item := &objectCacheEntry{ref: entry.ref, value: entry.value, size: entry.size}
-		clone.streams[item.ref] = item
+		item := &objectCacheEntry{key: entry.key, value: entry.value, size: entry.size}
+		clone.streams[item.key] = item
 		clone.pushFrontLocked(item)
 		clone.used += item.size
 	}
@@ -637,7 +654,7 @@ func (c *objectCache) evictLocked() {
 	for c.used > c.budget && c.tail != nil {
 		victim := c.tail
 		c.unlinkLocked(victim)
-		delete(c.streams, victim.ref)
+		delete(c.streams, victim.key)
 		c.used -= victim.size
 	}
 }
@@ -666,6 +683,20 @@ func (r *Reader) Close() error {
 // 入参: object 待解析对象
 // 返回: Object 解析后的对象, error 错误信息
 func (r *Reader) Resolve(object Object) (Object, error) {
+	return r.resolve(object, false)
+}
+
+// resolveEmbeddedFile 解析文件说明中的内嵌文件流引用，在EFF与StmF不同时按内嵌文件过滤器解密
+// 入参: object 内嵌文件对象或间接引用
+// 返回: Object 解析后的对象, error 错误信息
+func (r *Reader) resolveEmbeddedFile(object Object) (Object, error) {
+	return r.resolve(object, true)
+}
+
+// resolve 解析间接引用链并检测循环引用，支持按内嵌文件流过滤器解密
+// 入参: object 待解析对象, embedded 是否按内嵌文件流过滤器解密
+// 返回: Object 解析后的对象, error 错误信息
+func (r *Reader) resolve(object Object, embedded bool) (Object, error) {
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
@@ -676,7 +707,7 @@ func (r *Reader) Resolve(object Object) (Object, error) {
 	if !ok {
 		return object, nil
 	}
-	object, err := r.Object(ref)
+	object, err := r.object(ref, embedded)
 	if err != nil {
 		return nil, err
 	}
@@ -694,7 +725,7 @@ func (r *Reader) Resolve(object Object) (Object, error) {
 		}
 		seen[ref] = true
 		var err error
-		object, err = r.Object(ref)
+		object, err = r.object(ref, embedded)
 		if err != nil {
 			return nil, err
 		}
@@ -719,13 +750,21 @@ func (r *Reader) resolveOptional(object Object) (Object, error) {
 // 入参: ref 间接引用
 // 返回: Object 对象, error 错误信息
 func (r *Reader) Object(ref Reference) (Object, error) {
+	return r.object(ref, false)
+}
+
+// object 按编号与代数读取间接对象，支持为内嵌文件流指定EFF解密及独立流缓存
+// 入参: ref 间接引用, embedded 是否按内嵌文件流过滤器解密
+// 返回: Object 对象, error 错误信息
+func (r *Reader) object(ref Reference, embedded bool) (Object, error) {
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
 	if r.closed {
 		return nil, os.ErrClosed
 	}
-	if value, ok := r.cache.get(ref); ok {
+	useEmbedded := embedded && r.security != nil && r.security.embeddedFilter != r.security.streamFilter
+	if value, ok := r.cache.get(ref, useEmbedded); ok {
 		return value, nil
 	}
 	entry, ok := r.xref[ref.Number]
@@ -794,7 +833,7 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 			}
 		}
 		if err == nil && r.security != nil && !r.security.unencrypted[ref] {
-			value, err = r.security.decryptObject(value, ref)
+			value, err = r.security.decryptObject(r, value, ref, useEmbedded)
 			if err != nil {
 				err = &objectSecurityError{err: err}
 			}
@@ -812,7 +851,7 @@ func (r *Reader) Object(ref Reference) (Object, error) {
 			stream.hasWarning = r.ownerHasWarning
 		}
 	}
-	r.cache.set(ref, value)
+	r.cache.set(ref, value, useEmbedded)
 	return value, nil
 }
 
@@ -978,6 +1017,7 @@ func (r *Reader) loadCrossReferences() error {
 	}
 	visited := map[int64]bool{}
 	sections := 0
+	var totalEntries int64
 	for {
 		sections++
 		if sections > maxXrefSections {
@@ -991,10 +1031,11 @@ func (r *Reader) loadCrossReferences() error {
 			return fmt.Errorf("cyclic cross-reference chain")
 		}
 		visited[offset] = true
-		trailer, entries, actual, err := r.readXref(offset)
+		trailer, entries, actual, err := r.readXref(offset, maxXrefEntries-totalEntries)
 		if err != nil {
 			return err
 		}
+		totalEntries += int64(len(entries))
 		if actual != offset {
 			if visited[actual] {
 				if r.warning != nil && r.Trailer != nil {
@@ -1014,24 +1055,19 @@ func (r *Reader) loadCrossReferences() error {
 				return fmt.Errorf("cyclic hybrid cross-reference")
 			}
 			visited[int64(hybrid)] = true
-			_, supplement, err := r.readXrefStream(int64(hybrid))
+			_, supplement, err := r.readXrefStream(int64(hybrid), maxXrefEntries-totalEntries)
 			if err != nil {
 				return err
 			}
+			totalEntries += int64(len(supplement))
 			for id, entry := range supplement {
-				if _, exists := entries[id]; !exists {
-					if len(entries) >= maxXrefEntries {
-						return fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
-					}
+				if existing, exists := entries[id]; !exists || existing.kind == 0 && entry.kind != 0 {
 					entries[id] = entry
 				}
 			}
 		}
 		for id, entry := range entries {
 			if _, exists := r.xref[id]; !exists {
-				if len(r.xref) >= maxXrefEntries {
-					return fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
-				}
 				r.xref[id] = entry
 			}
 		}
@@ -1096,7 +1132,7 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 	damagedStreamIndex, hasObjectStreams := false, false
 	var objectStreams []Reference
 	var catalog Reference
-	var offset int64
+	var offset, xrefEntries int64
 	for offset < r.size {
 		var token string
 		var ref Reference
@@ -1154,11 +1190,12 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 			break
 		}
 		if token == "xref" {
-			_, entries, xrefErr := r.readXrefAt(start)
+			_, entries, xrefErr := r.readXrefAt(start, maxXrefEntries-xrefEntries)
 			if xrefErr != nil && !readerStructuralError(xrefErr) {
 				return nil, nil, xrefErr
 			}
 			if xrefErr == nil {
+				xrefEntries += int64(len(entries))
 				for id, entry := range entries {
 					if entry.kind == 0 {
 						index[id] = entry
@@ -1260,13 +1297,15 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 				}
 				end = next
 				if dict["Type"] == Name("XRef") {
-					_, entries, err := r.readXrefStream(start)
+					_, entries, err := r.readXrefStream(start, maxXrefEntries-xrefEntries)
 					if err != nil {
 						if !readerStructuralError(err) {
 							return nil, nil, err
 						}
 						damagedStreamIndex = true
 						r.warning(Diagnostic{Offset: start, Message: "invalid xref stream index; validated uncompressed object boundaries retained"})
+					} else {
+						xrefEntries += int64(len(entries))
 					}
 					for id, entry := range entries {
 						if entry.kind != 1 {
@@ -1763,10 +1802,10 @@ func (p *objectParser) objectBoundary() bool {
 }
 
 // readXref 读取传统或流式交叉引用区段，并返回实际定位的区段偏移
-// 入参: offset 交叉引用区段的字节偏移
+// 入参: offset 交叉引用区段的字节偏移, limit 剩余允许加载的最大条目数
 // 返回: Dictionary 尾字典或交叉引用流字典, map[int64]xrefEntry 交叉引用条目, int64 实际区段偏移, error 读取或解析错误
-func (r *Reader) readXref(offset int64) (Dictionary, map[int64]xrefEntry, int64, error) {
-	trailer, entries, original := r.readXrefAt(offset)
+func (r *Reader) readXref(offset int64, limit int64) (Dictionary, map[int64]xrefEntry, int64, error) {
+	trailer, entries, original := r.readXrefAt(offset, limit)
 	if original == nil || r.warning == nil || !readerStructuralError(original) {
 		return trailer, entries, offset, original
 	}
@@ -1778,7 +1817,7 @@ func (r *Reader) readXref(offset int64) (Dictionary, map[int64]xrefEntry, int64,
 		start, stop int64
 		claim       bool
 	}{{start, stop, false}, {max(int64(0), r.size-readerTailLimit), r.size, true}} {
-		trailer, entries, candidate, err := r.findXrefOffset(offset, region.start, region.stop, region.claim)
+		trailer, entries, candidate, err := r.findXrefOffset(offset, region.start, region.stop, region.claim, limit)
 		if err != nil {
 			return nil, nil, -1, err
 		}
@@ -1851,9 +1890,9 @@ func (r *Reader) rebaseXrefEntries(declared, actual int64, trailer Dictionary, e
 }
 
 // findXrefOffset 在限定范围校验唯一xref候选，远距离修复须与该区段的startxref声明相互印证
-// 入参: offset 错误声明偏移, start 起点, stop 终点, claim 是否要求尾部声明相符
+// 入参: offset 错误声明偏移, start 起点, stop 终点, claim 是否要求尾部声明相符, limit 剩余允许加载的最大条目数
 // 返回: Dictionary 尾字典, map[int64]xrefEntry 索引, int64 唯一位置或负值, error 源错误
-func (r *Reader) findXrefOffset(offset, start, stop int64, claim bool) (Dictionary, map[int64]xrefEntry, int64, error) {
+func (r *Reader) findXrefOffset(offset, start, stop int64, claim bool, limit int64) (Dictionary, map[int64]xrefEntry, int64, error) {
 	data, err := r.readRange(start, stop-start)
 	if err != nil {
 		return nil, nil, -1, err
@@ -1890,7 +1929,7 @@ func (r *Reader) findXrefOffset(offset, start, stop int64, claim bool) (Dictiona
 			return nil, nil, -1, nil
 		}
 		if claim {
-			matches, err := r.xrefClaimsOffset(at, offset)
+			matches, err := r.xrefClaimsOffset(at, offset, limit)
 			if err != nil {
 				return nil, nil, -1, err
 			}
@@ -1898,7 +1937,7 @@ func (r *Reader) findXrefOffset(offset, start, stop int64, claim bool) (Dictiona
 				continue
 			}
 		}
-		dict, found, err := r.readXrefAt(at)
+		dict, found, err := r.readXrefAt(at, limit)
 		if err != nil {
 			if !readerStructuralError(err) {
 				return nil, nil, -1, err
@@ -1914,9 +1953,9 @@ func (r *Reader) findXrefOffset(offset, start, stop int64, claim bool) (Dictiona
 }
 
 // xrefClaimsOffset 核对完整xref封装后紧接的startxref数值，不把旧版本区段误作当前尾部
-// 入参: at 候选实际位置, offset 待恢复声明位置
+// 入参: at 候选实际位置, offset 待恢复声明位置, limit 剩余允许加载的最大条目数
 // 返回: bool 声明是否相符, error 源读取错误
-func (r *Reader) xrefClaimsOffset(at, offset int64) (bool, error) {
+func (r *Reader) xrefClaimsOffset(at, offset, limit int64) (bool, error) {
 	var stream bool
 	var start, end int64
 	var ref Reference
@@ -1924,7 +1963,7 @@ func (r *Reader) xrefClaimsOffset(at, offset int64) (bool, error) {
 	err := r.parseAt(at, func(p *objectParser) error {
 		if p.token() == "xref" {
 			p.pos = 0
-			if _, _, err := r.classicXref(p); err != nil {
+			if _, _, err := r.classicXref(p, limit); err != nil {
 				return err
 			}
 			end = at + int64(p.pos)
@@ -1973,9 +2012,9 @@ func (r *Reader) xrefClaimsOffset(at, offset int64) (bool, error) {
 }
 
 // readXrefAt 读取指定位置的传统或流式交叉引用，不重新定位
-// 入参: offset 交叉引用区段的字节偏移
+// 入参: offset 交叉引用区段的字节偏移, limit 剩余允许加载的最大条目数
 // 返回: Dictionary 尾字典, map[int64]xrefEntry 交叉引用条目, error 读取或解析错误
-func (r *Reader) readXrefAt(offset int64) (Dictionary, map[int64]xrefEntry, error) {
+func (r *Reader) readXrefAt(offset int64, limit int64) (Dictionary, map[int64]xrefEntry, error) {
 	if offset < 0 || offset >= r.size {
 		return nil, nil, fmt.Errorf("cross-reference offset outside file")
 	}
@@ -1985,22 +2024,22 @@ func (r *Reader) readXrefAt(offset int64) (Dictionary, map[int64]xrefEntry, erro
 		return nil, nil, err
 	}
 	if probe.token() != "xref" {
-		return r.readXrefStream(offset)
+		return r.readXrefStream(offset, limit)
 	}
 	var trailer Dictionary
 	var result map[int64]xrefEntry
 	err = r.parseAt(offset, func(p *objectParser) error {
 		var err error
-		trailer, result, err = r.classicXref(p)
+		trailer, result, err = r.classicXref(p, limit)
 		return err
 	})
 	return trailer, result, err
 }
 
 // classicXref 解析传统交叉引用及其尾字典
-// 入参: p 位于xref关键字的解析器
+// 入参: p 位于xref关键字的解析器, limit 剩余允许加载的最大条目数
 // 返回: Dictionary 尾字典, map[int64]xrefEntry 交叉引用条目, error 语法错误
-func (r *Reader) classicXref(p *objectParser) (Dictionary, map[int64]xrefEntry, error) {
+func (r *Reader) classicXref(p *objectParser, limit int64) (Dictionary, map[int64]xrefEntry, error) {
 	p.token()
 	entries := map[int64]xrefEntry{}
 	for {
@@ -2021,7 +2060,7 @@ func (r *Reader) classicXref(p *objectParser) (Dictionary, map[int64]xrefEntry, 
 		if e1 != nil || e2 != nil || first < 0 || count < 0 || count > r.size/18 || first > (1<<63-1)-count {
 			return nil, nil, p.fail("invalid cross-reference subsection")
 		}
-		if count > maxXrefEntries-int64(len(entries)) {
+		if limit < 0 || count > limit-int64(len(entries)) {
 			return nil, nil, fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
 		}
 		for i := int64(0); i < count; i++ {
@@ -2047,9 +2086,9 @@ func (r *Reader) classicXref(p *objectParser) (Dictionary, map[int64]xrefEntry, 
 }
 
 // readXrefStream 读取交叉引用流并检查字段边界
-// 入参: offset 交叉引用流对象的字节偏移
+// 入参: offset 交叉引用流对象的字节偏移, limit 剩余允许加载的最大条目数
 // 返回: Dictionary 交叉引用流字典, map[int64]xrefEntry 交叉引用条目, error 读取或解析错误
-func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, error) {
+func (r *Reader) readXrefStream(offset int64, limit int64) (Dictionary, map[int64]xrefEntry, error) {
 	ref, object, err := r.indirect(offset)
 	if err != nil {
 		return nil, nil, err
@@ -2093,23 +2132,30 @@ func (r *Reader) readXrefStream(offset int64) (Dictionary, map[int64]xrefEntry, 
 			return nil, nil, fmt.Errorf("invalid cross-reference index")
 		}
 	}
+	var total int64
+	for i := 0; i < len(index); i += 2 {
+		first, ok1 := index[i].(Integer)
+		count, ok2 := index[i+1].(Integer)
+		if !ok1 || !ok2 || first < 0 || count < 0 || first > Integer(1<<63-1)-count {
+			return nil, nil, fmt.Errorf("invalid cross-reference range")
+		}
+		if limit < 0 || int64(count) > limit-total {
+			return nil, nil, fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
+		}
+		total += int64(count)
+	}
 	data, err := stream.decodeWith(context.Background(), nil, r.warning, 0)
 	if err != nil {
 		return nil, nil, err
 	}
 	entries := map[int64]xrefEntry{}
 	pos := 0
-	var total int64
 	for i := 0; i < len(index); i += 2 {
-		first, ok1 := index[i].(Integer)
-		count, ok2 := index[i+1].(Integer)
-		if !ok1 || !ok2 || first < 0 || count < 0 || first > Integer(1<<63-1)-count || int64(count) > int64((len(data)-pos)/stride) {
+		first := index[i].(Integer)
+		count := index[i+1].(Integer)
+		if int64(count) > int64((len(data)-pos)/stride) {
 			return nil, nil, fmt.Errorf("invalid cross-reference range")
 		}
-		if int64(count) > maxXrefEntries-total {
-			return nil, nil, fmt.Errorf("%w: cross-reference entry limit exceeded", ErrStreamLimitExceeded)
-		}
-		total += int64(count)
 		if count > size || first > size-count {
 			if r.warning == nil {
 				return nil, nil, fmt.Errorf("invalid cross-reference range")

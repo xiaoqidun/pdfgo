@@ -28,6 +28,14 @@ const (
 	annotationRichStrike
 )
 
+// 富文本嵌套与装饰上限
+const (
+	maxAnnotationRichDepth           = 64
+	maxAnnotationRichDecorations     = 16
+	maxAnnotationRichDecorationSpans = 65536
+	maxAnnotationRichContentBytes    = 16 << 20
+)
+
 // annotationRichDecoration 保留声明元素的装饰样式，后代颜色和基线不改变祖先装饰
 type annotationRichDecoration struct {
 	parent *annotationRichDecoration
@@ -35,6 +43,18 @@ type annotationRichDecoration struct {
 	size   *float64
 	color  *[3]float64
 	rise   float64
+	depth  int
+}
+
+// annotationRichContentLimit 计算富文本外观内容流的有效字节上限
+// 入参: reader 关联阅读器
+// 返回: int 内容流最大字节数
+func annotationRichContentLimit(reader *Reader) int {
+	limit := maxAnnotationRichContentBytes
+	if maxBytes, _ := effectiveStreamLimits(reader, nil); maxBytes > 0 && maxBytes < int64(limit) {
+		limit = int(maxBytes)
+	}
+	return limit
 }
 
 // annotationRichDecorationSpan 保存一段装饰的局部坐标及来源
@@ -85,10 +105,13 @@ func annotationRichDecorationDefaults(ctx context.Context, defaults string) (str
 	return content.String(), err
 }
 
-// writeAnnotationRichDecorations 按字号绘制填充装饰，保留透明度且不继承文字裁剪
-// 入参: ctx 取消上下文, content 外观内容, spans 装饰片段, defaults 默认填充操作, matrix 文字变换
-// 返回: error 取消或范围溢出
-func writeAnnotationRichDecorations(ctx context.Context, content *strings.Builder, spans []annotationRichDecorationSpan, defaults string, matrix Matrix) error {
+// writeAnnotationRichDecorations 按字号在字节上限内绘制填充装饰，保留透明度且不继承文字裁剪
+// 入参: ctx 取消上下文, content 外观内容, spans 装饰片段, defaults 默认填充操作, matrix 文字变换, maxBytes 内容流字节上限
+// 返回: error 取消、超限或范围溢出
+func writeAnnotationRichDecorations(ctx context.Context, content *strings.Builder, spans []annotationRichDecorationSpan, defaults string, matrix Matrix, maxBytes int) error {
+	if len(spans) > maxAnnotationRichDecorationSpans {
+		return fmt.Errorf("%w: rich text decoration span limit exceeded", ErrStreamLimitExceeded)
+	}
 	for _, span := range spans {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -116,15 +139,22 @@ func writeAnnotationRichDecorations(ctx context.Context, content *strings.Builde
 			writeAnnotationOperation(content, "re f", span.x, y, span.width, thickness)
 		}
 		content.WriteString("Q\n")
+		if maxBytes > 0 && content.Len() > maxBytes {
+			return fmt.Errorf("%w: rich text appearance content limit exceeded", ErrStreamLimitExceeded)
+		}
 	}
 	return nil
 }
 
-// add 收集一段文字的祖先装饰，横向范围包括适用的字词间距
-// 入参: glyph 字符, state 文字状态, size 默认字号, x 起点, y 基线, width 推进量
-func (d *annotationRichDecorations) add(glyph annotationRichGlyph, state graphicsState, size, x, y, width float64) {
+// add 在取消上下文和片段上限内收集并合并同一来源的连续装饰，横向范围包括适用的字词间距
+// 入参: ctx 取消上下文, glyph 字符, state 文字状态, size 默认字号, x 起点, y 基线, width 推进量
+// 返回: error 取消或装饰数量超限错误
+func (d *annotationRichDecorations) add(ctx context.Context, glyph annotationRichGlyph, state graphicsState, size, x, y, width float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if annotationRichSize(glyph, size) == 0 || width == 0 {
-		return
+		return nil
 	}
 	start := len(d.spans)
 	for origin := glyph.style.decorations; origin != nil; origin = origin.parent {
@@ -141,6 +171,9 @@ func (d *annotationRichDecorations) add(glyph annotationRichGlyph, state graphic
 					continue
 				}
 			}
+			if len(d.spans) >= maxAnnotationRichDecorationSpans {
+				return fmt.Errorf("%w: rich text decoration span limit exceeded", ErrStreamLimitExceeded)
+			}
 			d.spans = append(d.spans, annotationRichDecorationSpan{origin, x, baseline, width, fontSize})
 		}
 	}
@@ -151,4 +184,5 @@ func (d *annotationRichDecorations) add(glyph annotationRichGlyph, state graphic
 	for i := start; i < len(d.spans); i++ {
 		d.last[d.spans[i].origin] = i
 	}
+	return nil
 }

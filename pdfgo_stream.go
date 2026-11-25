@@ -106,8 +106,11 @@ var streamFilterAliases = map[Name]Name{
 // flateReaderPool 复用zlib解码器，降低高频Flate流解压的堆分配
 var flateReaderPool sync.Pool
 
-// brotliReaderPool 复用Brotli解码器，降低高频Brotli流解压的堆分配
+// brotliReaderPool 复用标准窗口Brotli解码器，降低高频Brotli流解压的堆分配
 var brotliReaderPool sync.Pool
+
+// brotliLargeReaderPool 复用大窗口Brotli解码器，与标准窗口缓冲池隔离
+var brotliLargeReaderPool sync.Pool
 
 // emptyZlibStream 保存空数据的合法zlib流，用于在归还解码器时解除原输入引用
 var emptyZlibStream = []byte{0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01}
@@ -584,6 +587,9 @@ func restorePredictorContext(ctx context.Context, data []byte, params Dictionary
 	if predictor == 1 {
 		return data, nil
 	}
+	if predictor != 2 && (predictor < 10 || predictor > 15) {
+		return nil, fmt.Errorf("invalid predictor")
+	}
 	columns, err := integerDefault(params, "Columns", 1)
 	if err != nil {
 		return nil, err
@@ -599,11 +605,11 @@ func restorePredictorContext(ctx context.Context, data []byte, params Dictionary
 	if columns <= 0 || colors <= 0 || (bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16) || uint64(columns) > uint64(1<<63-8)/uint64(colors)/uint64(bits) {
 		return nil, fmt.Errorf("invalid predictor dimensions")
 	}
+	if len(data) == 0 {
+		return data, nil
+	}
 	row := (columns*colors*bits + 7) / 8
 	bpp := (colors*bits + 7) / 8
-	if row > int64(len(data)) {
-		return nil, io.ErrUnexpectedEOF
-	}
 	if predictor == 2 {
 		if int64(len(data))%row != 0 {
 			return nil, io.ErrUnexpectedEOF
@@ -636,9 +642,6 @@ func restorePredictorContext(ctx context.Context, data []byte, params Dictionary
 			}
 		}
 		return out, ctx.Err()
-	}
-	if predictor < 10 || predictor > 15 {
-		return nil, fmt.Errorf("invalid predictor")
 	}
 	if int64(len(data))%(row+1) != 0 {
 		return nil, io.ErrUnexpectedEOF
@@ -791,25 +794,198 @@ func releaseZlibReader(reader io.ReadCloser) {
 	}
 }
 
-// acquireBrotliReader 从池中获取并重置Brotli解码器，启用RFC 9841大窗口以支持PDF 2.0扩展流
+// checkBrotliLimits 依据RFC 7932及RFC 9841预检Brotli窗口及块长度，防止解码器提前分配超限环形缓冲
+// 入参: data 压缩数据, maxBytes 解码字节上限，非正数表示不限制
+// 返回: error 超限时返回ErrStreamLimitExceeded
+func checkBrotliLimits(data []byte, maxBytes int64) error {
+	if maxBytes <= 0 || len(data) == 0 {
+		return nil
+	}
+	totalBits := int64(len(data)) * 8
+	var bitPos int64
+	readBits := func(n uint) (uint32, bool) {
+		if int64(n) > totalBits-bitPos {
+			return 0, false
+		}
+		var value uint32
+		for i := range n {
+			value |= uint32((data[bitPos>>3]>>uint(bitPos&7))&1) << i
+			bitPos++
+		}
+		return value, true
+	}
+	b0, _ := readBits(1)
+	var wbits uint32
+	if b0 == 0 {
+		wbits = 16
+	} else {
+		b1, ok := readBits(3)
+		if !ok {
+			return nil
+		}
+		if b1 != 0 {
+			wbits = 17 + b1
+		} else {
+			b2, ok := readBits(3)
+			if !ok {
+				return nil
+			}
+			switch b2 {
+			case 0:
+				wbits = 17
+			case 1:
+				b3, ok := readBits(1)
+				if !ok || b3 == 1 {
+					return nil
+				}
+				w, ok := readBits(6)
+				if !ok || w < 10 || w > 30 {
+					return nil
+				}
+				wbits = w
+			default:
+				wbits = 8 + b2
+			}
+		}
+	}
+	if wbits > 24 && int64(1)<<(wbits-1) >= maxBytes {
+		return ErrStreamLimitExceeded
+	}
+	var totalOut int64
+	for {
+		isLast, ok := readBits(1)
+		if !ok {
+			return nil
+		}
+		if isLast != 0 {
+			isLastEmpty, ok := readBits(1)
+			if !ok || isLastEmpty != 0 {
+				return nil
+			}
+		}
+		nibblesCode, ok := readBits(2)
+		if !ok {
+			return nil
+		}
+		if nibblesCode == 3 {
+			reserved, ok := readBits(1)
+			if !ok || reserved != 0 {
+				return nil
+			}
+			skipBytes, ok := readBits(2)
+			if !ok {
+				return nil
+			}
+			var skipLen int64
+			if skipBytes != 0 {
+				var raw uint32
+				for i := uint32(0); i < skipBytes; i++ {
+					b, ok := readBits(8)
+					if !ok {
+						return nil
+					}
+					if i+1 == skipBytes && skipBytes > 1 && b == 0 {
+						return nil
+					}
+					raw |= b << (i * 8)
+				}
+				skipLen = int64(raw) + 1
+			}
+			if rem := uint((8 - bitPos&7) & 7); rem != 0 {
+				pad, ok := readBits(rem)
+				if !ok || pad != 0 {
+					return nil
+				}
+			}
+			if skipLen > (totalBits-bitPos)/8 {
+				return nil
+			}
+			bitPos += skipLen * 8
+			if isLast != 0 {
+				return nil
+			}
+			continue
+		}
+		nibbles := nibblesCode + 4
+		var mlenMinus1 uint32
+		for i := uint32(0); i < nibbles; i++ {
+			nib, ok := readBits(4)
+			if !ok {
+				return nil
+			}
+			if i+1 == nibbles && nibbles > 4 && nib == 0 {
+				return nil
+			}
+			mlenMinus1 |= nib << (i * 4)
+		}
+		mlen := int64(mlenMinus1) + 1
+		var uncompressed uint32
+		if isLast == 0 {
+			uncompressed, ok = readBits(1)
+			if !ok {
+				return nil
+			}
+		}
+		if mlen > maxBytes-totalOut {
+			return ErrStreamLimitExceeded
+		}
+		totalOut += mlen
+		if isLast != 0 || uncompressed == 0 {
+			return nil
+		}
+		if rem := uint((8 - bitPos&7) & 7); rem != 0 {
+			pad, ok := readBits(rem)
+			if !ok || pad != 0 {
+				return nil
+			}
+		}
+		if mlen > (totalBits-bitPos)/8 {
+			return nil
+		}
+		bitPos += mlen * 8
+	}
+}
+
+// acquireBrotliReader 从标准窗口池中获取并重置Brotli解码器
 // 入参: input 压缩数据输入流
 // 返回: *brotli.Reader 可用解码器
 func acquireBrotliReader(input io.Reader) *brotli.Reader {
-	if cached, ok := brotliReaderPool.Get().(*brotli.Reader); ok {
+	return acquireBrotliReaderWith(input, false)
+}
+
+// acquireBrotliReaderWith 从对应池中获取并重置Brotli解码器，按需启用RFC 9841大窗口
+// 入参: input 压缩数据输入流, largeWindow 是否允许大窗口扩展
+// 返回: *brotli.Reader 可用解码器
+func acquireBrotliReaderWith(input io.Reader, largeWindow bool) *brotli.Reader {
+	pool := &brotliReaderPool
+	if largeWindow {
+		pool = &brotliLargeReaderPool
+	}
+	if cached, ok := pool.Get().(*brotli.Reader); ok {
 		_ = cached.Reset(input)
 		return cached
 	}
-	return brotli.NewReaderOptions(input, brotli.ReaderOptions{LargeWindow: true})
+	return brotli.NewReaderOptions(input, brotli.ReaderOptions{LargeWindow: largeWindow})
 }
 
-// releaseBrotliReader 清除输入引用后按规模决定是否归还Brotli解码器，避免大窗口长期驻留内存
+// releaseBrotliReader 清除输入引用后按规模归还标准窗口Brotli解码器
 // 入参: reader 待归还的解码器, decodedBytes 已解码字节数, failed 是否发生异常或超限
 func releaseBrotliReader(reader *brotli.Reader, decodedBytes int64, failed bool) {
+	releaseBrotliReaderWith(reader, decodedBytes, failed, false)
+}
+
+// releaseBrotliReaderWith 清除输入引用后按规模归还Brotli解码器，避免大窗口长期驻留内存
+// 入参: reader 待归还的解码器, decodedBytes 已解码字节数, failed 是否发生异常或超限, largeWindow 是否为大窗口解码器
+func releaseBrotliReaderWith(reader *brotli.Reader, decodedBytes int64, failed bool, largeWindow bool) {
 	if failed || decodedBytes > 1<<20 {
 		return
 	}
+	pool := &brotliReaderPool
+	if largeWindow {
+		pool = &brotliLargeReaderPool
+	}
 	if reader.Reset(bytes.NewReader(nil)) == nil {
-		brotliReaderPool.Put(reader)
+		pool.Put(reader)
 	}
 }
 
@@ -985,11 +1161,18 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 			}
 		case "BrotliDecode":
 			encoded := data
-			reader := acquireBrotliReader(&contextInput{ctx: ctx, reader: bytes.NewReader(encoded)})
+			if err := checkBrotliLimits(encoded, maxBytes); err != nil {
+				if limit > 0 {
+					return nil, fmt.Errorf("stream recovery %w", err)
+				}
+				return nil, fmt.Errorf("Brotli %w", err)
+			}
+			largeWindow := maxBytes == 0 || maxBytes > 16<<20
+			reader := acquireBrotliReaderWith(&contextInput{ctx: ctx, reader: bytes.NewReader(encoded)}, largeWindow)
 			input := limitStreamReader(&contextInput{ctx: ctx, reader: reader}, maxBytes)
 			data, err = readAllEstimated(input, estimateFlateCapacity(len(encoded), maxBytes))
 			exceeded := maxBytes > 0 && int64(len(data)) > maxBytes
-			releaseBrotliReader(reader, int64(len(data)), exceeded || err != nil)
+			releaseBrotliReaderWith(reader, int64(len(data)), exceeded || err != nil, largeWindow)
 			if exceeded {
 				if limit > 0 {
 					return nil, fmt.Errorf("stream recovery %w", ErrStreamLimitExceeded)

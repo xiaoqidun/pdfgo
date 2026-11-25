@@ -30,6 +30,13 @@ import (
 	"slices"
 )
 
+// pixelsWithinBudget 判断宽高像素数是否合法且不超过上限，避免整数乘法溢出
+// 入参: width 宽度, height 高度, limit 像素上限
+// 返回: bool 是否满足预算要求
+func pixelsWithinBudget(width, height, limit int64) bool {
+	return width > 0 && height > 0 && limit > 0 && width <= limit/height
+}
+
 // isFatalOptimizationReadError 判断错误是否属于必须向上传播的取消、关闭、认证、读取或安全错误
 // 入参: ctx 取消上下文, err 待检查错误
 // 返回: bool 是否为不可吞噬的致命读取错误
@@ -277,7 +284,7 @@ func (r *Reader) optimizeJPXImage(ctx context.Context, stream *Stream, options C
 		if scale > 0 && scale < 1 {
 			downscale = true
 			w, h := math.Ceil(float64(source.Width)*scale), math.Ceil(float64(source.Height)*scale)
-			if w*h > optimizationBufferLimit/8 {
+			if !(w > 0 && h > 0 && w <= float64(optimizationBufferLimit/8)/h) {
 				return stream, ctx.Err()
 			}
 		}
@@ -285,7 +292,7 @@ func (r *Reader) optimizeJPXImage(ctx context.Context, stream *Stream, options C
 	if !downscale {
 		size = image.Point{}
 	}
-	if int64(source.Width)*int64(source.Height) > optimizationBufferLimit/8 {
+	if !pixelsWithinBudget(int64(source.Width), int64(source.Height), optimizationBufferLimit/8) {
 		if !downscale {
 			return stream, ctx.Err()
 		}
@@ -306,6 +313,10 @@ func (r *Reader) optimizeJPXImage(ctx context.Context, stream *Stream, options C
 	if err != nil {
 		return stream, ctx.Err()
 	}
+	b := decoded.Bounds()
+	if !pixelsWithinBudget(int64(b.Dx()), int64(b.Dy()), optimizationBufferLimit/4) {
+		return stream, ctx.Err()
+	}
 	wantGray := targetSpace == Name("DeviceGray")
 	if wantGray && source.ColorSpace != Name("DeviceGray") {
 		gray, err := imageAllGray(ctx, decoded)
@@ -324,14 +335,24 @@ func (r *Reader) optimizeJPXImage(ctx context.Context, stream *Stream, options C
 	return stream, ctx.Err()
 }
 
-// readOptimizationImage 读取图像描述并在存在默认颜色空间资源时应用映射
+// readOptimizationImage 读取图像描述并仅应用文档自带的默认颜色空间资源，不将查看器设备配置文件烘焙进输出
 // 入参: stream 图像流, colorResources 可选颜色空间资源字典
 // 返回: *Image 图像描述, error 解析错误
 func (r *Reader) readOptimizationImage(stream *Stream, colorResources Dictionary) (*Image, error) {
-	if len(colorResources) != 0 {
-		return r.ReadImageWithResources(stream, Dictionary{"ColorSpace": colorResources})
+	view := r
+	if r.deviceProfile != nil {
+		copied := *r
+		copied.deviceProfile = nil
+		if copied.owner == nil {
+			copied.owner = r
+		}
+		copied.ownerHasWarning = r.rootHasWarning()
+		view = &copied
 	}
-	return r.ReadImage(stream)
+	if len(colorResources) != 0 {
+		return view.ReadImageWithResources(stream, Dictionary{"ColorSpace": colorResources})
+	}
+	return view.ReadImage(stream)
 }
 
 // lossyConvertibleColorSpace 判断PDF颜色空间在有损模式下能否安全转为sRGB或DeviceGray
@@ -463,6 +484,10 @@ func lossyColorConflict(space Object, targetSpace Name, colorResources Dictionar
 // 入参: ctx 取消上下文, orig 原始流, img 已缩放图像, wantGray 是否目标灰度, options 压缩配置, sourceJPEG 原流是否为JPEG编码, colorResources 可选默认颜色空间资源
 // 返回: *Stream 编码后的图像流或空值, error 取消或编码错误
 func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img image.Image, wantGray bool, options CompressionOptions, sourceJPEG bool, colorResources Dictionary) (*Stream, error) {
+	b := img.Bounds()
+	if !pixelsWithinBudget(int64(b.Dx()), int64(b.Dy()), optimizationBufferLimit/4) {
+		return nil, ctx.Err()
+	}
 	if wantGray {
 		if defaultColorConflict("DeviceGray", colorResources) {
 			return nil, ctx.Err()
@@ -560,11 +585,15 @@ func (r *Reader) isSMaskOpaque(ctx context.Context, smask *Stream) (bool, error)
 	if err != nil || maskImg.ImageMask || maskImg.ColorSpace != Name("DeviceGray") || maskImg.Mask != nil || maskImg.SoftMask != nil {
 		return false, ctx.Err()
 	}
-	if int64(maskImg.Width)*int64(maskImg.Height) > optimizationBufferLimit/4 {
+	if !pixelsWithinBudget(int64(maskImg.Width), int64(maskImg.Height), optimizationBufferLimit/4) {
 		return false, ctx.Err()
 	}
 	decoded, err := maskImg.DecodeImageContext(ctx)
 	if err != nil {
+		return false, ctx.Err()
+	}
+	b := decoded.Bounds()
+	if !pixelsWithinBudget(int64(b.Dx()), int64(b.Dy()), optimizationBufferLimit/4) {
 		return false, ctx.Err()
 	}
 	return imageMaskOpaque(ctx, decoded, false)
@@ -726,7 +755,7 @@ func (r *Reader) resolveOptimizationObjectRef(value Object, cached map[Reference
 	}
 }
 
-// imageOutputSizes 汇总页面、表单、注释外观及平铺图案中的图片最大显示尺寸，Type3字形图仅禁降采样
+// imageOutputSizes 汇总页面、表单、注释外观、媒体、渲染动作及平铺图案中的图片最大显示尺寸，Type3字形图仅禁降采样
 // 入参: ctx 取消上下文, dpi 分辨率上限
 // 返回: map[Reference]image.Point 图片像素上限, error 取消错误
 func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]image.Point, error) {
@@ -1257,23 +1286,30 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		markType3Fonts(resources, localUnsafe)
 		return walkPatterns(resources, initialMatrix, depth, budget, collector, localUnsafe)
 	}
-	walkAnnotationStream := func(page *Page, unit float64, rect Rectangle, rectValid bool, apStream *Stream) error {
-		apRes := page.Resources
-		if apStream.Dictionary["Resources"] != nil {
-			resVal, err := r.Resolve(apStream.Dictionary["Resources"])
+	resolveFormResources := func(stream *Stream, fallback Dictionary) (Dictionary, error) {
+		res := fallback
+		if stream.Dictionary["Resources"] != nil {
+			resVal, err := r.Resolve(stream.Dictionary["Resources"])
 			if err != nil {
 				if isFatalOptimizationReadError(ctx, err) {
-					return err
+					return nil, err
 				}
-				return errUnsafe
+				return nil, errUnsafe
 			}
 			if resVal != nil {
 				dict, ok := resVal.(Dictionary)
 				if !ok {
-					return errUnsafe
+					return nil, errUnsafe
 				}
-				apRes = dict
+				res = dict
 			}
+		}
+		return res, nil
+	}
+	walkAnnotationStream := func(page *Page, unit float64, rect Rectangle, rectValid bool, apStream *Stream) error {
+		apRes, err := resolveFormResources(apStream, page.Resources)
+		if err != nil {
+			return err
 		}
 		failSafe := func(cause error) error {
 			if isFatalOptimizationReadError(ctx, cause) {
@@ -1333,6 +1369,275 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		}
 		return ctx.Err()
 	}
+	walkAnnotationMedia := func(page *Page, unit float64, rect Rectangle, rectValid bool, rotate int64, unbounded bool, mediaObj Object) error {
+		if mediaObj == nil {
+			return nil
+		}
+		obj, ref, err := resolveObjectRef(mediaObj)
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
+			return nil
+		}
+		stream, ok := obj.(*Stream)
+		if !ok {
+			return nil
+		}
+		sub, err := r.Resolve(stream.Dictionary["Subtype"])
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
+			if ref.Number > 0 {
+				unsafe[ref] = true
+			}
+			return nil
+		}
+		targetRect := rect
+		if rectValid && rotate%180 != 0 {
+			targetRect = Rectangle{XMin: 0, YMin: 0, XMax: math.Abs(rect.YMax - rect.YMin), YMax: math.Abs(rect.XMax - rect.XMin)}
+		}
+		switch sub {
+		case Name("Image"):
+			if ref.Number <= 0 {
+				return nil
+			}
+			if unbounded || !rectValid || targetRect.XMin == targetRect.XMax || targetRect.YMin == targetRect.YMax {
+				unsafe[ref] = true
+				return nil
+			}
+			w := math.Abs(targetRect.XMax - targetRect.XMin)
+			h := math.Abs(targetRect.YMax - targetRect.YMin)
+			recordPlacement(ref, Matrix{unit * w, 0, 0, unit * h, 0, 0}, nil, unsafe)
+		case Name("Form"):
+			if unbounded {
+				res, err := resolveFormResources(stream, page.Resources)
+				if err != nil {
+					return err
+				}
+				if !markResourcesUnsafe(res, unsafe, map[Reference]bool{ref: true}, 0) {
+					return errUnsafe
+				}
+				return nil
+			}
+			return walkAnnotationStream(page, unit, targetRect, rectValid, stream)
+		}
+		return nil
+	}
+	var walkMediaClip func(Object, Dictionary, map[Reference]bool, int) error
+	walkMediaClip = func(clipObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
+		if clipObj == nil || depth > 32 {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		obj, ref, err := resolveObjectRef(clipObj)
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
+			return nil
+		}
+		if visited == nil {
+			visited = map[Reference]bool{}
+		}
+		if ref.Number > 0 {
+			if visited[ref] {
+				return nil
+			}
+			visited[ref] = true
+		}
+		switch v := obj.(type) {
+		case *Stream:
+			sub, err := r.Resolve(v.Dictionary["Subtype"])
+			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
+				}
+				if ref.Number > 0 {
+					unsafe[ref] = true
+				}
+				return nil
+			}
+			switch sub {
+			case Name("Image"):
+				if ref.Number > 0 {
+					unsafe[ref] = true
+				}
+			case Name("Form"):
+				clipRes, err := resolveFormResources(v, pageRes)
+				if err != nil {
+					return err
+				}
+				if clipRes == nil || !markResourcesUnsafe(clipRes, unsafe, map[Reference]bool{ref: true}, 0) {
+					return errUnsafe
+				}
+			}
+		case Dictionary:
+			return walkMediaClip(v["D"], pageRes, visited, depth+1)
+		}
+		return nil
+	}
+	var walkRendition func(Object, Dictionary, map[Reference]bool, int) error
+	walkRendition = func(rendObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
+		if rendObj == nil || depth > 32 {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		obj, ref, err := resolveObjectRef(rendObj)
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
+			return nil
+		}
+		if ref.Number > 0 {
+			if visited[ref] {
+				return nil
+			}
+			visited[ref] = true
+		}
+		dict, ok := obj.(Dictionary)
+		if !ok {
+			return nil
+		}
+		if err := walkMediaClip(dict["C"], pageRes, nil, 0); err != nil {
+			return err
+		}
+		if dict["R"] != nil {
+			arrVal, err := r.Resolve(dict["R"])
+			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
+				}
+				return nil
+			}
+			if arr, ok := arrVal.(Array); ok {
+				for _, item := range arr {
+					if err := walkRendition(item, pageRes, visited, depth+1); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+	var walkAction func(Object, Dictionary, map[Reference]bool, int) error
+	walkAction = func(actionObj Object, pageRes Dictionary, visited map[Reference]bool, depth int) error {
+		if actionObj == nil || depth > 32 {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		obj, ref, err := resolveObjectRef(actionObj)
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
+			return nil
+		}
+		if ref.Number > 0 {
+			if visited[ref] {
+				return nil
+			}
+			visited[ref] = true
+		}
+		switch v := obj.(type) {
+		case Array:
+			for _, item := range v {
+				if err := walkAction(item, pageRes, visited, depth+1); err != nil {
+					return err
+				}
+			}
+		case Dictionary:
+			s, err := r.Resolve(v["S"])
+			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
+				}
+				return nil
+			}
+			if s == Name("Rendition") && v["R"] != nil {
+				fallbackRes := pageRes
+				if fallbackRes == nil && v["AN"] != nil {
+					if anVal, anErr := r.Resolve(v["AN"]); anErr == nil {
+						if anDict, ok := anVal.(Dictionary); ok && anDict["P"] != nil {
+							nodeObj := anDict["P"]
+							for step := 0; step < 32 && nodeObj != nil && fallbackRes == nil; step++ {
+								pVal, pErr := r.Resolve(nodeObj)
+								if pErr != nil {
+									break
+								}
+								pDict, ok := pVal.(Dictionary)
+								if !ok {
+									break
+								}
+								if pDict["Resources"] != nil {
+									if rVal, rErr := r.Resolve(pDict["Resources"]); rErr == nil {
+										fallbackRes, _ = rVal.(Dictionary)
+									}
+									break
+								}
+								nodeObj = pDict["Parent"]
+							}
+						}
+					}
+				}
+				if err := walkRendition(v["R"], fallbackRes, map[Reference]bool{}, 0); err != nil {
+					return err
+				}
+			}
+			if v["Next"] != nil {
+				if err := walkAction(v["Next"], pageRes, visited, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	walkAdditionalActions := func(aaObj Object, pageRes Dictionary) error {
+		if aaObj == nil {
+			return nil
+		}
+		aaVal, err := r.Resolve(aaObj)
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
+			return nil
+		}
+		aaDict, ok := aaVal.(Dictionary)
+		if !ok {
+			return nil
+		}
+		for _, entry := range aaDict {
+			if err := walkAction(entry, pageRes, map[Reference]bool{}, 0); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	resolveOptionalInt := func(obj Object) (int64, error) {
+		if obj == nil {
+			return 0, nil
+		}
+		val, err := r.Resolve(obj)
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return 0, err
+			}
+			return 0, nil
+		}
+		if n, ok := val.(Integer); ok {
+			return int64(n), nil
+		}
+		return 0, nil
+	}
 	walkPageAnnotations := func(page *Page, unit float64) error {
 		if page.Dictionary["Annots"] == nil {
 			return nil
@@ -1360,17 +1665,6 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				continue
 			}
 			annotDict, ok := annotObj.(Dictionary)
-			if !ok || annotDict["AP"] == nil {
-				continue
-			}
-			apVal, err := r.Resolve(annotDict["AP"])
-			if err != nil {
-				if isFatalOptimizationReadError(ctx, err) {
-					return err
-				}
-				continue
-			}
-			apDict, ok := apVal.(Dictionary)
 			if !ok {
 				continue
 			}
@@ -1379,38 +1673,117 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				return rectErr
 			}
 			rectValid := rectErr == nil
-			for _, apKey := range []Name{"N", "R", "D"} {
-				entryVal, err := r.Resolve(apDict[apKey])
+			if annotDict["AP"] != nil {
+				apVal, err := r.Resolve(annotDict["AP"])
 				if err != nil {
 					if isFatalOptimizationReadError(ctx, err) {
 						return err
 					}
-					continue
-				}
-				if entryVal == nil {
-					continue
-				}
-				switch v := entryVal.(type) {
-				case *Stream:
-					if err := walkAnnotationStream(page, unit, rect, rectValid, v); err != nil {
-						return err
-					}
-				case Dictionary:
-					for _, stateEntry := range v {
-						stateObj, _, err := resolveObjectRef(stateEntry)
+				} else if apDict, ok := apVal.(Dictionary); ok {
+					for _, apKey := range []Name{"N", "R", "D"} {
+						entryVal, err := r.Resolve(apDict[apKey])
 						if err != nil {
 							if isFatalOptimizationReadError(ctx, err) {
 								return err
 							}
 							continue
 						}
-						if stateStream, ok := stateObj.(*Stream); ok {
-							if err := walkAnnotationStream(page, unit, rect, rectValid, stateStream); err != nil {
+						if entryVal == nil {
+							continue
+						}
+						switch v := entryVal.(type) {
+						case *Stream:
+							if err := walkAnnotationStream(page, unit, rect, rectValid, v); err != nil {
 								return err
+							}
+						case Dictionary:
+							for _, stateEntry := range v {
+								stateObj, _, err := resolveObjectRef(stateEntry)
+								if err != nil {
+									if isFatalOptimizationReadError(ctx, err) {
+										return err
+									}
+									continue
+								}
+								if stateStream, ok := stateObj.(*Stream); ok {
+									if err := walkAnnotationStream(page, unit, rect, rectValid, stateStream); err != nil {
+										return err
+									}
+								}
 							}
 						}
 					}
 				}
+			}
+			if err := walkAnnotationMedia(page, unit, rect, rectValid, 0, false, annotDict["Poster"]); err != nil {
+				return err
+			}
+			if annotDict["Movie"] != nil {
+				movieVal, err := r.Resolve(annotDict["Movie"])
+				if err != nil {
+					if isFatalOptimizationReadError(ctx, err) {
+						return err
+					}
+				} else if movieDict, ok := movieVal.(Dictionary); ok && movieDict["Poster"] != nil {
+					rotate, err := resolveOptionalInt(movieDict["Rotate"])
+					if err != nil {
+						return err
+					}
+					if err := walkAnnotationMedia(page, unit, rect, rectValid, rotate, false, movieDict["Poster"]); err != nil {
+						return err
+					}
+				}
+			}
+			if annotDict["MK"] != nil {
+				mkVal, err := r.Resolve(annotDict["MK"])
+				if err != nil {
+					if isFatalOptimizationReadError(ctx, err) {
+						return err
+					}
+				} else if mkDict, ok := mkVal.(Dictionary); ok {
+					rotate, err := resolveOptionalInt(mkDict["R"])
+					if err != nil {
+						return err
+					}
+					unbounded := false
+					if mkDict["IF"] != nil {
+						ifVal, ifErr := r.Resolve(mkDict["IF"])
+						if ifErr != nil {
+							if isFatalOptimizationReadError(ctx, ifErr) {
+								return ifErr
+							}
+							unbounded = true
+						} else if ifVal != nil {
+							ifDict, ok := ifVal.(Dictionary)
+							if !ok {
+								unbounded = true
+							} else if ifDict["SW"] != nil {
+								swVal, swErr := r.Resolve(ifDict["SW"])
+								if swErr != nil {
+									if isFatalOptimizationReadError(ctx, swErr) {
+										return swErr
+									}
+									unbounded = true
+								} else if swVal == Name("N") || swVal == Name("S") {
+									unbounded = true
+								}
+							}
+						}
+					}
+					for _, mkKey := range []Name{"I", "RI", "IX"} {
+						if err := walkAnnotationMedia(page, unit, rect, rectValid, rotate, unbounded, mkDict[mkKey]); err != nil {
+							return err
+						}
+					}
+				}
+			}
+			if annotDict["A"] != nil {
+				if err := walkAction(annotDict["A"], page.Resources, map[Reference]bool{}, 0); err != nil {
+					return err
+				}
+			}
+			if err := walkAdditionalActions(annotDict["AA"], page.Resources); err != nil {
+				return err
 			}
 		}
 		return ctx.Err()
@@ -1419,6 +1792,9 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		defer cleanup()
 		unit := page.UserUnit
 		if err := walkPageAnnotations(page, unit); err != nil {
+			return err
+		}
+		if err := walkAdditionalActions(page.Dictionary["AA"], page.Resources); err != nil {
 			return err
 		}
 		var content bytes.Buffer
@@ -1443,6 +1819,122 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		}
 		return nil
 	})
+	if err == nil && r.Trailer["Root"] != nil {
+		if rootVal, rootErr := r.Resolve(r.Trailer["Root"]); rootErr != nil {
+			if isFatalOptimizationReadError(ctx, rootErr) {
+				err = rootErr
+			}
+		} else if catalog, ok := rootVal.(Dictionary); ok {
+			if catalog["OpenAction"] != nil {
+				err = walkAction(catalog["OpenAction"], nil, map[Reference]bool{}, 0)
+			}
+			if err == nil {
+				err = walkAdditionalActions(catalog["AA"], nil)
+			}
+			if err == nil && catalog["Names"] != nil {
+				if namesVal, namesErr := r.Resolve(catalog["Names"]); namesErr != nil {
+					if isFatalOptimizationReadError(ctx, namesErr) {
+						err = namesErr
+					}
+				} else if namesDict, ok := namesVal.(Dictionary); ok && namesDict["Renditions"] != nil {
+					var walkRenditionTree func(Object, map[Reference]bool, int) error
+					walkRenditionTree = func(nodeObj Object, seen map[Reference]bool, depth int) error {
+						if nodeObj == nil || depth > 32 {
+							return nil
+						}
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+						obj, ref, nodeErr := resolveObjectRef(nodeObj)
+						if nodeErr != nil {
+							if isFatalOptimizationReadError(ctx, nodeErr) {
+								return nodeErr
+							}
+							return nil
+						}
+						if ref.Number > 0 {
+							if seen[ref] {
+								return nil
+							}
+							seen[ref] = true
+						}
+						dict, ok := obj.(Dictionary)
+						if !ok {
+							return nil
+						}
+						if dict["Names"] != nil {
+							if pairsVal, pairErr := r.Resolve(dict["Names"]); pairErr != nil {
+								if isFatalOptimizationReadError(ctx, pairErr) {
+									return pairErr
+								}
+							} else if pairs, ok := pairsVal.(Array); ok {
+								for i := 1; i < len(pairs); i += 2 {
+									if rErr := walkRendition(pairs[i], nil, map[Reference]bool{}, 0); rErr != nil {
+										return rErr
+									}
+								}
+							}
+						}
+						if dict["Kids"] != nil {
+							if kidsVal, kidErr := r.Resolve(dict["Kids"]); kidErr != nil {
+								if isFatalOptimizationReadError(ctx, kidErr) {
+									return kidErr
+								}
+							} else if kids, ok := kidsVal.(Array); ok {
+								for _, kid := range kids {
+									if kErr := walkRenditionTree(kid, seen, depth+1); kErr != nil {
+										return kErr
+									}
+								}
+							}
+						}
+						return nil
+					}
+					err = walkRenditionTree(namesDict["Renditions"], map[Reference]bool{}, 0)
+				}
+			}
+			if err == nil && catalog["Outlines"] != nil {
+				outlineSeen := map[Reference]bool{}
+				outlineQueue := []Object{catalog["Outlines"]}
+				for i := 0; i < len(outlineQueue) && i < 100000; i++ {
+					if cErr := ctx.Err(); cErr != nil {
+						err = cErr
+						break
+					}
+					obj, ref, oErr := resolveObjectRef(outlineQueue[i])
+					if oErr != nil {
+						if isFatalOptimizationReadError(ctx, oErr) {
+							err = oErr
+							break
+						}
+						continue
+					}
+					if ref.Number > 0 {
+						if outlineSeen[ref] {
+							continue
+						}
+						outlineSeen[ref] = true
+					}
+					dict, ok := obj.(Dictionary)
+					if !ok {
+						continue
+					}
+					if dict["A"] != nil {
+						if aErr := walkAction(dict["A"], nil, map[Reference]bool{}, 0); aErr != nil {
+							err = aErr
+							break
+						}
+					}
+					if dict["First"] != nil {
+						outlineQueue = append(outlineQueue, dict["First"])
+					}
+					if dict["Next"] != nil {
+						outlineQueue = append(outlineQueue, dict["Next"])
+					}
+				}
+			}
+		}
+	}
 	if err != nil {
 		if isFatalOptimizationReadError(ctx, err) {
 			return nil, err
@@ -1627,6 +2119,44 @@ func (r *Reader) imageDefaultColorResources(ctx context.Context, refs []Referenc
 				}
 			}
 		}
+		if res["Font"] != nil {
+			val, err := r.Resolve(res["Font"])
+			if err == nil {
+				if fonts, ok := val.(Dictionary); ok {
+					for _, entry := range fonts {
+						obj, ref, err := resolveObjectRef(entry)
+						if err != nil {
+							continue
+						}
+						dict, ok := obj.(Dictionary)
+						if !ok {
+							continue
+						}
+						sub, _ := r.Resolve(dict["Subtype"])
+						if sub != Name("Type3") {
+							continue
+						}
+						if canonical, aliased := aliases[ref]; aliased {
+							ref = canonical
+						}
+						if ref.Number > 0 && visited[ref] {
+							continue
+						}
+						if ref.Number > 0 {
+							visited[ref] = true
+						}
+						if dict["Resources"] == nil {
+							continue
+						}
+						if rVal, err := r.Resolve(dict["Resources"]); err == nil {
+							if rDict, ok := rVal.(Dictionary); ok {
+								walkRes(rDict, visited, depth+1)
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	walkAPStream := func(pageRes Dictionary, apStream *Stream) {
 		apRes := pageRes
@@ -1698,7 +2228,7 @@ func (r *Reader) imageDefaultColorResources(ctx context.Context, refs []Referenc
 // 入参: ctx 取消上下文, orig 原始流, baseline 体积比较基准流, w 宽度, h 高度, space 源颜色空间, targetSpace 目标设备色空间, options 压缩配置, size 像素需求, colorResources 可选默认颜色空间资源, ignoreSMask 是否忽略外部软遮罩, sourceJPEG 原流是否为JPEG编码
 // 返回: *Stream 更小的候选流或空值, error 取消或编码错误
 func (r *Reader) optimizePDFDecodedImage(ctx context.Context, orig, baseline *Stream, w, h Integer, space Object, targetSpace Name, options CompressionOptions, size image.Point, colorResources Dictionary, ignoreSMask, sourceJPEG bool) (*Stream, error) {
-	if w <= 0 || h <= 0 || int64(w)*int64(h) > optimizationBufferLimit/8 {
+	if !pixelsWithinBudget(int64(w), int64(h), optimizationBufferLimit/8) {
 		return nil, ctx.Err()
 	}
 	if lossyColorConflict(space, targetSpace, colorResources) {
@@ -1718,6 +2248,10 @@ func (r *Reader) optimizePDFDecodedImage(ctx context.Context, orig, baseline *St
 	resized, err := ResizeImage(ctx, decoded, size)
 	if err != nil {
 		return nil, err
+	}
+	b := resized.Bounds()
+	if !pixelsWithinBudget(int64(b.Dx()), int64(b.Dy()), optimizationBufferLimit/4) {
+		return nil, ctx.Err()
 	}
 	wantGray := targetSpace == Name("DeviceGray")
 	if wantGray && space != Name("DeviceGray") {
@@ -1789,7 +2323,7 @@ func (r *Reader) optimizePDFDCTImage(ctx context.Context, orig *Stream, dict, dc
 	if !hasDefaultOverride && (space == Name("DeviceRGB") || space == Name("DeviceGray")) && r.isIdentityDecode(dict["Decode"], expectedComp) && dctParams["ColorTransform"] == nil && configErr == nil && config.ColorModel == expectedModel {
 		frame, adobe, tagged, frameErr := jpegColorInfoContext(ctx, bestData)
 		if frameErr == nil && frame.components == expectedComp && !(frame.components == 3 && tagged && adobe != 1) {
-			downscale := size.X > 0 && size.Y > 0 && (size.X < config.Width || size.Y < config.Height)
+			downscale := size.X > 0 && size.Y > 0 && size.X < config.Width && size.Y < config.Height
 			if !downscale {
 				sufficient, err := jpegQualitySufficient(ctx, bestData, options.ImageQuality())
 				if err != nil {
@@ -1799,7 +2333,7 @@ func (r *Reader) optimizePDFDCTImage(ctx context.Context, orig *Stream, dict, dc
 					return losslessResult, ctx.Err()
 				}
 			}
-			if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 {
+			if !pixelsWithinBudget(int64(config.Width), int64(config.Height), optimizationBufferLimit/4) {
 				return losslessResult, ctx.Err()
 			}
 			img, err := jpeg.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(bestData)})
@@ -1825,7 +2359,7 @@ func (r *Reader) optimizePDFDCTImage(ctx context.Context, orig *Stream, dict, dc
 		if invertedCMYK || r.isIdentityDecode(dict["Decode"], 4) {
 			if source, err := r.ReadImage(orig); err == nil {
 				jpegData, frame, transform, tagged, err := source.jpegReadTransformContext(ctx, bestData, dctParams)
-				if err == nil && frame.components == 4 && int64(frame.width)*int64(frame.height) <= optimizationBufferLimit/4 {
+				if err == nil && frame.components == 4 && pixelsWithinBudget(int64(frame.width), int64(frame.height), optimizationBufferLimit/4) {
 					var reader io.Reader = bytes.NewReader(jpegData)
 					if !tagged {
 						marker := jpegAdobeMarker(transform)
@@ -1912,7 +2446,7 @@ func (r *Reader) optimizePDFPixelImage(ctx context.Context, orig *Stream, dict D
 	if space == Name("DeviceGray") {
 		channels = 1
 	}
-	if !hasDefaultOverride && dict["BitsPerComponent"] == Integer(8) && (space == Name("DeviceRGB") || space == Name("DeviceGray")) && r.isIdentityDecode(dict["Decode"], channels) && (len(filters) == 0 || len(filters) == 1 && filters[0] == Name("FlateDecode")) && int64(w)*int64(h) <= optimizationBufferLimit/4 {
+	if !hasDefaultOverride && dict["BitsPerComponent"] == Integer(8) && (space == Name("DeviceRGB") || space == Name("DeviceGray")) && r.isIdentityDecode(dict["Decode"], channels) && (len(filters) == 0 || len(filters) == 1 && filters[0] == Name("FlateDecode")) && pixelsWithinBudget(int64(w), int64(h), optimizationBufferLimit/4) {
 		pixels := orig.Data
 		var decodeErr error
 		if len(filters) == 1 {
@@ -2020,7 +2554,7 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 		if err != nil {
 			return nil, nil, false, err
 		}
-		if mw <= 0 || mh <= 0 || int64(mw)*int64(mh) > optimizationBufferLimit/8 || mainDict["Mask"] != nil || mainDict["ImageMask"] == Boolean(true) {
+		if !pixelsWithinBudget(int64(mw), int64(mh), optimizationBufferLimit/8) || mainDict["Mask"] != nil || mainDict["ImageMask"] == Boolean(true) {
 			return finish(baseMain, baseSMask, false)
 		}
 		source, err := r.readOptimizationImage(mainStream, colorResources)
@@ -2042,6 +2576,9 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 			}
 		}
 		b := decoded.Bounds()
+		if !pixelsWithinBudget(int64(b.Dx()), int64(b.Dy()), optimizationBufferLimit/8) {
+			return finish(baseMain, baseSMask, false)
+		}
 		rgbImg := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
 		alphaImg := image.NewGray(image.Rect(0, 0, b.Dx(), b.Dy()))
 		for y := 0; y < b.Dy(); y++ {
@@ -2094,7 +2631,7 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 		}
 		return finish(baseMain, baseSMask, false)
 	}
-	if downscale && int64(sw)*int64(sh) <= optimizationBufferLimit/4 {
+	if downscale && pixelsWithinBudget(int64(sw), int64(sh), optimizationBufferLimit/4) {
 		scaledMain, err := r.optimizeStreamSizeWithContext(ctx, mainStream, options, size, colorResources, true)
 		if err != nil {
 			return nil, nil, false, err
@@ -2124,9 +2661,10 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 					delete(smaskBase.Dictionary, "DecodeParms")
 					scaledSMask, err := r.encodeLosslessPixels(ctx, &smaskBase, smaskStream, resizedMask, 1)
 					if err != nil {
-						return nil, nil, false, err
-					}
-					if pdfStreamByteSize(ctx, scaledMain)+pdfStreamByteSize(ctx, scaledSMask) < pdfStreamByteSize(ctx, mainStream)+pdfStreamByteSize(ctx, baseSMask) {
+						if !errors.Is(err, io.ErrShortBuffer) {
+							return nil, nil, false, err
+						}
+					} else if pdfStreamByteSize(ctx, scaledMain)+pdfStreamByteSize(ctx, scaledSMask) < pdfStreamByteSize(ctx, mainStream)+pdfStreamByteSize(ctx, baseSMask) {
 						return finish(scaledMain, scaledSMask, false)
 					}
 				}
