@@ -18,16 +18,17 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"reflect"
 )
 
 // rewriteSound 写出采样流或自描述音频文件，不访问外部资源或执行音频编码
-// 入参: ctx 取消上下文, sound 音频信息, result 输出对象, number 最大对象编号, ref 音频输出引用
+// 入参: ctx 取消上下文, r 当前阅读器, sound 音频信息, result 输出对象, number 最大对象编号, ref 音频输出引用
 // 返回: *Stream 独立音频流, error 参数、复制或取消错误
-func rewriteSound(ctx context.Context, sound Sound, result map[Reference]Object, number *int64, ref Reference) (*Stream, error) {
+func rewriteSound(ctx context.Context, r *Reader, sound Sound, result map[Reference]Object, number *int64, ref Reference) (*Stream, error) {
 	dict := Dictionary{"Type": Name("Sound")}
 	if sound.File != nil {
-		ref, err := rewriteFile(ctx, *sound.File, result, number)
+		ref, err := rewriteFile(ctx, r, *sound.File, result, number)
 		if err != nil {
 			return nil, err
 		}
@@ -64,11 +65,18 @@ func rewriteSound(ctx context.Context, sound Sound, result map[Reference]Object,
 			dict["CP"] = parameter
 		}
 	}
-	source := *sound.Stream
-	source.Dictionary = dict
-	copier := rewriteObjectCopy{ctx: ctx, source: source.reader, objects: result, number: number, copied: make(map[rewriteObjectIdentity]Reference)}
+	stream := *sound.Stream
+	stream.Dictionary = dict
+	source := r
+	if !r.ownsObject(stream.reader, stream.cache) {
+		source = stream.reader
+	}
+	if source != nil && source.closed {
+		return nil, os.ErrClosed
+	}
+	copier := rewriteObjectCopy{ctx: ctx, source: source, objects: result, number: number, copied: make(map[rewriteObjectIdentity]Reference)}
 	copier.copied[rewriteObjectIdentity{kind: 's', pointer: reflect.ValueOf(sound.Stream).Pointer()}] = ref
-	return copier.copyStream(&source, 0)
+	return copier.copyStream(&stream, 0)
 }
 
 // soundReplacements 为动作中的音频分配输出资源，同一动作实例只写一次
@@ -106,7 +114,7 @@ func (r *Reader) soundReplacements(ctx context.Context, options RewriteOptions, 
 			if err != nil {
 				return nil, err
 			}
-			stream, err := rewriteSound(ctx, action.Sound.Sound, result, &number, ref)
+			stream, err := rewriteSound(ctx, r, action.Sound.Sound, result, &number, ref)
 			if err != nil {
 				return nil, err
 			}

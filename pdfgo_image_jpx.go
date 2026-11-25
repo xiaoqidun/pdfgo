@@ -457,7 +457,7 @@ func (i *Image) jpxMaskMode() (int, error) {
 	if len(filters) == 0 || filters[len(filters)-1] != Name("JPXDecode") {
 		return 0, nil
 	}
-	value, err := i.reader.Resolve(i.Stream.Dictionary["SMaskInData"])
+	value, err := i.reader.resolveOptional(i.Stream.Dictionary["SMaskInData"])
 	if err != nil || value == nil {
 		return 0, err
 	}
@@ -619,6 +619,26 @@ func (s jpxSample) RGBA() (uint32, uint32, uint32, uint32) {
 	return r * a / 65535, g * a / 65535, b * a / 65535, a
 }
 
+// jpxCodestreamDepth 按PDF规则从JPEG2000码流头推导有效位深
+// 入参: code 原始码流, count 分量数
+// 返回: int 有效位深, error 精度超限错误
+func jpxCodestreamDepth(code []byte, count int) (int, error) {
+	depth := int(code[42]&127) + 1
+	for n := 0; n < count; n++ {
+		bits := int(code[42+3*n]&127) + 1
+		if bits > 16 {
+			return 0, &UnsupportedError{Feature: "JPEG2000 component precision"}
+		}
+		if bits != depth {
+			depth = 16
+		}
+	}
+	if depth != 1 && depth != 2 && depth != 4 && depth != 8 {
+		depth = 16
+	}
+	return depth, nil
+}
+
 // jpxDefaults 读取JPEG2000码流位深及容器颜色声明，按PDF标准选择回退空间
 // 入参: stream 图像流
 // 返回: int 位深, Object 颜色空间, error 容器或颜色错误
@@ -642,18 +662,9 @@ func (r *Reader) jpxDefaults(stream *Stream) (int, Object, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	depth := int(code[42]&127) + 1
-	for n := 0; n < count; n++ {
-		bits := int(code[42+3*n]&127) + 1
-		if bits > 16 {
-			return 0, nil, &UnsupportedError{Feature: "JPEG2000 component precision"}
-		}
-		if bits != depth {
-			depth = 16
-		}
-	}
-	if depth != 1 && depth != 2 && depth != 4 && depth != 8 {
-		depth = 16
+	depth, err := jpxCodestreamDepth(code, count)
+	if err != nil {
+		return 0, nil, err
 	}
 	space, _, err := r.jpxColorSpace(data, stream.Dictionary, count)
 	return depth, space, err
@@ -663,7 +674,7 @@ func (r *Reader) jpxDefaults(stream *Stream) (int, Object, error) {
 // 入参: data 容器数据, dict 图像字典, count 码流通道数
 // 返回: Object 颜色空间, bool 是否使用sYCC, error 容器错误
 func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object, bool, error) {
-	space, err := r.Resolve(dict["ColorSpace"])
+	space, err := r.resolveOptional(dict["ColorSpace"])
 	if err != nil {
 		return nil, false, err
 	}
@@ -727,13 +738,13 @@ func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object,
 		case 2, 3:
 			profile := specification[3:]
 			if len(profile) < 128 {
-				if r.warning == nil {
+				if r == nil || r.warning == nil {
 					return nil, false, fmt.Errorf("invalid JPEG2000 ICC profile")
 				}
 				continue
 			}
 			components := map[string]Integer{"GRAY": 1, "RGB ": 3, "CMYK": 4}[string(profile[16:20])]
-			if components == 0 {
+			if components == 0 || r == nil {
 				continue
 			}
 			space := Array{Name("ICCBased"), &Stream{Dictionary: Dictionary{"N": components}, Data: profile, reader: r, cache: r.cache, hasWarning: r.warning != nil}}
@@ -752,7 +763,7 @@ func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object,
 		}
 		count -= len(opacity)
 	} else {
-		value, err := r.Resolve(dict["SMaskInData"])
+		value, err := r.resolveOptional(dict["SMaskInData"])
 		if err != nil {
 			return nil, false, err
 		}

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	"io"
 	"maps"
@@ -267,7 +268,7 @@ func (r *Reader) optimizeJPXImage(ctx context.Context, stream *Stream, options C
 		return stream, ctx.Err()
 	}
 	targetSpace, convertible := r.lossyConvertibleColorSpace(source.ColorSpace)
-	if !convertible {
+	if !convertible || lossyColorConflict(source.ColorSpace, targetSpace, colorResources) {
 		return stream, ctx.Err()
 	}
 	downscale := false
@@ -313,7 +314,7 @@ func (r *Reader) optimizeJPXImage(ctx context.Context, stream *Stream, options C
 		}
 		wantGray = gray
 	}
-	candidate, err := r.encodePDFImageLossy(ctx, stream, decoded, wantGray, options, false)
+	candidate, err := r.encodePDFImageLossy(ctx, stream, decoded, wantGray, options, false, colorResources)
 	if err != nil {
 		return nil, err
 	}
@@ -438,10 +439,37 @@ func (r *Reader) isInvertedCMYKDecodeValue(value Object) bool {
 	return values[0] == 1 && values[1] == 0 && values[2] == 1 && values[3] == 0 && values[4] == 1 && values[5] == 0 && values[6] == 1 && values[7] == 0
 }
 
-// encodePDFImageLossy 将已转换的8位目标图像编码为PDF流，原JPEG直接重编，严格保证通道数与ColorSpace一致
-// 入参: ctx 取消上下文, orig 原始流, img 已缩放图像, wantGray 是否目标灰度, options 压缩配置, sourceJPEG 原流是否为JPEG编码
+// defaultColorConflict 检查裸设备色输出是否会被当前资源字典中的Default色空间劫持
+// 入参: space 待输出的设备颜色空间, colorResources 可选默认颜色空间资源
+// 返回: bool 是否存在Default色空间冲突
+func defaultColorConflict(space Name, colorResources Dictionary) bool {
+	if len(colorResources) == 0 {
+		return false
+	}
+	return space == Name("DeviceRGB") && colorResources["DefaultRGB"] != nil || space == Name("DeviceGray") && colorResources["DefaultGray"] != nil
+}
+
+// lossyColorConflict 判断有损重编的目标设备色空间是否会与当前Default色空间冲突
+// 入参: space 源颜色空间, targetSpace 目标设备色空间, colorResources 可选默认颜色空间资源
+// 返回: bool 是否存在Default色空间冲突
+func lossyColorConflict(space Object, targetSpace Name, colorResources Dictionary) bool {
+	if targetSpace == Name("DeviceRGB") {
+		return defaultColorConflict("DeviceRGB", colorResources)
+	}
+	return targetSpace == Name("DeviceGray") && defaultColorConflict("DeviceGray", colorResources) && (space == Name("DeviceGray") || defaultColorConflict("DeviceRGB", colorResources))
+}
+
+// encodePDFImageLossy 结合默认颜色空间资源编码8位目标图像，目标裸设备色与Default色空间冲突时返回空值
+// 入参: ctx 取消上下文, orig 原始流, img 已缩放图像, wantGray 是否目标灰度, options 压缩配置, sourceJPEG 原流是否为JPEG编码, colorResources 可选默认颜色空间资源
 // 返回: *Stream 编码后的图像流或空值, error 取消或编码错误
-func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img image.Image, wantGray bool, options CompressionOptions, sourceJPEG bool) (*Stream, error) {
+func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img image.Image, wantGray bool, options CompressionOptions, sourceJPEG bool, colorResources Dictionary) (*Stream, error) {
+	if wantGray {
+		if defaultColorConflict("DeviceGray", colorResources) {
+			return nil, ctx.Err()
+		}
+	} else if _, isGray := img.(*image.Gray); !isGray && defaultColorConflict("DeviceRGB", colorResources) {
+		return nil, ctx.Err()
+	}
 	var encodeImg image.Image = img
 	channels := 3
 	if wantGray {
@@ -461,17 +489,20 @@ func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img imag
 		}
 	}
 	if !useJPEG {
+		outSpace := Name("DeviceRGB")
+		if wantGray {
+			outSpace = Name("DeviceGray")
+		}
+		if defaultColorConflict(outSpace, colorResources) {
+			return nil, ctx.Err()
+		}
 		base := *orig
 		base.Dictionary = maps.Clone(orig.Dictionary)
 		base.Dictionary["BitsPerComponent"] = Integer(8)
 		delete(base.Dictionary, "Decode")
 		delete(base.Dictionary, "DecodeParms")
 		delete(base.Dictionary, "SMaskInData")
-		if wantGray {
-			base.Dictionary["ColorSpace"] = Name("DeviceGray")
-		} else {
-			base.Dictionary["ColorSpace"] = Name("DeviceRGB")
-		}
+		base.Dictionary["ColorSpace"] = outSpace
 		candidate, err := r.encodeLosslessPixels(ctx, &base, orig, encodeImg, channels)
 		if err != nil {
 			return nil, err
@@ -485,6 +516,13 @@ func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img imag
 		if err != nil {
 			return nil, err
 		}
+	}
+	outSpace := Name("DeviceRGB")
+	if _, isGray := jpegSource.(*image.Gray); isGray {
+		outSpace = Name("DeviceGray")
+	}
+	if defaultColorConflict(outSpace, colorResources) {
+		return nil, ctx.Err()
 	}
 	var data bytes.Buffer
 	limit := &optimizationBuffer{buffer: &data, limit: optimizationBufferLimit}
@@ -505,11 +543,7 @@ func (r *Reader) encodePDFImageLossy(ctx context.Context, orig *Stream, img imag
 	result.Dictionary["BitsPerComponent"] = Integer(8)
 	delete(result.Dictionary, "Decode")
 	delete(result.Dictionary, "SMaskInData")
-	if _, isGray := jpegSource.(*image.Gray); isGray {
-		result.Dictionary["ColorSpace"] = Name("DeviceGray")
-	} else {
-		result.Dictionary["ColorSpace"] = Name("DeviceRGB")
-	}
+	result.Dictionary["ColorSpace"] = outSpace
 	result.Dictionary["Width"] = Integer(jpegSource.Bounds().Dx())
 	result.Dictionary["Height"] = Integer(jpegSource.Bounds().Dy())
 	return result, ctx.Err()
@@ -1667,6 +1701,9 @@ func (r *Reader) optimizePDFDecodedImage(ctx context.Context, orig, baseline *St
 	if w <= 0 || h <= 0 || int64(w)*int64(h) > optimizationBufferLimit/8 {
 		return nil, ctx.Err()
 	}
+	if lossyColorConflict(space, targetSpace, colorResources) {
+		return nil, ctx.Err()
+	}
 	source, err := r.readOptimizationImage(orig, colorResources)
 	if err != nil {
 		return nil, ctx.Err()
@@ -1690,7 +1727,7 @@ func (r *Reader) optimizePDFDecodedImage(ctx context.Context, orig, baseline *St
 		}
 		wantGray = gray
 	}
-	cand, err := r.encodePDFImageLossy(ctx, orig, resized, wantGray, options, sourceJPEG)
+	cand, err := r.encodePDFImageLossy(ctx, orig, resized, wantGray, options, sourceJPEG, colorResources)
 	if err != nil {
 		return nil, err
 	}
@@ -1745,13 +1782,13 @@ func (r *Reader) optimizePDFDCTImage(ctx context.Context, orig *Stream, dict, dc
 	if configErr != nil || Integer(config.Width) != w || Integer(config.Height) != h {
 		size = image.Point{}
 	}
-	expectedComp := 3
+	expectedComp, expectedModel := 3, color.YCbCrModel
 	if space == Name("DeviceGray") {
-		expectedComp = 1
+		expectedComp, expectedModel = 1, color.GrayModel
 	}
-	if !hasDefaultOverride && (space == Name("DeviceRGB") || space == Name("DeviceGray")) && r.isIdentityDecode(dict["Decode"], expectedComp) && dctParams["ColorTransform"] == nil && configErr == nil {
+	if !hasDefaultOverride && (space == Name("DeviceRGB") || space == Name("DeviceGray")) && r.isIdentityDecode(dict["Decode"], expectedComp) && dctParams["ColorTransform"] == nil && configErr == nil && config.ColorModel == expectedModel {
 		frame, adobe, tagged, frameErr := jpegColorInfoContext(ctx, bestData)
-		if frameErr == nil && frame.components == expectedComp && !(frame.components == 3 && tagged && adobe == 0) {
+		if frameErr == nil && frame.components == expectedComp && !(frame.components == 3 && tagged && adobe != 1) {
 			downscale := size.X > 0 && size.Y > 0 && (size.X < config.Width || size.Y < config.Height)
 			if !downscale {
 				sufficient, err := jpegQualitySufficient(ctx, bestData, options.ImageQuality())
@@ -1773,7 +1810,7 @@ func (r *Reader) optimizePDFDCTImage(ctx context.Context, orig *Stream, dict, dc
 			if err != nil {
 				return nil, err
 			}
-			cand, err := r.encodePDFImageLossy(ctx, orig, img, space == Name("DeviceGray"), options, true)
+			cand, err := r.encodePDFImageLossy(ctx, orig, img, space == Name("DeviceGray"), options, true, colorResources)
 			if err != nil {
 				return nil, err
 			}
@@ -1783,7 +1820,7 @@ func (r *Reader) optimizePDFDCTImage(ctx context.Context, orig *Stream, dict, dc
 			return losslessResult, ctx.Err()
 		}
 	}
-	if !hasDefaultOverride && space == Name("DeviceCMYK") {
+	if !hasDefaultOverride && space == Name("DeviceCMYK") && !defaultColorConflict("DeviceRGB", colorResources) {
 		invertedCMYK := r.isInvertedCMYKDecodeValue(dict["Decode"])
 		if invertedCMYK || r.isIdentityDecode(dict["Decode"], 4) {
 			if source, err := r.ReadImage(orig); err == nil {
@@ -1815,7 +1852,7 @@ func (r *Reader) optimizePDFDCTImage(ctx context.Context, orig *Stream, dict, dc
 								if err != nil {
 									return nil, err
 								}
-								cand, err := r.encodePDFImageLossy(ctx, orig, resized, false, options, true)
+								cand, err := r.encodePDFImageLossy(ctx, orig, resized, false, options, true, colorResources)
 								if err != nil {
 									return nil, err
 								}
@@ -1911,7 +1948,7 @@ func (r *Reader) optimizePDFPixelImage(ctx context.Context, orig *Stream, dict D
 			if err != nil {
 				return nil, err
 			}
-			cand, err := r.encodePDFImageLossy(ctx, orig, resized, channels == 1, options, false)
+			cand, err := r.encodePDFImageLossy(ctx, orig, resized, channels == 1, options, false, colorResources)
 			if err != nil {
 				return nil, err
 			}
@@ -1991,7 +2028,7 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 			return finish(baseMain, baseSMask, false)
 		}
 		targetSpace, convertible := r.lossyConvertibleColorSpace(source.ColorSpace)
-		if !convertible {
+		if !convertible || lossyColorConflict(source.ColorSpace, targetSpace, colorResources) {
 			return finish(baseMain, baseSMask, false)
 		}
 		decoded, err := source.DecodeImageContext(ctx)
@@ -2034,9 +2071,12 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 		}
 		mainFilters, _, _ := mainStream.filterChain(r)
 		sourceJPEG := len(mainFilters) > 0 && mainFilters[len(mainFilters)-1] == Name("DCTDecode")
-		candMain, err := r.encodePDFImageLossy(ctx, mainStream, mainImg, wantGray, options, sourceJPEG)
+		candMain, err := r.encodePDFImageLossy(ctx, mainStream, mainImg, wantGray, options, sourceJPEG, colorResources)
 		if err != nil {
 			return nil, nil, false, err
+		}
+		if candMain == nil {
+			return finish(baseMain, baseSMask, false)
 		}
 		smaskBase := *smaskStream
 		smaskBase.Dictionary = maps.Clone(smaskStream.Dictionary)
@@ -2049,7 +2089,7 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 		if err != nil {
 			return nil, nil, false, err
 		}
-		if candMain != nil && pdfStreamByteSize(ctx, candMain)+pdfStreamByteSize(ctx, candSMask) < pdfStreamByteSize(ctx, baseMain)+pdfStreamByteSize(ctx, baseSMask) {
+		if pdfStreamByteSize(ctx, candMain)+pdfStreamByteSize(ctx, candSMask) < pdfStreamByteSize(ctx, baseMain)+pdfStreamByteSize(ctx, baseSMask) {
 			return finish(candMain, candSMask, false)
 		}
 		return finish(baseMain, baseSMask, false)

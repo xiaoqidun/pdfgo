@@ -31,6 +31,7 @@ type deviceNSpace struct {
 	none          bool
 	input, output []float64
 	expressions   []affineValue
+	processInputs []int
 	program       *calculatorFunction
 	sampled       *sampledFunction
 	nested        *tintAlternate
@@ -123,6 +124,16 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 		}
 		if err := s.program.evaluate(input, values[:s.outputComponents()]); err != nil {
 			return values, err
+		}
+		values = clipGradientValue(values, s.output)
+	} else if s.processInputs != nil {
+		for c, input := range s.processInputs {
+			low, high := s.output[2*c], s.output[2*c+1]
+			if input < 0 {
+				values[c] = low
+				continue
+			}
+			values[c] = functionValue(math.Max(0, math.Min(1, tints[input])), low, high)
 		}
 		values = clipGradientValue(values, s.output)
 	} else {

@@ -125,6 +125,9 @@ func (p *ShadingPattern) source() (Paint, *Path, *Paint, error) {
 			matrix = Identity()
 		}
 		path := shadingRectangle(*bounds, matrix)
+		if !pathFinite(path) {
+			return Paint{}, nil, nil, fmt.Errorf("nonfinite shading pattern bounds")
+		}
 		clip = &path
 	}
 	bg := p.Background
@@ -158,8 +161,8 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		return Paint{}, &UnsupportedError{Feature: "shading pattern type"}
 	}
 	child := *p
+	child.resetTransient()
 	child.state = p.patternInitialState()
-	child.inText, child.opaqueGroup = false, false
 	matrix := p.patternMatrix
 	object, err = p.reader.Resolve(dict["Matrix"])
 	if err != nil {

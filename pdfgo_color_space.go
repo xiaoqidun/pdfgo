@@ -460,13 +460,6 @@ func (s *ColorSpace) validate(values []float64) error {
 	return nil
 }
 
-// readBlendingSpace 解析设备或可双向变换的ICC混合空间
-// 入参: value 颜色空间定义
-// 返回: *ColorSpace 混合空间, error 格式或能力错误
-func (r *Reader) readBlendingSpace(value Object) (*ColorSpace, error) {
-	return r.readBlendingSpaceContext(context.Background(), value)
-}
-
 // readBlendingSpaceContext 在取消上下文内解析设备或可双向变换的ICC混合空间
 // 入参: ctx 取消上下文, value 颜色空间定义
 // 返回: *ColorSpace 混合空间, error 格式、能力或取消错误

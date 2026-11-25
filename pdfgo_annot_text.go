@@ -287,7 +287,7 @@ func (r *Reader) readAnnotationText(ctx context.Context, annotation Annotation, 
 		return "", err
 	}
 	if err != nil {
-		if warning == nil {
+		if warning == nil || isFatalReaderError(err) {
 			return "", err
 		}
 		warning(Diagnostic{Message: fmt.Sprintf("invalid PDF annotation %s ignored; appearance retained", field)})
@@ -646,11 +646,12 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if text == "" && !(choice != nil && !choice.Combo && len(choice.Options) > choice.TopIndex) {
 		return nil
 	}
-	if flags&(1<<13) != 0 {
+	textField := !free && dict["FT"] == Name("Tx")
+	if textField && flags&(1<<13) != 0 {
 		text = strings.Repeat("*", utf8.RuneCountInString(text))
 	}
 	list := choice != nil && !choice.Combo
-	multiline := free || flags&(1<<12) != 0 || list
+	multiline := free || textField && flags&(1<<12) != 0 || list
 	if !multiline {
 		text = strings.ReplaceAll(text, "\n", " ")
 	}

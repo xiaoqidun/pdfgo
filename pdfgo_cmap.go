@@ -53,15 +53,29 @@ func ParseUnicodeMapContext(ctx context.Context, data []byte) (UnicodeMap, error
 // 入参: ctx 取消上下文, data 映射数据, active 当前命名继承链
 // 返回: UnicodeMap 独立映射, error 解析或取消错误
 func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bool) (UnicodeMap, error) {
-	p := objectParser{data: data}
 	result := UnicodeMap{}
+	if err := parseUnicodeMapIntoContext(ctx, result, data, active); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// parseUnicodeMapIntoContext 读取映射及命名继承并增量写入目标表，检查取消与总条目上限
+// 入参: ctx 取消上下文, target 目标映射, data 映射数据, active 当前命名继承链
+// 返回: error 解析、超限或取消错误
+func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []byte, active map[Name]bool) error {
+	p := objectParser{data: data}
 	var inherited UnicodeMap
+	var localWritten map[string]bool
+	trackLocal := len(target) > 0
+	hasUseCMap := false
+	wroteLocal := false
 	var expanded uint64
 	previous := ""
 	var name Name
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		p.skipSpace()
 		if p.pos == len(data) {
@@ -69,26 +83,33 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 			for code, text := range inherited {
 				if index&255 == 0 {
 					if err := ctx.Err(); err != nil {
-						return nil, err
+						return err
 					}
 				}
 				index++
-				if _, exists := result[code]; !exists {
-					if uint64(len(result)) >= maxCMapEntries {
-						return nil, p.fail("CMap mapping entries exceed limit")
+				if trackLocal {
+					if localWritten[code] {
+						continue
 					}
-					result[code] = text
+					if _, exists := target[code]; !exists && uint64(len(target)) >= maxCMapEntries {
+						return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
+					}
+					target[code] = text
+					continue
+				}
+				if _, exists := target[code]; !exists {
+					if uint64(len(target)) >= maxCMapEntries {
+						return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
+					}
+					target[code] = text
 				}
 			}
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return result, nil
+			return ctx.Err()
 		}
 		if b := p.data[p.pos]; b == '/' || b == '(' || b == '<' || b == '[' {
 			object, err := p.object()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			name, _ = object.(Name)
 			previous = ""
@@ -101,13 +122,20 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 			continue
 		}
 		if token == "usecmap" {
-			if name == "" || inherited != nil {
-				return nil, p.fail("invalid ToUnicode CMap inheritance")
+			if name == "" || hasUseCMap {
+				return p.fail("invalid ToUnicode CMap inheritance")
 			}
-			var err error
-			inherited, err = loadUnicodeCMapContext(ctx, name, active)
+			loaded, err := loadUnicodeCMapContext(ctx, name, active)
 			if err != nil {
-				return nil, err
+				return err
+			}
+			hasUseCMap = true
+			if !wroteLocal {
+				if err := copyUnicodeMapContext(ctx, target, loaded); err != nil {
+					return err
+				}
+			} else {
+				inherited = loaded
 			}
 			name = ""
 			continue
@@ -119,107 +147,130 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 		}
 		count, err := strconv.Atoi(previous)
 		if err != nil || count < 0 || count > 65536 {
-			return nil, p.fail("invalid CMap mapping count")
+			return p.fail("invalid CMap mapping count")
 		}
 		for index := range count {
 			if index&255 == 0 {
 				if err := ctx.Err(); err != nil {
-					return nil, err
+					return err
 				}
 			}
 			from, err := p.object()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			first, ok := from.(String)
 			if !ok || len(first) == 0 || len(first) > 4 {
-				return nil, p.fail("invalid CMap source code")
+				return p.fail("invalid CMap source code")
 			}
 			if token == "beginbfchar" {
 				to, err := p.object()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				str, ok := to.(String)
 				if !ok {
-					return nil, p.fail("invalid CMap Unicode value")
+					return p.fail("invalid CMap Unicode value")
 				}
 				value, err := unicodeBytes(str)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				if expanded >= maxCMapEntries {
-					return nil, p.fail("CMap mapping entries exceed limit")
+					return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
 				}
 				expanded++
-				result[string(first)] = value
+				key := string(first)
+				if _, exists := target[key]; !exists && uint64(len(target)) >= maxCMapEntries {
+					return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
+				}
+				target[key] = value
+				if trackLocal {
+					if localWritten == nil {
+						localWritten = map[string]bool{}
+					}
+					localWritten[key] = true
+				}
+				wroteLocal = true
 			} else {
 				lastObject, err := p.object()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				last, ok := lastObject.(String)
 				if !ok || len(last) != len(first) {
-					return nil, p.fail("invalid CMap source range")
+					return p.fail("invalid CMap source range")
 				}
 				a, b := codeNumber(first), codeNumber(last)
 				if b < a || b-a > 65535 {
-					return nil, p.fail("excessive CMap source range")
+					return p.fail("excessive CMap source range")
 				}
 				span := b - a + 1
 				if span > maxCMapEntries-expanded {
-					return nil, p.fail("CMap mapping entries exceed limit")
+					return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
 				}
 				expanded += span
 				to, err := p.object()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				for code := a; code <= b; code++ {
 					if (code-a)&255 == 0 {
 						if err := ctx.Err(); err != nil {
-							return nil, err
+							return err
 						}
 					}
-					var target String
+					var targetCode String
 					switch v := to.(type) {
 					case String:
-						target = append(String(nil), v...)
+						targetCode = append(String(nil), v...)
 						carry := code - a
-						for n := len(target) - 1; n >= 0; n-- {
-							carry += uint64(target[n])
-							target[n] = byte(carry)
+						for n := len(targetCode) - 1; n >= 0; n-- {
+							carry += uint64(targetCode[n])
+							targetCode[n] = byte(carry)
 							carry >>= 8
 						}
 						if carry != 0 {
-							return nil, p.fail("CMap destination overflow")
+							return p.fail("CMap destination overflow")
 						}
 					case Array:
 						if uint64(len(v)) != b-a+1 {
-							return nil, p.fail("CMap destination count mismatch")
+							return p.fail("CMap destination count mismatch")
 						}
 						var ok bool
-						target, ok = v[code-a].(String)
+						targetCode, ok = v[code-a].(String)
 						if !ok {
-							return nil, p.fail("invalid CMap destination")
+							return p.fail("invalid CMap destination")
 						}
 					default:
-						return nil, p.fail("invalid CMap destination")
+						return p.fail("invalid CMap destination")
 					}
-					value, err := unicodeBytes(target)
+					value, err := unicodeBytes(targetCode)
 					if err != nil {
 						if errors.Is(err, errInvalidUnicodeSurrogate) {
 							continue
 						}
-						return nil, err
+						return err
 					}
-					key := make([]byte, len(first))
+					var raw [4]byte
+					keyBytes := raw[:len(first)]
 					v := code
-					for n := len(key) - 1; n >= 0; n-- {
-						key[n] = byte(v)
+					for n := len(keyBytes) - 1; n >= 0; n-- {
+						keyBytes[n] = byte(v)
 						v >>= 8
 					}
-					result[string(key)] = value
+					key := string(keyBytes)
+					if _, exists := target[key]; !exists && uint64(len(target)) >= maxCMapEntries {
+						return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
+					}
+					target[key] = value
+					if trackLocal {
+						if localWritten == nil {
+							localWritten = map[string]bool{}
+						}
+						localWritten[key] = true
+					}
+					wroteLocal = true
 				}
 			}
 		}
@@ -228,7 +279,7 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 			end = "endbfrange"
 		}
 		if p.token() != end {
-			return nil, p.fail("missing CMap block terminator")
+			return p.fail("missing CMap block terminator")
 		}
 		previous = ""
 	}

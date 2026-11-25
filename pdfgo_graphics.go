@@ -138,6 +138,11 @@ type TextMark struct {
 	patternStreams        []*Stream
 	halftones             map[string]*Halftone
 	state                 *graphicsState
+	maskGroup             *Stream
+	blendingSpace         *ColorSpace
+	opaqueGroup           bool
+	patternMatrix         Matrix
+	bounds                Rectangle
 }
 
 // TextObject 保留文字对象身份，Knockout为真时整段挖空，为假时逐字合成
@@ -330,6 +335,52 @@ func matrixFinite(m Matrix) bool {
 // 返回: bool 是否全部有限
 func rectFinite(box Rectangle) bool {
 	return !math.IsNaN(box.XMin) && !math.IsInf(box.XMin, 0) && !math.IsNaN(box.YMin) && !math.IsInf(box.YMin, 0) && !math.IsNaN(box.XMax) && !math.IsInf(box.XMax, 0) && !math.IsNaN(box.YMax) && !math.IsInf(box.YMax, 0)
+}
+
+// pointFinite 判断二维坐标点各分量是否全部为有限数值
+// 入参: point 坐标点
+// 返回: bool 是否全部有限
+func pointFinite(point Point) bool {
+	return !math.IsNaN(point.X) && !math.IsInf(point.X, 0) && !math.IsNaN(point.Y) && !math.IsInf(point.Y, 0)
+}
+
+// pathFinite 判断路径全部顶点坐标是否为有限数值
+// 入参: path 路径对象
+// 返回: bool 是否全部有限
+func pathFinite(path Path) bool {
+	for _, segment := range path.Segments {
+		for _, point := range segment.Points {
+			if !pointFinite(point) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// resetTransient 清理拷贝自外层解释器的瞬时解析状态，不改变图形状态与递归链路
+func (p *pageInterpreter) resetTransient() {
+	p.stack = nil
+	p.marked = nil
+	p.sequence = nil
+	p.replacement = nil
+	p.hidden = false
+	p.textClips = nil
+	p.textMatrix, p.lineMatrix = Identity(), Identity()
+	p.inText, p.implicitText = false, false
+	p.textObject = nil
+	p.path = Path{}
+	p.pathPoints = nil
+	p.current, p.start = Point{}, Point{}
+	p.hasPoint = false
+	p.pendingClip, p.clipEvenOdd = false, false
+	p.compatibility = 0
+	p.opaqueGroup = false
+	p.uncoloredPattern = false
+	p.type3, p.uncoloredType3 = false, false
+	p.patternState = nil
+	p.tilingPatterns = nil
+	p.forms, p.content = nil, nil
 }
 
 // matrixProductDifference 补偿乘积相减的舍入残差，检查溢出、下溢及严重相消
@@ -764,6 +815,12 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if !r.ownsObject(font.reader, font.cache) {
 		r = font.reader
 	}
+	if r == nil {
+		return fmt.Errorf("invalid Type3 glyph reader")
+	}
+	if r.closed {
+		return os.ErrClosed
+	}
 	if mark.Mode == 3 {
 		return nil
 	}
@@ -821,7 +878,14 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	interpreter.glyphStreams = append(append([]*Stream(nil), mark.glyphStreams...), stream)
 	interpreter.formStreams = mark.formStreams
 	interpreter.patternStreams = mark.patternStreams
-	interpreter.patternMatrix = Identity()
+	interpreter.maskGroup = mark.maskGroup
+	interpreter.blendingSpace = mark.blendingSpace
+	interpreter.opaqueGroup = mark.opaqueGroup
+	interpreter.patternMatrix = mark.patternMatrix
+	if interpreter.patternMatrix == (Matrix{}) {
+		interpreter.patternMatrix = Identity()
+	}
+	interpreter.bounds = mark.bounds
 	if mark.state != nil {
 		interpreter.state = *mark.state
 		interpreter.state.matrix = matrix
@@ -843,7 +907,9 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 		if !rectFinite(bounds) {
 			return fmt.Errorf("nonfinite Type3 glyph bounds")
 		}
-		interpreter.bounds = bounds
+		if bounds.XMax > bounds.XMin && bounds.YMax > bounds.YMin {
+			interpreter.bounds = bounds
+		}
 	}
 	return interpreter.run(data)
 }
@@ -1179,16 +1245,24 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.state.style.Dash = dash
 		p.state.style.DashPhase = phase[0]
 	case "m":
-		p.current = point(v[0], v[1])
-		p.start = p.current
+		pt := point(v[0], v[1])
+		if !pointFinite(pt) {
+			return p.operationWarning(op, "nonfinite path coordinate")
+		}
+		p.current = pt
+		p.start = pt
 		p.hasPoint = true
-		add("M", p.current)
+		add("M", pt)
 	case "l":
 		if !p.hasPoint {
 			return p.operationWarning(op, "line without current point")
 		}
-		p.current = point(v[0], v[1])
-		add("L", p.current)
+		pt := point(v[0], v[1])
+		if !pointFinite(pt) {
+			return p.operationWarning(op, "nonfinite path coordinate")
+		}
+		p.current = pt
+		add("L", pt)
 	case "c", "v", "y":
 		if !p.hasPoint {
 			return p.operationWarning(op, "curve without current point")
@@ -1209,6 +1283,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 			end = point(v[2], v[3])
 			c2 = end
 		}
+		if !pointFinite(c1) || !pointFinite(c2) || !pointFinite(end) {
+			return p.operationWarning(op, "nonfinite path coordinate")
+		}
 		add("B", c1, c2, end)
 		p.current = end
 	case "h":
@@ -1218,13 +1295,18 @@ func (p *pageInterpreter) operation(op Operation) error {
 		add("C")
 		p.current = p.start
 	case "re":
-		p.start = point(v[0], v[1])
-		p.current = p.start
+		x2, y2 := v[0]+v[2], v[1]+v[3]
+		p0, p1, p2, p3 := point(v[0], v[1]), point(x2, v[1]), point(x2, y2), point(v[0], y2)
+		if math.IsNaN(x2) || math.IsInf(x2, 0) || math.IsNaN(y2) || math.IsInf(y2, 0) || !pointFinite(p0) || !pointFinite(p1) || !pointFinite(p2) || !pointFinite(p3) {
+			return p.operationWarning(op, "nonfinite path coordinate")
+		}
+		p.start = p0
+		p.current = p0
 		p.hasPoint = true
-		add("M", p.start)
-		add("L", point(v[0]+v[2], v[1]))
-		add("L", point(v[0]+v[2], v[1]+v[3]))
-		add("L", point(v[0], v[1]+v[3]))
+		add("M", p0)
+		add("L", p1)
+		add("L", p2)
+		add("L", p3)
 		add("C")
 	case "W", "W*":
 		p.pendingClip = true
@@ -1256,7 +1338,32 @@ func (p *pageInterpreter) operation(op Operation) error {
 			if stroke {
 				m := p.state.matrix
 				sx, sy := math.Hypot(m[0], m[1]), math.Hypot(m[2], m[3])
-				if sx == 0 || sy == 0 || math.IsNaN(sx) || math.IsInf(sx, 0) || math.IsNaN(sy) || math.IsInf(sy, 0) || math.Abs(sx-sy) > 1e-8*math.Max(1, sx) || math.Abs(m[0]*m[2]+m[1]*m[3]) > 1e-8*math.Max(1, sx*sy) {
+				uniform := sx > 0 && sy > 0 && !math.IsNaN(sx) && !math.IsInf(sx, 0) && !math.IsNaN(sy) && !math.IsInf(sy, 0)
+				if uniform {
+					cos := math.Abs((m[0]/sx)*(m[2]/sy) + (m[1]/sx)*(m[3]/sy))
+					uniform = cos <= 1e-8 && math.Abs(sx-sy) <= 1e-8*math.Max(sx, sy)
+				}
+				if uniform {
+					lineWidth, dashPhase := style.LineWidth*sx, style.DashPhase*sx
+					var scaledDash []float64
+					finite := !math.IsNaN(lineWidth) && !math.IsInf(lineWidth, 0) && !math.IsNaN(dashPhase) && !math.IsInf(dashPhase, 0)
+					if finite && len(style.Dash) != 0 {
+						scaledDash = make([]float64, len(style.Dash))
+						for n, value := range style.Dash {
+							scaledDash[n] = value * sx
+							if math.IsNaN(scaledDash[n]) || math.IsInf(scaledDash[n], 0) {
+								finite = false
+								break
+							}
+						}
+					}
+					if finite {
+						style.LineWidth, style.Dash, style.DashPhase = lineWidth, scaledDash, dashPhase
+					} else {
+						uniform = false
+					}
+				}
+				if !uniform {
 					strokeMatrix = Matrix{m[0], m[1], m[2], m[3], 0, 0}
 					if _, ok := strokeMatrix.Inverse(); !ok {
 						if p.visitor.Warning == nil {
@@ -1269,13 +1376,6 @@ func (p *pageInterpreter) operation(op Operation) error {
 						stroke = false
 						strokeMatrix = Matrix{}
 					}
-				} else {
-					style.LineWidth *= sx
-					style.Dash = append([]float64(nil), style.Dash...)
-					for n := range style.Dash {
-						style.Dash[n] *= sx
-					}
-					style.DashPhase *= sx
 				}
 			}
 			if fill || stroke {
@@ -1807,6 +1907,9 @@ func (p *pageInterpreter) showText(data []byte) error {
 			positions[n] = Point{advance.X, p.state.rise}
 			advance.X += (glyph.Width/1000*p.state.fontSize + spacing) * p.state.hscale
 		}
+		if !pointFinite(positions[n]) || !pointFinite(advance) {
+			return p.operationWarning(Operation{Operator: "Tj"}, "nonfinite text position")
+		}
 	}
 	if len(glyphs) > 0 && (!p.hidden || mode >= 4) {
 		if err := p.ctx.Err(); err != nil {
@@ -1819,6 +1922,15 @@ func (p *pageInterpreter) showText(data []byte) error {
 		if !matrixFinite(combined) {
 			return p.operationWarning(Operation{Operator: "Tj"}, "nonfinite text matrix")
 		}
+		scaledSize := p.state.fontSize * p.state.hscale
+		if math.IsNaN(scaledSize) || math.IsInf(scaledSize, 0) {
+			return p.operationWarning(Operation{Operator: "Tj"}, "nonfinite text position")
+		}
+		for _, pos := range positions {
+			if !pointFinite(combined.Apply(pos)) {
+				return p.operationWarning(Operation{Operator: "Tj"}, "nonfinite text position")
+			}
+		}
 		mark := TextMark{Object: p.textObject, Replacement: p.replacement, Font: p.state.font, Glyphs: glyphs, Positions: positions, Matrix: combined, StrokeMatrix: p.state.matrix, Size: p.state.fontSize, HorizontalScale: p.state.hscale, Style: p.state.style, Mode: mode}
 		mark.Sequence = p.sequence
 		if mark.Font.Subtype == "Type3" {
@@ -1826,6 +1938,11 @@ func (p *pageInterpreter) showText(data []byte) error {
 			mark.Resources = p.pageResources
 			stateCopy := p.state
 			mark.state = &stateCopy
+			mark.maskGroup = p.maskGroup
+			mark.blendingSpace = p.blendingSpace
+			mark.opaqueGroup = p.opaqueGroup
+			mark.patternMatrix = p.patternMatrix
+			mark.bounds = p.bounds
 		}
 		mark.depth = p.depth
 		mark.glyphStreams = p.glyphStreams

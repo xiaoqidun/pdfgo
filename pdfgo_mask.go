@@ -71,7 +71,6 @@ func (m *SoftMask) Walk(ctx context.Context, visitor Visitor) error {
 	}
 	p := m.interpreter
 	p.ctx = ctx
-	p.forms, p.content = nil, nil
 	if visitor.MarkedContent == nil {
 		visitor.MarkedContent = p.visitor.MarkedContent
 	}
@@ -145,7 +144,7 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 		return nil, fmt.Errorf("invalid soft mask transparency group")
 	}
 	m := &SoftMask{Subtype: subtype, interpreter: *p, stream: stream}
-	m.interpreter.forms, m.interpreter.content = nil, nil
+	m.interpreter.resetTransient()
 	v, err = p.reader.Resolve(group["CS"])
 	if err != nil {
 		return nil, err
@@ -182,6 +181,7 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 	}
 	m.interpreter.state.style.SoftMask = nil
 	m.interpreter.state.style.BlendMode = "Normal"
+	m.interpreter.state.style.AlphaIsShape = false
 	m.interpreter.state.style.Clips = nil
 	m.interpreter.state.style.Fill.Alpha, m.interpreter.state.style.Stroke.Alpha = 1, 1
 	if m.Subtype == "Luminosity" {

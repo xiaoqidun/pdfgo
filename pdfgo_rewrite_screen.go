@@ -133,9 +133,9 @@ func (r *Reader) validateMediaForm(form *Stream) error {
 	if form == nil {
 		return fmt.Errorf("missing media form")
 	}
-	source := form.reader
-	if source == nil {
-		source = r
+	source := r
+	if !r.ownsObject(form.reader, form.cache) {
+		source = form.reader
 	}
 	kind, err := source.Resolve(form.Dictionary["Subtype"])
 	if err != nil {

@@ -123,28 +123,53 @@ func (r *Reader) mediaDictionaries(object Object) ([]Dictionary, error) {
 	return result, nil
 }
 
+// resolveIndirect 解析间接引用链并返回最终间接引用与目标对象，直接对象返回零值引用与原对象
+// 入参: object 原始对象或间接引用
+// 返回: Reference 最终间接引用, Object 目标对象, error 引用或循环错误
+func (r *Reader) resolveIndirect(object Object) (Reference, Object, error) {
+	if r == nil {
+		return Reference{}, nil, fmt.Errorf("invalid reader")
+	}
+	if r.closed {
+		return Reference{}, nil, os.ErrClosed
+	}
+	ref, ok := object.(Reference)
+	if !ok {
+		return Reference{}, object, nil
+	}
+	resolved, err := r.Object(ref)
+	if err != nil {
+		return Reference{}, nil, err
+	}
+	if _, ok := resolved.(Reference); !ok {
+		return ref, resolved, nil
+	}
+	seen := map[Reference]bool{ref: true}
+	object = resolved
+	for {
+		next, ok := object.(Reference)
+		if !ok {
+			return ref, object, nil
+		}
+		if seen[next] {
+			return Reference{}, nil, fmt.Errorf("cyclic indirect reference %d %d", next.Number, next.Generation)
+		}
+		seen[next] = true
+		ref = next
+		resolved, err = r.Object(next)
+		if err != nil {
+			return Reference{}, nil, err
+		}
+		object = resolved
+	}
+}
+
 // resolveIndirectReference 解析对象对应的最终间接引用，直接对象返回零值引用
 // 入参: object 原始对象或间接引用
 // 返回: Reference 最终间接引用, error 引用或循环错误
 func (r *Reader) resolveIndirectReference(object Object) (Reference, error) {
-	var ref Reference
-	seen := map[Reference]bool{}
-	for {
-		next, ok := object.(Reference)
-		if !ok {
-			return ref, nil
-		}
-		if seen[next] {
-			return Reference{}, fmt.Errorf("cyclic indirect reference %d %d", next.Number, next.Generation)
-		}
-		seen[next] = true
-		ref = next
-		resolved, err := r.Object(next)
-		if err != nil {
-			return Reference{}, err
-		}
-		object = resolved
-	}
+	ref, _, err := r.resolveIndirect(object)
+	return ref, err
 }
 
 // mediaDictionariesWithRefs 读取媒体字典数组及其间接引用，不预先解析字典内的脚本或数据流

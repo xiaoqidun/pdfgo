@@ -647,30 +647,25 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 	}
 	activeStreams[stream] = true
 	defer delete(activeStreams, stream)
-	data, err := r.DecodeStreamContext(ctx, stream)
-	if err != nil {
-		return nil, err
-	}
-	result, err := ParseUnicodeMapContext(ctx, data)
-	if err != nil {
-		return nil, err
-	}
 	useRaw := stream.Dictionary["UseCMap"]
 	base, err := r.Resolve(useRaw)
 	if err != nil {
 		return nil, err
 	}
-	if base == nil {
-		if err := ctx.Err(); err != nil {
+	var mapping UnicodeMap
+	if base != nil {
+		mapping, err = r.readUnicodeCMapContext(ctx, useRaw, activeRefs, activeStreams, depth+1)
+		if err != nil {
 			return nil, err
 		}
-		return result, nil
+	} else {
+		mapping = UnicodeMap{}
 	}
-	mapping, err := r.readUnicodeCMapContext(ctx, useRaw, activeRefs, activeStreams, depth+1)
+	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
 	}
-	if err := copyUnicodeMapContext(ctx, mapping, result); err != nil {
+	if err := parseUnicodeMapIntoContext(ctx, mapping, data, nil); err != nil {
 		return nil, err
 	}
 	return mapping, nil

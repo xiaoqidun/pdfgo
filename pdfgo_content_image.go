@@ -166,10 +166,7 @@ func inlineFilterLength(ctx context.Context, data []byte, filter Name, params Ob
 		if err != nil {
 			return 0, err
 		}
-		var input io.Reader = &contextInput{ctx: ctx, reader: z}
-		if maxBytes > 0 {
-			input = io.LimitReader(input, maxBytes+1)
-		}
+		input := limitStreamReader(&contextInput{ctx: ctx, reader: z}, maxBytes)
 		written, err := io.Copy(io.Discard, input)
 		closeErr := z.Close()
 		releaseZlibReader(z)
@@ -386,10 +383,7 @@ func (p *pageInterpreter) recoverLZWImage(image *Image) error {
 			return decodeErr
 		}
 		decoder := lzw.NewReader(bytes.NewReader(source.Data), lzw.MSB, 8)
-		var input io.Reader = &contextInput{ctx: p.ctx, reader: decoder}
-		if maxBytes > 0 {
-			input = io.LimitReader(input, maxBytes+1)
-		}
+		input := limitStreamReader(&contextInput{ctx: p.ctx, reader: decoder}, maxBytes)
 		var err error
 		data, err = io.ReadAll(input)
 		closeErr := decoder.Close()

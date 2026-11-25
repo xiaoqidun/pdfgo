@@ -253,7 +253,7 @@ func (w *renditionOutput) clip(clip *MediaClip, depth int) (Reference, error) {
 		if clip.File != nil {
 			ref, exists := w.files[clip.File]
 			if !exists {
-				ref, err = rewriteFile(w.copy.ctx, *clip.File, w.copy.objects, w.copy.number)
+				ref, err = rewriteFile(w.copy.ctx, w.reader, *clip.File, w.copy.objects, w.copy.number)
 				if err != nil {
 					return Reference{}, err
 				}

@@ -510,6 +510,11 @@ func imageCMYKAt(source image.Image, x, y int) (cmykSample, bool) {
 			return cmykSample{}, false
 		}
 		return s.sample(x, y), true
+	case *packedCMYKAImage:
+		if !image.Pt(x, y).In(s.rect) {
+			return cmykSample{}, false
+		}
+		return s.sample(x, y).values, true
 	case *imageResample:
 		b := s.source.Bounds()
 		if b == s.bounds {
@@ -590,7 +595,7 @@ func (i *Image) HasSoftMask() (bool, error) {
 	if i.SoftMask == nil {
 		return false, nil
 	}
-	value, err := i.reader.Resolve(i.SoftMask)
+	value, err := i.reader.resolveOptional(i.SoftMask)
 	return value != nil && value != Name("None"), err
 }
 
@@ -662,13 +667,23 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 	if encoded == nil {
 		return nil, nil
 	}
-	hasHeader, err := i.validateJBIG2FileHeader(encoded, params["JBIG2Globals"] != nil)
+	globalsObj := params["JBIG2Globals"]
+	if globalsObj != nil {
+		resolved, err := i.reader.resolveOptional(globalsObj)
+		if err != nil {
+			return nil, err
+		}
+		if resolved == nil {
+			globalsObj = nil
+		}
+	}
+	hasHeader, err := i.validateJBIG2FileHeader(encoded, globalsObj != nil)
 	if err != nil {
 		return nil, err
 	}
 	var globals []byte
-	if params["JBIG2Globals"] != nil {
-		globals, err = i.jbig2GlobalsRaw(ctx, params["JBIG2Globals"])
+	if globalsObj != nil {
+		globals, err = i.jbig2GlobalsRaw(ctx, globalsObj)
 		if err != nil {
 			return nil, err
 		}
@@ -887,7 +902,7 @@ func (i *Image) renderingIntent() (Name, error) {
 	if i.Intent != "" {
 		return normalizeRenderingIntent(i.Intent), nil
 	}
-	value, err := i.reader.Resolve(i.Stream.Dictionary["Intent"])
+	value, err := i.reader.resolveOptional(i.Stream.Dictionary["Intent"])
 	if err != nil {
 		return "", err
 	}
@@ -1080,7 +1095,13 @@ func (s *imageResample) At(x, y int) color.Color {
 		return sample
 	}
 	var values [4]float64
-	_, cmyk := imageCMYKSample(s.source.At(b.Min.X, b.Min.Y))
+	var alpha float64
+	first := s.source.At(b.Min.X, b.Min.Y)
+	_, cmyk := imageCMYKSample(first)
+	cmykAlpha := false
+	if sample, ok := first.(jpxSample); ok && sample.cmyk {
+		cmykAlpha = true
+	}
 	for dy := 0; dy < 2; dy++ {
 		for dx := 0; dx < 2; dx++ {
 			weightX, weightY := 1-fx, 1-fy
@@ -1090,21 +1111,90 @@ func (s *imageResample) At(x, y int) color.Color {
 			if dy == 1 {
 				weightY = fy
 			}
+			weight := weightX * weightY
 			pixel := s.source.At(b.Min.X+min(b.Dx()-1, max(0, x0+dx)), b.Min.Y+min(b.Dy()-1, max(0, y0+dy)))
-			r, g, b, a := pixel.RGBA()
 			if cmyk {
 				c, _ := imageCMYKSample(pixel)
-				r, g, b, a = uint32(c[0]), uint32(c[1]), uint32(c[2]), uint32(c[3])
+				for i, v := range c {
+					values[i] += float64(v) * weight
+				}
+				if cmykAlpha {
+					alpha += float64(pixel.(jpxSample).alpha) * weight
+				}
+				continue
 			}
+			r, g, b, a := pixel.RGBA()
 			for i, v := range [4]uint32{r, g, b, a} {
-				values[i] += float64(v) * weightX * weightY
+				values[i] += float64(v) * weight
 			}
 		}
 	}
 	if cmyk {
-		return cmykSample{uint16(math.Round(values[0])), uint16(math.Round(values[1])), uint16(math.Round(values[2])), uint16(math.Round(values[3]))}
+		sample := cmykSample{uint16(math.Round(values[0])), uint16(math.Round(values[1])), uint16(math.Round(values[2])), uint16(math.Round(values[3]))}
+		if cmykAlpha {
+			return jpxSample{values: sample, alpha: uint16(math.Round(alpha)), cmyk: true}
+		}
+		return sample
 	}
 	return color.RGBA64{R: uint16(math.Round(values[0])), G: uint16(math.Round(values[1])), B: uint16(math.Round(values[2])), A: uint16(math.Round(values[3]))}
+}
+
+// effectiveBitsPerComponent 校验并归一化图像分量位深，模板缺省按一位处理，JPEG2000按码流精度放行
+// 入参: isJPX 末级过滤器是否为JPXDecode
+// 返回: int 生效分量位深, error 非法位深错误
+func (i *Image) effectiveBitsPerComponent(isJPX bool) (int, error) {
+	if i.ImageMask {
+		if i.BitsPerComponent == 0 || i.BitsPerComponent == 1 {
+			return 1, nil
+		}
+		return 0, fmt.Errorf("invalid stencil component depth")
+	}
+	if isJPX {
+		if i.BitsPerComponent < 0 || i.BitsPerComponent > 38 {
+			return 0, fmt.Errorf("invalid image component depth")
+		}
+		return i.BitsPerComponent, nil
+	}
+	if i.BitsPerComponent != 1 && i.BitsPerComponent != 2 && i.BitsPerComponent != 4 && i.BitsPerComponent != 8 && i.BitsPerComponent != 16 {
+		return 0, fmt.Errorf("invalid image component depth")
+	}
+	return i.BitsPerComponent, nil
+}
+
+// imageSampleMaximum 返回给定分量位深的最大离散样本值，避免移位溢出
+// 入参: bits 分量位深
+// 返回: float64 最大样本值
+func imageSampleMaximum(bits int) float64 {
+	if bits <= 0 || bits > 38 {
+		return 0
+	}
+	return float64((uint64(1) << uint(bits)) - 1)
+}
+
+// jpxBitDepth 从JPEG2000码流头推导有效分量位深，供缺省位深的直构图像计算索引与色键范围
+// 入参: ctx 取消上下文, indexed 是否索引色图像
+// 返回: int 有效分量位深, error 编码、精度或取消错误
+func (i *Image) jpxBitDepth(ctx context.Context, indexed bool) (int, error) {
+	data, _, err := i.encodedFileContext(ctx, "JPXDecode")
+	if err != nil {
+		return 0, err
+	}
+	code, err := jpxCodestream(data)
+	if err != nil {
+		return 0, err
+	}
+	_, _, count, err := jpxSize(code)
+	if err != nil {
+		return 0, err
+	}
+	if indexed {
+		depth := int(code[42]&127) + 1
+		if depth > 16 {
+			return 0, &UnsupportedError{Feature: "JPEG2000 component precision"}
+		}
+		return depth, nil
+	}
+	return jpxCodestreamDepth(code, count)
 }
 
 // DecodeSamples 解码原始图像样本，不应用Decode数组、遮罩或色彩管理
@@ -1139,9 +1229,6 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
 	}
-	if i.BitsPerComponent != 1 && i.BitsPerComponent != 2 && i.BitsPerComponent != 4 && i.BitsPerComponent != 8 && i.BitsPerComponent != 16 {
-		return nil, fmt.Errorf("invalid image component depth")
-	}
 	filters, parameters, err := i.Stream.filterChain(i.reader)
 	if err != nil {
 		return nil, err
@@ -1162,6 +1249,15 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 			filters = filters[:len(filters)-1]
 			parameters = parameters[:len(parameters)-1]
 		}
+	}
+	bits, err := i.effectiveBitsPerComponent(terminal == "JPXDecode")
+	if err != nil {
+		return nil, err
+	}
+	if bits != i.BitsPerComponent {
+		normalized := *i
+		normalized.BitsPerComponent = bits
+		i = &normalized
 	}
 	target := image.Point{}
 	if size.X > 0 && size.Y > 0 {
@@ -1212,13 +1308,23 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 		if _, _, err := imageBufferSize(i.Width, i.Height, 1); err != nil {
 			return nil, err
 		}
-		if _, err := i.validateJBIG2FileHeader(data, terminalParams["JBIG2Globals"] != nil); err != nil {
+		globalsObj := terminalParams["JBIG2Globals"]
+		if globalsObj != nil {
+			resolved, err := i.reader.resolveOptional(globalsObj)
+			if err != nil {
+				return nil, err
+			}
+			if resolved == nil {
+				globalsObj = nil
+			}
+		}
+		if _, err := i.validateJBIG2FileHeader(data, globalsObj != nil); err != nil {
 			return nil, err
 		}
 		opts := i.jbig2DecodeOptions(ctx)
 		var parsedGlobals *jbig2.Globals
-		if terminalParams["JBIG2Globals"] != nil {
-			parsedGlobals, err = i.jbig2GlobalsParsed(ctx, terminalParams["JBIG2Globals"], opts)
+		if globalsObj != nil {
+			parsedGlobals, err = i.jbig2GlobalsParsed(ctx, globalsObj, opts)
 			if err != nil {
 				return nil, err
 			}
@@ -1595,10 +1701,21 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
 	}
-	if i.BitsPerComponent != 1 && i.BitsPerComponent != 2 && i.BitsPerComponent != 4 && i.BitsPerComponent != 8 && i.BitsPerComponent != 16 {
-		return nil, fmt.Errorf("invalid image component depth")
+	filters, _, err := i.Stream.filterChain(i.reader)
+	if err != nil {
+		return nil, err
 	}
-	if target == nil && !i.ImageMask {
+	isJPX := len(filters) != 0 && filters[len(filters)-1] == Name("JPXDecode")
+	bits, err := i.effectiveBitsPerComponent(isJPX)
+	if err != nil {
+		return nil, err
+	}
+	if bits != i.BitsPerComponent {
+		normalized := *i
+		normalized.BitsPerComponent = bits
+		i = &normalized
+	}
+	if target == nil && !i.ImageMask && i.reader != nil {
 		none, err := i.reader.colorSpaceNone(i.ColorSpace, i.effectiveColorSpace)
 		if err != nil {
 			return nil, err
@@ -1705,20 +1822,35 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		bounds := profile.sourceRanges()
 		copy(ranges, bounds[:components*2])
 	}
+	if isJPX && bits == 0 {
+		needDepth := palette != nil
+		if !needDepth && embeddedMask == 0 && i.Mask != nil {
+			maskObj, err := i.reader.resolveOptional(i.Mask)
+			if err != nil {
+				return nil, err
+			}
+			_, needDepth = maskObj.(Array)
+		}
+		if needDepth {
+			bits, err = i.jpxBitDepth(ctx, palette != nil)
+			if err != nil {
+				return nil, err
+			}
+			if bits != i.BitsPerComponent {
+				normalized := *i
+				normalized.BitsPerComponent = bits
+				i = &normalized
+			}
+		}
+	}
 	limits := append([]float64(nil), ranges...)
 	if palette != nil {
-		ranges[1] = float64((uint32(1) << i.BitsPerComponent) - 1)
+		ranges[1] = imageSampleMaximum(bits)
 	}
 	defaultDecode := true
 	decode := i.Decode
-	if len(decode) != 0 && !i.ImageMask {
-		filters, _, err := i.Stream.filterChain(i.reader)
-		if err != nil {
-			return nil, err
-		}
-		if len(filters) != 0 && filters[len(filters)-1] == Name("JPXDecode") {
-			decode = nil
-		}
+	if len(decode) != 0 && !i.ImageMask && isJPX {
+		decode = nil
 	}
 	if len(decode) != 0 {
 		if len(decode) != len(ranges) {
@@ -1734,8 +1866,20 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			}
 		}
 		for n, value := range decode {
-			v, err := i.reader.number(value)
-			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			resolved, err := i.reader.resolveOptional(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid image Decode value")
+			}
+			var v float64
+			switch num := resolved.(type) {
+			case Integer:
+				v = float64(num)
+			case Real:
+				v = float64(num)
+			default:
+				return nil, fmt.Errorf("invalid image Decode value")
+			}
+			if math.IsNaN(v) || math.IsInf(v, 0) {
 				return nil, fmt.Errorf("invalid image Decode value")
 			}
 			defaultDecode = defaultDecode && v == ranges[n]
@@ -1844,7 +1988,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		}
 		if palette == nil && len(keys) == 0 && (samples.Bounds().Dx() > bounds.Dx() || samples.Bounds().Dy() > bounds.Dy()) {
 			dst := boundedSampleSize(samples.Bounds().Dx(), samples.Bounds().Dy(), bounds.Size())
-			samples, err = downsampleDecodedImage(ctx, samples, dst)
+			samples, err = downsampleDecodedImageMode(ctx, samples, dst, embeddedMask == 2)
 			if err != nil {
 				return nil, err
 			}
@@ -1893,7 +2037,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				}
 			}
 		}
-		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: float64((uint32(1) << i.BitsPerComponent) - 1), byteExact: byteExact, embedded: embeddedMask != 0 || sampleHasAlpha}, nil
+		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: imageSampleMaximum(bits), byteExact: byteExact, embedded: embeddedMask != 0 || sampleHasAlpha}, nil
 	}
 	var out *image.NRGBA64
 	var encoder *pngImageEncoder
@@ -1973,7 +2117,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 					return nil, fmt.Errorf("invalid CMYK image samples")
 				}
 			}
-			target.view = &imageComponentView{source: samples, mask: mask, channels: components, ranges: ranges, keys: keys, matte: matte, inverted: inverted, embedded: embeddedMask != 0, maximum: float64((uint32(1) << i.BitsPerComponent) - 1)}
+			target.view = &imageComponentView{source: samples, mask: mask, channels: components, ranges: ranges, keys: keys, matte: matte, inverted: inverted, embedded: embeddedMask != 0, maximum: imageSampleMaximum(bits)}
 			return nil, nil
 		}
 		size := 0
@@ -2001,7 +2145,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			target.Pix = make([]uint16, size/2)
 		}
 	}
-	maximum := float64((uint32(1) << i.BitsPerComponent) - 1)
+	maximum := imageSampleMaximum(bits)
 	var componentBuffer [4]float64
 	inputs := componentBuffer[:min(components, len(componentBuffer))]
 	if components > len(componentBuffer) {
@@ -2338,7 +2482,7 @@ func (i *Image) palette() (*imagePalette, error) {
 			components = 3
 		}
 	}
-	high, err := i.reader.Resolve(array[2])
+	high, err := i.reader.resolveOptional(array[2])
 	if err != nil {
 		return nil, err
 	}
@@ -2346,7 +2490,7 @@ func (i *Image) palette() (*imagePalette, error) {
 	if !ok || n < 0 || n > 255 {
 		return nil, fmt.Errorf("invalid Indexed high value")
 	}
-	lookup, err := i.reader.Resolve(array[3])
+	lookup, err := i.reader.resolveOptional(array[3])
 	if err != nil {
 		return nil, err
 	}
@@ -2355,7 +2499,11 @@ func (i *Image) palette() (*imagePalette, error) {
 	case String:
 		data = value
 	case *Stream:
-		data, err = i.reader.decodeStream(value)
+		if i.reader != nil {
+			data, err = i.reader.decodeStream(value)
+		} else {
+			data, err = value.decodeWith(context.Background(), nil, i.Warning, 0)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -2515,10 +2663,13 @@ func (i *Image) prepareMask(ctx context.Context, components int) (*Image, []floa
 		if len(keys) != components*2 {
 			return nil, nil, false, nil, fmt.Errorf("invalid color key mask")
 		}
+		if i.BitsPerComponent <= 0 || i.BitsPerComponent > 38 {
+			return nil, nil, false, nil, fmt.Errorf("invalid image component depth")
+		}
 		values := make([]float64, len(keys))
-		maximum := (int64(1) << i.BitsPerComponent) - 1
+		maximum := (int64(1) << uint(i.BitsPerComponent)) - 1
 		for n, key := range keys {
-			value, err := i.reader.Resolve(key)
+			value, err := i.reader.resolveOptional(key)
 			if err != nil {
 				return nil, nil, false, nil, err
 			}
@@ -2591,7 +2742,7 @@ func (i *Image) prepareMask(ctx context.Context, components int) (*Image, []floa
 // maskObject 解析生效的外部遮罩，软遮罩优先，空引用不构成遮罩
 // 返回: Object 遮罩流或颜色键, bool 是否软遮罩, error 引用解析错误
 func (i *Image) maskObject() (Object, bool, error) {
-	object, err := i.reader.Resolve(i.SoftMask)
+	object, err := i.reader.resolveOptional(i.SoftMask)
 	if err != nil {
 		return nil, false, err
 	}
@@ -2601,10 +2752,10 @@ func (i *Image) maskObject() (Object, bool, error) {
 	if i.ImageMask {
 		return nil, false, nil
 	}
-	object, err = i.reader.Resolve(i.Mask)
+	object, err = i.reader.resolveOptional(i.Mask)
 	if err == nil && i.Warning != nil {
 		if stream, ok := object.(*Stream); ok && stream != nil {
-			flag, resolveErr := i.reader.Resolve(stream.Dictionary["ImageMask"])
+			flag, resolveErr := i.reader.resolveOptional(stream.Dictionary["ImageMask"])
 			if resolveErr != nil {
 				return nil, false, resolveErr
 			}
@@ -2702,7 +2853,7 @@ func (i *Image) rawSampleComponents() (int, error) {
 		components = 1
 	}
 	if space, ok := i.ColorSpace.(Array); ok && len(space) == 2 && space[0] == Name("ICCBased") {
-		profile, err := i.reader.Resolve(space[1])
+		profile, err := i.reader.resolveOptional(space[1])
 		if err != nil {
 			return 0, err
 		}
@@ -2710,7 +2861,7 @@ func (i *Image) rawSampleComponents() (int, error) {
 		if !ok {
 			return 0, fmt.Errorf("invalid ICC profile stream")
 		}
-		nVal, err := i.reader.Resolve(stream.Dictionary["N"])
+		nVal, err := i.reader.resolveOptional(stream.Dictionary["N"])
 		if err != nil {
 			return 0, err
 		}

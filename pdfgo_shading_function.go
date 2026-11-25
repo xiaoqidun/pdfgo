@@ -24,6 +24,22 @@ import (
 // maxGradientLinearStops 限制一维采样渐变展开为线性分段的最大断点数，超限时退回按需函数求值
 const maxGradientLinearStops = 65536
 
+// maxGradientFunctionNodes 限制单次渐变函数解析允许访问的最大节点数，防止共享DAG指数展开
+const maxGradientFunctionNodes = 4096
+
+// gradientFunctionKey 标识单次解析中可复用的间接函数对象及通道数
+type gradientFunctionKey struct {
+	ref      Reference
+	channels int
+}
+
+// gradientParseState 保存单次渐变函数解析的节点预算与间接引用记忆表
+type gradientParseState struct {
+	nodes     int
+	functions map[gradientFunctionKey]*gradientFunction
+	vectors   map[gradientFunctionKey]*gradientVector
+}
+
 // gradientFunction 保存已解析的一维颜色函数及可精确展开的线性分段
 type gradientFunction struct {
 	value     func(float64) [4]float64
@@ -89,6 +105,9 @@ func iccGradientFunction(source *gradientFunction, profile *iccColorSpace) *grad
 // 入参: stops 源分量分段, profile ICC源空间
 // 返回: []GradientStop 合成分量分段
 func iccGradientStops(stops []GradientStop, profile *iccColorSpace) []GradientStop {
+	if len(stops) == 0 || len(stops) > maxGradientLinearStops {
+		return nil
+	}
 	if profile == nil || profile.ranges == nil {
 		return stops
 	}
@@ -122,17 +141,29 @@ func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
 				if i > 0 && stops[i-1].Position < stop.Position {
 					previous := stops[i-1]
 					mappedStops := tint.linear([2]float64{previous.Values[0], stop.Values[0]})
+					if len(mappedStops) == 0 {
+						return nil
+					}
 					for _, mapped := range mappedStops {
 						mapped.Position = gradientPosition(previous.Position, stop.Position, mapped.Position)
 						if len(result) == 0 || result[len(result)-1] != mapped {
+							if len(result) >= maxGradientLinearStops {
+								return nil
+							}
 							result = append(result, mapped)
 						}
 					}
 				} else {
 					mappedStops := tint.linear([2]float64{stop.Values[0], stop.Values[0]})
+					if len(mappedStops) == 0 {
+						return nil
+					}
 					values := gradientValue(mappedStops, 0)
 					mapped := GradientStop{Position: stop.Position, Values: values}
 					if len(result) == 0 || result[len(result)-1] != mapped {
+						if len(result) >= maxGradientLinearStops {
+							return nil
+						}
 						result = append(result, mapped)
 					}
 				}
@@ -194,30 +225,47 @@ func clipGradientValue(values [4]float64, limits []float64) [4]float64 {
 	return values
 }
 
-// mergeGradientFunctions 合并独立分量的精确断点和跳变
+// mergeGradientFunctions 合并独立分量的精确断点和跳变，超限或缺失分段时返回nil
 // 入参: functions 分量函数, interval 输入区间
 // 返回: []GradientStop 合并分段
 func mergeGradientFunctions(functions []*gradientFunction, interval [2]float64) []GradientStop {
 	parts := make([][]GradientStop, len(functions))
 	positions := []float64{0, 1}
 	for i, function := range functions {
-		parts[i] = function.linear(interval)
-		for _, stop := range parts[i] {
+		part := function.linear(interval)
+		if len(part) == 0 || len(part) > maxGradientLinearStops {
+			return nil
+		}
+		parts[i] = part
+		for _, stop := range part {
 			positions = append(positions, stop.Position)
+		}
+		if len(positions) > maxGradientLinearStops {
+			slices.Sort(positions)
+			positions = slices.Compact(positions)
+			if len(positions) > maxGradientLinearStops {
+				return nil
+			}
 		}
 	}
 	slices.Sort(positions)
-	var stops []GradientStop
-	for _, position := range slices.Compact(positions) {
+	positions = slices.Compact(positions)
+	stops := make([]GradientStop, 0, len(positions))
+	for _, position := range positions {
 		for _, left := range []bool{true, false} {
 			stop := GradientStop{Position: position}
 			for c, part := range parts {
 				stop.Values[c] = gradientValueSide(part, position, left)[0]
 			}
-			stops = append(stops, stop)
+			if len(stops) == 0 || stops[len(stops)-1] != stop {
+				if len(stops) >= maxGradientLinearStops {
+					return nil
+				}
+				stops = append(stops, stop)
+			}
 		}
 	}
-	return slices.Compact(stops)
+	return stops
 }
 
 // sampledGradientStops 展开采样函数的精确断点及范围截断，超限时返回nil退回按需求值
@@ -280,17 +328,17 @@ func (f *gradientFunction) evaluate(x float64) ([4]float64, error) {
 	return f.value(x), nil
 }
 
-// readGradientFunction 解析采样、指数、拼接及计算器函数，不近似非线性函数
-// 入参: object 函数对象, channels 输出分量数, depth 嵌套深度
-// 返回: *gradientFunction 颜色函数, error 解析错误
-func (r *Reader) readGradientFunction(object Object, channels, depth int) (*gradientFunction, error) {
-	return r.readGradientFunctionContext(context.Background(), object, channels, depth)
-}
-
 // readGradientFunctionContext 在取消上下文内解析采样、指数、拼接及计算器函数
 // 入参: ctx 取消上下文, object 函数对象, channels 输出分量数, depth 嵌套深度
 // 返回: *gradientFunction 颜色函数, error 解析或取消错误
 func (r *Reader) readGradientFunctionContext(ctx context.Context, object Object, channels, depth int) (*gradientFunction, error) {
+	return r.readGradientFunctionState(ctx, object, channels, depth, &gradientParseState{})
+}
+
+// readGradientFunctionState 携带节点预算与间接引用记忆表解析渐变函数
+// 入参: ctx 取消上下文, object 函数对象, channels 输出分量数, depth 嵌套深度, state 解析状态
+// 返回: *gradientFunction 颜色函数, error 解析或取消错误
+func (r *Reader) readGradientFunctionState(ctx context.Context, object Object, channels, depth int, state *gradientParseState) (*gradientFunction, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -300,6 +348,34 @@ func (r *Reader) readGradientFunctionContext(ctx context.Context, object Object,
 	if depth >= 32 {
 		return nil, fmt.Errorf("gradient function recursion limit exceeded")
 	}
+	state.nodes++
+	if state.nodes > maxGradientFunctionNodes {
+		return nil, fmt.Errorf("gradient function complexity limit exceeded")
+	}
+	ref, isRef := object.(Reference)
+	key := gradientFunctionKey{ref: ref, channels: channels}
+	if isRef && state.functions != nil {
+		if cached := state.functions[key]; cached != nil {
+			return cached, nil
+		}
+	}
+	f, err := r.readGradientFunctionNode(ctx, object, channels, depth, state)
+	if err != nil {
+		return nil, err
+	}
+	if isRef {
+		if state.functions == nil {
+			state.functions = make(map[gradientFunctionKey]*gradientFunction)
+		}
+		state.functions[key] = f
+	}
+	return f, nil
+}
+
+// readGradientFunctionNode 解析单个渐变函数节点并在拼接展开超限时退回按需求值
+// 入参: ctx 取消上下文, object 函数对象, channels 输出分量数, depth 嵌套深度, state 解析状态
+// 返回: *gradientFunction 颜色函数, error 解析或取消错误
+func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, channels, depth int, state *gradientParseState) (*gradientFunction, error) {
 	v, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -311,7 +387,7 @@ func (r *Reader) readGradientFunctionContext(ctx context.Context, object Object,
 		parts := make([]*gradientFunction, channels)
 		linear := true
 		for i, object := range array {
-			parts[i], err = r.readGradientFunctionContext(ctx, object, 1, depth+1)
+			parts[i], err = r.readGradientFunctionState(ctx, object, 1, depth+1, state)
 			if err != nil {
 				return nil, err
 			}
@@ -486,7 +562,7 @@ func (r *Reader) readGradientFunctionContext(ctx context.Context, object Object,
 		if points[i] > points[i+1] {
 			return nil, fmt.Errorf("invalid gradient stitching bounds")
 		}
-		parts[i], err = r.readGradientFunctionContext(ctx, object, channels, depth+1)
+		parts[i], err = r.readGradientFunctionState(ctx, object, channels, depth+1, state)
 		if err != nil {
 			return nil, err
 		}
@@ -519,6 +595,10 @@ func (r *Reader) readGradientFunctionContext(ctx context.Context, object Object,
 			if points[i] == points[i+1] {
 				if i == len(parts)-1 {
 					partStops := part.linear([2]float64{encode[2*i], encode[2*i]})
+					if len(partStops) == 0 || len(partStops) > maxGradientLinearStops-len(stops) {
+						stops = nil
+						break
+					}
 					for _, stop := range partStops {
 						stop.Position = 1
 						stops = append(stops, stop)
@@ -527,15 +607,21 @@ func (r *Reader) readGradientFunctionContext(ctx context.Context, object Object,
 				continue
 			}
 			partStops := part.linear([2]float64{encode[2*i], encode[2*i+1]})
+			if len(partStops) == 0 || len(partStops) > maxGradientLinearStops-len(stops) {
+				stops = nil
+				break
+			}
 			for _, stop := range partStops {
 				position := gradientPosition(points[i], points[i+1], stop.Position)
 				stop.Position = functionPosition(position, domain[0], domain[1])
 				stops = append(stops, stop)
 			}
 		}
-		stops = clipGradientValues(stops, limits)
 		if len(stops) > 0 {
-			f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
+			stops = clipGradientValues(stops, limits)
+			if len(stops) > 0 {
+				f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
+			}
 		}
 	}
 	return f, nil

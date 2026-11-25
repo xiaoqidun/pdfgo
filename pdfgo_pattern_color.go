@@ -27,25 +27,11 @@ type patternColorSpace struct {
 	blending   *ColorSpace
 }
 
-// readPatternBase 读取无色图案的设备、校准、索引或专色空间
-// 入参: object 底层颜色空间
-// 返回: *patternColorSpace 颜色变换, error 解析错误
-func (r *Reader) readPatternBase(object Object) (*patternColorSpace, error) {
-	return r.readPatternColorSpaceContext(context.Background(), object, false)
-}
-
 // readPatternBaseContext 在取消上下文内读取无色图案的设备、校准、索引或专色空间
 // 入参: ctx 取消上下文, object 底层颜色空间
 // 返回: *patternColorSpace 颜色变换, error 解析或取消错误
 func (r *Reader) readPatternBaseContext(ctx context.Context, object Object) (*patternColorSpace, error) {
 	return r.readPatternColorSpaceContext(ctx, object, false)
-}
-
-// readPatternColorSpace 读取原始或已按资源校验的图案基础空间
-// 入参: object 基础空间, effective 是否已按资源校验并替换
-// 返回: *patternColorSpace 分量数及颜色变换, error 颜色空间错误
-func (r *Reader) readPatternColorSpace(object Object, effective bool) (*patternColorSpace, error) {
-	return r.readPatternColorSpaceContext(context.Background(), object, effective)
 }
 
 // readPatternColorSpaceContext 在取消上下文内读取原始或已按资源校验的图案基础空间
@@ -106,6 +92,10 @@ func (r *Reader) readPatternColorSpaceContext(ctx context.Context, object Object
 					paint.Colorant = newColorantPaint(palette.colorants, palette.tints[index])
 				}
 				if palette.space != nil {
+					if palette.space.Model == "DeviceCMYK" && palette.space.profile == nil {
+						cmyk := paint.Values
+						paint.CMYK = &cmyk
+					}
 					var err error
 					paint.RGB, err = palette.space.SRGB(paint.Values[:palette.space.Components()], intent)
 					return paint, err

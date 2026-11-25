@@ -701,6 +701,19 @@ func (r *Reader) Resolve(object Object) (Object, error) {
 	}
 }
 
+// resolveOptional 在绑定阅读器时解析对象，未绑定阅读器时原样返回直接对象
+// 入参: object 待解析对象
+// 返回: Object 解析后的对象, error 阅读器状态或引用错误
+func (r *Reader) resolveOptional(object Object) (Object, error) {
+	if r != nil {
+		return r.Resolve(object)
+	}
+	if _, ok := object.(Reference); ok {
+		return nil, fmt.Errorf("invalid reader")
+	}
+	return object, nil
+}
+
 // Object 按编号与代数读取间接对象
 // 不存在或已释放的引用按PDF规则返回空对象
 // 入参: ref 间接引用

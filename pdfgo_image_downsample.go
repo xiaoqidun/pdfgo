@@ -331,7 +331,7 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 	default:
 		return nil, false, nil
 	}
-	if maxBytes > 0 {
+	if maxBytes > 0 && maxBytes < math.MaxInt64 {
 		limited = &io.LimitedReader{R: reader, N: maxBytes + 1}
 		reader = limited
 	}
@@ -675,10 +675,105 @@ func downsampleYCbCr(ctx context.Context, src *image.YCbCr, target image.Point, 
 	return out, ctx.Err()
 }
 
+// packedCMYKAImage 保留十六位四色分量及独立透明度，供带内嵌遮罩的四色降采样使用
+type packedCMYKAImage struct {
+	data   []byte
+	rect   image.Rectangle
+	stride int
+}
+
+// packedDeviceNAImage 按行保留十六位专色分量及独立透明度，供带内嵌遮罩的专色降采样使用
+type packedDeviceNAImage struct {
+	data             []byte
+	rect             image.Rectangle
+	stride, channels int
+}
+
+// packedDeviceNASample 按需读取带独立透明度的十六位专色像素
+type packedDeviceNASample struct {
+	source *packedDeviceNAImage
+	x, y   int
+}
+
+// ColorModel 返回非预乘颜色模型
+// 返回: color.Model 颜色模型
+func (s *packedCMYKAImage) ColorModel() color.Model { return color.NRGBA64Model }
+
+// Bounds 返回带透明度的四色图像边界
+// 返回: image.Rectangle 图像边界
+func (s *packedCMYKAImage) Bounds() image.Rectangle { return s.rect }
+
+// At 读取十六位四色分量及独立透明度，边界外返回零值样本
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 四色透明样本
+func (s *packedCMYKAImage) At(x, y int) color.Color {
+	if !image.Pt(x, y).In(s.rect) {
+		return jpxSample{}
+	}
+	return s.sample(x, y)
+}
+
+// sample 读取已校验边界内的四色分量及独立透明度
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: jpxSample 四色透明样本
+func (s *packedCMYKAImage) sample(x, y int) jpxSample {
+	off := (y-s.rect.Min.Y)*s.stride + (x-s.rect.Min.X)*10
+	return jpxSample{
+		values: cmykSample{
+			binary.BigEndian.Uint16(s.data[off:]),
+			binary.BigEndian.Uint16(s.data[off+2:]),
+			binary.BigEndian.Uint16(s.data[off+4:]),
+			binary.BigEndian.Uint16(s.data[off+6:]),
+		},
+		alpha: binary.BigEndian.Uint16(s.data[off+8:]),
+		cmyk:  true,
+	}
+}
+
+// ColorModel 返回非预乘颜色模型
+// 返回: color.Model 颜色模型
+func (s *packedDeviceNAImage) ColorModel() color.Model { return color.NRGBA64Model }
+
+// Bounds 返回带透明度的专色图像边界
+// 返回: image.Rectangle 图像边界
+func (s *packedDeviceNAImage) Bounds() image.Rectangle { return s.rect }
+
+// At 读取带独立透明度的专色样本，边界外返回透明色
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 专色透明样本
+func (s *packedDeviceNAImage) At(x, y int) color.Color {
+	if !image.Pt(x, y).In(s.rect) {
+		return color.NRGBA64{}
+	}
+	return packedDeviceNASample{source: s, x: x, y: y}
+}
+
+// component 读取指定通道的十六位专色或透明度样本
+// 入参: channel 通道索引
+// 返回: uint16 样本值
+func (s packedDeviceNASample) component(channel int) uint16 {
+	off := (s.y-s.source.rect.Min.Y)*s.source.stride + ((s.x-s.source.rect.Min.X)*(s.source.channels+1)+channel)*2
+	return binary.BigEndian.Uint16(s.source.data[off:])
+}
+
+// RGBA 返回前三个专色分量的预乘预览及独立透明度
+// 返回: uint32 红、绿、蓝及透明度
+func (s packedDeviceNASample) RGBA() (uint32, uint32, uint32, uint32) {
+	alpha := uint32(s.component(s.source.channels))
+	return uint32(s.component(0)) * alpha / 65535, uint32(s.component(1)) * alpha / 65535, uint32(s.component(2)) * alpha / 65535, alpha
+}
+
 // downsampleDecodedImage 对已解码图像按目标尺寸执行盒式区域平均降采样，保留原始通道布局
 // 入参: ctx 取消上下文, src 源图像, target 目标尺寸
 // 返回: image.Image 降采样后的图像, error 缓冲或取消错误
 func downsampleDecodedImage(ctx context.Context, src image.Image, target image.Point) (image.Image, error) {
+	return downsampleDecodedImageMode(ctx, src, target, false)
+}
+
+// downsampleDecodedImageMode 按预乘模式对已解码图像执行盒式区域平均降采样，保留原始通道布局
+// 入参: ctx 取消上下文, src 源图像, target 目标尺寸, premultiplied 内嵌透明样本是否已预乘
+// 返回: image.Image 降采样后的图像, error 缓冲或取消错误
+func downsampleDecodedImageMode(ctx context.Context, src image.Image, target image.Point, premultiplied bool) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -979,7 +1074,7 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 		}
 		return out, nil
 	case *jpxSampleImage:
-		return downsampleJPXImage(ctx, s, target, xStarts)
+		return downsampleJPXImage(ctx, s, target, xStarts, premultiplied)
 	default:
 		if _, _, err := imageBufferSize(dstW, dstH, 8); err != nil {
 			return nil, err
@@ -1019,11 +1114,11 @@ func downsampleDecodedImage(ctx context.Context, src image.Image, target image.P
 	}
 }
 
-// downsampleJPXImage 对已解码的JPEG2000分量图像执行盒式降采样，保留原始颜色通道语义
-// 入参: ctx 取消上下文, s JPEG2000样本图, target 目标尺寸, xStarts 水平区间边界
+// downsampleJPXImage 对已解码的JPEG2000分量图像执行盒式降采样，保留原始颜色通道及预乘语义
+// 入参: ctx 取消上下文, s JPEG2000样本图, target 目标尺寸, xStarts 水平区间边界, premultiplied 内嵌透明是否已预乘
 // 返回: image.Image 降采样后的样本图, error 缓冲或取消错误
-func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Point, xStarts []int) (image.Image, error) {
-	if s.rows != nil || s.alpha >= 0 && (s.cmyk || len(s.channels) > 4) {
+func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Point, xStarts []int, premultiplied bool) (image.Image, error) {
+	if s.rows != nil {
 		return s, nil
 	}
 	b := s.bounds
@@ -1032,6 +1127,58 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 	rect := image.Rect(0, 0, dstW, dstH)
 	channels := len(s.channels)
 	if channels > 4 {
+		if s.alpha >= 0 {
+			outStride, outBytes, err := imageSampleSize(dstW, dstH, channels+1, 16)
+			if err != nil {
+				return nil, err
+			}
+			out := &packedDeviceNAImage{data: make([]byte, outBytes), rect: rect, stride: outStride, channels: channels}
+			sum := make([]uint64, channels)
+			for dy := 0; dy < dstH; dy++ {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
+				outRow := out.data[dy*out.stride:]
+				for dx := 0; dx < dstW; dx++ {
+					x0, x1 := xStarts[dx], xStarts[dx+1]
+					clear(sum)
+					var sumA uint64
+					for sy := y0; sy < y1; sy++ {
+						for sx := x0; sx < x1; sx++ {
+							a := uint64(s.sample(s.alpha, b.Min.X+sx, b.Min.Y+sy))
+							if premultiplied {
+								for c, idx := range s.channels {
+									sum[c] += uint64(s.sample(idx, b.Min.X+sx, b.Min.Y+sy))
+								}
+							} else {
+								for c, idx := range s.channels {
+									sum[c] += uint64(s.sample(idx, b.Min.X+sx, b.Min.Y+sy)) * a
+								}
+							}
+							sumA += a
+						}
+					}
+					count := uint64(x1-x0) * uint64(y1-y0)
+					base := dx * (channels + 1) * 2
+					if premultiplied {
+						for c := 0; c < channels; c++ {
+							binary.BigEndian.PutUint16(outRow[base+c*2:], uint16((sum[c]+count/2)/count))
+						}
+						binary.BigEndian.PutUint16(outRow[base+channels*2:], uint16((sumA+count/2)/count))
+						continue
+					}
+					if sumA == 0 {
+						continue
+					}
+					for c := 0; c < channels; c++ {
+						binary.BigEndian.PutUint16(outRow[base+c*2:], uint16(min(65535, (sum[c]+sumA/2)/sumA)))
+					}
+					binary.BigEndian.PutUint16(outRow[base+channels*2:], uint16((sumA+count/2)/count))
+				}
+			}
+			return out, nil
+		}
 		outStride, outBytes, err := imageSampleSize(dstW, dstH, channels, 16)
 		if err != nil {
 			return nil, err
@@ -1063,6 +1210,58 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 		return out, nil
 	}
 	if s.cmyk {
+		if s.alpha >= 0 {
+			outStride, outBytes, err := imageSampleSize(dstW, dstH, 5, 16)
+			if err != nil {
+				return nil, err
+			}
+			out := &packedCMYKAImage{data: make([]byte, outBytes), rect: rect, stride: outStride}
+			for dy := 0; dy < dstH; dy++ {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
+				outRow := out.data[dy*out.stride:]
+				for dx := 0; dx < dstW; dx++ {
+					x0, x1 := xStarts[dx], xStarts[dx+1]
+					var sum [4]uint64
+					var sumA uint64
+					for sy := y0; sy < y1; sy++ {
+						for sx := x0; sx < x1; sx++ {
+							p := s.pixel(b.Min.X+sx, b.Min.Y+sy)
+							if premultiplied {
+								for c := 0; c < 4; c++ {
+									sum[c] += uint64(p.values[c])
+								}
+								sumA += uint64(p.alpha)
+							} else {
+								a := uint64(p.alpha)
+								for c := 0; c < 4; c++ {
+									sum[c] += uint64(p.values[c]) * a
+								}
+								sumA += a
+							}
+						}
+					}
+					count := uint64(x1-x0) * uint64(y1-y0)
+					if premultiplied {
+						for c := 0; c < 4; c++ {
+							binary.BigEndian.PutUint16(outRow[dx*10+c*2:], uint16((sum[c]+count/2)/count))
+						}
+						binary.BigEndian.PutUint16(outRow[dx*10+8:], uint16((sumA+count/2)/count))
+						continue
+					}
+					if sumA == 0 {
+						continue
+					}
+					for c := 0; c < 4; c++ {
+						binary.BigEndian.PutUint16(outRow[dx*10+c*2:], uint16(min(65535, (sum[c]+sumA/2)/sumA)))
+					}
+					binary.BigEndian.PutUint16(outRow[dx*10+8:], uint16((sumA+count/2)/count))
+				}
+			}
+			return out, nil
+		}
 		outStride, outBytes, err := imageSampleSize(dstW, dstH, 4, 16)
 		if err != nil {
 			return nil, err
@@ -1201,6 +1400,35 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 					G: uint16((sumG + count/2) / count),
 					B: uint16((sumB + count/2) / count),
 					A: 65535,
+				})
+			}
+		}
+		return out, nil
+	}
+	if premultiplied {
+		for dy := 0; dy < dstH; dy++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
+			for dx := 0; dx < dstW; dx++ {
+				x0, x1 := xStarts[dx], xStarts[dx+1]
+				var sumR, sumG, sumB, sumA uint64
+				for sy := y0; sy < y1; sy++ {
+					for sx := x0; sx < x1; sx++ {
+						p := s.pixel(b.Min.X+sx, b.Min.Y+sy)
+						sumR += uint64(p.values[0])
+						sumG += uint64(p.values[1])
+						sumB += uint64(p.values[2])
+						sumA += uint64(p.alpha)
+					}
+				}
+				count := uint64(x1-x0) * uint64(y1-y0)
+				out.SetNRGBA64(dx, dy, color.NRGBA64{
+					R: uint16((sumR + count/2) / count),
+					G: uint16((sumG + count/2) / count),
+					B: uint16((sumB + count/2) / count),
+					A: uint16((sumA + count/2) / count),
 				})
 			}
 		}

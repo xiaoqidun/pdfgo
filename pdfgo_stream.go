@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"hash/adler32"
 	"io"
+	"math"
 	"math/bits"
 	"os"
 	"strings"
@@ -139,11 +140,21 @@ type contextInput struct {
 	reader io.Reader
 }
 
+// limitStreamReader 在有效字节上限小于最大有符号整数时包装超限探测读取器，避免加一溢出
+// 入参: input 原始读取器, maxBytes 解码字节上限，非正数表示不限制
+// 返回: io.Reader 受限或原始读取器
+func limitStreamReader(input io.Reader, maxBytes int64) io.Reader {
+	if maxBytes > 0 && maxBytes < math.MaxInt64 {
+		return io.LimitReader(input, maxBytes+1)
+	}
+	return input
+}
+
 // completeFlatePayload 验证完整压缩块及截断校验尾部，不恢复截断压缩数据
 // 入参: ctx 取消上下文, encoded 压缩数据, decodedLen 已解码字节长度
 // 返回: bool 是否仅存在校验尾部问题
 func completeFlatePayload(ctx context.Context, encoded []byte, decodedLen int64) bool {
-	if len(encoded) < 2 || encoded[1]&0x20 != 0 || decodedLen < 0 {
+	if len(encoded) < 2 || encoded[1]&0x20 != 0 || decodedLen < 0 || decodedLen == math.MaxInt64 {
 		return false
 	}
 	source := bytes.NewReader(encoded[2:])
@@ -950,10 +961,7 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 			var reader io.ReadCloser
 			reader, err = acquireZlibReader(bytes.NewReader(data))
 			if err == nil {
-				var input io.Reader = &contextInput{ctx: ctx, reader: reader}
-				if maxBytes > 0 {
-					input = io.LimitReader(input, maxBytes+1)
-				}
+				input := limitStreamReader(&contextInput{ctx: ctx, reader: reader}, maxBytes)
 				data, err = readAllEstimated(input, estimateFlateCapacity(len(encoded), maxBytes))
 				closeErr := reader.Close()
 				releaseZlibReader(reader)
@@ -978,10 +986,7 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 		case "BrotliDecode":
 			encoded := data
 			reader := acquireBrotliReader(&contextInput{ctx: ctx, reader: bytes.NewReader(encoded)})
-			var input io.Reader = &contextInput{ctx: ctx, reader: reader}
-			if maxBytes > 0 {
-				input = io.LimitReader(input, maxBytes+1)
-			}
+			input := limitStreamReader(&contextInput{ctx: ctx, reader: reader}, maxBytes)
 			data, err = readAllEstimated(input, estimateFlateCapacity(len(encoded), maxBytes))
 			exceeded := maxBytes > 0 && int64(len(data)) > maxBytes
 			releaseBrotliReader(reader, int64(len(data)), exceeded || err != nil)
@@ -1215,6 +1220,10 @@ func (s *Stream) filterChainWith(reader *Reader, warning func(Diagnostic)) (Arra
 			if reader != nil || s.filterRefs != nil {
 				resolved := make(Dictionary, len(dict))
 				for key, value := range dict {
+					if key == "JBIG2Globals" {
+						resolved[key] = value
+						continue
+					}
 					resolved[key], err = resolve(value)
 					if err != nil {
 						return nil, nil, err

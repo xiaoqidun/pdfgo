@@ -115,6 +115,10 @@ func (s *graphicsColorSpace) paint(values []float64) (Paint, error) {
 		if s.palette.colorants != nil {
 			paint.Colorant = newColorantPaint(s.palette.colorants, s.palette.tints[index])
 		}
+		if s.palette.space != nil && s.palette.space.Model == "DeviceCMYK" && s.palette.space.profile == nil {
+			cmyk := paint.Values
+			paint.CMYK = &cmyk
+		}
 		paint.None = c.A == 0
 	} else if s.lab != nil {
 		paint.SourceSpace = "Lab"

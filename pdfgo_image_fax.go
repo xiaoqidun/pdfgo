@@ -55,6 +55,7 @@ type faxReader struct {
 	group4                         bool
 	allowDamage, damage            int
 	previousDamaged                bool
+	resynced                       bool
 	done                           bool
 	row, previous                  []byte
 	changes                        []int
@@ -500,7 +501,9 @@ func (r *faxReader) nextRow() (result error) {
 		r.done = true
 		return io.EOF
 	}
-	if r.align {
+	if r.resynced {
+		r.resynced = false
+	} else if r.align {
 		if _, err := r.take(r.available % 8); err != nil {
 			return err
 		}
@@ -529,6 +532,7 @@ func (r *faxReader) nextRow() (result error) {
 				return boundaryErr
 			}
 		}
+		r.resynced = true
 		r.damage++
 		if r.previousDamaged || r.rows == 0 {
 			for n := range r.row {

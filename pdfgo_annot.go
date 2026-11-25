@@ -328,11 +328,12 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	}
 	if optional != nil {
 		object := annotation.Dictionary["OC"]
-		visible := visitor.OptionalContent
-		if visible == nil {
-			visible = r.OptionalContentVisible
+		var show bool
+		if visitor.OptionalContent != nil {
+			show, err = visitor.OptionalContent(object)
+		} else {
+			show, err = r.optionalContentVisibleContext(ctx, object)
 		}
-		show, err := visible(object)
 		if err != nil || !show {
 			return err
 		}

@@ -62,13 +62,6 @@ func sampledSplineSpan(position float64, size int) ([4]int, [4]float64) {
 	return indices, weights
 }
 
-// readSampledFunction 读取线性或三次插值采样函数并验证数据范围
-// 入参: stream 函数数据流, inputs 输入数量, outputs 输出数量
-// 返回: *sampledFunction 函数, error 格式或能力错误
-func (r *Reader) readSampledFunction(stream *Stream, inputs, outputs int) (*sampledFunction, error) {
-	return r.readSampledFunctionContext(context.Background(), stream, inputs, outputs)
-}
-
 // readSampledFunctionContext 在本次取消上下文内解码和验证采样函数
 // 入参: ctx 取消上下文, stream 函数数据流, inputs 输入数量, outputs 输出数量
 // 返回: *sampledFunction 函数, error 格式、解码或取消错误

@@ -347,6 +347,19 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	protectingScale := false
 	preservingData := false
 	signed := false
+	isLiveRef := func(ref Reference) bool {
+		if _, ok := replacements[ref]; ok || lazyImages[ref] != nil {
+			return true
+		}
+		entry, ok := r.xref[ref.Number]
+		if !ok || entry.kind == 0 {
+			return false
+		}
+		if entry.kind == 2 {
+			return ref.Generation == 0
+		}
+		return entry.generation == ref.Generation
+	}
 	var collect func(Object, int) error
 	collect = func(value Object, depth int) error {
 		if err := ctx.Err(); err != nil {
@@ -360,11 +373,8 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			if v.Number <= 0 || v.Generation < 0 || v.Generation > 65535 {
 				return fmt.Errorf("invalid PDF reference")
 			}
-			_, hasReplacement := replacements[v]
-			if !hasReplacement && lazyImages[v] == nil {
-				if entry, ok := r.xref[v.Number]; ok && entry.kind != 0 && (entry.kind == 1 && entry.generation != v.Generation || entry.kind == 2 && v.Generation != 0) {
-					return nil
-				}
+			if !isLiveRef(v) {
+				return nil
 			}
 			if !seen[v] {
 				seen[v] = true
@@ -697,29 +707,11 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 	}
 	slices.SortFunc(refs, compareReference)
-	isLiveRef := func(ref Reference) bool {
-		if _, ok := replacements[ref]; ok || lazyImages[ref] != nil {
-			return true
-		}
-		entry, ok := r.xref[ref.Number]
-		if !ok || entry.kind == 0 {
-			return false
-		}
-		if entry.kind == 2 {
-			return ref.Generation == 0
-		}
-		return entry.generation == ref.Generation
-	}
 	filteredRefs := refs[:0]
 	for i := 0; i < len(refs); {
 		j := i + 1
 		for j < len(refs) && refs[j].Number == refs[i].Number {
 			j++
-		}
-		if j-i == 1 {
-			filteredRefs = append(filteredRefs, refs[i])
-			i = j
-			continue
 		}
 		liveCount := 0
 		var liveRef Reference
@@ -775,7 +767,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if options.Creator != "" {
 			newInfo["Creator"], newInfo["Producer"] = String(encoded), String(encoded)
 		}
-		if infoRef.Number == 0 {
+		if infoRef.Number == 0 || !isLiveRef(infoRef) {
 			maxID++
 			infoRef = Reference{Number: maxID}
 			refs = append(refs, infoRef)
@@ -1296,23 +1288,6 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 	} else {
 		ids := slices.Sorted(maps.Keys(entries))
-		if _, err := fmt.Fprintf(out, "xref\n0 %d\n", maxID+1); err != nil {
-			return report, err
-		}
-		freeNext := func(after int64, idx int) int64 {
-			cand := after + 1
-			for idx < len(ids) && ids[idx] < cand {
-				idx++
-			}
-			for idx < len(ids) && ids[idx] == cand {
-				cand++
-				idx++
-			}
-			if cand > maxID {
-				return 0
-			}
-			return cand
-		}
 		var xrefBuf bytes.Buffer
 		xrefBuf.Grow(4096)
 		flushXref := func() error {
@@ -1323,28 +1298,76 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			xrefBuf.Reset()
 			return err
 		}
-		idx := 1
-		for id := int64(0); id <= maxID; id++ {
-			if id&4095 == 0 {
-				if err := ctx.Err(); err != nil {
-					return report, err
-				}
+		if maxID+1 > max(int64(len(entries))*4+1024, 65536) || maxID >= maxXrefEntries {
+			if _, err := io.WriteString(out, "xref\n0 1\n0000000000 65535 f \n"); err != nil {
+				return report, err
 			}
-			if id == 0 {
-				fmt.Fprintf(&xrefBuf, "%010d 65535 f \n", freeNext(0, 1))
-			} else if idx < len(ids) && ids[idx] == id {
-				item := entries[id]
-				idx++
-				if item.position > 9999999999 {
-					return report, fmt.Errorf("PDF cross-reference offset exceeds classic limit")
+			for i := 1; i < len(ids); {
+				j := i + 1
+				for j < len(ids) && ids[j] == ids[j-1]+1 {
+					j++
 				}
-				fmt.Fprintf(&xrefBuf, "%010d %05d n \n", item.position, item.generation)
-			} else {
-				fmt.Fprintf(&xrefBuf, "%010d 65535 f \n", freeNext(id, idx))
+				fmt.Fprintf(&xrefBuf, "%d %d\n", ids[i], j-i)
+				for k := i; k < j; k++ {
+					if k&4095 == 0 {
+						if err := ctx.Err(); err != nil {
+							return report, err
+						}
+					}
+					item := entries[ids[k]]
+					if item.position > 9999999999 {
+						return report, fmt.Errorf("PDF cross-reference offset exceeds classic limit")
+					}
+					fmt.Fprintf(&xrefBuf, "%010d %05d n \n", item.position, item.generation)
+					if xrefBuf.Len() >= 4096 {
+						if err := flushXref(); err != nil {
+							return report, err
+						}
+					}
+				}
+				i = j
 			}
-			if xrefBuf.Len() >= 4096 {
-				if err := flushXref(); err != nil {
-					return report, err
+		} else {
+			if _, err := fmt.Fprintf(out, "xref\n0 %d\n", maxID+1); err != nil {
+				return report, err
+			}
+			freeNext := func(after int64, idx int) int64 {
+				cand := after + 1
+				for idx < len(ids) && ids[idx] < cand {
+					idx++
+				}
+				for idx < len(ids) && ids[idx] == cand {
+					cand++
+					idx++
+				}
+				if cand > maxID {
+					return 0
+				}
+				return cand
+			}
+			idx := 1
+			for id := int64(0); id <= maxID; id++ {
+				if id&4095 == 0 {
+					if err := ctx.Err(); err != nil {
+						return report, err
+					}
+				}
+				if id == 0 {
+					fmt.Fprintf(&xrefBuf, "%010d 65535 f \n", freeNext(0, 1))
+				} else if idx < len(ids) && ids[idx] == id {
+					item := entries[id]
+					idx++
+					if item.position > 9999999999 {
+						return report, fmt.Errorf("PDF cross-reference offset exceeds classic limit")
+					}
+					fmt.Fprintf(&xrefBuf, "%010d %05d n \n", item.position, item.generation)
+				} else {
+					fmt.Fprintf(&xrefBuf, "%010d 65535 f \n", freeNext(id, idx))
+				}
+				if xrefBuf.Len() >= 4096 {
+					if err := flushXref(); err != nil {
+						return report, err
+					}
 				}
 			}
 		}

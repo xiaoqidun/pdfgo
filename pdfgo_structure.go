@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 )
 
 // StructureTree 保存逻辑结构根、角色映射和属性类，树索引及扩展信息保留在原始字典中
@@ -273,49 +274,77 @@ func (r *Reader) WalkStructure(ctx context.Context, visit func(int, StructureIte
 	}
 	type frame struct {
 		children Array
+		index    int
 		parent   Reference
 		page     Reference
+		kRef     Reference
 	}
-	children, err := r.structureChildren(tree.Dictionary["K"])
+	children, kRef, err := r.structureChildren(tree.Dictionary["K"])
 	if err != nil {
 		return err
 	}
-	stack := []frame{{children: children, parent: tree.Reference}}
+	activeK := make(map[Reference]bool)
+	if kRef != (Reference{}) {
+		activeK[kRef] = true
+	}
+	stack := []frame{{children: children, parent: tree.Reference, kRef: kRef}}
 	seen := make(map[Reference]bool)
+	seenDicts := make(map[uintptr]Dictionary)
 	for len(stack) > 0 {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		current := &stack[len(stack)-1]
-		if len(current.children) == 0 {
+		if current.index >= len(current.children) {
+			if current.kRef != (Reference{}) {
+				delete(activeK, current.kRef)
+			}
 			stack = stack[:len(stack)-1]
 			continue
 		}
-		object := current.children[0]
-		current.children = current.children[1:]
-		item, err := r.structureItem(object, current.parent, current.page)
+		object := current.children[current.index]
+		current.index++
+		elemRef, value, err := r.resolveIndirect(object)
+		if err != nil {
+			return err
+		}
+		item, err := r.structureItem(object, value, current.parent, current.page)
 		if err != nil {
 			return err
 		}
 		if len(stack) == 1 && item.Type != "StructElem" {
 			return fmt.Errorf("structure root child is not an element")
 		}
-		if item.Type == "StructElem" && item.Reference != (Reference{}) {
-			if seen[item.Reference] {
-				return fmt.Errorf("repeated structure element")
+		if item.Type == "StructElem" {
+			if elemRef != (Reference{}) {
+				if seen[elemRef] {
+					return fmt.Errorf("repeated structure element")
+				}
+				seen[elemRef] = true
 			}
-			seen[item.Reference] = true
+			if ptr := reflect.ValueOf(item.Dictionary).Pointer(); ptr != 0 {
+				if _, exists := seenDicts[ptr]; exists {
+					return fmt.Errorf("repeated structure element")
+				}
+				seenDicts[ptr] = item.Dictionary
+			}
 		}
 		if err := visit(len(stack)-1, item); err != nil {
 			return err
 		}
 		if item.Type == "StructElem" {
-			children, err := r.structureChildren(item.Dictionary["K"])
+			children, childKRef, err := r.structureChildren(item.Dictionary["K"])
 			if err != nil {
 				return err
 			}
 			if len(children) > 0 {
-				stack = append(stack, frame{children: children, parent: item.Reference, page: item.Page})
+				if childKRef != (Reference{}) {
+					if activeK[childKRef] {
+						return fmt.Errorf("cyclic structure children")
+					}
+					activeK[childKRef] = true
+				}
+				stack = append(stack, frame{children: children, parent: item.Reference, page: item.Page, kRef: childKRef})
 			}
 		}
 	}
@@ -351,6 +380,9 @@ func (r *Reader) StructureAttributes(ctx context.Context, item StructureItem) ([
 		case Dictionary:
 			attribute.Dictionary = value
 		case *Stream:
+			if value == nil {
+				return fmt.Errorf("invalid structure attribute object")
+			}
 			attribute.Stream, attribute.Dictionary = value, value.Dictionary
 		default:
 			return fmt.Errorf("invalid structure attribute object")
@@ -439,7 +471,11 @@ func (r *Reader) WalkStructureIDs(ctx context.Context, visit func(string, Struct
 		return err
 	}
 	return r.WalkNameTree(ctx, tree.Dictionary["IDTree"], func(id string, object Object) error {
-		item, err := r.structureItem(object, Reference{}, Reference{})
+		resolved, err := r.Resolve(object)
+		if err != nil {
+			return err
+		}
+		item, err := r.structureItem(object, resolved, Reference{}, Reference{})
 		if err != nil {
 			return err
 		}
@@ -586,30 +622,26 @@ func (r *Reader) walkStructureRevisions(ctx context.Context, object Object, visi
 	return ctx.Err()
 }
 
-// structureChildren 读取K的单个子项或有序数组，保留间接子项的引用
+// structureChildren 读取K的单个子项或有序数组，保留间接子项引用及间接数组引用
 // 入参: object 子项声明
-// 返回: Array 子项, error 解析错误
-func (r *Reader) structureChildren(object Object) (Array, error) {
-	value, err := r.Resolve(object)
+// 返回: Array 子项, Reference 间接数组规范化引用, error 解析错误
+func (r *Reader) structureChildren(object Object) (Array, Reference, error) {
+	ref, value, err := r.resolveIndirect(object)
 	if err != nil || value == nil {
-		return nil, err
+		return nil, Reference{}, err
 	}
 	if children, ok := value.(Array); ok {
-		return children, nil
+		return children, ref, nil
 	}
-	return Array{object}, nil
+	return Array{object}, Reference{}, nil
 }
 
 // structureItem 解析结构元素、标记内容引用或对象引用
-// 入参: object 原始子项, parent 直属父元素, page 父元素声明的页面
+// 入参: object 原始子项, value 已解析对象, parent 直属父元素, page 父元素声明的页面
 // 返回: StructureItem 结构项, error 解析或结构错误
-func (r *Reader) structureItem(object Object, parent, page Reference) (StructureItem, error) {
+func (r *Reader) structureItem(object, value Object, parent, page Reference) (StructureItem, error) {
 	item := StructureItem{Parent: parent, Page: page}
 	item.Reference, _ = object.(Reference)
-	value, err := r.Resolve(object)
-	if err != nil {
-		return item, err
-	}
 	if id, ok := value.(Integer); ok {
 		if id < 0 || page == (Reference{}) {
 			return item, fmt.Errorf("invalid structure marked-content reference")

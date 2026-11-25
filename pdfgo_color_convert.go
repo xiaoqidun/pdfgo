@@ -118,16 +118,28 @@ func (s *iccColorSpace) xyz(values []float64, intent Name) ([3]float64, error) {
 	if xyz, used, err := s.processXYZ(values, intent); used || err != nil {
 		return xyz, err
 	}
-	if s.lab {
-		device[0] /= 100
-		device[1], device[2] = (device[1]+128)/255, (device[2]+128)/255
-	}
 	legacy := intent
 	if legacy == "AbsoluteColorimetric" {
 		legacy = "RelativeColorimetric"
 	}
 	var xyz [3]float64
 	if s.lut != nil {
+		if s.lab {
+			index, err := iccIntentIndex(legacy)
+			if err != nil {
+				return xyz, err
+			}
+			active := s.lut.toPCS[index]
+			if active == nil {
+				active = s.lut.toPCS[0]
+			}
+			scale := 1.0
+			if active.precision == 16 && active.pipeline == nil {
+				scale = 65280.0 / 65535
+			}
+			device[0] = device[0] / 100 * scale
+			device[1], device[2] = (device[1]+128)/255*scale, (device[2]+128)/255*scale
+		}
 		var err error
 		xyz, err = s.lut.xyz(values, legacy)
 		if err != nil {
@@ -185,7 +197,7 @@ func (s *iccColorSpace) fromXYZ(xyz [3]float64, intent Name) ([4]float64, error)
 		return s.alternateFromXYZ(xyz, intent)
 	}
 	values, err := s.fromDeviceXYZ(xyz, intent)
-	if err != nil || s.ranges == nil && !s.lab {
+	if err != nil {
 		return values, err
 	}
 	return s.normalize(values[:s.components()]), nil
@@ -224,9 +236,17 @@ func (s *iccColorSpace) fromDeviceXYZ(xyz [3]float64, intent Name) ([4]float64, 
 	}
 	if s.lut != nil || lut != nil && (lut.fromPCS[legacyIndex] != nil || lut.fromPCS[0] != nil) {
 		values, err := lut.fromXYZ(xyz, intent)
-		if s.lab {
-			values[0] *= 100
-			values[1], values[2] = values[1]*255-128, values[2]*255-128
+		if err == nil && s.lab {
+			active := lut.fromPCS[legacyIndex]
+			if active == nil {
+				active = lut.fromPCS[0]
+			}
+			scale := 1.0
+			if active.precision == 16 && active.pipeline == nil {
+				scale = 65535.0 / 65280
+			}
+			values[0] = math.Min(100, values[0]*100*scale)
+			values[1], values[2] = values[1]*255*scale-128, values[2]*255*scale-128
 		}
 		return values, err
 	}

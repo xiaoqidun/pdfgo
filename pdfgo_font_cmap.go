@@ -165,7 +165,7 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool, warning fu
 		}
 		var table []byte
 		var err error
-		if warning != nil && uint64(candidate.offset) < uint64(4+entries*8) {
+		if uint64(candidate.offset) < uint64(4+entries*8) {
 			err = fmt.Errorf("invalid cmap offset")
 		} else {
 			table, err = fontCmapSubtableContext(ctx, cmap, uint64(candidate.offset))

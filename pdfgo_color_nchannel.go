@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"context"
 	"fmt"
+	"math"
 )
 
 // ProcessColorants 保存过程空间及源分量对应的过程通道，专色通道为-1，Channels切片只读
@@ -191,15 +192,28 @@ func (r *Reader) applyNChannelProcess(ctx context.Context, space Array, tint *de
 		tint.output = append([]float64(nil), ranges[:output.Components()*2]...)
 	}
 	tint.transform, tint.sampled, tint.program = nil, nil, nil
-	tint.expressions = make([]affineValue, output.Components())
+	tint.processInputs = nil
+	expressions := make([]affineValue, output.Components())
+	overflow := false
 	for channel, input := range indices {
 		low, high := tint.output[2*channel], tint.output[2*channel+1]
-		tint.expressions[channel] = make(affineValue, tint.components+1)
-		tint.expressions[channel][0] = low
+		expressions[channel] = make(affineValue, tint.components+1)
+		expressions[channel][0] = low
 		if input >= 0 {
-			tint.expressions[channel][input+1] = high - low
+			span := high - low
+			if math.IsInf(span, 0) || math.IsNaN(span) {
+				overflow = true
+			} else {
+				expressions[channel][input+1] = span
+			}
 			tint.process.Channels[input] = channel
 		}
+	}
+	if overflow {
+		tint.expressions = nil
+		tint.processInputs = indices
+	} else {
+		tint.expressions = expressions
 	}
 	return nil
 }

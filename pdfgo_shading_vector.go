@@ -87,17 +87,17 @@ func projectedTintStops(f *tintFunction, channel int) []GradientStop {
 	return stops
 }
 
-// readGradientVector 解析多分量采样、指数、拼接及计算器函数
-// 入参: object 函数对象, channels 输出数量, depth 嵌套深度
-// 返回: *gradientVector 分量函数, error 格式或求值错误
-func (r *Reader) readGradientVector(object Object, channels, depth int) (*gradientVector, error) {
-	return r.readGradientVectorContext(context.Background(), object, channels, depth)
-}
-
 // readGradientVectorContext 在取消上下文内解析多分量采样、指数、拼接及计算器函数
 // 入参: ctx 取消上下文, object 函数对象, channels 输出数量, depth 嵌套深度
 // 返回: *gradientVector 分量函数, error 格式、求值或取消错误
 func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, channels, depth int) (*gradientVector, error) {
+	return r.readGradientVectorState(ctx, object, channels, depth, &gradientParseState{})
+}
+
+// readGradientVectorState 携带节点预算与间接引用记忆表解析多分量渐变函数
+// 入参: ctx 取消上下文, object 函数对象, channels 输出数量, depth 嵌套深度, state 解析状态
+// 返回: *gradientVector 分量函数, error 格式、求值或取消错误
+func (r *Reader) readGradientVectorState(ctx context.Context, object Object, channels, depth int, state *gradientParseState) (*gradientVector, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -105,7 +105,7 @@ func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, c
 		return nil, fmt.Errorf("invalid gradient vector dimensions or recursion")
 	}
 	if channels <= 4 {
-		function, err := r.readGradientFunctionContext(ctx, object, channels, depth)
+		function, err := r.readGradientFunctionState(ctx, object, channels, depth, state)
 		if err != nil {
 			return nil, err
 		}
@@ -115,6 +115,34 @@ func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, c
 			return err
 		}}, nil
 	}
+	state.nodes++
+	if state.nodes > maxGradientFunctionNodes {
+		return nil, fmt.Errorf("gradient function complexity limit exceeded")
+	}
+	ref, isRef := object.(Reference)
+	key := gradientFunctionKey{ref: ref, channels: channels}
+	if isRef && state.vectors != nil {
+		if cached := state.vectors[key]; cached != nil {
+			return cached, nil
+		}
+	}
+	f, err := r.readGradientVectorNode(ctx, object, channels, depth, state)
+	if err != nil {
+		return nil, err
+	}
+	if isRef {
+		if state.vectors == nil {
+			state.vectors = make(map[gradientFunctionKey]*gradientVector)
+		}
+		state.vectors[key] = f
+	}
+	return f, nil
+}
+
+// readGradientVectorNode 解析单个高通道渐变函数节点并在拼接展开超限时退回按需求值
+// 入参: ctx 取消上下文, object 函数对象, channels 输出数量, depth 嵌套深度, state 解析状态
+// 返回: *gradientVector 分量函数, error 格式、求值或取消错误
+func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, channels, depth int, state *gradientParseState) (*gradientVector, error) {
 	value, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -125,7 +153,7 @@ func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, c
 			return nil, fmt.Errorf("invalid gradient function count")
 		}
 		for c, item := range array {
-			f.parts[c], err = r.readGradientFunctionContext(ctx, item, 1, depth+1)
+			f.parts[c], err = r.readGradientFunctionState(ctx, item, 1, depth+1, state)
 			if err != nil {
 				return nil, err
 			}
@@ -242,7 +270,7 @@ func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, c
 			if points[i] > points[i+1] {
 				return nil, fmt.Errorf("invalid gradient stitching bounds")
 			}
-			parts[i], err = r.readGradientVectorContext(ctx, item, channels, depth+1)
+			parts[i], err = r.readGradientVectorState(ctx, item, channels, depth+1, state)
 			if err != nil {
 				return nil, err
 			}
@@ -269,6 +297,10 @@ func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, c
 				if points[i] == points[i+1] {
 					if i == len(parts)-1 {
 						partStops := part.parts[c].linear([2]float64{encode[2*i], encode[2*i]})
+						if len(partStops) == 0 || len(partStops) > maxGradientLinearStops-len(stops) {
+							stops = nil
+							break
+						}
 						for _, stop := range partStops {
 							stop.Position = 1
 							stops = append(stops, stop)
@@ -277,12 +309,16 @@ func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, c
 					continue
 				}
 				partStops := part.parts[c].linear([2]float64{encode[2*i], encode[2*i+1]})
+				if len(partStops) == 0 || len(partStops) > maxGradientLinearStops-len(stops) {
+					stops = nil
+					break
+				}
 				for _, stop := range partStops {
 					stop.Position = functionPosition(gradientPosition(points[i], points[i+1], stop.Position), domain[0], domain[1])
 					stops = append(stops, stop)
 				}
 			}
-			if limits != nil {
+			if len(stops) > 0 && limits != nil {
 				stops = clipGradientValues(stops, limits[2*c:2*c+2])
 			}
 			if len(stops) > 0 {
@@ -355,11 +391,19 @@ func (r *Reader) deviceNWideGradientContext(ctx context.Context, function Object
 				for _, stop := range parts[c] {
 					positions = append(positions, stop.Position)
 				}
+				if len(positions) > maxGradientLinearStops {
+					slices.Sort(positions)
+					positions = slices.Compact(positions)
+					if len(positions) > maxGradientLinearStops {
+						return nil
+					}
+				}
 			}
 			slices.Sort(positions)
-			var stops []GradientStop
+			positions = slices.Compact(positions)
+			stops := make([]GradientStop, 0, len(positions))
 			values := make([]float64, tint.components)
-			for _, position := range slices.Compact(positions) {
+			for _, position := range positions {
 				for _, left := range []bool{true, false} {
 					for c, part := range parts {
 						values[c] = gradientValueSide(part, position, left)[0]
@@ -371,10 +415,15 @@ func (r *Reader) deviceNWideGradientContext(ctx context.Context, function Object
 							stop.Values[c] += coefficient * values[j]
 						}
 					}
-					stops = append(stops, stop)
+					if len(stops) == 0 || stops[len(stops)-1] != stop {
+						if len(stops) >= maxGradientLinearStops {
+							return nil
+						}
+						stops = append(stops, stop)
+					}
 				}
 			}
-			return iccGradientStops(clipGradientValues(slices.Compact(stops), tint.output), tint.alternate.profile)
+			return iccGradientStops(clipGradientValues(stops, tint.output), tint.alternate.profile)
 		}
 	}
 	var stops []GradientStop

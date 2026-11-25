@@ -334,7 +334,7 @@ func (p *objectParser) object() (Object, error) {
 
 // integerOrReference 将已解析整数按上下文尝试组合为间接引用，否则回退返回整数
 // 入参: value 整数值
-// 返回: Object 间接引用或整数对象
+// 返回: Object 间接引用、整数或空对象
 func (p *objectParser) integerOrReference(value int64) Object {
 	if p.content {
 		return Integer(value)
@@ -344,6 +344,7 @@ func (p *objectParser) integerOrReference(value int64) Object {
 		if refRaw := p.tokenBytes(); len(refRaw) == 1 && refRaw[0] == 'R' {
 			if value == 0 {
 				p.warning(Diagnostic{Offset: p.base + int64(saved), Message: "zero object number in indirect reference treated as null"})
+				return nil
 			}
 			return Reference{Number: value, Generation: generation}
 		}

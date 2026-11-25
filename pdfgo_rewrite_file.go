@@ -14,12 +14,15 @@
 
 package pdfgo
 
-import "context"
+import (
+	"context"
+	"os"
+)
 
 // rewriteFile 写出结构化文件说明及可选内嵌内容，不访问外部文件或添加时间信息
-// 入参: ctx 取消上下文, file 文件说明, result 输出对象, number 最大对象编号
+// 入参: ctx 取消上下文, r 当前阅读器, file 文件说明, result 输出对象, number 最大对象编号
 // 返回: Reference 文件说明引用, error 参数、资源复制或取消错误
-func rewriteFile(ctx context.Context, file FileSpecification, result map[Reference]Object, number *int64) (Reference, error) {
+func rewriteFile(ctx context.Context, r *Reader, file FileSpecification, result map[Reference]Object, number *int64) (Reference, error) {
 	embedded := file.Embedded
 	file.Embedded = nil
 	spec, err := externalFileSpecification(file)
@@ -27,7 +30,14 @@ func rewriteFile(ctx context.Context, file FileSpecification, result map[Referen
 		return Reference{}, err
 	}
 	if embedded != nil {
-		copier := rewriteObjectCopy{ctx: ctx, source: embedded.reader, objects: result, number: number, copied: make(map[rewriteObjectIdentity]Reference)}
+		source := r
+		if !r.ownsObject(embedded.reader, embedded.cache) {
+			source = embedded.reader
+		}
+		if source != nil && source.closed {
+			return Reference{}, os.ErrClosed
+		}
+		copier := rewriteObjectCopy{ctx: ctx, source: source, objects: result, number: number, copied: make(map[rewriteObjectIdentity]Reference)}
 		value, err := copier.copy(embedded, 0)
 		if err != nil {
 			return Reference{}, err

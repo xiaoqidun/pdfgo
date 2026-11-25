@@ -306,8 +306,11 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		} else if budget := maxBytes * 4; budget > maxMeshBudget {
 			maxMeshBudget = budget
 		}
-		maxTriangles = maxMeshBudget / 144
-		maxPatches = maxMeshBudget / 400
+		maxTriangles = maxMeshBudget / (144 + int64(components)*24)
+		maxPatches = maxMeshBudget / (400 + int64(components)*32)
+		if (kind == 4 || kind == 5) && maxTriangles == 0 || (kind == 6 || kind == 7) && maxPatches == 0 {
+			return Paint{}, fmt.Errorf("%w: mesh shading element limit exceeded", ErrStreamLimitExceeded)
+		}
 	}
 	if kind == 4 || kind == 5 {
 		g.Triangles, err = p.meshTriangleData(d, data, depths, ranges, colorBounds, components, kind == 5, maxTriangles)

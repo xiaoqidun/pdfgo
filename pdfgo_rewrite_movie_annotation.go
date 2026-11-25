@@ -154,9 +154,9 @@ func (r *Reader) rewriteMovie(ctx context.Context, movie Movie, result map[Refer
 		if poster == nil {
 			return Reference{}, fmt.Errorf("missing movie poster")
 		}
-		source := poster.reader
-		if source == nil {
-			source = r
+		source := r
+		if !r.ownsObject(poster.reader, poster.cache) {
+			source = poster.reader
 		}
 		if _, err := source.ReadImage(poster); err != nil {
 			return Reference{}, err
@@ -170,7 +170,7 @@ func (r *Reader) rewriteMovie(ctx context.Context, movie Movie, result map[Refer
 	default:
 		return Reference{}, fmt.Errorf("invalid movie poster")
 	}
-	file, err := rewriteFile(ctx, movie.File, result, number)
+	file, err := rewriteFile(ctx, r, movie.File, result, number)
 	if err != nil {
 		return Reference{}, err
 	}

@@ -189,7 +189,7 @@ func deviceNColorFunction(source *gradientFunction, tint *deviceNSpace) *gradien
 // 入参: stops 源分段, bounds 各分量下界与上界
 // 返回: []GradientStop 截断后的分段，不可精确表达时为空
 func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
-	if len(stops) == 0 {
+	if len(stops) == 0 || len(stops) > maxGradientLinearStops {
 		return nil
 	}
 	result := make([]GradientStop, 0, len(stops))
@@ -233,8 +233,14 @@ func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
 				for c := range v.Values {
 					v.Values[c] = functionValue(t, a.Values[c], stop.Values[c])
 				}
+				if len(result) >= maxGradientLinearStops {
+					return nil
+				}
 				result = append(result, v)
 			}
+		}
+		if len(result) >= maxGradientLinearStops {
+			return nil
 		}
 		result = append(result, stop)
 	}
@@ -318,21 +324,42 @@ func gradientValue(stops []GradientStop, position float64) [4]float64 {
 // 入参: stops 分段, position 位置, left 是否取左极限
 // 返回: [4]float64 颜色分量
 func gradientValueSide(stops []GradientStop, position float64, left bool) [4]float64 {
+	if len(stops) == 0 {
+		return [4]float64{}
+	}
 	if position < stops[0].Position {
 		return stops[0].Values
 	}
-	for i := 1; i < len(stops); i++ {
-		if position < stops[i].Position || left && position == stops[i].Position && stops[i-1].Position < position {
-			a, b := stops[i-1], stops[i]
-			t := functionPosition(position, a.Position, b.Position)
-			var value [4]float64
-			for c := range value {
-				value[c] = functionValue(t, a.Values[c], b.Values[c])
-			}
-			return value
-		}
+	if math.IsNaN(position) {
+		return stops[len(stops)-1].Values
 	}
-	return stops[len(stops)-1].Values
+	var offset int
+	if left && position > stops[0].Position {
+		offset, _ = slices.BinarySearchFunc(stops[1:], position, func(stop GradientStop, target float64) int {
+			if stop.Position < target {
+				return -1
+			}
+			return 1
+		})
+	} else {
+		offset, _ = slices.BinarySearchFunc(stops[1:], position, func(stop GradientStop, target float64) int {
+			if stop.Position <= target {
+				return -1
+			}
+			return 1
+		})
+	}
+	i := offset + 1
+	if i >= len(stops) {
+		return stops[len(stops)-1].Values
+	}
+	a, b := stops[i-1], stops[i]
+	t := functionPosition(position, a.Position, b.Position)
+	var value [4]float64
+	for c := range value {
+		value[c] = functionValue(t, a.Values[c], b.Values[c])
+	}
+	return value
 }
 
 // ColorAt 在源颜色空间内插值，再按渲染意图转换为sRGB
@@ -591,12 +618,15 @@ func (p *pageInterpreter) shadingFill(operands []Object, offset int64) error {
 			return err
 		}
 		clip := shadingRectangle(box, p.state.matrix)
+		if !pathFinite(clip) {
+			return p.operationWarning(Operation{Operator: "sh", Offset: offset}, "nonfinite shading bounds")
+		}
 		style.Clips = append(append([]Path(nil), style.Clips...), clip)
 	}
 	if p.visitor.Path == nil {
 		return fmt.Errorf("path visitor missing")
 	}
-	if p.bounds.XMax <= p.bounds.XMin || p.bounds.YMax <= p.bounds.YMin {
+	if !rectFinite(p.bounds) || p.bounds.XMax <= p.bounds.XMin || p.bounds.YMax <= p.bounds.YMin {
 		return fmt.Errorf("missing shading bounds")
 	}
 	return p.visitor.Path(PathMark{Sequence: p.sequence, Path: shadingRectangle(p.bounds, Identity()), Style: style, Fill: true})
