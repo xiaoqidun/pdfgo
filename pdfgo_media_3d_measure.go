@@ -173,7 +173,11 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 		if err != nil {
 			return result, err
 		}
-		value, err := r.number(dict["V"])
+		resolved, err := r.Resolve(dict["V"])
+		if err != nil {
+			return result, err
+		}
+		value, err := r.number(resolved)
 		if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 			return result, fmt.Errorf("invalid 3D measurement value")
 		}
@@ -266,13 +270,12 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 			}
 		}
 	}
-	comment, err := r.Resolve(dict["S"])
+	ref, comment, err := r.resolveIndirect(dict["S"])
 	if err != nil {
 		return result, err
 	}
 	if comment != nil {
-		ref, ok := dict["S"].(Reference)
-		if !ok {
+		if ref == (Reference{}) {
 			return result, fmt.Errorf("invalid 3D measurement comment reference")
 		}
 		dict, ok := comment.(Dictionary)
@@ -305,7 +308,11 @@ func (r *Reader) threeDMeasureVector(object Object, required bool) (*[3]float64,
 	}
 	result := new([3]float64)
 	for i, object := range array {
-		value, err := r.number(object)
+		resolved, err := r.Resolve(object)
+		if err != nil {
+			return nil, err
+		}
+		value, err := r.number(resolved)
 		if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 			return nil, fmt.Errorf("invalid 3D measurement coordinate")
 		}

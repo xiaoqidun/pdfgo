@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 )
@@ -48,8 +49,7 @@ type annotationRichFontSelection struct {
 	source     *annotationRichFonts
 	style      *annotationRichStyle
 	generation int
-	characters [128]rune
-	fonts      [128]*annotationRichFont
+	cache      map[rune]*annotationRichFont
 }
 
 // annotationRichStretchRank 为缺失宽度选择替代字体，窄类先向窄侧、宽类先向宽侧查找
@@ -164,25 +164,28 @@ func annotationRichStandardName(family string, weight int, italic bool) string {
 	return regular
 }
 
-// letter 复用当前样式的字符字体，缓存冲突时仍按完整规则选择
+// letter 复用当前样式的字符字体，字体资源增加时失效重选
 // 入参: ch Unicode字符
 // 返回: *annotationRichFont 字体, annotationLetter 编码和度量, error 字体或取消错误
 func (s *annotationRichFontSelection) letter(ch rune) (*annotationRichFont, annotationLetter, error) {
 	if err := s.source.ctx.Err(); err != nil {
 		return nil, annotationLetter{}, err
 	}
-	index := uint32(ch) % uint32(len(s.fonts))
-	if s.generation == len(s.source.entries) && s.fonts[index] != nil && s.characters[index] == ch {
-		font := s.fonts[index]
-		return font, font.letters[ch], nil
+	if s.generation == len(s.source.entries) {
+		if font := s.cache[ch]; font != nil {
+			return font, font.letters[ch], nil
+		}
 	}
 	font, letter, err := s.source.selectLetter(*s.style, ch)
 	if s.generation != len(s.source.entries) {
-		clear(s.fonts[:])
+		clear(s.cache)
 		s.generation = len(s.source.entries)
 	}
 	if err == nil {
-		s.characters[index], s.fonts[index] = ch, font
+		if s.cache == nil {
+			s.cache = make(map[rune]*annotationRichFont)
+		}
+		s.cache[ch] = font
 	}
 	return font, letter, err
 }
@@ -221,6 +224,11 @@ func (r *Reader) newAnnotationRichFonts(ctx context.Context, resources Dictionar
 	if err != nil {
 		return nil, err
 	}
+	type familySliceKey struct {
+		first  *annotationRichFamilyName
+		length int
+	}
+	seenSlices := map[familySliceKey]bool{}
 	families := map[string]bool{}
 	for _, paragraph := range paragraphs {
 		for _, run := range paragraph.runs {
@@ -230,10 +238,16 @@ func (r *Reader) newAnnotationRichFonts(ctx context.Context, resources Dictionar
 			if run.style.size != nil && *run.style.size == 0 {
 				continue
 			}
-			for _, family := range run.style.families {
-				families[strings.ToLower(annotationRichFamily(family))] = true
-			}
-			if len(run.style.families) == 0 && (run.style.weight != 0 || run.style.italic != nil || run.style.stretch != 0) {
+			if len(run.style.families) != 0 {
+				key := familySliceKey{&run.style.families[0], len(run.style.families)}
+				if seenSlices[key] {
+					continue
+				}
+				seenSlices[key] = true
+				for _, family := range run.style.families {
+					families[strings.ToLower(annotationRichFamily(family))] = true
+				}
+			} else if run.style.weight != 0 || run.style.italic != nil || run.style.stretch != 0 {
 				families[strings.ToLower(s.base.family)] = true
 			}
 		}
@@ -326,8 +340,14 @@ func (r *Reader) annotationRichResourceFamily(ctx context.Context, object Object
 	if err != nil {
 		return "", err
 	}
-	if descriptor, ok := value.(Dictionary); ok && descriptor["FontFamily"] != nil {
-		return r.readAnnotationText(ctx, Annotation{Dictionary: descriptor}, "FontFamily", nil)
+	if descriptor, ok := value.(Dictionary); ok {
+		fontFamily, err := r.Resolve(descriptor["FontFamily"])
+		if err != nil {
+			return "", err
+		}
+		if fontFamily != nil {
+			return r.readAnnotationText(ctx, Annotation{Dictionary: Dictionary{"FontFamily": fontFamily}}, "FontFamily", nil)
+		}
 	}
 	return family, ctx.Err()
 }
@@ -389,25 +409,33 @@ func (s *annotationRichFonts) add(name Name, font *Font) (*annotationRichFont, e
 				return nil, fmt.Errorf("invalid rich text font descriptor stretch")
 			}
 		}
-		if descriptor["FontFamily"] != nil {
-			family, err = s.reader.readAnnotationText(s.ctx, Annotation{Dictionary: descriptor}, "FontFamily", nil)
+		fontFamily, err := s.reader.Resolve(descriptor["FontFamily"])
+		if err != nil {
+			return nil, err
+		}
+		if fontFamily != nil {
+			family, err = s.reader.readAnnotationText(s.ctx, Annotation{Dictionary: Dictionary{"FontFamily": fontFamily}}, "FontFamily", nil)
 			if err != nil {
 				return nil, err
 			}
 		}
-		if descriptor["FontWeight"] != nil {
-			n, err := s.reader.number(descriptor["FontWeight"])
-			if err != nil || n < 100 || n > 900 {
+		fontWeight, err := s.reader.Resolve(descriptor["FontWeight"])
+		if err != nil {
+			return nil, err
+		}
+		if fontWeight != nil {
+			n, err := s.reader.number(fontWeight)
+			if err != nil || n < 100 || n > 900 || math.IsNaN(n) {
 				return nil, fmt.Errorf("invalid rich text font descriptor weight")
 			}
 			weight = int(n)
 		}
-		if descriptor["Flags"] != nil {
-			value, err := s.reader.Resolve(descriptor["Flags"])
-			if err != nil {
-				return nil, err
-			}
-			flags, ok := value.(Integer)
+		flagsValue, err := s.reader.Resolve(descriptor["Flags"])
+		if err != nil {
+			return nil, err
+		}
+		if flagsValue != nil {
+			flags, ok := flagsValue.(Integer)
 			if !ok {
 				return nil, fmt.Errorf("invalid rich text font descriptor flags")
 			}

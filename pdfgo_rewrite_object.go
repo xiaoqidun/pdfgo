@@ -62,8 +62,13 @@ func (c *rewriteObjectCopy) copy(value Object, depth int) (Object, error) {
 	}
 	var id rewriteObjectIdentity
 	switch v := value.(type) {
-	case nil, Boolean, Integer, Name:
+	case nil, Boolean, Integer:
 		return value, nil
+	case Name:
+		if !validPDFName(v) {
+			return nil, fmt.Errorf("null byte in PDF name")
+		}
+		return v, nil
 	case Real:
 		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
 			return nil, fmt.Errorf("invalid PDF resource number")
@@ -95,6 +100,9 @@ func (c *rewriteObjectCopy) copy(value Object, depth int) (Object, error) {
 	case Dictionary:
 		result := make(Dictionary, len(v))
 		for _, key := range slices.Sorted(maps.Keys(v)) {
+			if !validPDFName(key) {
+				return nil, fmt.Errorf("null byte in PDF name")
+			}
 			result[key], err = c.copy(v[key], depth+1)
 			if err != nil {
 				return nil, err
@@ -136,6 +144,9 @@ func (c *rewriteObjectCopy) copyStream(stream *Stream, depth int) (*Stream, erro
 		return nil, err
 	}
 	for i, filter := range filters {
+		if name, ok := filter.(Name); ok && !validPDFName(name) {
+			return nil, fmt.Errorf("null byte in PDF name")
+		}
 		if filter != Name("Crypt") {
 			continue
 		}
@@ -148,6 +159,9 @@ func (c *rewriteObjectCopy) copyStream(stream *Stream, depth int) (*Stream, erro
 		filters, parameters = filters[1:], parameters[1:]
 	}
 	for _, key := range slices.Sorted(maps.Keys(stream.Dictionary)) {
+		if !validPDFName(key) {
+			return nil, fmt.Errorf("null byte in PDF name")
+		}
 		if key == "Length" || key == "Filter" || key == "DecodeParms" {
 			continue
 		}

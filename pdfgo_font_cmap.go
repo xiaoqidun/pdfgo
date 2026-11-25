@@ -159,9 +159,13 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool, warning fu
 		candidates = candidates[:1]
 	}
 	var firstErr error
+	var failedOffsets map[uint32]bool
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
+		}
+		if failedOffsets[candidate.offset] {
+			continue
 		}
 		var table []byte
 		var err error
@@ -180,6 +184,10 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool, warning fu
 			if firstErr == nil {
 				firstErr = err
 			}
+			if failedOffsets == nil {
+				failedOffsets = make(map[uint32]bool)
+			}
+			failedOffsets[candidate.offset] = true
 			continue
 		}
 		if firstErr != nil {

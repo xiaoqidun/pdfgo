@@ -36,6 +36,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"unicode/utf16"
@@ -62,14 +63,15 @@ type OptimizeReport struct {
 
 // pdfOutput 写出间接对象并累计文件偏移
 type pdfOutput struct {
-	ctx         context.Context
-	writer      io.Writer
-	reader      *Reader
-	security    *standardSecurity
-	unencrypted map[Reference]bool
-	aliases     map[Reference]Reference
-	live        map[Reference]bool
-	count       int64
+	ctx           context.Context
+	writer        io.Writer
+	reader        *Reader
+	security      *standardSecurity
+	unencrypted   map[Reference]bool
+	embeddedFiles map[Reference]bool
+	aliases       map[Reference]Reference
+	live          map[Reference]bool
+	count         int64
 }
 
 // smaskOptInfo 缓存共享软遮罩的不透明与预混合检测结果
@@ -81,6 +83,7 @@ type smaskOptInfo struct {
 // streamOptJob 保存有界并发流优化任务的输入与输出状态
 type streamOptJob struct {
 	ref            Reference
+	embedded       bool
 	lazy           *lazyReplacementImage
 	stream         *Stream
 	ownedMaskRef   Reference
@@ -264,7 +267,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	if writer == nil {
 		return report, fmt.Errorf("missing output writer")
 	}
-	out := &pdfOutput{ctx: ctx, writer: writer, reader: r, security: r.security}
+	embeddedFiles := make(map[Reference]bool)
+	trackEmbedded := r.security != nil && r.security.embeddedFilter != r.security.streamFilter
+	out := &pdfOutput{ctx: ctx, writer: writer, reader: r, security: r.security, embeddedFiles: embeddedFiles}
 	defer func() { report.Bytes = out.count }()
 	progress := func(stage string, done, total int) error {
 		if err := ctx.Err(); err != nil {
@@ -302,7 +307,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		if value, ok := replacements[ref]; ok {
 			return value, nil
 		}
-		return r.Object(ref)
+		return r.object(ref, embeddedFiles[ref])
 	}
 	trailer := maps.Clone(r.Trailer)
 	for _, name := range []Name{"Prev", "XRefStm", "Type", "W", "Index", "Length", "Filter", "DecodeParms"} {
@@ -342,6 +347,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	var noDownsampleRefs []Reference
 	var dataRoots []Object
 	var dataRefs []Reference
+	var efRoots []Object
 	lossless := make(map[Reference]bool)
 	noDownsample := make(map[Reference]bool)
 	exactData := make(map[Reference]bool)
@@ -406,6 +412,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 						dataRoots = append(dataRoots, v[key])
 					}
 				}
+				if trackEmbedded && v["EF"] != nil {
+					efRoots = append(efRoots, v["EF"])
+				}
 			}
 			if !protecting && !protectingScale && !preservingData && options.Compression.Mode == CompressionLossy {
 				for _, key := range []Name{"SMask", "Mask"} {
@@ -437,40 +446,186 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	originalObjectStreams := r.objectStreams
 	defer func() { r.objectStreams = originalObjectStreams }()
 	defer r.cache.prune(originalCache)
-	for i := 0; i < len(refs); i++ {
-		if err := progress("scan", i, len(refs)); err != nil {
-			return report, err
+	scanned := make(map[Reference]bool)
+	scannedEmbedded := make(map[Reference]bool)
+	deferredSecurity := make(map[Reference]error)
+	var deferredOrder []Reference
+	var reprocess []Reference
+	queuedReprocess := make(map[Reference]bool)
+	markEmbeddedFromEF := func(ef Object) error {
+		efChain := make(map[Reference]bool)
+		cur := ef
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			ref, isRef := cur.(Reference)
+			if !isRef {
+				break
+			}
+			if efChain[ref] || !isLiveRef(ref) {
+				return nil
+			}
+			efChain[ref] = true
+			if rep, ok := replacements[ref]; ok {
+				cur = rep
+				continue
+			}
+			if lazyImages[ref] != nil {
+				return nil
+			}
+			resolved, readErr := r.Object(ref)
+			if !originalCache[ref] {
+				r.cache.delete(ref)
+			}
+			if readErr != nil {
+				return readErr
+			}
+			cur = resolved
 		}
-		var value Object
-		if lazy := lazyImages[refs[i]]; lazy != nil {
-			value = lazy.baseDict
+		efDict, ok := cur.(Dictionary)
+		if !ok {
+			return nil
+		}
+		for _, key := range slices.Sorted(maps.Keys(efDict)) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			entryRef, isRef := efDict[key].(Reference)
+			if !isRef {
+				continue
+			}
+			chain := make(map[Reference]bool)
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if chain[entryRef] || embeddedFiles[entryRef] || !isLiveRef(entryRef) {
+					break
+				}
+				chain[entryRef] = true
+				var resolved Object
+				if rep, ok := replacements[entryRef]; ok {
+					resolved = rep
+				} else if lazyImages[entryRef] != nil {
+					break
+				} else {
+					var readErr error
+					resolved, readErr = r.object(entryRef, true)
+					if !originalCache[entryRef] {
+						r.cache.delete(entryRef)
+					}
+					if readErr != nil {
+						return readErr
+					}
+				}
+				if next, ok := resolved.(Reference); ok {
+					entryRef = next
+					continue
+				}
+				if _, isStreamObj := resolved.(*Stream); isStreamObj {
+					embeddedFiles[entryRef] = true
+					if _, deferred := deferredSecurity[entryRef]; deferred {
+						delete(deferredSecurity, entryRef)
+						if !queuedReprocess[entryRef] {
+							queuedReprocess[entryRef] = true
+							reprocess = append(reprocess, entryRef)
+						}
+					} else if scanned[entryRef] && !scannedEmbedded[entryRef] && !queuedReprocess[entryRef] {
+						queuedReprocess[entryRef] = true
+						reprocess = append(reprocess, entryRef)
+					}
+				}
+				break
+			}
+		}
+		return nil
+	}
+	drainEF := func() error {
+		for len(efRoots) > 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			root := efRoots[0]
+			efRoots = efRoots[1:]
+			if err := markEmbeddedFromEF(root); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := drainEF(); err != nil {
+		return report, err
+	}
+	for i := 0; i < len(refs) || len(reprocess) > 0; {
+		var ref Reference
+		allowDefer := true
+		if len(reprocess) > 0 {
+			ref = reprocess[0]
+			reprocess = reprocess[1:]
+			delete(queuedReprocess, ref)
+			allowDefer = false
 		} else {
-			value, err = object(refs[i])
-			if err != nil {
+			if err := progress("scan", i, len(refs)); err != nil {
 				return report, err
 			}
+			ref = refs[i]
+			i++
+		}
+		var value Object
+		if lazy := lazyImages[ref]; lazy != nil {
+			value = lazy.baseDict
+		} else {
+			value, err = object(ref)
+			if err != nil {
+				var secErr *objectSecurityError
+				if allowDefer && trackEmbedded && !embeddedFiles[ref] && errors.As(err, &secErr) {
+					if _, exists := deferredSecurity[ref]; !exists {
+						deferredOrder = append(deferredOrder, ref)
+					}
+					deferredSecurity[ref] = err
+					continue
+				}
+				return report, err
+			}
+		}
+		scanned[ref] = true
+		if embeddedFiles[ref] {
+			scannedEmbedded[ref] = true
 		}
 		if err = collect(value, 0); err != nil {
 			return report, err
 		}
+		if err = drainEF(); err != nil {
+			return report, err
+		}
 		if stream, ok := value.(*Stream); ok {
-			isStream[refs[i]] = true
-			metadata[refs[i]] = stream.Dictionary
-			streamHashes[refs[i]] = sha256.Sum256(stream.Data)
-			if stream.Dictionary["Type"] == Name("EmbeddedFile") {
-				dataRoots = append(dataRoots, refs[i])
+			isStream[ref] = true
+			metadata[ref] = stream.Dictionary
+			streamHashes[ref] = sha256.Sum256(stream.Data)
+			streamType, typeErr := resolveObjectType(r, stream.Dictionary["Type"], ref)
+			if typeErr != nil {
+				return report, typeErr
+			}
+			if streamType == Name("EmbeddedFile") {
+				dataRoots = append(dataRoots, ref)
 			}
 		} else {
-			metadata[refs[i]] = value
+			metadata[ref] = value
 		}
-		if !originalCache[refs[i]] {
-			r.cache.delete(refs[i])
+		if !originalCache[ref] {
+			r.cache.delete(ref)
 		}
 		if signed {
 			if len(replacements) != 0 || len(lazyImages) != 0 || len(information) != 0 {
 				return report, ErrSignedDocument
 			}
 			return report, copySource()
+		}
+	}
+	for _, ref := range deferredOrder {
+		if err, exists := deferredSecurity[ref]; exists {
+			return report, err
 		}
 	}
 	for ref := range replacements {
@@ -579,6 +734,9 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		for ref := range out.unencrypted {
 			protectedAliases[ref] = true
 		}
+	}
+	for ref := range embeddedFiles {
+		protectedAliases[ref] = true
 	}
 	if options.Compression.Mode != CompressionUnchanged {
 		if err := progress("compress", 0, 0); err != nil {
@@ -984,6 +1142,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		job := &streamOptJob{
 			ref:            ref,
+			embedded:       embeddedFiles[ref],
 			lazy:           lazy,
 			compression:    compression,
 			mode:           options.Compression.Mode,
@@ -1420,6 +1579,13 @@ func (w *pdfOutput) Write(data []byte) (int, error) {
 	return n, err
 }
 
+// validPDFName 检查PDF名称对象是否不含标准禁止的空字节
+// 入参: name PDF名称对象
+// 返回: bool 是否合法
+func validPDFName(name Name) bool {
+	return strings.IndexByte(string(name), 0) < 0
+}
+
 // object 编码PDF对象，字符串使用十六进制保持原始字节
 // 入参: value 对象, ref 所属间接对象, depth 嵌套深度, encrypt 是否加密
 // 返回: error 编码或写入错误
@@ -1444,6 +1610,9 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 		}
 		text = strconv.FormatFloat(float64(v), 'f', -1, 64)
 	case Name:
+		if !validPDFName(v) {
+			return fmt.Errorf("null byte in PDF name")
+		}
 		var b bytes.Buffer
 		b.WriteByte('/')
 		for _, c := range []byte(v) {
@@ -1510,11 +1679,21 @@ func (w *pdfOutput) object(value Object, ref Reference, depth int, encrypt bool)
 	case *Stream:
 		data := v.Data
 		dict := maps.Clone(v.Dictionary)
-		if dict["Type"] == Name("XRef") {
+		var streamType Name
+		if w.reader != nil {
+			var err error
+			streamType, err = resolveObjectType(w.reader, dict["Type"], ref)
+			if err != nil {
+				return err
+			}
+		} else {
+			streamType, _ = dict["Type"].(Name)
+		}
+		if streamType == Name("XRef") {
 			encrypt = false
 		}
 		if encrypt && w.security != nil {
-			name, err := w.security.outputStreamFilter(v, w.reader)
+			name, err := w.security.outputStreamFilter(v, w.reader, streamType, w.embeddedFiles[ref])
 			if err != nil {
 				return err
 			}
@@ -1599,7 +1778,7 @@ func (r *Reader) executeStreamJob(ctx context.Context, job *streamOptJob) {
 	} else if job.stream != nil {
 		stream = job.stream
 	} else {
-		val, err := r.Object(job.ref)
+		val, err := r.object(job.ref, job.embedded)
 		if err != nil {
 			job.err = err
 			return
@@ -2059,18 +2238,18 @@ func (s *standardSecurity) explicitStreamCryptFilter(stream *Stream, r *Reader) 
 	return name, true, nil
 }
 
-// outputStreamFilter 获取原流的加密过滤器，保留显式Identity及嵌入文件策略
-// 入参: stream 原始流, r 阅读器
+// outputStreamFilter 获取原流的加密过滤器，保留显式Identity、流类型及内嵌文件策略
+// 入参: stream 原始流, r 阅读器, streamType 已解析的流类型, embedded 是否属于内嵌文件流
 // 返回: Name 过滤器名称, error 解析错误
-func (s *standardSecurity) outputStreamFilter(stream *Stream, r *Reader) (Name, error) {
+func (s *standardSecurity) outputStreamFilter(stream *Stream, r *Reader, streamType Name, embedded bool) (Name, error) {
 	if stream.Dictionary["F"] != nil {
 		return "Identity", nil
 	}
 	name := s.streamFilter
-	if stream.Dictionary["Type"] == Name("EmbeddedFile") {
+	if embedded || streamType == Name("EmbeddedFile") {
 		name = s.embeddedFilter
 	}
-	if stream.Dictionary["Type"] == Name("Metadata") && !s.encryptMetadata {
+	if streamType == Name("Metadata") && !s.encryptMetadata {
 		name = "Identity"
 	}
 	if explicitName, explicit, err := s.explicitStreamCryptFilter(stream, r); err != nil {

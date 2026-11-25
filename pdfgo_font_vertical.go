@@ -25,9 +25,9 @@ type VerticalMetrics struct {
 	Origin  Point
 }
 
-// readVerticalMetricsContext 展开竖排度量并响应本次取消
+// readVerticalMetricsContext 读取竖排度量并响应本次取消
 // 入参: ctx 取消上下文, font 字体资源, metrics CID字体字典
-// 返回: error 读取或取消错误
+// 返回: error 读取、超限或取消错误
 func (r *Reader) readVerticalMetricsContext(ctx context.Context, font *Font, metrics Dictionary) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -57,7 +57,8 @@ func (r *Reader) readVerticalMetricsContext(ctx context.Context, font *Font, met
 	if !ok {
 		return fmt.Errorf("invalid CID vertical metrics")
 	}
-	font.verticals = cidMetrics[VerticalMetrics]{}
+	var builder cidMetricBuilder[VerticalMetrics]
+	entries := 0
 	for n := 0; n < len(array); {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -79,6 +80,11 @@ func (r *Reader) readVerticalMetricsContext(ctx context.Context, font *Font, met
 			if len(values)%3 != 0 || int64(len(values)/3)+int64(start) > 65536 {
 				return fmt.Errorf("invalid CID vertical range")
 			}
+			count := len(values) / 3
+			if count > maxCIDMetricEntries-entries {
+				return fmt.Errorf("%w: CID vertical metric entry limit exceeded", ErrStreamLimitExceeded)
+			}
+			entries += count
 			for i := 0; i < len(values); i += 3 {
 				if (i/3)&255 == 0 {
 					if err := ctx.Err(); err != nil {
@@ -89,22 +95,27 @@ func (r *Reader) readVerticalMetricsContext(ctx context.Context, font *Font, met
 				if err != nil {
 					return err
 				}
-				font.verticals.set(uint32(start)+uint32(i/3), uint32(start)+uint32(i/3), metric)
+				builder.add(uint32(start)+uint32(i/3), uint32(start)+uint32(i/3), metric)
 			}
 		} else {
 			end, ok := value.(Integer)
 			if !ok || end < start || end > 65535 || len(array)-n < 3 {
 				return fmt.Errorf("invalid CID vertical range")
 			}
+			if entries >= maxCIDMetricEntries {
+				return fmt.Errorf("%w: CID vertical metric entry limit exceeded", ErrStreamLimitExceeded)
+			}
+			entries++
 			metric, err := r.verticalMetric(array[n : n+3])
 			if err != nil {
 				return err
 			}
 			n += 3
-			font.verticals.set(uint32(start), uint32(end), metric)
+			builder.add(uint32(start), uint32(end), metric)
 		}
 	}
-	return ctx.Err()
+	font.verticals, err = builder.finish(ctx)
+	return err
 }
 
 // verticalMetric 读取竖排位移及原点向量

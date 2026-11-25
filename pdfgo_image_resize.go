@@ -30,12 +30,15 @@ type imageScaleSource struct{ image.Image }
 // ResizeImage 按两轴像素需求等比缩小图片，保留灰度和透明通道，不修改输入
 // 需求非正或无需缩小时返回原图；超出工作内存预算时保持原尺寸
 // 入参: ctx 取消上下文, src 原图, size 像素需求
-// 返回: image.Image 输出图片, error 取消错误
+// 返回: image.Image 输出图片, error 参数或取消错误
 func ResizeImage(ctx context.Context, src image.Image, size image.Point) (image.Image, error) {
 	if ctx == nil || src == nil {
 		return nil, fmt.Errorf("missing image resize context or source")
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validatePalettedImage(ctx, src); err != nil {
 		return nil, err
 	}
 	bounds := src.Bounds()

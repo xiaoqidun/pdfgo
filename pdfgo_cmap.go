@@ -26,6 +26,34 @@ import (
 // maxCMapEntries 限制展开为字符映射表时的最大总条目数，防止大范围区间展开耗尽内存
 const maxCMapEntries uint64 = 262144
 
+// maxCMapTargetBytes 限制单个Unicode映射目标编码的最大字节数
+const maxCMapTargetBytes = 4096
+
+// maxCMapTotalBytes 限制Unicode映射表累计展开与保存的最大总字节数
+const maxCMapTotalBytes uint64 = 8 << 20
+
+// unicodeMapBytes 统计Unicode映射表已占用的键与文本总字节数，超限时返回错误
+// 入参: ctx 取消上下文, mapping 字符映射
+// 返回: uint64 总字节数, error 超限或取消错误
+func unicodeMapBytes(ctx context.Context, mapping UnicodeMap) (uint64, error) {
+	var total uint64
+	index := 0
+	for code, text := range mapping {
+		if index&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
+		index++
+		added := uint64(len(code) + len(text))
+		if added > maxCMapTotalBytes-total {
+			return 0, fmt.Errorf("%w: unicode cmap byte limit exceeded", ErrStreamLimitExceeded)
+		}
+		total += added
+	}
+	return total, ctx.Err()
+}
+
 // errInvalidUnicodeSurrogate 表示Unicode映射中的代理项配对无效
 var errInvalidUnicodeSurrogate = errors.New("invalid Unicode surrogate")
 
@@ -60,7 +88,7 @@ func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bo
 	return result, nil
 }
 
-// parseUnicodeMapIntoContext 读取映射及命名继承并增量写入目标表，检查取消与总条目上限
+// parseUnicodeMapIntoContext 读取映射及命名继承并增量写入目标表，检查取消、总条目与总字节上限
 // 入参: ctx 取消上下文, target 目标映射, data 映射数据, active 当前命名继承链
 // 返回: error 解析、超限或取消错误
 func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []byte, active map[Name]bool) error {
@@ -71,6 +99,10 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 	hasUseCMap := false
 	wroteLocal := false
 	var expanded uint64
+	totalBytes, err := unicodeMapBytes(ctx, target)
+	if err != nil {
+		return err
+	}
 	previous := ""
 	var name Name
 	for {
@@ -91,9 +123,22 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 					if localWritten[code] {
 						continue
 					}
-					if _, exists := target[code]; !exists && uint64(len(target)) >= maxCMapEntries {
+					old, exists := target[code]
+					if !exists && uint64(len(target)) >= maxCMapEntries {
 						return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
 					}
+					add := uint64(len(code) + len(text))
+					if exists {
+						if len(text) > len(old) {
+							add = uint64(len(text) - len(old))
+						} else {
+							add = 0
+						}
+					}
+					if add > maxCMapTotalBytes-totalBytes {
+						return fmt.Errorf("%w: unicode cmap byte limit exceeded", ErrStreamLimitExceeded)
+					}
+					totalBytes += add
 					target[code] = text
 					continue
 				}
@@ -101,6 +146,11 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 					if uint64(len(target)) >= maxCMapEntries {
 						return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
 					}
+					add := uint64(len(code) + len(text))
+					if add > maxCMapTotalBytes-totalBytes {
+						return fmt.Errorf("%w: unicode cmap byte limit exceeded", ErrStreamLimitExceeded)
+					}
+					totalBytes += add
 					target[code] = text
 				}
 			}
@@ -131,7 +181,8 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 			}
 			hasUseCMap = true
 			if !wroteLocal {
-				if err := copyUnicodeMapContext(ctx, target, loaded); err != nil {
+				totalBytes, err = copyUnicodeMapContext(ctx, target, loaded)
+				if err != nil {
 					return err
 				}
 			} else {
@@ -172,14 +223,29 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 				if !ok {
 					return p.fail("invalid CMap Unicode value")
 				}
-				value, err := unicodeBytes(str)
-				if err != nil {
-					return err
+				if len(str) > maxCMapTargetBytes {
+					return fmt.Errorf("%w: unicode cmap value limit exceeded", ErrStreamLimitExceeded)
 				}
 				if expanded >= maxCMapEntries {
 					return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
 				}
 				expanded++
+				rawBytes := uint64(len(first) + len(str))
+				if rawBytes > maxCMapTotalBytes-totalBytes {
+					return fmt.Errorf("%w: unicode cmap byte limit exceeded", ErrStreamLimitExceeded)
+				}
+				totalBytes += rawBytes
+				value, err := unicodeBytes(str)
+				if err != nil {
+					return err
+				}
+				if len(value) > len(str) {
+					extra := uint64(len(value) - len(str))
+					if extra > maxCMapTotalBytes-totalBytes {
+						return fmt.Errorf("%w: unicode cmap byte limit exceeded", ErrStreamLimitExceeded)
+					}
+					totalBytes += extra
+				}
 				key := string(first)
 				if _, exists := target[key]; !exists && uint64(len(target)) >= maxCMapEntries {
 					return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
@@ -214,6 +280,24 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 				if err != nil {
 					return err
 				}
+				var baseTarget String
+				var listTarget Array
+				var scratch String
+				switch v := to.(type) {
+				case String:
+					if len(v) > maxCMapTargetBytes {
+						return fmt.Errorf("%w: unicode cmap value limit exceeded", ErrStreamLimitExceeded)
+					}
+					baseTarget = v
+					scratch = make(String, len(v))
+				case Array:
+					if uint64(len(v)) != span {
+						return p.fail("CMap destination count mismatch")
+					}
+					listTarget = v
+				default:
+					return p.fail("invalid CMap destination")
+				}
 				for code := a; code <= b; code++ {
 					if (code-a)&255 == 0 {
 						if err := ctx.Err(); err != nil {
@@ -221,36 +305,46 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 						}
 					}
 					var targetCode String
-					switch v := to.(type) {
-					case String:
-						targetCode = append(String(nil), v...)
+					if listTarget == nil {
+						copy(scratch, baseTarget)
 						carry := code - a
-						for n := len(targetCode) - 1; n >= 0; n-- {
-							carry += uint64(targetCode[n])
-							targetCode[n] = byte(carry)
+						for n := len(scratch) - 1; n >= 0 && carry != 0; n-- {
+							carry += uint64(scratch[n])
+							scratch[n] = byte(carry)
 							carry >>= 8
 						}
 						if carry != 0 {
 							return p.fail("CMap destination overflow")
 						}
-					case Array:
-						if uint64(len(v)) != b-a+1 {
-							return p.fail("CMap destination count mismatch")
-						}
+						targetCode = scratch
+					} else {
 						var ok bool
-						targetCode, ok = v[code-a].(String)
+						targetCode, ok = listTarget[code-a].(String)
 						if !ok {
 							return p.fail("invalid CMap destination")
 						}
-					default:
-						return p.fail("invalid CMap destination")
+						if len(targetCode) > maxCMapTargetBytes {
+							return fmt.Errorf("%w: unicode cmap value limit exceeded", ErrStreamLimitExceeded)
+						}
 					}
+					rawBytes := uint64(len(first) + len(targetCode))
+					if rawBytes > maxCMapTotalBytes-totalBytes {
+						return fmt.Errorf("%w: unicode cmap byte limit exceeded", ErrStreamLimitExceeded)
+					}
+					totalBytes += rawBytes
 					value, err := unicodeBytes(targetCode)
 					if err != nil {
 						if errors.Is(err, errInvalidUnicodeSurrogate) {
 							continue
 						}
 						return err
+					}
+					if len(value) > len(targetCode) {
+						extra := uint64(len(value) - len(targetCode))
+						if extra > maxCMapTotalBytes-totalBytes {
+							return fmt.Errorf("%w: unicode cmap byte limit exceeded", ErrStreamLimitExceeded)
+						}
+						totalBytes += extra
 					}
 					var raw [4]byte
 					keyBytes := raw[:len(first)]

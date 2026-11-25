@@ -34,6 +34,9 @@ func externalFileSpecification(file FileSpecification) (Dictionary, error) {
 	}
 	dict := Dictionary{"Type": Name("Filespec"), "F": String(file.Name), "UF": name}
 	if file.FileSystem != "" {
+		if !validPDFName(file.FileSystem) {
+			return nil, fmt.Errorf("null byte in PDF name")
+		}
 		dict["FS"] = file.FileSystem
 	}
 	if file.FileSystem == "URL" {
@@ -127,6 +130,9 @@ func (r *Reader) rewriteRemoteDestination(destination RemoteDestination) (Object
 	if destination.Named != nil {
 		switch name := destination.Named.(type) {
 		case Name:
+			if !validPDFName(name) {
+				return nil, fmt.Errorf("null byte in PDF name")
+			}
 			return name, nil
 		case String:
 			return String(bytes.Clone(name)), nil

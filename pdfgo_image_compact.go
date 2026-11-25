@@ -136,6 +136,9 @@ func encodeImage(ctx context.Context, source image.Image, options CompressionOpt
 		}
 		return output.Bytes(), nil
 	}
+	if err := validatePalettedImage(ctx, source); err != nil {
+		return nil, err
+	}
 	var jpegBest []byte
 	if resource && options.Mode == CompressionLossy {
 		photo, err := photographicImage(ctx, source)
@@ -527,8 +530,12 @@ func encodeBestPNG16(ctx context.Context, img image.Image, best []byte) ([]byte,
 
 // encodePhotoJPEG 将不透明照片直接编码为优化后的JPEG，灰度图使用单通道编码
 // 入参: ctx 取消上下文, img 图像, quality 有损质量, maxBytes 编码缓冲上限
-// 返回: []byte JPEG编码，超限时为空, error 编码或取消错误
+// 返回: []byte JPEG编码，超限或超尺寸时为空, error 编码或取消错误
 func encodePhotoJPEG(ctx context.Context, img image.Image, quality, maxBytes int) ([]byte, error) {
+	bounds := img.Bounds()
+	if bounds.Dx() > 65535 || bounds.Dy() > 65535 {
+		return nil, nil
+	}
 	gray, err := imageAllGray(ctx, img)
 	if err != nil {
 		return nil, err

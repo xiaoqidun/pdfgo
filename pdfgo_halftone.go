@@ -341,14 +341,24 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 			target *int
 		}{{"Xsquare", &h.Xsquare}, {"Ysquare", &h.Ysquare}}
 	}
-	if kind == 16 && (dict["Width2"] != nil || dict["Height2"] != nil) {
-		fields = append(fields, struct {
-			key    Name
-			target *int
-		}{"Width2", &h.Width2}, struct {
-			key    Name
-			target *int
-		}{"Height2", &h.Height2})
+	if kind == 16 {
+		width2, err := r.Resolve(dict["Width2"])
+		if err != nil {
+			return nil, err
+		}
+		height2, err := r.Resolve(dict["Height2"])
+		if err != nil {
+			return nil, err
+		}
+		if width2 != nil || height2 != nil {
+			fields = append(fields, struct {
+				key    Name
+				target *int
+			}{"Width2", &h.Width2}, struct {
+				key    Name
+				target *int
+			}{"Height2", &h.Height2})
+		}
 	}
 	for _, field := range fields {
 		value, err := r.Resolve(dict[field.key])

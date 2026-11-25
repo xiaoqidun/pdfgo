@@ -62,6 +62,7 @@ type annotationShaper struct {
 	paragraphs  []annotationShapedParagraph
 	widths      map[uint16]float64
 	resourceIDs []uint16
+	maxBytes    int
 }
 
 // annotationShapedParagraph 保存段落方向与完整整形结果，不随候选行缓存淘汰
@@ -384,9 +385,10 @@ func (s *annotationShaper) lines(text string, state graphicsState, size, width f
 
 // write 生成带字形定位和ActualText的横排外观，不改变源字体编码
 // 入参: ctx 取消上下文, shape 整形后端, p 默认文字状态, resources 外观资源, content 外观内容
-// 返回: error 整形、布局或取消错误
+// 返回: error 整形、布局、超限或取消错误
 func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pageInterpreter, resources Dictionary, content *strings.Builder) error {
-	s := annotationShaper{ctx: ctx, shape: shape, font: p.state.font, cache: make(map[annotationShapeKey]*annotationShapedLine), entries: make(map[uint16]fontEncodedGlyph)}
+	limit := annotationRichContentLimit(p.reader)
+	s := annotationShaper{ctx: ctx, shape: shape, font: p.state.font, cache: make(map[annotationShapeKey]*annotationShapedLine), entries: make(map[uint16]fontEncodedGlyph), maxBytes: limit}
 	state := p.state
 	width, height := v.frame.XMax-v.frame.XMin, v.frame.YMax-v.frame.YMin
 	size := state.fontSize
@@ -478,6 +480,9 @@ func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pa
 			if row >= 0 && row < len(lines) {
 				content.WriteString("q 0.153 0.392 0.714 rg\n")
 				writeAnnotationOperation(content, "re f Q", v.frame.XMin, v.frame.YMax-float64(row+1)*leading, width, leading)
+				if content.Len() > limit {
+					return fmt.Errorf("%w: shaped text appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 		}
 		content.WriteString("Q\n")
@@ -487,17 +492,26 @@ func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pa
 	}
 	fmt.Fprintf(content, "/Span << /ActualText <%x> >> BDC\nBT\n%s\n/%s ", []byte(actual), v.defaults, escapeAnnotationName(v.font))
 	writeAnnotationOperation(content, "Tf", size)
+	if content.Len() > limit {
+		return fmt.Errorf("%w: shaped text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	baseline := v.frame.YMin + (height-size)/2 + size*.2 - state.rise
 	if v.multiline {
 		baseline = v.frame.YMax - size - state.rise
 	}
 	for i, line := range lines {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if list {
 			content.WriteString("0 g\n" + v.defaults)
 			fmt.Fprintf(content, "/%s ", escapeAnnotationName(v.font))
 			writeAnnotationOperation(content, "Tf", size)
 			if _, selected := slices.BinarySearch(v.choice.Selected, v.choice.TopIndex+i); selected {
 				content.WriteString("1 g\n")
+			}
+			if content.Len() > limit {
+				return fmt.Errorf("%w: shaped text appearance content limit exceeded", ErrStreamLimitExceeded)
 			}
 		}
 		left := v.frame.XMin + float64(v.align)*(width-line.width(state, size))/2
@@ -510,12 +524,15 @@ func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pa
 		content.WriteString("EMC\n")
 	}
 	content.WriteString("Q\n")
+	if content.Len() > limit {
+		return fmt.Errorf("%w: shaped text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	return ctx.Err()
 }
 
 // writeLine 按视觉位置写入整形字形，保留间距、偏移与原始文字矩阵
 // 入参: content 外观内容, line 整形行, state 文字状态, size 字号, matrix 定位矩阵, left 左边界, baseline 基线
-// 返回: error 定位或取消错误
+// 返回: error 定位、超限或取消错误
 func (s *annotationShaper) writeLine(content *strings.Builder, line *annotationShapedLine, state graphicsState, size float64, matrix Matrix, left, baseline float64) error {
 	extra := make([]float64, len(line.clusters))
 	for _, cluster := range line.clusters {
@@ -526,9 +543,11 @@ func (s *annotationShaper) writeLine(content *strings.Builder, line *annotationS
 		extra[order] = shift
 		shift += spacing
 	}
-	for _, glyph := range line.glyphs {
-		if err := s.ctx.Err(); err != nil {
-			return err
+	for i, glyph := range line.glyphs {
+		if i&255 == 0 {
+			if err := s.ctx.Err(); err != nil {
+				return err
+			}
 		}
 		x := left + (glyph.X*size/1000+extra[glyph.VisualOrder])*state.hscale
 		y := baseline + glyph.Y*size/1000
@@ -536,6 +555,9 @@ func (s *annotationShaper) writeLine(content *strings.Builder, line *annotationS
 			return err
 		}
 		fmt.Fprintf(content, "<%x> Tj\n", s.entries[glyph.ID].code)
+		if s.maxBytes > 0 && content.Len() > s.maxBytes {
+			return fmt.Errorf("%w: shaped text appearance content limit exceeded", ErrStreamLimitExceeded)
+		}
 	}
 	return s.ctx.Err()
 }

@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -27,10 +28,25 @@ import (
 	"sync"
 )
 
+// maxCIDMetricEntries 限制CID字体横排或竖排度量数组的累计展开条目数
+const maxCIDMetricEntries = 262144
+
 // cidMetricRange 保存连续CID共用的度量，不展开逐字缓存
 type cidMetricRange[T comparable] struct {
 	first, last uint32
 	value       T
+}
+
+// cidMetricEntry 保存待规范化的CID度量区间及其声明顺序
+type cidMetricEntry[T comparable] struct {
+	first, last uint32
+	order       int
+	value       T
+}
+
+// cidMetricBuilder 收集CID度量声明并在解析结束时统一合并为互不相交范围
+type cidMetricBuilder[T comparable] struct {
+	entries []cidMetricEntry[T]
 }
 
 // cidMetrics 按CID排列互不相交的度量范围，后声明的范围覆盖前值
@@ -47,12 +63,15 @@ type fontProgramMetrics struct {
 	cffMetrics   *cffFontMetrics
 }
 
-// type1FontMetrics 保存字体矩阵及未执行的Type1字形和子程序
+// type1FontMetrics 保存字体矩阵、未执行的Type1字形以及并发安全的解密子程序与字宽缓存
 type type1FontMetrics struct {
-	matrix Matrix
-	lenIV  int
-	glyphs map[string][]byte
-	subrs  map[int][]byte
+	mu             sync.RWMutex
+	matrix         Matrix
+	lenIV          int
+	glyphs         map[string][]byte
+	subrs          map[int][]byte
+	decryptedSubrs map[int][]byte
+	widths         map[string]float64
 }
 
 // cffFontMetrics 保存CFF字形、子程序和私有字宽，仅解释实际使用的字形
@@ -289,9 +308,9 @@ func type1MetricDecrypt(ctx context.Context, data []byte, seed uint16, skip int)
 }
 
 // type1MetricWidth 执行Type1前缀直到hsbw或sbw，不执行后续轮廓指令
-// 入参: ctx 取消上下文, data 字形指令, subrs 子程序, lenIV 加密前缀长度, args 操作数栈, steps 累计指令数, depth 调用深度
+// 入参: ctx 取消上下文, data 字形指令, subr 子程序查找回调, args 操作数栈, steps 累计指令数, depth 调用深度
 // 返回: Point 字体空间字宽向量, bool 是否获得字宽, error 指令或资源限制错误
-func type1MetricWidth(ctx context.Context, data []byte, subrs map[int][]byte, lenIV int, args *[]float64, steps *int, depth int) (Point, bool, error) {
+func type1MetricWidth(ctx context.Context, data []byte, subr func(int) ([]byte, error), args *[]float64, steps *int, depth int) (Point, bool, error) {
 	if depth > 10 {
 		return Point{}, false, fmt.Errorf("Type1 metric subroutine nesting limit")
 	}
@@ -371,16 +390,12 @@ func type1MetricWidth(ctx context.Context, data []byte, subrs map[int][]byte, le
 			if value < 0 || value > math.MaxInt32 || math.Trunc(value) != value {
 				return Point{}, false, fmt.Errorf("invalid Type1 metric subroutine index")
 			}
-			subr, ok := subrs[int(value)]
-			if !ok {
-				return Point{}, false, fmt.Errorf("missing Type1 metric subroutine")
-			}
-			*args = a[:len(a)-1]
-			subr, err := type1MetricDecrypt(ctx, subr, 4330, lenIV)
+			body, err := subr(int(value))
 			if err != nil {
 				return Point{}, false, err
 			}
-			width, found, err := type1MetricWidth(ctx, subr, subrs, lenIV, args, steps, depth+1)
+			*args = a[:len(a)-1]
+			width, found, err := type1MetricWidth(ctx, body, subr, args, steps, depth+1)
 			if err != nil || found {
 				return width, found, err
 			}
@@ -462,34 +477,104 @@ func readCFFFontMetrics(ctx context.Context, data []byte) (*cffFontMetrics, erro
 	return metrics, ctx.Err()
 }
 
-// set 覆盖指定范围，保留两端旧值并合并相邻同值范围
+// add 记录一条CID度量范围并顺手合并尾部相邻同值范围
 // 入参: first 起始CID, last 结束CID, value 度量
-func (m *cidMetrics[T]) set(first, last uint32, value T) {
-	i := sort.Search(len(m.ranges), func(i int) bool { return m.ranges[i].last >= first })
-	j := sort.Search(len(m.ranges), func(i int) bool { return m.ranges[i].first > last })
-	var replacement [3]cidMetricRange[T]
-	n := 0
-	if i < j && m.ranges[i].first < first {
-		replacement[n] = m.ranges[i]
-		replacement[n].last = first - 1
-		n++
+func (b *cidMetricBuilder[T]) add(first, last uint32, value T) {
+	if n := len(b.entries); n > 0 && b.entries[n-1].last+1 == first && b.entries[n-1].value == value {
+		b.entries[n-1].last = last
+		return
 	}
-	replacement[n] = cidMetricRange[T]{first: first, last: last, value: value}
-	n++
-	if i < j && m.ranges[j-1].last > last {
-		replacement[n] = m.ranges[j-1]
-		replacement[n].first = last + 1
-		n++
+	b.entries = append(b.entries, cidMetricEntry[T]{first: first, last: last, order: len(b.entries), value: value})
+}
+
+// finish 按后声明覆盖先声明的规则合并为有序互不相交的CID度量表
+// 入参: ctx 取消上下文
+// 返回: cidMetrics[T] 合并后的度量表, error 取消错误
+func (b *cidMetricBuilder[T]) finish(ctx context.Context) (cidMetrics[T], error) {
+	if len(b.entries) == 0 {
+		return cidMetrics[T]{}, ctx.Err()
 	}
-	m.ranges = slices.Replace(m.ranges, i, j, replacement[:n]...)
-	for k := max(i-1, 0); k+1 < len(m.ranges) && k <= i+n; {
-		if m.ranges[k].last+1 == m.ranges[k+1].first && m.ranges[k].value == m.ranges[k+1].value {
-			m.ranges[k].last = m.ranges[k+1].last
-			m.ranges = slices.Delete(m.ranges, k+1, k+2)
-		} else {
-			k++
+	if len(b.entries) == 1 {
+		e := b.entries[0]
+		return cidMetrics[T]{ranges: []cidMetricRange[T]{{first: e.first, last: e.last, value: e.value}}}, ctx.Err()
+	}
+	slices.SortFunc(b.entries, func(a, b cidMetricEntry[T]) int {
+		if d := cmp.Compare(a.first, b.first); d != 0 {
+			return d
+		}
+		return cmp.Compare(b.order, a.order)
+	})
+	var heap []cidMetricEntry[T]
+	push := func(entry cidMetricEntry[T]) {
+		heap = append(heap, entry)
+		for idx := len(heap) - 1; idx > 0; {
+			parent := (idx - 1) / 2
+			if heap[parent].order >= heap[idx].order {
+				break
+			}
+			heap[parent], heap[idx] = heap[idx], heap[parent]
+			idx = parent
 		}
 	}
+	pop := func() {
+		last := len(heap) - 1
+		heap[0] = heap[last]
+		heap = heap[:last]
+		for idx := 0; ; {
+			left := idx*2 + 1
+			if left >= len(heap) {
+				break
+			}
+			best := left
+			if right := left + 1; right < len(heap) && heap[right].order > heap[left].order {
+				best = right
+			}
+			if heap[idx].order >= heap[best].order {
+				break
+			}
+			heap[idx], heap[best] = heap[best], heap[idx]
+			idx = best
+		}
+	}
+	out := make([]cidMetricRange[T], 0, len(b.entries))
+	var pos uint32
+	i, steps := 0, 0
+	for i < len(b.entries) || len(heap) > 0 {
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return cidMetrics[T]{}, err
+			}
+		}
+		steps++
+		if len(heap) == 0 {
+			pos = b.entries[i].first
+		}
+		for i < len(b.entries) && b.entries[i].first == pos {
+			push(b.entries[i])
+			i++
+		}
+		for len(heap) > 0 && heap[0].last < pos {
+			pop()
+		}
+		if len(heap) == 0 {
+			continue
+		}
+		top := heap[0]
+		segEnd := top.last
+		if i < len(b.entries) && b.entries[i].first <= segEnd {
+			segEnd = b.entries[i].first - 1
+		}
+		if n := len(out); n > 0 && out[n-1].last+1 == pos && out[n-1].value == top.value {
+			out[n-1].last = segEnd
+		} else {
+			out = append(out, cidMetricRange[T]{first: pos, last: segEnd, value: top.value})
+		}
+		if segEnd == top.last {
+			pop()
+		}
+		pos = segEnd + 1
+	}
+	return cidMetrics[T]{ranges: out}, ctx.Err()
 }
 
 // get 查找CID的显式度量，未声明时交由字体使用默认值
@@ -528,10 +613,53 @@ func (m *fontProgramMetrics) load(ctx context.Context) (*type1FontMetrics, *cffF
 	return m.type1Metrics, m.cffMetrics, ctx.Err()
 }
 
-// glyphWidth 仅解密所选字形及必要子程序，转换为千分之一横向字宽
+// subr 并发安全地按需解密并缓存Type1子程序，取消或解密失败不缓存
+// 入参: ctx 取消上下文, index 子程序编号
+// 返回: []byte 解密后的子程序指令, error 缺失、解密或取消错误
+func (m *type1FontMetrics) subr(ctx context.Context, index int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	plain, ok := m.decryptedSubrs[index]
+	m.mu.RUnlock()
+	if ok {
+		return plain, nil
+	}
+	raw, ok := m.subrs[index]
+	if !ok {
+		return nil, fmt.Errorf("missing Type1 metric subroutine")
+	}
+	plain, err := type1MetricDecrypt(ctx, raw, 4330, m.lenIV)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if m.decryptedSubrs == nil {
+		m.decryptedSubrs = make(map[int][]byte)
+	}
+	if existing, ok := m.decryptedSubrs[index]; ok {
+		m.mu.Unlock()
+		return existing, nil
+	}
+	m.decryptedSubrs[index] = plain
+	m.mu.Unlock()
+	return plain, nil
+}
+
+// glyphWidth 按需解密并缓存所选字形的横向字宽，仅首次解密实际使用的子程序
 // 入参: ctx 取消上下文, name 实际字形名称
 // 返回: float64 横向字宽, error 字形度量或取消错误
 func (m *type1FontMetrics) glyphWidth(ctx context.Context, name string) (float64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.RLock()
+	cached, ok := m.widths[name]
+	m.mu.RUnlock()
+	if ok {
+		return cached, nil
+	}
 	raw, ok := m.glyphs[name]
 	if !ok {
 		return 0, fmt.Errorf("Type1 glyph %s lacks metrics", name)
@@ -542,7 +670,7 @@ func (m *type1FontMetrics) glyphWidth(ctx context.Context, name string) (float64
 	}
 	steps := 0
 	args := make([]float64, 0, 24)
-	width, found, err := type1MetricWidth(ctx, data, m.subrs, m.lenIV, &args, &steps, 0)
+	width, found, err := type1MetricWidth(ctx, data, func(index int) ([]byte, error) { return m.subr(ctx, index) }, &args, &steps, 0)
 	if err != nil {
 		return 0, fmt.Errorf("Type1 glyph %s metrics: %w", name, err)
 	}
@@ -557,7 +685,16 @@ func (m *type1FontMetrics) glyphWidth(ctx context.Context, name string) (float64
 	if y != 0 {
 		return 0, &UnsupportedError{Feature: "nonhorizontal Type1 glyph metrics"}
 	}
-	return x, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	if m.widths == nil {
+		m.widths = make(map[string]float64)
+	}
+	m.widths[name] = x
+	m.mu.Unlock()
+	return x, nil
 }
 
 // type1MetricBinary 按声明长度读取二进制字形，不解释数据中的词项
@@ -593,11 +730,12 @@ func (m *cffFontMetrics) glyphWidth(ctx context.Context, gid uint16) (float64, e
 	args := make([]float64, 0, 48)
 	var width Point
 	if m.kind == 1 {
-		subrs := make(map[int][]byte, len(m.locals))
-		for i, data := range m.locals {
-			subrs[i] = data
-		}
-		value, found, err := type1MetricWidth(ctx, m.chars[gid], subrs, -1, &args, &steps, 0)
+		value, found, err := type1MetricWidth(ctx, m.chars[gid], func(index int) ([]byte, error) {
+			if index < 0 || index >= len(m.locals) {
+				return nil, fmt.Errorf("missing Type1 metric subroutine")
+			}
+			return m.locals[index], nil
+		}, &args, &steps, 0)
 		if err != nil {
 			return 0, err
 		}

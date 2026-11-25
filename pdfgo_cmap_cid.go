@@ -48,7 +48,6 @@ type cidNotdefRange struct {
 type cidMappedRange struct {
 	first   uint64
 	last    uint64
-	end     uint64
 	cid     uint16
 	order   int
 	invalid bool
@@ -129,14 +128,14 @@ func ParseCIDMapContext(ctx context.Context, data []byte) (CIDMap, error) {
 
 // parseCIDCMapContext 解析CID元数据和范围，取消时不保留部分映射
 // 入参: ctx 取消上下文, data CMap数据
-// 返回: *cidCMap 本层映射, error 格式或取消错误
+// 返回: *cidCMap 本层映射, error 格式、超限或取消错误
 func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
 	return parseCIDCMapRecoveryContext(ctx, data, nil)
 }
 
 // parseCIDCMapRecoveryContext 按诊断策略读取可确定的CID条目，无效目标保留到使用时拒绝
 // 入参: ctx 取消上下文, data CMap数据, warning 恢复诊断，空值严格校验
-// 返回: *cidCMap 本层映射, error 格式或取消错误
+// 返回: *cidCMap 本层映射, error 格式、超限或取消错误
 func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(Diagnostic)) (*cidCMap, error) {
 	p := objectParser{data: data}
 	result := &cidCMap{}
@@ -148,20 +147,11 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 		}
 		p.skipSpace()
 		if p.pos == len(data) {
-			slices.SortFunc(result.ranges, func(a, b cidMappedRange) int { return cmp.Compare(a.first, b.first) })
-			var end uint64
-			for i := range result.ranges {
-				if i&255 == 0 {
-					if err := ctx.Err(); err != nil {
-						return nil, err
-					}
-				}
-				end = max(end, result.ranges[i].last)
-				result.ranges[i].end = end
-			}
-			if err := ctx.Err(); err != nil {
+			ranges, err := normalizeCIDMappedRanges(ctx, result.ranges)
+			if err != nil {
 				return nil, err
 			}
+			result.ranges = ranges
 			return result, nil
 		}
 		if b := p.data[p.pos]; b == '/' || b == '(' || b == '<' || b == '[' {
@@ -278,6 +268,9 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 						return nil, p.fail("invalid CMap codespace range")
 					}
 				}
+				if uint64(len(result.spaces)) >= maxCMapEntries {
+					return nil, fmt.Errorf("%w: CID CMap codespace limit exceeded", ErrStreamLimitExceeded)
+				}
 				result.spaces = append(result.spaces, cidCodeRange{first, last})
 				continue
 			}
@@ -301,6 +294,9 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 				if invalid {
 					return nil, p.fail("invalid CMap CID")
 				}
+				if uint64(len(result.notdef)) >= maxCMapEntries {
+					return nil, fmt.Errorf("%w: CID CMap notdef limit exceeded", ErrStreamLimitExceeded)
+				}
 				result.notdef = append(result.notdef, cidNotdefRange{start, end, len(first), uint16(cid)})
 				continue
 			}
@@ -311,6 +307,9 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 				}
 				result.recovered = true
 				warning(Diagnostic{Offset: int64(p.pos), Message: "out-of-range CMap CID destination retained as invalid; use is rejected"})
+			}
+			if uint64(len(result.ranges)) >= maxCMapEntries {
+				return nil, fmt.Errorf("%w: CID CMap range limit exceeded", ErrStreamLimitExceeded)
 			}
 			size := uint64(len(first)) << 32
 			result.ranges = append(result.ranges, cidMappedRange{first: size | start, last: size | end, cid: uint16(cid), order: len(result.ranges), invalid: invalid})
@@ -323,24 +322,134 @@ func parseCIDCMapRecoveryContext(ctx context.Context, data []byte, warning func(
 	}
 }
 
-// copyUnicodeMapContext 合并独立映射，在复制期间检查取消及总条目数上限
+// normalizeCIDMappedRanges 将可能重叠的CID区间按后定义覆盖先定义规范化为有序互不相交区间
+// 入参: ctx 取消上下文, ranges 原始CID区间列表
+// 返回: []cidMappedRange 规范化区间列表, error 取消错误
+func normalizeCIDMappedRanges(ctx context.Context, ranges []cidMappedRange) ([]cidMappedRange, error) {
+	if len(ranges) <= 1 {
+		return ranges, ctx.Err()
+	}
+	slices.SortFunc(ranges, func(a, b cidMappedRange) int {
+		if d := cmp.Compare(a.first, b.first); d != 0 {
+			return d
+		}
+		return cmp.Compare(b.order, a.order)
+	})
+	var heap []cidMappedRange
+	push := func(entry cidMappedRange) {
+		heap = append(heap, entry)
+		for idx := len(heap) - 1; idx > 0; {
+			parent := (idx - 1) / 2
+			if heap[parent].order >= heap[idx].order {
+				break
+			}
+			heap[parent], heap[idx] = heap[idx], heap[parent]
+			idx = parent
+		}
+	}
+	pop := func() {
+		last := len(heap) - 1
+		heap[0] = heap[last]
+		heap = heap[:last]
+		for idx := 0; ; {
+			left := idx*2 + 1
+			if left >= len(heap) {
+				break
+			}
+			best := left
+			if right := left + 1; right < len(heap) && heap[right].order > heap[left].order {
+				best = right
+			}
+			if heap[idx].order >= heap[best].order {
+				break
+			}
+			heap[idx], heap[best] = heap[best], heap[idx]
+			idx = best
+		}
+	}
+	out := make([]cidMappedRange, 0, len(ranges))
+	var pos uint64
+	i, steps := 0, 0
+	for i < len(ranges) || len(heap) > 0 {
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		steps++
+		if len(heap) == 0 {
+			pos = ranges[i].first
+		}
+		for i < len(ranges) && ranges[i].first == pos {
+			push(ranges[i])
+			i++
+		}
+		for len(heap) > 0 && heap[0].last < pos {
+			pop()
+		}
+		if len(heap) == 0 {
+			continue
+		}
+		top := heap[0]
+		segEnd := top.last
+		if i < len(ranges) && ranges[i].first <= segEnd {
+			segEnd = ranges[i].first - 1
+		}
+		var segCID uint16
+		if !top.invalid {
+			segCID = top.cid + uint16(pos-top.first)
+		}
+		if n := len(out); n > 0 && out[n-1].first>>32 == pos>>32 && out[n-1].last+1 == pos && out[n-1].invalid == top.invalid && (top.invalid || uint64(out[n-1].cid)+(pos-out[n-1].first) == uint64(segCID)) {
+			out[n-1].last = segEnd
+		} else {
+			out = append(out, cidMappedRange{first: pos, last: segEnd, cid: segCID, invalid: top.invalid})
+		}
+		if segEnd == top.last {
+			pop()
+		}
+		pos = segEnd + 1
+	}
+	return out, ctx.Err()
+}
+
+// copyUnicodeMapContext 合并独立映射，在复制期间检查取消、总条目数及总字节上限
 // 入参: ctx 取消上下文, target 目标映射, source 源映射
-// 返回: error 取消或条目超限错误
-func copyUnicodeMapContext(ctx context.Context, target, source UnicodeMap) error {
+// 返回: uint64 合并后总字节数, error 取消或超限错误
+func copyUnicodeMapContext(ctx context.Context, target, source UnicodeMap) (uint64, error) {
+	totalBytes, err := unicodeMapBytes(ctx, target)
+	if err != nil {
+		return 0, err
+	}
 	index := 0
 	for code, text := range source {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
-				return err
+				return 0, err
 			}
 		}
 		index++
-		if _, exists := target[code]; !exists && uint64(len(target)) >= maxCMapEntries {
-			return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
+		old, exists := target[code]
+		if !exists && uint64(len(target)) >= maxCMapEntries {
+			return 0, fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
 		}
+		add := uint64(len(code) + len(text))
+		if exists {
+			if len(text) > len(old) {
+				add = uint64(len(text) - len(old))
+			} else {
+				add = 0
+			}
+		}
+		if add > maxCMapTotalBytes-totalBytes {
+			return 0, fmt.Errorf("%w: unicode cmap byte limit exceeded", ErrStreamLimitExceeded)
+		}
+		totalBytes += add
 		target[code] = text
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return totalBytes, nil
 }
 
 // inherit 补齐基础映射的编码范围、字符集及书写方向
@@ -418,21 +527,16 @@ func (c *cidCMap) mapped(raw []byte) (uint16, bool) {
 	return entry.cid + uint16(codeNumber(raw)-uint64(uint32(entry.first))), true
 }
 
-// mappedRange 查找最后声明的匹配范围，不将无效目标回退到父映射
+// mappedRange 二分查找规范化后的匹配范围，不将无效目标回退到父映射
 // 入参: raw 原始字符码
 // 返回: *cidMappedRange 范围项，未匹配时为空
 func (c *cidCMap) mappedRange(raw []byte) *cidMappedRange {
 	code := uint64(len(raw))<<32 | codeNumber(raw)
-	index := sort.Search(len(c.ranges), func(i int) bool { return c.ranges[i].first > code })
-	order := -1
-	var result *cidMappedRange
-	for i := index - 1; i >= 0 && c.ranges[i].end >= code; i-- {
-		entry := &c.ranges[i]
-		if code <= entry.last && entry.order > order {
-			result, order = entry, entry.order
-		}
+	index := sort.Search(len(c.ranges), func(i int) bool { return c.ranges[i].last >= code })
+	if index < len(c.ranges) && c.ranges[index].first <= code {
+		return &c.ranges[index]
 	}
-	return result
+	return nil
 }
 
 // validateCode 拒绝实际使用的无效CID范围，未引用的异常条目不影响已知字形
@@ -485,12 +589,13 @@ func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, 
 					raw[size-i-1] = byte(code >> (i * 8))
 				}
 				data := raw[:size]
+				key := string(data)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
 				if n, valid := c.next(data); valid && n == size && c.validateCode(data, true) == nil && c.lookup(data, true) == cid {
-					key := string(data)
-					if !seen[key] {
-						seen[key] = true
-						codes = append(codes, key)
-					}
+					codes = append(codes, key)
 				}
 			}
 		}
@@ -627,7 +732,7 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 			return nil, err
 		}
 		result := make(UnicodeMap, len(mapping))
-		if err := copyUnicodeMapContext(ctx, result, mapping); err != nil {
+		if _, err := copyUnicodeMapContext(ctx, result, mapping); err != nil {
 			return nil, err
 		}
 		return result, nil

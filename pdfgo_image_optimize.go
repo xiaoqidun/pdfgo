@@ -494,6 +494,9 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 				allowGray = false
 			}
 		}
+		if hdrColor {
+			allowGray = false
+		}
 		candidate, err := compactPNGSourceMode(ctx, data, best, options, size, false, img, allowGray, allowColor)
 		if err != nil {
 			return nil, err

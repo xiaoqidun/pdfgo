@@ -82,15 +82,14 @@ func (r *Reader) ReadRenditionPlayback(ctx context.Context, object Object) (Rend
 	} else if result.Operation != nil && (*result.Operation == 0 || *result.Operation == 4) {
 		return result, fmt.Errorf("%w: missing media rendition", ErrInvalidAction)
 	}
-	value, err = r.Resolve(dict["AN"])
+	ref, value, err := r.resolveIndirect(dict["AN"])
 	if err != nil {
 		return result, err
 	}
 	if value == nil && (result.Operation == nil || *result.Operation < 0 || *result.Operation > 4) {
 		return result, ctx.Err()
 	}
-	ref, ok := dict["AN"].(Reference)
-	if !ok {
+	if ref == (Reference{}) {
 		return result, fmt.Errorf("%w: missing screen annotation reference", ErrInvalidAction)
 	}
 	screen, ok := value.(Dictionary)
@@ -104,13 +103,12 @@ func (r *Reader) ReadRenditionPlayback(ctx context.Context, object Object) (Rend
 	if kind != Name("Screen") {
 		return result, fmt.Errorf("%w: rendition target is not a screen annotation", ErrInvalidAction)
 	}
-	page, ok := screen["P"].(Reference)
-	if !ok {
-		return result, fmt.Errorf("%w: missing screen page reference", ErrInvalidAction)
-	}
-	value, err = r.Resolve(page)
+	page, value, err := r.resolveIndirect(screen["P"])
 	if err != nil {
 		return result, err
+	}
+	if page == (Reference{}) {
+		return result, fmt.Errorf("%w: missing screen page reference", ErrInvalidAction)
 	}
 	owner, ok := value.(Dictionary)
 	if !ok {
@@ -136,7 +134,11 @@ func (r *Reader) ReadRenditionPlayback(ctx context.Context, object Object) (Rend
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		if current, ok := object.(Reference); ok && current == ref {
+		current, err := r.resolveIndirectReference(object)
+		if err != nil {
+			return result, err
+		}
+		if current == ref {
 			found = true
 			break
 		}

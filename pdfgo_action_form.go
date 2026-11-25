@@ -137,7 +137,7 @@ func (r *Reader) actionTargets(ctx context.Context, objects Array, annotations b
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		value, err := r.Resolve(object)
+		ref, value, err := r.resolveIndirect(object)
 		if err != nil {
 			return nil, err
 		}
@@ -149,9 +149,8 @@ func (r *Reader) actionTargets(ctx context.Context, objects Array, annotations b
 			result = append(result, ActionTarget{Name: name})
 			continue
 		}
-		ref, indirect := object.(Reference)
 		dict, valid := value.(Dictionary)
-		if !indirect || ref.Number <= 0 || !valid || dict == nil {
+		if ref.Number <= 0 || !valid || dict == nil {
 			return nil, fmt.Errorf("%w: invalid action target", ErrInvalidAction)
 		}
 		if annotations {

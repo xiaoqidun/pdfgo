@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"os"
 )
 
 // MoviePlayback 保存动作目标、视频资源及合并后的播放参数，不读取文件或执行播放
@@ -34,7 +35,16 @@ type MoviePlayback struct {
 // 返回: MoviePlayback 视频播放信息, error 目标、参数、引用或取消错误
 func (r *Reader) ReadMoviePlayback(ctx context.Context, page *Page, object Object) (MoviePlayback, error) {
 	var result MoviePlayback
-	if r == nil || ctx == nil || page == nil || page.reader != r {
+	if r == nil || ctx == nil {
+		return result, fmt.Errorf("invalid movie playback context")
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if r.closed {
+		return result, os.ErrClosed
+	}
+	if page == nil || page.reader != r {
 		return result, fmt.Errorf("invalid movie playback context")
 	}
 	action, err := r.ReadMovieAction(ctx, object)
@@ -88,13 +98,12 @@ func (r *Reader) movieTarget(ctx context.Context, page *Page, action MovieAction
 		if err := ctx.Err(); err != nil {
 			return Annotation{}, err
 		}
-		ref, indirect := object.(Reference)
-		if action.Annotation != (Reference{}) && (!indirect || ref != action.Annotation) {
-			continue
-		}
-		value, err := r.Resolve(object)
+		ref, value, err := r.resolveIndirect(object)
 		if err != nil {
 			return Annotation{}, err
+		}
+		if action.Annotation != (Reference{}) && ref != action.Annotation {
+			continue
 		}
 		dict, ok := value.(Dictionary)
 		if !ok {

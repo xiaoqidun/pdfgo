@@ -38,7 +38,7 @@ type ThreeDMarkup struct {
 // 返回: [16]byte 校验和, error 解码、关闭或取消错误
 func (r *Reader) ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16]byte, error) {
 	var result [16]byte
-	if r == nil || ctx == nil || stream == nil {
+	if r == nil || ctx == nil {
 		return result, fmt.Errorf("invalid 3D artwork checksum source")
 	}
 	if err := ctx.Err(); err != nil {
@@ -46,6 +46,9 @@ func (r *Reader) ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16
 	}
 	if r.closed {
 		return result, os.ErrClosed
+	}
+	if stream == nil {
+		return result, fmt.Errorf("invalid 3D artwork checksum source")
 	}
 	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {

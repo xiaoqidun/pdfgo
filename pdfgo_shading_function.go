@@ -33,11 +33,12 @@ type gradientFunctionKey struct {
 	channels int
 }
 
-// gradientParseState 保存单次渐变函数解析的节点预算与间接引用记忆表
+// gradientParseState 保存单次渐变函数解析的节点与跨通道总断点预算及间接引用记忆表
 type gradientParseState struct {
-	nodes     int
-	functions map[gradientFunctionKey]*gradientFunction
-	vectors   map[gradientFunctionKey]*gradientVector
+	nodes       int
+	vectorStops int
+	functions   map[gradientFunctionKey]*gradientFunction
+	vectors     map[gradientFunctionKey]*gradientVector
 }
 
 // gradientFunction 保存已解析的一维颜色函数及可精确展开的线性分段
@@ -449,7 +450,11 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			return
 		}}
 		if tint.domain[0] == tint.domain[1] {
-			return constantGradientFunction(f.value(tint.domain[0])), nil
+			values := f.value(tint.domain[0])
+			if !finiteFloats(values[:channels]) {
+				return f, nil
+			}
+			return constantGradientFunction(values), nil
 		}
 		if tint.sampled && (tint.order != 3 || tint.size < 4) {
 			stops := sampledGradientStops(ctx, tint)
@@ -467,7 +472,11 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			stops := []GradientStop{{Position: 0}, {Position: 1}}
 			for i, x := range tint.domain {
 				for c := 0; c < channels; c++ {
-					stops[i].Values[c] = functionValue(math.Pow(x, tint.exponent), tint.values[2*c], tint.values[2*c+1])
+					v := functionValue(math.Pow(x, tint.exponent), tint.values[2*c], tint.values[2*c+1])
+					if !finiteFloat(v) {
+						return f, nil
+					}
+					stops[i].Values[c] = v
 				}
 			}
 			stops = clipGradientValues(stops, tint.outputRange)
@@ -478,14 +487,18 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		return f, nil
 	}
 	domain, err := r.numberArray(dict["Domain"], 2)
-	if err != nil || domain[0] > domain[1] {
+	if err != nil || !finiteFloats(domain) || domain[0] > domain[1] {
 		return nil, fmt.Errorf("invalid gradient function domain")
 	}
+	rangeValue, err := r.Resolve(dict["Range"])
+	if err != nil {
+		return nil, err
+	}
 	var limits []float64
-	if dict["Range"] != nil || kind == Integer(4) {
-		limits, err = r.numberArray(dict["Range"], 2*channels)
-		if err != nil {
-			return nil, err
+	if rangeValue != nil || kind == Integer(4) {
+		limits, err = r.numberArray(rangeValue, 2*channels)
+		if err != nil || !finiteFloats(limits) {
+			return nil, fmt.Errorf("invalid gradient function range")
 		}
 		for i := 0; i < len(limits); i += 2 {
 			if limits[i] > limits[i+1] {
@@ -568,12 +581,12 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		return nil, fmt.Errorf("invalid stitching function domain")
 	}
 	bounds, err := r.numberArray(dict["Bounds"], len(functions)-1)
-	if err != nil {
-		return nil, err
+	if err != nil || !finiteFloats(bounds) {
+		return nil, fmt.Errorf("invalid gradient stitching bounds")
 	}
 	encode, err := r.numberArray(dict["Encode"], len(functions)*2)
-	if err != nil {
-		return nil, err
+	if err != nil || !finiteFloats(encode) {
+		return nil, fmt.Errorf("invalid gradient stitching encode")
 	}
 	points := append(append([]float64{domain[0]}, bounds...), domain[1])
 	parts := make([]*gradientFunction, len(functions))

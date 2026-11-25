@@ -176,6 +176,12 @@ func (g GradientPosition) PositionAt(point Point) (float64, bool) {
 	if a == 0 {
 		if b != 0 {
 			roots[0] = -c / b
+		} else if c == 0 {
+			t := 1.0
+			if g.extend[1] && dr < 0 {
+				t = math.Max(1, gradientFinite(-g.radius/dr))
+			}
+			return t, g.accept(t)
 		}
 	} else if discriminant := b*b - 4*a*c; discriminant >= 0 {
 		q := -.5 * (b + math.Copysign(math.Sqrt(discriminant), b))

@@ -467,6 +467,9 @@ func ccittImageReader(source io.Reader, width, height int, params Dictionary) (i
 // 入参: pixel 样本颜色
 // 返回: color.NRGBA64 非预乘颜色
 func imageNRGBASample(pixel color.Color) color.NRGBA64 {
+	if pixel == nil {
+		return color.NRGBA64{}
+	}
 	switch c := pixel.(type) {
 	case color.CMYK:
 		sample := cmykSample{uint16(c.C) * 257, uint16(c.M) * 257, uint16(c.Y) * 257, uint16(c.K) * 257}
@@ -1334,6 +1337,9 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	if terminal == "" || len(filters) != 0 {
 		data, err = (&Stream{Dictionary: Dictionary{"Filter": filters, "DecodeParms": parameters}, Data: data, maxStreamBytes: i.Stream.maxStreamBytes, maxFilterChain: i.Stream.maxFilterChain}).decodeWith(ctx, i.reader, i.Warning, 0)
 		if err != nil {
+			if errors.Is(err, ErrStreamLimitExceeded) {
+				return nil, err
+			}
 			if terminal == "" {
 				recovered, recErr := i.recoverArrayPredictorSamplesContext(ctx, filters, parameters, err)
 				if recErr != nil || target == (image.Point{}) {
@@ -1487,7 +1493,14 @@ func (i *Image) recoverArrayPredictorSamplesContext(ctx context.Context, filters
 		}
 	}
 	stride, expected, err := imageSampleSize(i.Width, i.Height, components, i.BitsPerComponent)
-	if err != nil || expected >= imageBufferLimit() {
+	if err != nil {
+		return nil, originalErr
+	}
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maxBytes > 0 && int64(expected) > maxBytes {
+		return nil, fmt.Errorf("Flate %w", ErrStreamLimitExceeded)
+	}
+	if expected >= imageBufferLimit() {
 		return nil, originalErr
 	}
 	decoder, err := zlib.NewReader(bytes.NewReader(i.Stream.Data))
@@ -2759,6 +2772,9 @@ func (i *Image) prepareMask(ctx context.Context, components int, channelDepths [
 		if stream, ok := object.(*Stream); ok && stream != nil {
 			copyStream := *stream
 			copyStream.Dictionary = maps.Clone(stream.Dictionary)
+			if copyStream.Dictionary == nil {
+				copyStream.Dictionary = make(Dictionary)
+			}
 			for key, fallback := range map[Name]int{"Width": i.Width, "Height": i.Height} {
 				value, err := i.reader.Resolve(stream.Dictionary[key])
 				if err != nil {
@@ -2852,6 +2868,10 @@ func (i *Image) ccittSamplesContext(ctx context.Context, data []byte, params Dic
 	_, expected, err := imageSampleSize(i.Width, i.Height, 1, 1)
 	if err != nil {
 		return nil, err
+	}
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maxBytes > 0 && int64(expected) > maxBytes {
+		return nil, fmt.Errorf("CCITT %w", ErrStreamLimitExceeded)
 	}
 	reader, endOfBlock, err := ccittImageReader(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, i.Width, i.Height, params)
 	if err != nil {

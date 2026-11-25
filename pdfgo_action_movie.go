@@ -58,7 +58,7 @@ func (r *Reader) ReadMovieAction(ctx context.Context, object Object) (MovieActio
 	if err != nil {
 		return result, err
 	}
-	annotation, err := r.Resolve(dict["Annotation"])
+	ref, annotation, err := r.resolveIndirect(dict["Annotation"])
 	if err != nil {
 		return result, err
 	}
@@ -70,9 +70,8 @@ func (r *Reader) ReadMovieAction(ctx context.Context, object Object) (MovieActio
 		return result, fmt.Errorf("%w: invalid movie action target", ErrInvalidAction)
 	}
 	if annotation != nil {
-		ref, indirect := dict["Annotation"].(Reference)
 		target, valid := annotation.(Dictionary)
-		if !indirect || ref.Number <= 0 || !valid || target == nil {
+		if ref.Number <= 0 || !valid || target == nil {
 			return result, fmt.Errorf("%w: invalid movie annotation reference", ErrInvalidAction)
 		}
 		kind, err := r.Resolve(target["Subtype"])

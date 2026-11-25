@@ -205,11 +205,14 @@ func (r *Reader) ReadRemoteDestination(object Object) (RemoteDestination, error)
 // 入参: ctx 取消上下文, remote 已解析的远程目标
 // 返回: Destination 当前文档目标, error 命名目标、越界或页面树错误
 func (r *Reader) ResolveRemoteDestination(ctx context.Context, remote RemoteDestination) (Destination, error) {
-	if ctx == nil {
+	if r == nil || ctx == nil {
 		return Destination{}, fmt.Errorf("invalid destination context")
 	}
 	if err := ctx.Err(); err != nil {
 		return Destination{}, err
+	}
+	if r.closed {
+		return Destination{}, os.ErrClosed
 	}
 	var destination Destination
 	if remote.Named != nil {

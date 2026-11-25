@@ -300,6 +300,9 @@ func (r *Reader) readMultiDeviceN(ctx context.Context, space Array, effective bo
 	if err != nil {
 		return nil, err
 	}
+	if !finiteFloats(input) || !finiteFloats(output) {
+		return nil, fmt.Errorf("invalid DeviceN tint bounds")
+	}
 	for _, bounds := range [][]float64{input, output} {
 		for i := 0; i < len(bounds); i += 2 {
 			if bounds[i] > bounds[i+1] {

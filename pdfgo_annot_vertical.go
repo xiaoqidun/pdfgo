@@ -76,7 +76,7 @@ func annotationVerticalBounds(letter annotationLetter, state graphicsState, size
 
 // write 按字体纵向度量生成外观，自右向左分列，按Q调整文字块的水平对齐
 // 入参: p 默认文字状态, content 外观内容
-// 返回: error 排版、度量或取消错误
+// 返回: error 排版、度量、超限或取消错误
 func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Builder) error {
 	ctx, state := p.ctx, p.state
 	width, height := v.frame.XMax-v.frame.XMin, v.frame.YMax-v.frame.YMin
@@ -129,6 +129,7 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 	if list {
 		right = v.frame.XMax
 	}
+	limit := annotationRichContentLimit(p.reader)
 	content.WriteString("q\n")
 	writeAnnotationOperation(content, "re W n", v.clip.XMin, v.clip.YMin, v.clip.XMax-v.clip.XMin, v.clip.YMax-v.clip.YMin)
 	if list {
@@ -144,6 +145,9 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 				content.WriteString("q 0.153 0.392 0.714 rg\n")
 				writeAnnotationOperation(content, "cm", v.matrix[:]...)
 				writeAnnotationOperation(content, "re f Q", edge-column.advance, v.frame.YMin, column.advance, height)
+				if content.Len() > limit {
+					return fmt.Errorf("%w: vertical text appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 			edge -= column.advance
 		}
@@ -152,6 +156,14 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 		content.WriteString("/Tx BMC\n")
 	}
 	content.WriteString("BT\n")
+	if !list {
+		content.WriteString("0 g\n" + v.defaults)
+		fmt.Fprintf(content, "/%s ", escapeAnnotationName(v.font))
+		writeAnnotationOperation(content, "Tf", size)
+		if content.Len() > limit {
+			return fmt.Errorf("%w: vertical text appearance content limit exceeded", ErrStreamLimitExceeded)
+		}
+	}
 	for i, column := range columns {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -159,15 +171,17 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 		if list && right <= v.frame.XMin {
 			break
 		}
-		selected := false
 		if list {
-			_, selected = slices.BinarySearch(v.choice.Selected, v.choice.TopIndex+i)
-		}
-		content.WriteString("0 g\n" + v.defaults)
-		fmt.Fprintf(content, "/%s ", escapeAnnotationName(v.font))
-		writeAnnotationOperation(content, "Tf", size)
-		if selected {
-			content.WriteString("1 g\n")
+			_, selected := slices.BinarySearch(v.choice.Selected, v.choice.TopIndex+i)
+			content.WriteString("0 g\n" + v.defaults)
+			fmt.Fprintf(content, "/%s ", escapeAnnotationName(v.font))
+			writeAnnotationOperation(content, "Tf", size)
+			if selected {
+				content.WriteString("1 g\n")
+			}
+			if content.Len() > limit {
+				return fmt.Errorf("%w: vertical text appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 		}
 		x, y := right-column.bounds.XMax, v.frame.YMax-column.bounds.YMax
 		if !v.multiline {
@@ -187,19 +201,30 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 					return err
 				}
 				fmt.Fprintf(content, "<%x> Tj\n", letter.code)
+				if content.Len() > limit {
+					return fmt.Errorf("%w: vertical text appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 		} else {
 			if err := v.position(content, x, y); err != nil {
 				return err
 			}
 			content.WriteByte('<')
-			for _, letter := range column.letters {
-				if err := ctx.Err(); err != nil {
-					return err
+			for j, letter := range column.letters {
+				if j&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					if content.Len() > limit {
+						return fmt.Errorf("%w: vertical text appearance content limit exceeded", ErrStreamLimitExceeded)
+					}
 				}
 				fmt.Fprintf(content, "%x", letter.code)
 			}
 			content.WriteString("> Tj\n")
+			if content.Len() > limit {
+				return fmt.Errorf("%w: vertical text appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 		}
 		right -= column.advance
 	}
@@ -208,6 +233,9 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 		content.WriteString("EMC\n")
 	}
 	content.WriteString("Q\n")
+	if content.Len() > limit {
+		return fmt.Errorf("%w: vertical text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	return ctx.Err()
 }
 

@@ -135,11 +135,11 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 		if len(spans) == 0 {
 			return nil
 		}
-		var content bytes.Buffer
-		if _, err := source.WriteContent(ctx, &content); err != nil {
+		content, err := source.ContentContext(ctx)
+		if err != nil {
 			return err
 		}
-		data, err := r.replaceContentText(ctx, content.Bytes(), source.Resources, spans)
+		data, err := r.replaceContentText(ctx, content, source.Resources, spans)
 		if err != nil {
 			return err
 		}
@@ -304,11 +304,11 @@ func (r *Reader) transformPageContent(ctx context.Context, transform func(contex
 		if hasPending {
 			input = bytes.Clone(raw)
 		} else {
-			var content bytes.Buffer
-			if _, err := page.WriteContent(ctx, &content); err != nil {
+			var err error
+			input, err = page.ContentContext(ctx)
+			if err != nil {
 				return err
 			}
-			input = content.Bytes()
 		}
 		data, err := transform(ctx, page, input)
 		if err != nil {
@@ -325,13 +325,7 @@ func (r *Reader) transformPageContent(ctx context.Context, transform func(contex
 			return err
 		}
 		stream := &Stream{Dictionary: Dictionary{"Filter": Name("FlateDecode")}, Data: encoded, compressed: compressLevel == zlib.BestCompression}
-		ref, reusable := page.Dictionary["Contents"].(Reference)
-		_, original := r.xref[ref.Number]
-		if reusable && !original {
-			result[ref] = stream
-		} else {
-			ref, err = appendRewriteObject(result, &number, stream)
-		}
+		ref, err := appendRewriteObject(result, &number, stream)
 		if err != nil {
 			return err
 		}

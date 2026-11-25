@@ -283,6 +283,7 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 	isFlate := false
 	isBrotli := false
 	brotliFailed := true
+	brotliLargeWindow := false
 	switch filterName {
 	case "", "Crypt":
 		if filterName == "Crypt" && filterParams["Name"] != nil && filterParams["Name"] != Name("Identity") {
@@ -320,7 +321,11 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 		if maxBytes > 0 && declaredBytes > maxBytes {
 			return nil, true, ErrStreamLimitExceeded
 		}
-		brotliReader = acquireBrotliReader(&contextInput{ctx: ctx, reader: bytes.NewReader(i.Stream.Data)})
+		if err := checkBrotliLimits(i.Stream.Data, maxBytes); err != nil {
+			return nil, true, err
+		}
+		brotliLargeWindow = maxBytes == 0 || maxBytes > 16<<20
+		brotliReader = acquireBrotliReaderWith(&contextInput{ctx: ctx, reader: bytes.NewReader(i.Stream.Data)}, brotliLargeWindow)
 		reader = &contextInput{ctx: ctx, reader: brotliReader}
 		isBrotli = true
 	case "RunLengthDecode":
@@ -341,7 +346,7 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 			if limited != nil {
 				decodedBytes = maxBytes + 1 - limited.N
 			}
-			releaseBrotliReader(brotliReader, decodedBytes, brotliFailed)
+			releaseBrotliReaderWith(brotliReader, decodedBytes, brotliFailed, brotliLargeWindow)
 		}()
 	}
 	result, trailingErr, err := i.downsampleRawReaderContext(ctx, reader, components, stride, target, isFlate || isBrotli)

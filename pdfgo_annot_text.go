@@ -396,8 +396,12 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 	}
 	w, h := annotation.Rect.XMax-annotation.Rect.XMin, annotation.Rect.YMax-annotation.Rect.YMin
 	matrix := Identity()
-	if mk["R"] != nil {
-		n, err := r.number(mk["R"])
+	rotation, err := r.Resolve(mk["R"])
+	if err != nil {
+		return nil, err
+	}
+	if rotation != nil {
+		n, err := r.number(rotation)
 		if err != nil || math.Mod(n, 90) != 0 {
 			return nil, fmt.Errorf("invalid widget rotation")
 		}
@@ -583,7 +587,7 @@ func (r *Reader) encodeAnnotationCaption(ctx context.Context, font *Font, object
 
 // writeAnnotationText 按字段值和默认外观生成裁剪后的文字内容
 // 入参: ctx 取消上下文, annotation 注解, mk 外观属性, flags 字段标志, frame 内框, border 边框, resources 字体资源, content 内容
-// 返回: error 布局、字体或编码错误
+// 返回: error 布局、字体、编码、超限或取消错误
 func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation, mk Dictionary, flags Integer, frame Rectangle, border *annotationBorder, resources Dictionary, content *strings.Builder) error {
 	dict := annotation.Dictionary
 	free := annotation.Subtype == "FreeText"
@@ -721,6 +725,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		}
 		return layout.write(p, content)
 	}
+	contentLimit := annotationRichContentLimit(r)
 	size := p.state.fontSize
 	if list && size == 0 {
 		size = math.Min(12, height)
@@ -769,10 +774,16 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		content.WriteString("q\n")
 		writeAnnotationOperation(content, "cm", matrix[:]...)
 		for _, selected := range choice.Selected {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			row := selected - choice.TopIndex
 			if row >= 0 && float64(row)*leading < height {
 				content.WriteString("q 0.153 0.392 0.714 rg\n")
 				writeAnnotationOperation(content, "re f Q", x, y+height-float64(row+1)*leading, width, leading)
+				if content.Len() > contentLimit {
+					return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 		}
 		content.WriteString("Q\n")
@@ -782,6 +793,9 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	}
 	fmt.Fprintf(content, "BT\n%s\n/%s ", stateContent, escapeAnnotationName(fontName))
 	writeAnnotationOperation(content, "Tf", size)
+	if content.Len() > contentLimit {
+		return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	lineWidth := width
 	if list {
 		lineWidth = math.Inf(1)
@@ -799,14 +813,25 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			start = comb - len(letters)
 		}
 		for i, letter := range letters {
+			if i&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			left := x + (float64(start+i)+.5)*width/float64(comb) - letter.width*size*p.state.hscale/2000
 			if err := writeAnnotationTextMatrix(content, matrix, left, baseline); err != nil {
 				return err
 			}
 			fmt.Fprintf(content, "<%x> Tj\n", letter.code)
+			if content.Len() > contentLimit {
+				return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 		}
 	} else {
 		for i, line := range lines {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if list {
 				if float64(i)*leading >= height {
 					break
@@ -817,16 +842,30 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 				if _, selected := slices.BinarySearch(choice.Selected, choice.TopIndex+i); selected {
 					content.WriteString("1 g\n")
 				}
+				if content.Len() > contentLimit {
+					return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 			left := x + float64(align)*(width-annotationLineWidth(line, p.state, size))/2
 			if err := writeAnnotationTextMatrix(content, matrix, left, baseline-float64(i)*leading); err != nil {
 				return err
 			}
 			content.WriteByte('<')
-			for _, letter := range line {
+			for j, letter := range line {
+				if j&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					if content.Len() > contentLimit {
+						return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)
+					}
+				}
 				fmt.Fprintf(content, "%x", letter.code)
 			}
 			content.WriteString("> Tj\n")
+			if content.Len() > contentLimit {
+				return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 		}
 	}
 	content.WriteString("ET\n")
@@ -834,7 +873,10 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		content.WriteString("EMC\n")
 	}
 	content.WriteString("Q\n")
-	return nil
+	if content.Len() > contentLimit {
+		return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
+	return ctx.Err()
 }
 
 // annotationComb 读取文本字段有效的分格数量，忽略不适用的标志
@@ -857,7 +899,7 @@ func (r *Reader) annotationComb(dict Dictionary, flags Integer) (int, error) {
 
 // annotationTextState 解析默认外观的字体和文字状态，保留合法绘图操作
 // 入参: ctx 取消上下文, object 默认外观, resources 外观资源
-// 返回: *pageInterpreter 文字状态, Name 字体名, string 状态操作, error 操作或资源错误
+// 返回: *pageInterpreter 文字状态, Name 字体名, string 状态操作, error 操作、资源、超限或取消错误
 func (r *Reader) annotationTextState(ctx context.Context, object Object, resources Dictionary) (*pageInterpreter, Name, string, error) {
 	value, err := r.Resolve(object)
 	if err != nil {
@@ -873,9 +915,13 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 	}}
 	var fontName Name
 	var stateContent strings.Builder
+	contentLimit := annotationRichContentLimit(r)
 	matrices := 0
 	hasFont := false
 	err = walkOperationsBorrowed(ctx, appearance, func(op Operation) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		auto := false
 		switch op.Operator {
 		case "Tf":
@@ -918,8 +964,14 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 					return err
 				}
 				stateContent.WriteByte(' ')
+				if stateContent.Len() > contentLimit {
+					return fmt.Errorf("%w: default appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 			stateContent.WriteString(op.Operator + "\n")
+			if stateContent.Len() > contentLimit {
+				return fmt.Errorf("%w: default appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 		}
 		return nil
 	})

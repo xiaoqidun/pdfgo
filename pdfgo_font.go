@@ -120,7 +120,7 @@ func (r *Reader) ReadFont(object Object) (*Font, error) {
 
 // ReadFontContext 读取字体及映射，解码和度量展开使用本次取消上下文
 // 入参: ctx 取消上下文, object 字体字典或引用
-// 返回: *Font 完整字体资源, error 读取或取消错误
+// 返回: *Font 完整字体资源, error 读取、超限或取消错误
 func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, error) {
 	if r == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid font context")
@@ -257,6 +257,8 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			if !ok {
 				return nil, fmt.Errorf("invalid CID widths")
 			}
+			var builder cidMetricBuilder[float64]
+			entries := 0
 			for n := 0; n < len(array); {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -279,6 +281,10 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 					if int64(len(widths))+int64(start) > 65536 {
 						return nil, fmt.Errorf("excessive CID width range")
 					}
+					if len(widths) > maxCIDMetricEntries-entries {
+						return nil, fmt.Errorf("%w: CID width entry limit exceeded", ErrStreamLimitExceeded)
+					}
+					entries += len(widths)
 					for j, value := range widths {
 						if j&255 == 0 {
 							if err := ctx.Err(); err != nil {
@@ -289,20 +295,28 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 						if err != nil {
 							return nil, err
 						}
-						font.cidWidths.set(uint32(start)+uint32(j), uint32(start)+uint32(j), width)
+						builder.add(uint32(start)+uint32(j), uint32(start)+uint32(j), width)
 					}
 				} else {
 					end, ok := values.(Integer)
 					if !ok || end < start || end > 65535 || n >= len(array) {
 						return nil, fmt.Errorf("invalid CID width range")
 					}
+					if entries >= maxCIDMetricEntries {
+						return nil, fmt.Errorf("%w: CID width entry limit exceeded", ErrStreamLimitExceeded)
+					}
+					entries++
 					width, err := r.number(array[n])
 					if err != nil {
 						return nil, err
 					}
 					n++
-					font.cidWidths.set(uint32(start), uint32(end), width)
+					builder.add(uint32(start), uint32(end), width)
 				}
+			}
+			font.cidWidths, err = builder.finish(ctx)
+			if err != nil {
+				return nil, err
 			}
 		}
 		if font.Vertical {
@@ -437,8 +451,15 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 					return nil, err
 				}
 			}
-			if dict["FontBBox"] != nil {
-				box, err := r.rectangle(dict["FontBBox"])
+			boxValue, err := r.Resolve(dict["FontBBox"])
+			if err != nil {
+				if r.warning == nil || isFatalReaderError(err) {
+					return nil, err
+				}
+				font.Recovered = true
+				r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid FontBBox ignored: %v", font.Name, err)})
+			} else if boxValue != nil {
+				box, err := r.rectangle(boxValue)
 				if err != nil {
 					if r.warning == nil || isFatalReaderError(err) {
 						return nil, err

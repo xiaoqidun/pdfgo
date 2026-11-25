@@ -37,7 +37,7 @@ func unwrapImage(source image.Image) image.Image {
 			return source
 		}
 		inner := wrapper.Unwrap()
-		if inner == nil || inner == source {
+		if inner == nil {
 			return source
 		}
 		source = inner
@@ -58,7 +58,7 @@ func imageNRGBAAt(source image.Image, x, y int) color.NRGBA {
 
 // imageNativeAlpha 按行扫描原生透明度或调色板索引，保留十六位透明度精度
 // 入参: ctx 取消上下文, source 图像
-// 返回: bool 是否完全不透明, bool 是否支持原生扫描, error 取消错误
+// 返回: bool 是否完全不透明, bool 是否支持原生扫描, error 取消或调色板错误
 func imageNativeAlpha(ctx context.Context, source image.Image) (bool, bool, error) {
 	var pixels []byte
 	var stride, step int
@@ -107,14 +107,79 @@ func imageNativeAlpha(ctx context.Context, source image.Image) (bool, bool, erro
 	return true, true, ctx.Err()
 }
 
+// validatePalettedImage 校验调色板图像的有效颜色条目、像素缓冲及索引边界
+// 入参: ctx 取消上下文, source 待校验图像
+// 返回: error 调色板非法、越界或取消错误
+func validatePalettedImage(ctx context.Context, source image.Image) error {
+	img := unwrapImage(source)
+	p, isPaletted := img.(*image.Paletted)
+	var palette color.Palette
+	hasPalette := isPaletted
+	if isPaletted {
+		palette = p.Palette
+	} else {
+		palette, hasPalette = img.ColorModel().(color.Palette)
+	}
+	if hasPalette {
+		if len(palette) == 0 {
+			return fmt.Errorf("empty palette")
+		}
+		for _, entry := range palette {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if entry == nil {
+				return fmt.Errorf("invalid palette color")
+			}
+		}
+	}
+	if !isPaletted {
+		return ctx.Err()
+	}
+	bounds := p.Bounds()
+	if bounds.Empty() {
+		return ctx.Err()
+	}
+	width := bounds.Dx()
+	checkIndex := len(p.Palette) < 256
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		offset := p.PixOffset(bounds.Min.X, y)
+		if offset < 0 || width > len(p.Pix)-offset {
+			return fmt.Errorf("invalid palette pixel buffer")
+		}
+		if !checkIndex {
+			continue
+		}
+		row := p.Pix[offset : offset+width]
+		for x, index := range row {
+			if x&4095 == 4095 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			if int(index) >= len(p.Palette) {
+				return fmt.Errorf("palette index out of range")
+			}
+		}
+	}
+	return ctx.Err()
+}
+
 // imagePalettedAlpha 扫描实际使用的调色板索引，单次调用复用各索引的不透明判定
 // 入参: ctx 取消上下文, source 索引图像
-// 返回: bool 是否完全不透明, error 取消错误
+// 返回: bool 是否完全不透明, error 取消或调色板错误
 func imagePalettedAlpha(ctx context.Context, source *image.Paletted) (bool, error) {
 	var opaque [256]bool
 	width, height := source.Rect.Dx(), source.Rect.Dy()
-	for y := 0; y < height && width != 0; y++ {
-		row := source.Pix[y*source.Stride:][:width]
+	for y := 0; y < height && width > 0; y++ {
+		offset := y * source.Stride
+		if offset < 0 || width > len(source.Pix)-offset {
+			return false, fmt.Errorf("invalid palette pixel buffer")
+		}
+		row := source.Pix[offset : offset+width]
 		for x, index := range row {
 			if x&4095 == 0 {
 				if err := ctx.Err(); err != nil {
@@ -127,7 +192,11 @@ func imagePalettedAlpha(ctx context.Context, source *image.Paletted) (bool, erro
 			if int(index) >= len(source.Palette) {
 				return false, fmt.Errorf("palette index out of range")
 			}
-			_, _, _, alpha := source.Palette[index].RGBA()
+			entry := source.Palette[index]
+			if entry == nil {
+				return false, fmt.Errorf("invalid palette color")
+			}
+			_, _, _, alpha := entry.RGBA()
 			if alpha != 65535 {
 				return false, ctx.Err()
 			}
@@ -139,7 +208,7 @@ func imagePalettedAlpha(ctx context.Context, source *image.Paletted) (bool, erro
 
 // imageOpaqueContext 分段检查透明度，已知无透明通道时不扫描颜色
 // 入参: ctx 取消上下文, source 图像
-// 返回: bool 是否完全不透明, error 取消错误
+// 返回: bool 是否完全不透明, error 取消或调色板错误
 func imageOpaqueContext(ctx context.Context, source image.Image) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -201,7 +270,21 @@ func imageNRGBA64At(source image.Image, x, y int) color.NRGBA64 {
 		}
 		return imageNRGBASample(s.CMYKAt(x, y))
 	case *image.Paletted:
-		return imageNRGBASample(s.At(x, y))
+		if len(s.Palette) == 0 {
+			return color.NRGBA64{}
+		}
+		if !image.Pt(x, y).In(s.Rect) {
+			return imageNRGBASample(s.Palette[0])
+		}
+		offset := s.PixOffset(x, y)
+		if offset < 0 || offset >= len(s.Pix) {
+			return color.NRGBA64{}
+		}
+		idx := int(s.Pix[offset])
+		if idx >= len(s.Palette) {
+			return color.NRGBA64{}
+		}
+		return imageNRGBASample(s.Palette[idx])
 	case *packedGrayImage:
 		if !image.Pt(x, y).In(s.rect) {
 			return color.NRGBA64{}
@@ -224,6 +307,21 @@ func imageRGBA64At(source image.Image, x, y int) color.RGBA64 {
 	if s, ok := source.(*image.CMYK); ok {
 		pixel := imageNRGBA64At(s, x, y)
 		return color.RGBA64{R: pixel.R, G: pixel.G, B: pixel.B, A: pixel.A}
+	}
+	if s, ok := source.(*image.Paletted); ok {
+		if len(s.Palette) == 0 || !image.Pt(x, y).In(s.Rect) {
+			return color.RGBA64{}
+		}
+		offset := s.PixOffset(x, y)
+		if offset < 0 || offset >= len(s.Pix) {
+			return color.RGBA64{}
+		}
+		idx := int(s.Pix[offset])
+		if idx >= len(s.Palette) || s.Palette[idx] == nil {
+			return color.RGBA64{}
+		}
+		r, g, b, a := s.Palette[idx].RGBA()
+		return color.RGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(a)}
 	}
 	if s, ok := source.(image.RGBA64Image); ok {
 		return s.RGBA64At(x, y)

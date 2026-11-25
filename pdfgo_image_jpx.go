@@ -244,6 +244,8 @@ func jpxChannelsFromCdef(cdefBoxes [][]byte, planes, colors int, masked bool) ([
 		for c := range channels {
 			channels[c] = -1
 		}
+		alpha = -1
+		clear(coverage)
 		for entry := entries; len(entry) > 0; entry = entry[6:] {
 			channel, kind, association := int(binary.BigEndian.Uint16(entry)), binary.BigEndian.Uint16(entry[2:]), int(binary.BigEndian.Uint16(entry[4:]))
 			if channel >= planes {
@@ -303,6 +305,28 @@ func jpxChannelsFromCdef(cdefBoxes [][]byte, planes, colors int, masked bool) ([
 		alpha = -1
 	}
 	return channels, alpha, nil
+}
+
+// jpxHasCmap 检测JP2容器头中是否存在非空分量映射盒
+// 入参: data 容器或码流数据
+// 返回: bool 是否存在非空cmap盒, error 容器错误
+func jpxHasCmap(data []byte) (bool, error) {
+	if len(data) >= 2 && data[0] == 255 && data[1] == 79 {
+		return false, nil
+	}
+	found := false
+	err := walkJPXBoxes(data, func(name string, payload []byte) error {
+		if name != "jp2h" {
+			return nil
+		}
+		return walkJPXBoxes(payload, func(name string, payload []byte) error {
+			if name == "cmap" && len(payload) > 0 {
+				found = true
+			}
+			return nil
+		})
+	})
+	return found, err
 }
 
 // jpxChannels 解析颜色排序及全通道软遮罩，未指定软遮罩时忽略透明度
@@ -650,6 +674,7 @@ func jpxChannelPrecisions(data []byte, compBits []int, colorCount int, explicitS
 	count := len(compBits)
 	planeBits := compBits
 	applyMapping := !(indexed && explicitSpace)
+	hasCmap := false
 	var palette, channelMap []byte
 	var cdefBoxes [][]byte
 	if !(len(data) >= 2 && data[0] == 255 && data[1] == 79) {
@@ -667,6 +692,9 @@ func jpxChannelPrecisions(data []byte, compBits []int, colorCount int, explicitS
 						palette = payload
 					}
 				case "cmap":
+					if len(payload) > 0 {
+						hasCmap = true
+					}
 					if applyMapping {
 						if channelMap != nil {
 							return fmt.Errorf("duplicate JPEG2000 component mapping")
@@ -685,6 +713,9 @@ func jpxChannelPrecisions(data []byte, compBits []int, colorCount int, explicitS
 		if err != nil {
 			return nil, err
 		}
+	}
+	if !applyMapping && hasCmap {
+		cdefBoxes = nil
 	}
 	if palette != nil || channelMap != nil {
 		if len(channelMap) == 0 || len(channelMap)%4 != 0 {
@@ -745,7 +776,7 @@ func jpxChannelPrecisions(data []byte, compBits []int, colorCount int, explicitS
 			channel := int(binary.BigEndian.Uint16(entry))
 			kind := binary.BigEndian.Uint16(entry[2:])
 			association := int(binary.BigEndian.Uint16(entry[4:]))
-			if kind == 0 && channel < len(planeBits) && association >= 1 {
+			if kind == 0 && channel < len(planeBits) && association >= 1 && association != 65535 {
 				entries = append(entries, colorEntry{association: association, bits: planeBits[channel]})
 			}
 		}
@@ -1106,6 +1137,7 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	if space, ok := colorSpace.(Array); ok && len(space) > 0 {
 		indexed = space[0] == Name("Indexed")
 	}
+	channelData := data
 	if !(indexed && i.Stream.Dictionary["ColorSpace"] != nil) {
 		mapping, err = jpxComponentMapping(data, components)
 		if err != nil {
@@ -1114,8 +1146,16 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 		if len(mapping) != 0 {
 			planeCount = len(mapping)
 		}
+	} else {
+		hasCmap, err := jpxHasCmap(data)
+		if err != nil {
+			return nil, err
+		}
+		if hasCmap {
+			channelData = stream
+		}
 	}
-	channels, alpha, err := jpxChannels(data, planeCount, count, mode != 0)
+	channels, alpha, err := jpxChannels(channelData, planeCount, count, mode != 0)
 	if err != nil {
 		return nil, err
 	}

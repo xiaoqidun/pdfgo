@@ -946,13 +946,6 @@ func checkBrotliLimits(data []byte, maxBytes int64) error {
 	}
 }
 
-// acquireBrotliReader 从标准窗口池中获取并重置Brotli解码器
-// 入参: input 压缩数据输入流
-// 返回: *brotli.Reader 可用解码器
-func acquireBrotliReader(input io.Reader) *brotli.Reader {
-	return acquireBrotliReaderWith(input, false)
-}
-
 // acquireBrotliReaderWith 从对应池中获取并重置Brotli解码器，按需启用RFC 9841大窗口
 // 入参: input 压缩数据输入流, largeWindow 是否允许大窗口扩展
 // 返回: *brotli.Reader 可用解码器
@@ -966,12 +959,6 @@ func acquireBrotliReaderWith(input io.Reader, largeWindow bool) *brotli.Reader {
 		return cached
 	}
 	return brotli.NewReaderOptions(input, brotli.ReaderOptions{LargeWindow: largeWindow})
-}
-
-// releaseBrotliReader 清除输入引用后按规模归还标准窗口Brotli解码器
-// 入参: reader 待归还的解码器, decodedBytes 已解码字节数, failed 是否发生异常或超限
-func releaseBrotliReader(reader *brotli.Reader, decodedBytes int64, failed bool) {
-	releaseBrotliReaderWith(reader, decodedBytes, failed, false)
 }
 
 // releaseBrotliReaderWith 清除输入引用后按规模归还Brotli解码器，避免大窗口长期驻留内存

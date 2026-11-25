@@ -195,7 +195,7 @@ func (r *Reader) readTintFunction(ctx context.Context, object Object, channels i
 		return nil, fmt.Errorf("invalid tint function")
 	}
 	domain, err := r.numberArray(dict["Domain"], 2)
-	if err != nil || domain[0] > domain[1] {
+	if err != nil || !finiteFloats(domain) || domain[0] > domain[1] {
 		return nil, fmt.Errorf("invalid tint function domain")
 	}
 	f := &tintFunction{domain: domain, channels: channels}
@@ -232,24 +232,38 @@ func (r *Reader) readTintFunction(ctx context.Context, object Object, channels i
 			key   Name
 			index int
 		}{{"C0", 0}, {"C1", 1}} {
-			if dict[entry.key] == nil {
+			item, err := r.Resolve(dict[entry.key])
+			if err != nil {
+				return nil, err
+			}
+			if item == nil {
 				if channels != 1 {
 					return nil, fmt.Errorf("invalid default tint component count")
 				}
 				continue
 			}
-			values, err := r.numberArray(dict[entry.key], channels)
+			values, err := r.numberArray(item, channels)
 			if err != nil {
 				return nil, err
+			}
+			if !finiteFloats(values) {
+				return nil, fmt.Errorf("invalid tint function values")
 			}
 			for n, v := range values {
 				f.values[2*n+entry.index] = v
 			}
 		}
-		if dict["Range"] != nil {
-			f.outputRange, err = r.numberArray(dict["Range"], 2*channels)
+		rangeValue, err := r.Resolve(dict["Range"])
+		if err != nil {
+			return nil, err
+		}
+		if rangeValue != nil {
+			f.outputRange, err = r.numberArray(rangeValue, 2*channels)
 			if err != nil {
 				return nil, err
+			}
+			if !finiteFloats(f.outputRange) {
+				return nil, fmt.Errorf("invalid tint function range")
 			}
 			for n := 0; n < channels; n++ {
 				if f.outputRange[2*n] > f.outputRange[2*n+1] {
@@ -279,6 +293,12 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 	}
 	position := functionValue(functionPosition(tint, f.domain[0], f.domain[1]), f.encoded[0], f.encoded[1])
 	position = math.Max(0, math.Min(float64(f.size-1), position))
+	if math.IsNaN(position) {
+		for n := range out {
+			out[n] = math.NaN()
+		}
+		return
+	}
 	maxSample := float64(uint64(1)<<uint(f.bits) - 1)
 	if f.order == 3 && f.size >= 4 {
 		indices, weights := sampledSplineSpan(position, f.size)

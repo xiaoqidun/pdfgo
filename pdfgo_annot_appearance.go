@@ -22,7 +22,7 @@ import (
 	"strings"
 )
 
-// maxSquigglyWaves 限制波浪线注释外观单段最大锯齿数，防止极端长宽比触发死循环或内存耗尽
+// maxSquigglyWaves 限制波浪线注释外观全部四边形的累计最大锯齿数，防止极端长宽比或多段四边形耗尽内存
 const maxSquigglyWaves = 65536
 
 // annotationBorder 保存注解边框和笔画的公共样式
@@ -102,8 +102,12 @@ func (r *Reader) readAnnotationBorder(annotation Annotation) (*annotationBorder,
 		if !ok {
 			return nil, fmt.Errorf("invalid annotation border style")
 		}
-		if border["W"] != nil {
-			width, err = r.number(border["W"])
+		value, err = r.Resolve(border["W"])
+		if err != nil {
+			return nil, err
+		}
+		if value != nil {
+			width, err = r.number(value)
 			if err != nil {
 				return nil, err
 			}
@@ -327,8 +331,12 @@ func (r *Reader) inkAppearance(annotation Annotation) (*Stream, error) {
 		return nil, fmt.Errorf("invalid ink paths")
 	}
 	alpha := 1.0
-	if annotation.Dictionary["CA"] != nil {
-		alpha, err = r.number(annotation.Dictionary["CA"])
+	value, err = r.Resolve(annotation.Dictionary["CA"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		alpha, err = r.number(value)
 		if err != nil || alpha < 0 || alpha > 1 || math.IsNaN(alpha) {
 			return nil, fmt.Errorf("invalid annotation opacity")
 		}
@@ -397,6 +405,8 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 	if err != nil {
 		return nil, err
 	}
+	contentLimit := annotationRichContentLimit(r)
+	totalWaves := 0
 	for i := 0; i < len(values); i += 8 {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -427,6 +437,9 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 			writeAnnotationOperation(&content, "l", c.X, c.Y)
 			writeAnnotationOperation(&content, "l", d.X, d.Y)
 			content.WriteString("h f\n")
+			if content.Len() > contentLimit {
+				return nil, fmt.Errorf("%w: text markup appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 			continue
 		}
 		writeAnnotationOperation(&content, "w", width)
@@ -436,10 +449,12 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 		writeAnnotationOperation(&content, "m", a.X, a.Y)
 		if annotation.Subtype == "Squiggly" {
 			steps := math.Ceil(length / (2 * width))
-			if math.IsInf(steps, 0) || steps > maxSquigglyWaves {
-				return nil, fmt.Errorf("text markup wave count exceeds limit")
+			if math.IsInf(steps, 0) || steps > float64(maxSquigglyWaves-totalWaves) {
+				return nil, fmt.Errorf("%w: text markup wave count exceeds limit", ErrStreamLimitExceeded)
 			}
-			for j := 1; j < int(steps); j++ {
+			count := int(steps)
+			totalWaves += count
+			for j := 1; j < count; j++ {
 				if j&255 == 0 {
 					if err := ctx.Err(); err != nil {
 						return nil, err
@@ -448,9 +463,15 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 				distance := float64(j) * length / steps
 				offset := float64(j%2) * 2 * width
 				writeAnnotationOperation(&content, "l", a.X+(distance*dx-offset*dy)/length, a.Y+(distance*dy+offset*dx)/length)
+				if content.Len() > contentLimit {
+					return nil, fmt.Errorf("%w: text markup appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 		}
 		writeAnnotationOperation(&content, "l S", b.X, b.Y)
+		if content.Len() > contentLimit {
+			return nil, fmt.Errorf("%w: text markup appearance content limit exceeded", ErrStreamLimitExceeded)
+		}
 	}
 	return r.annotationAppearance(annotation, content.String(), nil)
 }
@@ -530,7 +551,11 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 		if err != nil {
 			return nil, err
 		}
-		if annotation.Dictionary["Path"] != nil {
+		pathValue, err := r.Resolve(annotation.Dictionary["Path"])
+		if err != nil {
+			return nil, err
+		}
+		if pathValue != nil {
 			return nil, &UnsupportedError{Feature: "annotation curved path"}
 		}
 		if cloud > 0 {
@@ -657,6 +682,9 @@ func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Ann
 			start, step = len(points)-2, -2
 		}
 		x, y := points[start], points[start+1]
+		if math.IsInf(x, 0) || math.IsNaN(x) || math.IsInf(y, 0) || math.IsNaN(y) {
+			return fmt.Errorf("annotation line ending coordinate overflow")
+		}
 		dx, dy := 0.0, 0.0
 		for j := start + step; j >= 0 && j < len(points); j += step {
 			dx, dy = points[j]-x, points[j+1]-y
@@ -668,7 +696,14 @@ func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Ann
 		if length == 0 {
 			return fmt.Errorf("annotation line ending has no direction")
 		}
+		if math.IsInf(length, 0) || math.IsNaN(length) {
+			return fmt.Errorf("annotation line ending length overflow")
+		}
 		dx, dy = dx/length, dy/length
+		size, closed := 3*border.width, false
+		if math.IsInf(size, 0) {
+			return fmt.Errorf("annotation line ending size overflow")
+		}
 		content.WriteString("q [] 0 d ")
 		writeAnnotationOperation(content, "cm", dx, dy, -dy, dx, x, y)
 		fill := false
@@ -686,7 +721,6 @@ func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Ann
 				return err
 			}
 		}
-		size, closed := 3*border.width, false
 		switch style {
 		case "Square":
 			writeAnnotationOperation(content, "re", -size/2, -size/2, size, size)
@@ -722,8 +756,9 @@ func (r *Reader) writeAnnotationEndings(content *strings.Builder, annotation Ann
 			writeAnnotationOperation(content, "m", 0, -size/2)
 			writeAnnotationOperation(content, "l", 0, size/2)
 		case "Slash":
-			writeAnnotationOperation(content, "m", -size/4, -size*math.Sqrt(3)/4)
-			writeAnnotationOperation(content, "l", size/4, size*math.Sqrt(3)/4)
+			sx, sy := size/4, (size/4)*math.Sqrt(3)
+			writeAnnotationOperation(content, "m", -sx, -sy)
+			writeAnnotationOperation(content, "l", sx, sy)
 		}
 		if closed && fill {
 			content.WriteString("B Q\n")
@@ -774,13 +809,16 @@ func (r *Reader) annotationAppearance(annotation Annotation, content string, res
 	if resources != nil {
 		body.Dictionary["Resources"] = resources
 	}
-	if annotation.Dictionary["CA"] == nil && annotation.Subtype != "Highlight" {
+	ca, err := r.Resolve(annotation.Dictionary["CA"])
+	if err != nil {
+		return nil, err
+	}
+	if ca == nil && annotation.Subtype != "Highlight" {
 		return body, nil
 	}
 	alpha := 1.0
-	if annotation.Dictionary["CA"] != nil {
-		var err error
-		alpha, err = r.number(annotation.Dictionary["CA"])
+	if ca != nil {
+		alpha, err = r.number(ca)
 		if err != nil || alpha < 0 || alpha > 1 || math.IsNaN(alpha) {
 			return nil, fmt.Errorf("invalid annotation opacity")
 		}

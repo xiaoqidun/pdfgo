@@ -109,7 +109,11 @@ func (r *Reader) ReadMovie(object Object) (Movie, error) {
 			return movie, fmt.Errorf("invalid movie aspect")
 		}
 		for index, target := range []*float64{&movie.Width, &movie.Height} {
-			*target, err = r.number(array[index])
+			item, err := r.Resolve(array[index])
+			if err != nil {
+				return movie, err
+			}
+			*target, err = r.number(item)
 			if err != nil || *target <= 0 || math.IsInf(*target, 0) || math.IsNaN(*target) {
 				return movie, fmt.Errorf("invalid movie dimension")
 			}
@@ -170,7 +174,11 @@ func (r *Reader) ReadSound(object Object) (Sound, error) {
 		result.File = &specification
 		return result, err
 	}
-	result.Rate, err = r.number(stream.Dictionary["R"])
+	rate, err := r.Resolve(stream.Dictionary["R"])
+	if err != nil {
+		return result, err
+	}
+	result.Rate, err = r.number(rate)
 	if err != nil || math.IsNaN(result.Rate) || math.IsInf(result.Rate, 0) || result.Rate <= 0 {
 		return result, fmt.Errorf("invalid sound sampling rate")
 	}
@@ -240,16 +248,17 @@ func (r *Reader) ReadFileSpecification(object Object) (FileSpecification, error)
 			return result, fmt.Errorf("invalid file system")
 		}
 	}
-	key := Name("UF")
-	name, err := r.Resolve(dict[key])
-	if err != nil {
-		return result, err
-	}
-	if name == nil {
-		key = "F"
-		name, err = r.Resolve(dict[key])
+	fileKeys := [...]Name{"UF", "F", "DOS", "Mac", "Unix"}
+	var key Name
+	var name Object
+	for _, candidate := range fileKeys {
+		value, err := r.Resolve(dict[candidate])
 		if err != nil {
 			return result, err
+		}
+		if value != nil {
+			key, name = candidate, value
+			break
 		}
 	}
 	for _, field := range []struct {
@@ -283,14 +292,25 @@ func (r *Reader) ReadFileSpecification(object Object) (FileSpecification, error)
 	if !ok {
 		return result, fmt.Errorf("invalid embedded file dictionary")
 	}
-	stream, err := r.resolveEmbeddedFile(files[key])
-	if err != nil {
-		return result, err
-	}
-	if stream == nil && key == "UF" {
-		stream, err = r.resolveEmbeddedFile(files["F"])
+	var stream Object
+	if key != "" {
+		stream, err = r.resolveEmbeddedFile(files[key])
 		if err != nil {
 			return result, err
+		}
+	}
+	if stream == nil {
+		for _, candidate := range fileKeys {
+			if candidate == key {
+				continue
+			}
+			stream, err = r.resolveEmbeddedFile(files[candidate])
+			if err != nil {
+				return result, err
+			}
+			if stream != nil {
+				break
+			}
 		}
 	}
 	if stream != nil {

@@ -161,7 +161,7 @@ func (r *Reader) readSpotFunctionContext(ctx context.Context, object Object) (*S
 	if err != nil {
 		return nil, err
 	}
-	if domain[0] > domain[1] || domain[2] > domain[3] || rangeValues[0] > rangeValues[1] {
+	if !finiteFloats(domain) || !finiteFloats(rangeValues) || domain[0] > domain[1] || domain[2] > domain[3] || rangeValues[0] > rangeValues[1] {
 		return nil, fmt.Errorf("invalid spot function bounds")
 	}
 	data, err := r.DecodeStreamContext(ctx, stream)

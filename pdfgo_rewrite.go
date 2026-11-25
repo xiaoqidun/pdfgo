@@ -91,6 +91,9 @@ func rewriteInformation(ctx context.Context, changes Dictionary) (Dictionary, er
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if !validPDFName(key) {
+			return nil, fmt.Errorf("null byte in PDF name")
+		}
 		if value == nil {
 			result[key] = nil
 			continue

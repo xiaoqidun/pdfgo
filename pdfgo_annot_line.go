@@ -254,8 +254,12 @@ func (r *Reader) readLineCaption(ctx context.Context, page *Page, annotation Ann
 	default:
 		return nil, fmt.Errorf("invalid annotation caption position")
 	}
-	if annotation.Dictionary["CO"] != nil {
-		offset, err := r.numberArray(annotation.Dictionary["CO"], 2)
+	value, err = r.Resolve(annotation.Dictionary["CO"])
+	if err != nil {
+		return nil, err
+	}
+	if value != nil {
+		offset, err := r.numberArray(value, 2)
 		if err != nil {
 			return nil, err
 		}

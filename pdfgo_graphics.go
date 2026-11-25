@@ -1354,12 +1354,17 @@ func (p *pageInterpreter) operation(op Operation) error {
 					finite := !math.IsNaN(lineWidth) && !math.IsInf(lineWidth, 0) && !math.IsNaN(dashPhase) && !math.IsInf(dashPhase, 0)
 					if finite && len(style.Dash) != 0 {
 						scaledDash = make([]float64, len(style.Dash))
+						sum := 0.0
 						for n, value := range style.Dash {
 							scaledDash[n] = value * sx
 							if math.IsNaN(scaledDash[n]) || math.IsInf(scaledDash[n], 0) {
 								finite = false
 								break
 							}
+							sum += scaledDash[n]
+						}
+						if sum == 0 || math.IsInf(sum, 0) {
+							finite = false
 						}
 					}
 					if finite {
@@ -1592,7 +1597,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 				if pattern.PaintType == 2 && patternBase == nil || pattern.PaintType == 1 && patternBase != nil {
 					return fmt.Errorf("pattern paint type does not match color space")
 				}
-				paint.Tiling, paint.Axial, paint.Radial, paint.Mesh, paint.Function, paint.Shading = pattern, nil, nil, nil, nil, nil
+				if pattern.PaintType == 1 {
+					paint = Paint{Alpha: paint.Alpha, Tiling: pattern}
+				} else {
+					paint.Tiling, paint.Axial, paint.Radial, paint.Mesh, paint.Function, paint.Shading = pattern, nil, nil, nil, nil, nil
+				}
 				if operator == "g" {
 					p.state.style.Fill = paint
 				} else {
@@ -1979,10 +1988,14 @@ func (p *pageInterpreter) visiblePaint(fill, stroke bool) (bool, bool) {
 	}
 	fill, stroke = fill && p.paintVisible(p.state.style.Fill), stroke && p.paintVisible(p.state.style.Stroke)
 	if s := p.state.fillPatternBase; p.state.fillSpace == "Pattern" && s != nil && s.invisible {
-		fill = fill && p.state.style.Fill.Colorant != nil && p.paintVisible(p.state.style.Fill)
+		if f := p.state.style.Fill; !(f.Tiling != nil && f.Tiling.PaintType == 1 || f.Axial != nil || f.Radial != nil || f.Mesh != nil || f.Function != nil || f.Shading != nil) {
+			fill = fill && f.Colorant != nil
+		}
 	}
 	if s := p.state.strokePatternBase; p.state.strokeSpace == "Pattern" && s != nil && s.invisible {
-		stroke = stroke && p.state.style.Stroke.Colorant != nil && p.paintVisible(p.state.style.Stroke)
+		if st := p.state.style.Stroke; !(st.Tiling != nil && st.Tiling.PaintType == 1 || st.Axial != nil || st.Radial != nil || st.Mesh != nil || st.Function != nil || st.Shading != nil) {
+			stroke = stroke && st.Colorant != nil
+		}
 	}
 	if s := p.state.fillSeparation; p.state.fillSpace == "Separation" && s != nil && s.name == "None" {
 		fill = false
@@ -2690,6 +2703,9 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 			if err != nil {
 				return err
 			}
+			if p.opaqueGroup && mode != "Normal" && mode != "Compatible" {
+				return &UnsupportedError{Feature: "isolated transparency group"}
+			}
 			p.state.style.BlendMode = mode
 		case "SMask":
 			if value == Name("None") {
@@ -2698,6 +2714,9 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				mask, err := p.readSoftMask(value)
 				if err != nil {
 					return err
+				}
+				if p.opaqueGroup {
+					return &UnsupportedError{Feature: "isolated transparency group"}
 				}
 				p.state.style.SoftMask = mask
 			}

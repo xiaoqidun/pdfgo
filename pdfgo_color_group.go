@@ -266,6 +266,9 @@ func (p *ColorantPixel) Knockout(initial, source ColorantPixel) error {
 			return err
 		}
 	}
+	if source.Effect > source.Shape {
+		return fmt.Errorf("invalid knockout source effect")
+	}
 	f := source.Shape
 	if f == 0 {
 		return nil
@@ -277,8 +280,8 @@ func (p *ColorantPixel) Knockout(initial, source ColorantPixel) error {
 		}
 	}
 	p.Alpha = math.Max(0, math.Min(1, alpha))
-	p.Effect = p.Effect*(1-f) + source.Effect
-	p.Shape += f * (1 - p.Shape)
+	p.Effect = math.Max(0, math.Min(1, p.Effect*(1-f)+source.Effect))
+	p.Shape = math.Max(0, math.Min(1, p.Shape+f*(1-p.Shape)))
 	return nil
 }
 

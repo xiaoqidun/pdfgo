@@ -102,14 +102,14 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
 		return fmt.Errorf("invalid PNG dimensions")
 	}
+	if err := validatePalettedImage(ctx, source); err != nil {
+		return err
+	}
 	if palette, ok := source.ColorModel().(color.Palette); ok {
 		precise := false
 		for _, entry := range palette {
 			if err := ctx.Err(); err != nil {
 				return err
-			}
-			if entry == nil {
-				return fmt.Errorf("invalid PNG palette color")
 			}
 			pixel := imageNRGBASample(entry)
 			if pixel.R%257 != 0 || pixel.G%257 != 0 || pixel.B%257 != 0 || pixel.A%257 != 0 {

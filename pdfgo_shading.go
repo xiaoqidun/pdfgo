@@ -189,11 +189,19 @@ func deviceNColorFunction(source *gradientFunction, tint *deviceNSpace) *gradien
 // 入参: stops 源分段, bounds 各分量下界与上界
 // 返回: []GradientStop 截断后的分段，不可精确表达时为空
 func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
-	if len(stops) == 0 || len(stops) > maxGradientLinearStops {
+	if len(stops) == 0 || len(stops) > maxGradientLinearStops || !finiteFloats(bounds) {
 		return nil
 	}
 	result := make([]GradientStop, 0, len(stops))
 	for i, stop := range stops {
+		if !finiteFloat(stop.Position) {
+			return nil
+		}
+		for _, value := range stop.Values {
+			if !finiteFloat(value) {
+				return nil
+			}
+		}
 		if i > 0 && stops[i-1].Position < stop.Position {
 			a := stops[i-1]
 			var storage [8]float64
@@ -210,7 +218,7 @@ func clipGradientValues(stops []GradientStop, bounds []float64) []GradientStop {
 				}
 				for _, bound := range bounds[c*2 : c*2+2] {
 					t := functionPosition(bound, a.Values[c], stop.Values[c])
-					if bound > lower && bound < upper && (t <= 0 || t >= 1) {
+					if math.IsNaN(t) || bound > lower && bound < upper && (t <= 0 || t >= 1) {
 						return nil
 					}
 					if t > 0 && t < 1 {
@@ -656,7 +664,7 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		if err != nil {
 			return Paint{}, err
 		}
-		if d[0] >= d[1] {
+		if !finiteFloats(d) || d[0] >= d[1] {
 			return Paint{}, fmt.Errorf("invalid shading domain")
 		}
 		domain = [2]float64(d)
@@ -670,6 +678,9 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 	coords, err := p.reader.numberArray(shading["Coords"], count)
 	if err != nil {
 		return Paint{}, err
+	}
+	if !finiteFloats(coords) {
+		return Paint{}, fmt.Errorf("invalid shading coordinates")
 	}
 	start := Point{coords[0], coords[1]}
 	if count == 6 {

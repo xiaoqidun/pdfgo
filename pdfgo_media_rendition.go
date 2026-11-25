@@ -255,7 +255,7 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 		if err != nil {
 			return nil, err
 		}
-		if typeValue != Name("XObject") || kind != Name("Form") || contentType != nil {
+		if (typeValue != nil && typeValue != Name("XObject")) || kind != Name("Form") || contentType != nil {
 			return nil, fmt.Errorf("invalid form media clip")
 		}
 		result.Form = stream

@@ -104,6 +104,16 @@ func (r *Reader) mediaDictionary(object Object, optional bool) (Dictionary, erro
 // 入参: object 数组或引用
 // 返回: []Dictionary 字典列表, error 数组、字典或引用错误
 func (r *Reader) mediaDictionaries(object Object) ([]Dictionary, error) {
+	return r.mediaDictionariesContext(context.Background(), object)
+}
+
+// mediaDictionariesContext 按取消上下文读取媒体字典数组，不预先解析字典内的脚本或数据流
+// 入参: ctx 取消上下文, object 数组或引用
+// 返回: []Dictionary 字典列表, error 数组、字典、引用或取消错误
+func (r *Reader) mediaDictionariesContext(ctx context.Context, object Object) ([]Dictionary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil || value == nil {
 		return nil, err
@@ -114,13 +124,16 @@ func (r *Reader) mediaDictionaries(object Object) ([]Dictionary, error) {
 	}
 	result := make([]Dictionary, 0, len(array))
 	for _, object := range array {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		dict, err := r.mediaDictionary(object, false)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, dict)
 	}
-	return result, nil
+	return result, ctx.Err()
 }
 
 // resolveIndirect 解析间接引用链并返回最终间接引用与目标对象，直接对象返回零值引用与原对象
@@ -172,10 +185,13 @@ func (r *Reader) resolveIndirectReference(object Object) (Reference, error) {
 	return ref, err
 }
 
-// mediaDictionariesWithRefs 读取媒体字典数组及其间接引用，不预先解析字典内的脚本或数据流
-// 入参: object 数组或引用
-// 返回: []Dictionary 字典列表, []Reference 对应间接引用列表, error 数组、字典或引用错误
-func (r *Reader) mediaDictionariesWithRefs(object Object) ([]Dictionary, []Reference, error) {
+// mediaDictionariesWithRefs 按取消上下文读取媒体字典数组及其间接引用，不预先解析字典内的脚本或数据流
+// 入参: ctx 取消上下文, object 数组或引用
+// 返回: []Dictionary 字典列表, []Reference 对应间接引用列表, error 数组、字典、引用或取消错误
+func (r *Reader) mediaDictionariesWithRefs(ctx context.Context, object Object) ([]Dictionary, []Reference, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	value, err := r.Resolve(object)
 	if err != nil || value == nil {
 		return nil, nil, err
@@ -187,18 +203,21 @@ func (r *Reader) mediaDictionariesWithRefs(object Object) ([]Dictionary, []Refer
 	result := make([]Dictionary, 0, len(array))
 	refs := make([]Reference, 0, len(array))
 	for _, item := range array {
-		ref, err := r.resolveIndirectReference(item)
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		ref, value, err := r.resolveIndirect(item)
 		if err != nil {
 			return nil, nil, err
 		}
-		dict, err := r.mediaDictionary(item, false)
-		if err != nil {
-			return nil, nil, err
+		dict, ok := value.(Dictionary)
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid media dictionary")
 		}
 		result = append(result, dict)
 		refs = append(refs, ref)
 	}
-	return result, refs, nil
+	return result, refs, ctx.Err()
 }
 
 // ReadThreeD 解析3D注解及共享数据引用，保留模型原始编码和视图选择
@@ -262,7 +281,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 	if !ok || result.Format == "" {
 		return result, fmt.Errorf("invalid 3D format")
 	}
-	result.Views, result.ViewReferences, err = r.mediaDictionariesWithRefs(stream.Dictionary["VA"])
+	result.Views, result.ViewReferences, err = r.mediaDictionariesWithRefs(ctx, stream.Dictionary["VA"])
 	if err != nil {
 		return result, err
 	}
@@ -308,6 +327,9 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 			return result, err
 		}
 		for i, view := range result.Views {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
 			value, err := r.Resolve(view["IN"])
 			if err != nil {
 				return result, err
@@ -431,7 +453,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 
 // ReadRichMedia 解析资源名称树和实例配置，允许实例资源不出现在名称树中
 // 入参: ctx 取消上下文, annotation 富媒体注解
-// 返回: RichMedia 媒体信息, error 资源、配置或引用错误
+// 返回: RichMedia 媒体信息, error 资源、配置、引用、关闭或取消错误
 func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (RichMedia, error) {
 	result := RichMedia{}
 	if ctx == nil || r == nil {
@@ -466,7 +488,7 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 	if err != nil {
 		return result, err
 	}
-	configs, configRefs, err := r.mediaDictionariesWithRefs(dict["Configurations"])
+	configs, configRefs, err := r.mediaDictionariesWithRefs(ctx, dict["Configurations"])
 	if err != nil {
 		return result, err
 	}
@@ -486,7 +508,7 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 			return result, fmt.Errorf("invalid rich media configuration subtype")
 		}
 		converted := MediaConfiguration{Reference: configRefs[index], Subtype: kind, Dictionary: config}
-		instances, err := r.mediaDictionaries(config["Instances"])
+		instances, err := r.mediaDictionariesContext(ctx, config["Instances"])
 		if err != nil {
 			return result, err
 		}
@@ -517,7 +539,7 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 		}
 		result.Configurations = append(result.Configurations, converted)
 	}
-	result.Views, err = r.mediaDictionaries(dict["Views"])
+	result.Views, err = r.mediaDictionariesContext(ctx, dict["Views"])
 	if err != nil {
 		return result, err
 	}
@@ -560,5 +582,5 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 			return result, fmt.Errorf("rich media activation configuration is not in content")
 		}
 	}
-	return result, nil
+	return result, ctx.Err()
 }

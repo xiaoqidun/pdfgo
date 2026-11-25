@@ -472,6 +472,9 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 	if width <= 0 || height <= 0 {
 		return nil, nil, fmt.Errorf("invalid replacement image dimensions")
 	}
+	if err := validatePalettedImage(ctx, img); err != nil {
+		return nil, nil, err
+	}
 	switch source := img.(type) {
 	case *packedGrayImage:
 		if source.depth == 1 || source.depth == 2 || source.depth == 4 || source.depth == 8 {
@@ -859,9 +862,6 @@ func encodePDFImagePass(ctx context.Context, img image.Image, bounds image.Recta
 					var c color.NRGBA64
 					if indexes != nil {
 						index := indexes[x]
-						if int(index) >= len(indexed.Palette) {
-							return nil, nil, false, false, fmt.Errorf("palette index out of range")
-						}
 						if !paletteReady[index] {
 							palette[index] = imageNRGBASample(indexed.Palette[index])
 							paletteReady[index] = true
@@ -1030,6 +1030,9 @@ func (r *Reader) prepareImageReplacements(ctx context.Context, images map[Refere
 		bounds := source.Bounds()
 		if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
 			return nil, fmt.Errorf("invalid replacement image dimensions")
+		}
+		if err := validatePalettedImage(ctx, source); err != nil {
+			return nil, err
 		}
 		dict := maps.Clone(original.Stream.Dictionary)
 		for _, key := range []Name{"Length", "Filter", "DecodeParms", "Decode", "Mask", "SMask", "SMaskInData", "ImageMask", "Matte", "F", "FFilter", "FDecodeParms", "Alternates"} {

@@ -310,15 +310,20 @@ func annotationRichWeight(value string) (int, error) {
 	return n, nil
 }
 
-// annotationRichFamilies 解析有序字体名称列表，保留名称中的空格
+// maxAnnotationRichFamilies 限制富文本单条样式允许声明的唯一字体家族数量上限
+const maxAnnotationRichFamilies = 64
+
+// annotationRichFamilies 解析有序字体名称列表，保留名称中的空格并去重限制数量
 // 入参: value 字体列表
-// 返回: []annotationRichFamilyName 字体名称, error 空名称或引号错误
+// 返回: []annotationRichFamilyName 字体名称, error 空名称、超限或引号错误
 func annotationRichFamilies(value string) ([]annotationRichFamilyName, error) {
 	fields, err := splitAnnotationRichCSS(value, ',')
 	if err != nil {
 		return nil, err
 	}
-	families := make([]annotationRichFamilyName, 0, len(fields))
+	capacity := min(len(fields), maxAnnotationRichFamilies)
+	families := make([]annotationRichFamilyName, 0, capacity)
+	seen := make(map[string]bool, capacity)
 	for _, field := range fields {
 		field = strings.TrimSpace(field)
 		quoted := false
@@ -337,7 +342,16 @@ func annotationRichFamilies(value string) ([]annotationRichFamilyName, error) {
 			}
 			field = strings.Join(strings.Fields(field), " ")
 		}
-		families = append(families, annotationRichFamilyName{field, generic})
+		item := annotationRichFamilyName{field, generic}
+		key := strings.ToLower(annotationRichFamily(item))
+		if seen[key] {
+			continue
+		}
+		if len(families) >= maxAnnotationRichFamilies {
+			return nil, fmt.Errorf("%w: rich text font family limit exceeded", ErrStreamLimitExceeded)
+		}
+		seen[key] = true
+		families = append(families, item)
 	}
 	return families, nil
 }

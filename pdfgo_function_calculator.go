@@ -413,7 +413,16 @@ func calculatorOperation(op string, values []calculatorValue) (calculatorValue, 
 	case "floor":
 		result = math.Floor(a)
 	case "round":
-		result = math.Floor(a + 0.5)
+		if math.Trunc(a) == a {
+			result = a
+		} else {
+			f := math.Floor(a)
+			if a-f >= 0.5 {
+				result = f + 1
+			} else {
+				result = f
+			}
+		}
 	case "truncate":
 		result = math.Trunc(a)
 	case "cvi":
@@ -434,6 +443,9 @@ func calculatorOperation(op string, values []calculatorValue) (calculatorValue, 
 		result, integer = math.Atan2(a, b)*180/math.Pi, false
 		if result < 0 {
 			result += 360
+			if result >= 360 {
+				result = 0
+			}
 		}
 	case "exp":
 		result, integer = math.Pow(a, b), false

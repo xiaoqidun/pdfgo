@@ -366,15 +366,21 @@ func (r *Reader) readAnnotationIconFit(object Object) (annotationIconFit, error)
 		}
 		*field.out = name
 	}
-	if fit.kind == "P" && dict["A"] != nil {
-		values, err := r.numberArray(dict["A"], 2)
+	if fit.kind == "P" {
+		value, err := r.Resolve(dict["A"])
 		if err != nil {
 			return fit, err
 		}
-		if values[0] < 0 || values[0] > 1 || values[1] < 0 || values[1] > 1 {
-			return fit, fmt.Errorf("invalid button icon alignment")
+		if value != nil {
+			values, err := r.numberArray(value, 2)
+			if err != nil {
+				return fit, err
+			}
+			if !finiteFloats(values) || values[0] < 0 || values[0] > 1 || values[1] < 0 || values[1] > 1 {
+				return fit, fmt.Errorf("invalid button icon alignment")
+			}
+			fit.x, fit.y = values[0], values[1]
 		}
-		fit.x, fit.y = values[0], values[1]
 	}
 	value, err = r.Resolve(dict["FB"])
 	if err != nil {
@@ -403,8 +409,12 @@ func (r *Reader) writeAnnotationButtonIcon(icon *Stream, fit annotationIconFit, 
 		return err
 	}
 	matrix := Identity()
-	if icon.Dictionary["Matrix"] != nil {
-		values, err := r.numberArray(icon.Dictionary["Matrix"], 6)
+	matrixValue, err := r.Resolve(icon.Dictionary["Matrix"])
+	if err != nil {
+		return err
+	}
+	if matrixValue != nil {
+		values, err := r.numberArray(matrixValue, 6)
 		if err != nil {
 			return err
 		}

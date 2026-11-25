@@ -83,6 +83,9 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 	if err != nil {
 		return nil, err
 	}
+	if !finiteFloats(f.domain) || !finiteFloats(f.bounds) {
+		return nil, fmt.Errorf("invalid sampled function bounds")
+	}
 	for _, ranges := range [][]float64{f.domain, f.bounds} {
 		for i := 0; i < len(ranges); i += 2 {
 			if ranges[i] > ranges[i+1] {
@@ -93,6 +96,9 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 	sizes, err := r.numberArray(dict["Size"], inputs)
 	if err != nil {
 		return nil, err
+	}
+	if !finiteFloats(sizes) {
+		return nil, fmt.Errorf("invalid or truncated sampled function size")
 	}
 	bits, err := r.number(dict["BitsPerSample"])
 	if err != nil || bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 12 && bits != 16 && bits != 24 && bits != 32 {
@@ -147,6 +153,9 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 		if err != nil {
 			return nil, err
 		}
+		if !finiteFloats(f.encode) {
+			return nil, fmt.Errorf("invalid sampled function encode")
+		}
 	}
 	f.decode = f.bounds
 	value, err = r.Resolve(dict["Decode"])
@@ -157,6 +166,9 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 		f.decode, err = r.numberArray(value, 2*outputs)
 		if err != nil {
 			return nil, err
+		}
+		if !finiteFloats(f.decode) {
+			return nil, fmt.Errorf("invalid sampled function decode")
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -182,6 +194,12 @@ func (f *sampledFunction) evaluate(inputs, outputs []float64) {
 		value = math.Max(f.domain[2*i], math.Min(f.domain[2*i+1], value))
 		value = functionValue(functionPosition(value, f.domain[2*i], f.domain[2*i+1]), f.encode[2*i], f.encode[2*i+1])
 		value = math.Max(0, math.Min(float64(f.sizes[i]-1), value))
+		if math.IsNaN(value) {
+			for c := range outputs {
+				outputs[c] = math.NaN()
+			}
+			return
+		}
 		lower[i] = int(value)
 		upper[i] = min(lower[i]+1, f.sizes[i]-1)
 		weights[i] = value - float64(lower[i])
@@ -231,6 +249,12 @@ func (f *sampledFunction) evaluateCubic(inputs, outputs []float64) {
 	for i, value := range inputs {
 		value = math.Max(f.domain[2*i], math.Min(f.domain[2*i+1], value))
 		value = functionValue(functionPosition(value, f.domain[2*i], f.domain[2*i+1]), f.encode[2*i], f.encode[2*i+1])
+		if math.IsNaN(value) {
+			for c := range outputs {
+				outputs[c] = math.NaN()
+			}
+			return
+		}
 		indices[i], weights[i] = sampledSplineSpan(value, f.sizes[i])
 	}
 	clear(outputs)

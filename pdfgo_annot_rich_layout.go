@@ -43,11 +43,21 @@ type annotationRichLine struct {
 	advance float64
 }
 
+// annotationRichStyleKey 按影响选字的样式字段复用字体选择缓存
+type annotationRichStyleKey struct {
+	first   *annotationRichFamilyName
+	length  int
+	weight  int
+	stretch int
+	italic  int8
+}
+
 // annotationRichGlyphs 按富文本样式选择源编码，分格可保留零字号字符的位置
 // 入参: ctx 取消上下文, fonts 字体选择器, paragraphs 富文本, keepZero 是否保留零字号字符
 // 返回: [][]annotationRichGlyph 段落字符, error 字体、编码或布局错误
 func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, paragraphs []annotationRichParagraph, keepZero bool) ([][]annotationRichGlyph, error) {
 	glyphs := make([][]annotationRichGlyph, len(paragraphs))
+	selections := make(map[annotationRichStyleKey]*annotationRichFontSelection)
 	for i := range paragraphs {
 		capacity := 0
 		for _, run := range paragraphs[i].runs {
@@ -71,7 +81,24 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 				continue
 			}
 			start := len(glyphs[i])
-			selection := annotationRichFontSelection{source: fonts, style: &run.style}
+			key := annotationRichStyleKey{length: len(run.style.families), weight: run.style.weight, stretch: run.style.stretch}
+			if key.length != 0 {
+				key.first = &run.style.families[0]
+			}
+			if run.style.italic != nil {
+				if *run.style.italic {
+					key.italic = 2
+				} else {
+					key.italic = 1
+				}
+			}
+			selection := selections[key]
+			if selection == nil {
+				selection = &annotationRichFontSelection{source: fonts, style: &run.style}
+				if len(selections) < 256 {
+					selections[key] = selection
+				}
+			}
 			for _, ch := range run.text {
 				if err := ctx.Err(); err != nil {
 					return nil, err
