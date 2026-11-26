@@ -2715,7 +2715,7 @@ func (p *pageInterpreter) extState(a []Object, offset int64) error {
 // 入参: dict 图形状态字典
 // 返回: error 参数或资源错误
 func (p *pageInterpreter) applyExtState(dict Dictionary) error {
-	if p.uncoloredPattern || p.uncoloredType3 {
+	if p.uncoloredPattern {
 		for _, key := range []Name{"RI", "TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT"} {
 			value, err := p.reader.Resolve(dict[key])
 			if err != nil {
@@ -2725,10 +2725,6 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				return fmt.Errorf("color graphics state in uncolored content")
 			}
 		}
-	}
-	transfer, err := p.reader.Resolve(dict["TR2"])
-	if err != nil {
-		return err
 	}
 	nonstrokingOverprint, err := p.reader.Resolve(dict["op"])
 	if err != nil {
@@ -2741,10 +2737,13 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 		default:
 			continue
 		}
-		if key == "TR" && transfer != nil {
-			continue
+		if p.uncoloredType3 {
+			switch key {
+			case "RI", "TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT":
+				continue
+			}
 		}
-		if key == "BG" || key == "UCR" {
+		if key == "TR" || key == "BG" || key == "UCR" {
 			replacement, err := p.reader.Resolve(dict[key+"2"])
 			if err != nil {
 				return err

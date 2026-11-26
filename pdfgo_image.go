@@ -2149,7 +2149,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			mask = &imageResample{source: decoded, bounds: decoded.Bounds(), interpolate: maskImage.Interpolate}
 		}
 	}
-	deferScale := outSize != (image.Point{}) && (mask != nil && len(matte) == 0 || len(keys) != 0 || palette != nil && embeddedMask != 0)
+	deferScale := outSize != (image.Point{}) && (mask != nil && len(matte) == 0 || len(keys) != 0 || embeddedMask == 1)
 	sampleSize := outSize
 	if deferScale || palette != nil {
 		sampleSize = image.Point{}

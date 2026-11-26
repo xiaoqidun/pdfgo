@@ -167,6 +167,13 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 					if err != nil {
 						return nil, err
 					}
+				case attr.Name.Space == "" && attr.Name.Local == "dir":
+					if strings.EqualFold(attr.Value, "rtl") {
+						return nil, &UnsupportedError{Feature: "rich text direction rtl"}
+					}
+					if !strings.EqualFold(attr.Value, "ltr") {
+						return nil, fmt.Errorf("invalid rich text direction")
+					}
 				case attr.Name.Space == "xmlns" || attr.Name.Local == "xmlns", (attr.Name.Space == "http://www.xfa.org/schema/xfa-data/1.0/" || attr.Name.Space == "http://www.xfa.org/schema/xfa-data/1.0") && (attr.Name.Local == "contentType" || attr.Name.Local == "APIVersion" || attr.Name.Local == "spec"):
 				default:
 					return nil, &UnsupportedError{Feature: "rich text attribute " + attr.Name.Local}

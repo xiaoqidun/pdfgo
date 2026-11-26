@@ -304,7 +304,11 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	if err != nil {
 		return Paint{}, err
 	}
-	if d["Function"] != nil {
+	fnValue, err := p.reader.Resolve(d["Function"])
+	if err != nil {
+		return Paint{}, err
+	}
+	if fnValue != nil {
 		g.function, err = p.reader.readGradientVectorContext(p.ctx, d["Function"], components, 0)
 		if err != nil {
 			return Paint{}, err

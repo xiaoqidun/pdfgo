@@ -124,7 +124,7 @@ func (r *Reader) writeAnnotationPushButton(ctx context.Context, annotation Annot
 		}
 	}
 	if caption != "" {
-		return r.writeAnnotationButtonCaption(ctx, annotation, mk, caption, textFrame, border, resources, content)
+		return r.writeAnnotationButtonCaption(ctx, annotation, mk, caption, nil, textFrame, border, resources, content)
 	}
 	return nil
 }
@@ -175,11 +175,20 @@ func (r *Reader) writeAnnotationToggleButton(ctx context.Context, annotation Ann
 		return err
 	}
 	if caption != nil {
-		text, err := r.readAnnotationText(ctx, Annotation{Dictionary: mk}, "CA", nil)
+		if raw, ok := annotationRawSingleByte(caption); ok {
+			if len(raw) > annotationRichContentLimit(r) {
+				return fmt.Errorf("%w: annotation text limit exceeded", ErrStreamLimitExceeded)
+			}
+			return r.writeAnnotationButtonCaption(ctx, annotation, mk, "", raw, frame, border, resources, content)
+		}
+		if _, ok := caption.(String); !ok {
+			return fmt.Errorf("invalid annotation CA: expected text string")
+		}
+		text, err := r.annotationTextStringValue(ctx, caption)
 		if err != nil || text == "" {
 			return err
 		}
-		return r.writeAnnotationButtonCaption(ctx, annotation, mk, text, frame, border, resources, content)
+		return r.writeAnnotationButtonCaption(ctx, annotation, mk, text, nil, frame, border, resources, content)
 	}
 	if radio {
 		content.WriteString("0 g\n")
@@ -315,9 +324,9 @@ func (r *Reader) annotationButtonState(ctx context.Context, annotation Annotatio
 }
 
 // writeAnnotationButtonCaption 绘制按钮标题，未声明DA时选择可编码字体并自动适配字号
-// 入参: ctx 取消上下文, annotation 控件, mk 外观属性, caption 标题, frame 内框, border 边框, resources 外观资源, content 内容
+// 入参: ctx 取消上下文, annotation 控件, mk 外观属性, caption 标题, rawCaption 开关按钮原始单字节标题, frame 内框, border 边框, resources 外观资源, content 内容
 // 返回: error 标题、字体或布局错误
-func (r *Reader) writeAnnotationButtonCaption(ctx context.Context, annotation Annotation, mk Dictionary, caption string, frame Rectangle, border *annotationBorder, resources Dictionary, content *strings.Builder) error {
+func (r *Reader) writeAnnotationButtonCaption(ctx context.Context, annotation Annotation, mk Dictionary, caption string, rawCaption String, frame Rectangle, border *annotationBorder, resources Dictionary, content *strings.Builder) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -331,9 +340,31 @@ func (r *Reader) writeAnnotationButtonCaption(ctx context.Context, annotation An
 		return err
 	}
 	if value == nil {
-		encoded, err := r.annotationCaptionFont(ctx, resources, caption)
-		if err != nil {
-			return err
+		var fontObject Object
+		if len(rawCaption) > 0 {
+			zapf := Dictionary{"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("ZapfDingbats")}
+			font, err := r.ReadFontContext(ctx, zapf)
+			if err != nil {
+				return err
+			}
+			if _, err := annotationZapfDingbatsLetters(ctx, font, rawCaption); err == nil {
+				fontObject = zapf
+			} else if isFatalReaderError(err) {
+				return err
+			}
+		}
+		if fontObject == nil {
+			if len(rawCaption) > 0 {
+				caption, err = r.annotationTextStringValue(ctx, rawCaption)
+				if err != nil {
+					return err
+				}
+			}
+			encoded, err := r.annotationCaptionFont(ctx, resources, caption)
+			if err != nil {
+				return err
+			}
+			fontObject = encoded.object
 		}
 		value, err := r.Resolve(resources["Font"])
 		if err != nil {
@@ -351,7 +382,7 @@ func (r *Reader) writeAnnotationButtonCaption(ctx context.Context, annotation An
 		for i := 1; fonts[name] != nil; i++ {
 			name = Name(fmt.Sprintf("ButtonCaption%d", i))
 		}
-		fonts[name] = encoded.object
+		fonts[name] = fontObject
 		resources["Font"] = fonts
 		annotation.Dictionary = maps.Clone(annotation.Dictionary)
 		annotation.Dictionary["DA"] = String("/" + escapeAnnotationName(name) + " 0 Tf 0 g")

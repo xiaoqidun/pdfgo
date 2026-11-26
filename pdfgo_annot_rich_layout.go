@@ -410,7 +410,8 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 	if err != nil {
 		return err
 	}
-	multiline := annotation.Subtype == "FreeText" || flags&(1<<12) != 0
+	free := annotation.Subtype == "FreeText"
+	multiline := free || flags&(1<<12) != 0
 	if !multiline && len(paragraphs) > 1 {
 		all := glyphs[0]
 		for i := 1; i < len(glyphs); i++ {
@@ -441,7 +442,7 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 		layout := annotationRichVertical{
 			glyphs: glyphs, paragraphs: paragraphs, state: state, defaults: stateContent, matrix: matrix,
 			frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
-			multiline: multiline, comb: comb, align: int(align), maxBytes: contentLimit,
+			multiline: multiline, comb: comb, align: int(align), maxBytes: contentLimit, free: free,
 		}
 		return layout.write(ctx, content)
 	}
@@ -485,8 +486,6 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 	if err != nil {
 		return err
 	}
-	content.WriteString("q\n")
-	writeAnnotationOperation(content, "re W n", x, y, clipWidth, clipHeight)
 	decorated := annotationRichDecorated(lines)
 	var decorations annotationRichDecorations
 	var decorationDefaults string
@@ -495,6 +494,13 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 		if err != nil {
 			return err
 		}
+	}
+	content.WriteString("q\n")
+	writeAnnotationOperation(content, "re W n", x, y, clipWidth, clipHeight)
+	if !free {
+		content.WriteString("/Tx BMC\n")
+	}
+	if decorated {
 		content.WriteString("q\n")
 	}
 	content.WriteString("BT\n")
@@ -553,6 +559,9 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 		if err := writeAnnotationRichDecorations(ctx, content, decorations.spans, decorationDefaults, matrix, contentLimit); err != nil {
 			return err
 		}
+	}
+	if !free {
+		content.WriteString("EMC\n")
 	}
 	content.WriteString("Q\n")
 	if content.Len() > contentLimit {

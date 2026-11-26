@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"maps"
@@ -81,6 +82,49 @@ func annotationChoiceVisibleText(ctx context.Context, text string, state graphic
 		leading = size * 1.2
 	}
 	return annotationChoiceVisibleLines(ctx, text, height, leading)
+}
+
+// annotationRawSingleByte 提取不带Unicode字节序标记的非空单字节字符串
+// 入参: value 已解析的对象
+// 返回: String 原始字节串, bool 是否为非空单字节串
+func annotationRawSingleByte(value Object) (String, bool) {
+	raw, ok := value.(String)
+	if !ok || len(raw) == 0 {
+		return nil, false
+	}
+	if bytes.HasPrefix(raw, []byte{0xfe, 0xff}) || bytes.HasPrefix(raw, []byte{0xff, 0xfe}) || bytes.HasPrefix(raw, []byte{0xef, 0xbb, 0xbf}) {
+		return nil, false
+	}
+	return raw, true
+}
+
+// annotationZapfDingbatsLetters 按单字节ZapfDingbats编码查找已定义字形并构造排版字符
+// 入参: ctx 取消上下文, font 字体, raw 原始单字节串
+// 返回: []annotationLetter 编码与度量, error 缺字、解码或取消错误
+func annotationZapfDingbatsLetters(ctx context.Context, font *Font, raw String) ([]annotationLetter, error) {
+	letters := make([]annotationLetter, 0, len(raw))
+	for i, b := range raw {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		code := string([]byte{b})
+		glyph, ok, err := font.encodingGlyph(ctx, code)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, &UnsupportedError{Feature: fmt.Sprintf("font cannot encode ZapfDingbats byte 0x%02X", b)}
+		}
+		ch, _ := utf8.DecodeRuneInString(glyph.Text)
+		letter := annotationLetter{text: ch, code: code, width: glyph.Width, word: glyph.WordSpace}
+		if font.Vertical {
+			letter.vertical = &glyph.Vertical
+		}
+		letters = append(letters, letter)
+	}
+	return letters, ctx.Err()
 }
 
 // annotationLetters 将Unicode文本映射回原字体字符码，不替换缺失字形
@@ -376,8 +420,22 @@ func (r *Reader) annotationTextString(ctx context.Context, object Object) (strin
 	if err != nil || value == nil {
 		return "", err
 	}
+	return r.annotationTextStringValue(ctx, value)
+}
+
+// annotationTextStringValue 解码已解析的文本字符串或文本流，并统一换行符
+// 入参: ctx 取消上下文, value 已解析对象
+// 返回: string Unicode文本, error 类型、编码、超限或取消错误
+func (r *Reader) annotationTextStringValue(ctx context.Context, value Object) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if value == nil {
+		return "", nil
+	}
 	limit := annotationRichContentLimit(r)
 	var data []byte
+	var err error
 	switch value := value.(type) {
 	case String:
 		if len(value) > 3 && (len(value)-3)/2 > limit {
@@ -690,9 +748,33 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		return &UnsupportedError{Feature: "generated field type"}
 	}
 	var text string
+	var rawButton String
+	var textErr error
 	var err error
 	if choice == nil {
-		text, err = r.annotationTextString(ctx, textObject)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		value, resolveErr := r.Resolve(textObject)
+		if canceled := ctx.Err(); canceled != nil {
+			return canceled
+		}
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if !free && dict["FT"] == Name("Btn") {
+			if raw, ok := annotationRawSingleByte(value); ok {
+				if len(raw) > annotationRichContentLimit(r) {
+					return fmt.Errorf("%w: annotation text limit exceeded", ErrStreamLimitExceeded)
+				}
+				rawButton = raw
+			}
+		}
+		text, err = r.annotationTextStringValue(ctx, value)
+		if err != nil && len(rawButton) > 0 && !isFatalReaderError(err) {
+			textErr = err
+			err = nil
+		}
 	} else if choice.Combo {
 		if len(choice.Selected) != 0 {
 			text = choice.Options[choice.Selected[0]].Label
@@ -727,7 +809,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if choice != nil && choice.Combo {
 		text = strings.NewReplacer("\r", " ", "\n", " ").Replace(text)
 	}
-	if text == "" && !(choice != nil && !choice.Combo && len(choice.Options) > choice.TopIndex) {
+	if text == "" && len(rawButton) == 0 && !(choice != nil && !choice.Combo && len(choice.Options) > choice.TopIndex) {
 		return nil
 	}
 	textField := !free && dict["FT"] == Name("Tx")
@@ -794,15 +876,30 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			return err
 		}
 	}
-	if r.textShaper != nil && !p.state.font.Vertical && comb == 0 && annotationNeedsShaping(text) {
-		layout := annotationShapedText{
-			text: text, matrix: matrix, font: fontName, defaults: stateContent,
-			frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
-			align: align, multiline: multiline, free: free, choice: choice,
+	var letters []annotationLetter
+	if len(rawButton) > 0 && p.state.font.Name == "ZapfDingbats" {
+		if textErr == nil {
+			letters, err = annotationLetters(ctx, p.state.font, text)
+		} else {
+			err = textErr
 		}
-		return layout.write(ctx, r.textShaper, p, resources, content)
+		if err != nil && !isFatalReaderError(err) {
+			letters, err = annotationZapfDingbatsLetters(ctx, p.state.font, rawButton)
+		}
+	} else {
+		if textErr != nil {
+			return textErr
+		}
+		if r.textShaper != nil && !p.state.font.Vertical && comb == 0 && annotationNeedsShaping(text) {
+			layout := annotationShapedText{
+				text: text, matrix: matrix, font: fontName, defaults: stateContent,
+				frame: Rectangle{x, y, x + width, y + height}, clip: Rectangle{x, y, x + clipWidth, y + clipHeight},
+				align: align, multiline: multiline, free: free, choice: choice,
+			}
+			return layout.write(ctx, r.textShaper, p, resources, content)
+		}
+		letters, err = annotationLetters(ctx, p.state.font, text)
 	}
-	letters, err := annotationLetters(ctx, p.state.font, text)
 	if err != nil {
 		return err
 	}
@@ -1103,31 +1200,121 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 	return p, fontName, stateContent.String(), err
 }
 
-// annotationDefaultColor 读取自由文本默认外观的边框颜色
-// 入参: ctx 取消上下文, object 默认外观字符串
-// 返回: Array 设备颜色, error 属性或颜色空间错误
-func (r *Reader) annotationDefaultColor(ctx context.Context, object Object) (Array, error) {
+// annotationDefaultDeviceSpace 展开颜色空间资源别名，判断其是否为标准设备色彩空间
+// 入参: name 颜色空间名称, resources 合并后的资源字典
+// 返回: Name 标准设备空间名，非设备空间时为空, error 引用错误
+func (r *Reader) annotationDefaultDeviceSpace(name Name, resources Dictionary) (Name, error) {
+	if name == "DeviceGray" || name == "DeviceRGB" || name == "DeviceCMYK" {
+		return name, nil
+	}
+	spacesValue, err := r.Resolve(resources["ColorSpace"])
+	if err != nil {
+		return "", err
+	}
+	spaces, ok := spacesValue.(Dictionary)
+	if !ok {
+		return "", nil
+	}
+	var seen map[Name]bool
+	current := name
+	for {
+		entry, err := r.Resolve(spaces[current])
+		if err != nil || entry == nil {
+			return "", err
+		}
+		if arr, ok := entry.(Array); ok && len(arr) == 1 {
+			entry, err = r.Resolve(arr[0])
+			if err != nil {
+				return "", err
+			}
+		}
+		target, ok := entry.(Name)
+		if !ok {
+			return "", nil
+		}
+		if target == "DeviceGray" || target == "DeviceRGB" || target == "DeviceCMYK" {
+			return target, nil
+		}
+		if seen == nil {
+			seen = map[Name]bool{current: true}
+		}
+		if seen[target] {
+			return "", nil
+		}
+		seen[target] = true
+		current = target
+	}
+}
+
+// annotationDefaultColor 读取自由文本默认外观的边框颜色及色彩空间类别
+// 入参: ctx 取消上下文, object 默认外观字符串, resources 合并后的资源字典
+// 返回: Array 设备颜色, bool 最终填充色是否来自非设备色彩空间, error 属性或操作数错误
+func (r *Reader) annotationDefaultColor(ctx context.Context, object Object, resources Dictionary) (Array, bool, error) {
 	value, err := r.Resolve(object)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	data, ok := value.(String)
 	if !ok {
-		return nil, fmt.Errorf("missing free text default appearance")
+		return nil, false, fmt.Errorf("missing free text default appearance")
 	}
 	color := Array{Integer(0)}
+	space := Name("DeviceGray")
 	err = walkOperationsBorrowed(ctx, data, func(op Operation) error {
 		switch op.Operator {
 		case "g", "rg", "k":
-			count := map[string]int{"g": 1, "rg": 3, "k": 4}[op.Operator]
+			count, target := 1, Name("DeviceGray")
+			if op.Operator == "rg" {
+				count, target = 3, "DeviceRGB"
+			} else if op.Operator == "k" {
+				count, target = 4, "DeviceCMYK"
+			}
+			if _, err := numbers(op.Operands, count); err != nil {
+				return err
+			}
+			color, space = slices.Clone(op.Operands), target
+		case "cs":
+			if len(op.Operands) != 1 {
+				return fmt.Errorf("invalid color space")
+			}
+			name, ok := op.Operands[0].(Name)
+			if !ok {
+				return fmt.Errorf("invalid color space name")
+			}
+			resolved, err := r.annotationDefaultDeviceSpace(name, resources)
+			if err != nil {
+				return err
+			}
+			space = resolved
+			switch resolved {
+			case "DeviceGray":
+				color = Array{Integer(0)}
+			case "DeviceRGB":
+				color = Array{Integer(0), Integer(0), Integer(0)}
+			case "DeviceCMYK":
+				color = Array{Integer(0), Integer(0), Integer(0), Integer(1)}
+			}
+		case "sc", "scn":
+			var count int
+			switch space {
+			case "DeviceGray":
+				count = 1
+			case "DeviceRGB":
+				count = 3
+			case "DeviceCMYK":
+				count = 4
+			default:
+				if len(op.Operands) == 0 {
+					return fmt.Errorf("invalid color operands")
+				}
+				return nil
+			}
 			if _, err := numbers(op.Operands, count); err != nil {
 				return err
 			}
 			color = slices.Clone(op.Operands)
-		case "cs", "sc", "scn":
-			return &UnsupportedError{Feature: "generated free text non-device border color"}
 		}
 		return nil
 	})
-	return color, err
+	return color, space == "", err
 }

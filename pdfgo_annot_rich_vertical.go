@@ -35,6 +35,7 @@ type annotationRichVertical struct {
 	comb       int
 	align      int
 	maxBytes   int
+	free       bool
 }
 
 // annotationRichColumn 保存混合字体列及其占用范围
@@ -145,6 +146,9 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 	}
 	content.WriteString("q\n")
 	writeAnnotationOperation(content, "re W n", v.clip.XMin, v.clip.YMin, v.clip.XMax-v.clip.XMin, v.clip.YMax-v.clip.YMin)
+	if !v.free {
+		content.WriteString("/Tx BMC\n")
+	}
 	if decorated {
 		content.WriteString("q\n")
 	}
@@ -249,6 +253,9 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 		if err := v.decorate(ctx, content, decorations, decorationDefaults); err != nil {
 			return err
 		}
+	}
+	if !v.free {
+		content.WriteString("EMC\n")
 	}
 	content.WriteString("Q\n")
 	if content.Len() > v.maxBytes {

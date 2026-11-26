@@ -57,7 +57,11 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 	}
 	frame.XMin, frame.XMax = frame.XMin-box.XMin, frame.XMax-box.XMin
 	frame.YMin, frame.YMax = frame.YMin-box.YMin, frame.YMax-box.YMin
-	color, err := r.annotationDefaultColor(ctx, dict["DA"])
+	resources, err := r.freeTextResources(page.Resources)
+	if err != nil {
+		return nil, err
+	}
+	color, nonDevice, err := r.annotationDefaultColor(ctx, dict["DA"], resources)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +71,9 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 	border, err := r.readAnnotationBorder(borderAnnotation)
 	if err != nil {
 		return nil, err
+	}
+	if nonDevice && border.width > 0 {
+		return nil, &UnsupportedError{Feature: "generated free text non-device border color"}
 	}
 	var content strings.Builder
 	contentLimit := annotationRichContentLimit(r)
@@ -132,10 +139,6 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 		default:
 			return nil, &UnsupportedError{Feature: "generated free text border style " + string(border.style)}
 		}
-	}
-	resources, err := r.freeTextResources(page.Resources)
-	if err != nil {
-		return nil, err
 	}
 	if err := r.writeAnnotationText(ctx, annotation, nil, 0, frame, border, resources, &content); err != nil {
 		return nil, err

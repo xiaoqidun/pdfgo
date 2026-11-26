@@ -611,8 +611,12 @@ func (p *pageInterpreter) shadingFill(operands []Object, offset int64) error {
 	style := p.state.style
 	paint.Alpha = style.Fill.Alpha
 	style.Fill = paint
-	if dict["BBox"] != nil {
-		box, err := p.reader.rectangle(dict["BBox"])
+	boundsValue, err := p.reader.Resolve(dict["BBox"])
+	if err != nil {
+		return err
+	}
+	if boundsValue != nil {
+		box, err := p.reader.rectangle(boundsValue)
 		if err != nil {
 			return err
 		}
@@ -662,12 +666,16 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		return p.functionShading(shading, m)
 	}
 	domain := [2]float64{0, 1}
-	if shading["Domain"] != nil {
-		d, err := p.reader.numberArray(shading["Domain"], 2)
+	domainValue, err := p.reader.Resolve(shading["Domain"])
+	if err != nil {
+		return Paint{}, err
+	}
+	if domainValue != nil {
+		d, err := p.reader.numberArray(domainValue, 2)
 		if err != nil {
 			return Paint{}, err
 		}
-		if !finiteFloats(d) || d[0] >= d[1] {
+		if !finiteFloats(d) {
 			return Paint{}, fmt.Errorf("invalid shading domain")
 		}
 		domain = [2]float64(d)
@@ -723,12 +731,12 @@ func (p *pageInterpreter) shadingPaint(shading Dictionary, m Matrix) (Paint, err
 		end := Point{coords[3], coords[4]}
 		paint.Radial = &RadialGradient{Matrix: m, Start: start, End: end, StartRadius: coords[2], EndRadius: coords[5]}
 	}
-	if shading["Extend"] != nil {
-		v, err := p.reader.Resolve(shading["Extend"])
-		if err != nil {
-			return Paint{}, err
-		}
-		a, ok := v.(Array)
+	extendValue, err := p.reader.Resolve(shading["Extend"])
+	if err != nil {
+		return Paint{}, err
+	}
+	if extendValue != nil {
+		a, ok := extendValue.(Array)
 		if !ok || len(a) != 2 {
 			return Paint{}, fmt.Errorf("invalid shading extension")
 		}

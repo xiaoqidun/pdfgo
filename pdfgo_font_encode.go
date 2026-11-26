@@ -379,7 +379,7 @@ func (f *Font) encodingGlyph(ctx context.Context, code string) (Glyph, bool, err
 		return Glyph{}, false, nil
 	}
 	if f.cidMap != nil {
-		if _, mapped, err := f.cidMap.mappedCID(ctx, []byte(code)); err != nil || !mapped {
+		if cid, mapped, err := f.cidMap.mappedCID(ctx, []byte(code)); err != nil || !mapped || len(f.Program) != 0 && !f.hasCIDGlyph(uint32(cid)) {
 			return Glyph{}, false, err
 		}
 	}
@@ -390,8 +390,24 @@ func (f *Font) encodingGlyph(ctx context.Context, code string) (Glyph, bool, err
 	if len(glyphs) != 1 || glyphs[0].HasID && glyphs[0].ID == 0 || glyphs[0].Name == ".notdef" {
 		return Glyph{}, false, nil
 	}
-	if !glyphs[0].HasID && f.Subtype == Name("TrueType") && f.simpleGlyphName(glyphs[0].Code, nil) == ".notdef" {
-		return Glyph{}, false, nil
+	if !glyphs[0].HasID && f.Subtype == Name("TrueType") {
+		var core *coreFontMetrics
+		if f.coreName != "" {
+			fonts, err := coreFonts()
+			if err != nil {
+				return Glyph{}, false, err
+			}
+			core = fonts[f.coreName]
+		}
+		name := f.simpleGlyphName(glyphs[0].Code, core)
+		if name == ".notdef" {
+			return Glyph{}, false, nil
+		}
+		if core != nil && name != "" {
+			if _, exists := core.widths[name]; !exists {
+				return Glyph{}, false, nil
+			}
+		}
 	}
 	return glyphs[0], true, nil
 }
