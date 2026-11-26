@@ -463,6 +463,19 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 						maskRoots = append(maskRoots, v[key])
 					}
 				}
+				if v["Alternates"] != nil {
+					if v["ImageMask"] == Boolean(true) {
+						maskRoots = append(maskRoots, v["Alternates"])
+					} else if _, indirect := v["ImageMask"].(Reference); indirect {
+						maskVal, maskErr := resolveOptValue(v["ImageMask"])
+						if maskErr != nil {
+							return maskErr
+						}
+						if maskVal == Boolean(true) {
+							maskRoots = append(maskRoots, v["Alternates"])
+						}
+					}
+				}
 				if options.Compression.ImageDPI() > 0 && v["CharProcs"] != nil {
 					noDownsampleRoots = append(noDownsampleRoots, v["CharProcs"])
 				}

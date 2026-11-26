@@ -209,7 +209,7 @@ func (r *Reader) readDeviceNSpace(space Array, effective bool, depth int) (*devi
 
 // readDeviceNSpaceContext 在取消上下文内读取原始多色或已校验的默认空间替换
 // 入参: ctx 取消上下文, space 多色数组, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: *deviceNSpace 专色变换, error 定义、函数或取消错误
+// 返回: *deviceNSpace 专色变换, error 定义、函数、预算或取消错误
 func (r *Reader) readDeviceNSpaceContext(ctx context.Context, space Array, effective bool, depth int) (*deviceNSpace, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -220,6 +220,7 @@ func (r *Reader) readDeviceNSpaceContext(ctx context.Context, space Array, effec
 	if len(space) != 4 && len(space) != 5 || space[0] != Name("DeviceN") {
 		return nil, fmt.Errorf("invalid DeviceN color space")
 	}
+	ctx = withGradientParseBudget(ctx, r)
 	object, err := r.Resolve(space[1])
 	if err != nil {
 		return nil, err
@@ -247,7 +248,7 @@ func (r *Reader) readDeviceNSpaceContext(ctx context.Context, space Array, effec
 
 // readMultiDeviceN 读取多分量专色的备用空间、区间和着色函数
 // 入参: ctx 取消上下文, space 多色定义, effective 是否已按资源校验并替换, depth 嵌套深度
-// 返回: *deviceNSpace 专色变换, error 解析或取消错误
+// 返回: *deviceNSpace 专色变换, error 解析、预算或取消错误
 func (r *Reader) readMultiDeviceN(ctx context.Context, space Array, effective bool, depth int) (*deviceNSpace, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -288,56 +289,72 @@ func (r *Reader) readMultiDeviceN(ctx context.Context, space Array, effective bo
 		}
 		result := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), sampled: function, none: alternate.none}
 		if alternate.separation != nil || alternate.deviceN != nil {
-			result.nested, result.none = alternate, alternate.none
+			result.nested = alternate
 		}
 		return result, nil
 	}
 	if !ok || kind != Integer(4) {
 		return nil, &UnsupportedError{Feature: "DeviceN tint function"}
 	}
-	input, err := r.numberArray(stream.Dictionary["Domain"], 2*len(names))
-	if err != nil {
-		return nil, err
-	}
-	output, err := r.numberArray(stream.Dictionary["Range"], 2*alternate.components)
-	if err != nil {
-		return nil, err
-	}
-	if !finiteFloats(input) || !finiteFloats(output) {
-		return nil, fmt.Errorf("invalid DeviceN tint bounds")
-	}
-	for _, bounds := range [][]float64{input, output} {
-		for i := 0; i < len(bounds); i += 2 {
-			if bounds[i] > bounds[i+1] {
-				return nil, fmt.Errorf("invalid DeviceN tint bounds")
+	state := gradientStateFromContext(ctx, r)
+	calcKey := streamFunctionKey{stream: stream, inputs: len(names), outputs: alternate.components}
+	cached := state.calculators[calcKey]
+	if cached == nil {
+		input, err := r.numberArray(stream.Dictionary["Domain"], 2*len(names))
+		if err != nil {
+			return nil, err
+		}
+		output, err := r.numberArray(stream.Dictionary["Range"], 2*alternate.components)
+		if err != nil {
+			return nil, err
+		}
+		if !finiteFloats(input) || !finiteFloats(output) {
+			return nil, fmt.Errorf("invalid DeviceN tint bounds")
+		}
+		for _, bounds := range [][]float64{input, output} {
+			for i := 0; i < len(bounds); i += 2 {
+				if bounds[i] > bounds[i+1] {
+					return nil, fmt.Errorf("invalid DeviceN tint bounds")
+				}
 			}
 		}
+		data, err := r.DecodeStreamContext(ctx, stream)
+		if err != nil {
+			return nil, err
+		}
+		if state.limit > 0 && int64(len(data)) > state.limit-state.bytes {
+			return nil, fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
+		}
+		program, err := newCalculatorFunction(data, r.warning)
+		if err != nil {
+			return nil, err
+		}
+		if err := state.reserveBytes(max(int64(len(data)), calculatorProgramBytes(program))); err != nil {
+			return nil, err
+		}
+		cached = &cachedCalculator{input: input, output: output}
+		expressions, err := affineCalculator(data, len(names), alternate.components)
+		if err == nil && affineExpressionsFinite(expressions, input) {
+			cached.expressions = expressions
+		} else {
+			cached.program = program
+		}
+		inputs := make([]float64, len(names))
+		var outputs [4]float64
+		for i := range names {
+			inputs[i] = input[2*i]
+		}
+		if err := program.evaluate(inputs, outputs[:alternate.components]); err != nil {
+			return nil, err
+		}
+		if state.calculators == nil {
+			state.calculators = make(map[streamFunctionKey]*cachedCalculator)
+		}
+		state.calculators[calcKey] = cached
 	}
-	data, err := r.DecodeStreamContext(ctx, stream)
-	if err != nil {
-		return nil, err
-	}
-	program, err := newCalculatorFunction(data, r.warning)
-	if err != nil {
-		return nil, err
-	}
-	s := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), input: input, output: output, none: alternate.none}
+	s := &deviceNSpace{alternate: alternate.space, lab: alternate.lab, components: len(names), input: cached.input, output: cached.output, expressions: cached.expressions, program: cached.program, none: alternate.none}
 	if alternate.separation != nil || alternate.deviceN != nil {
-		s.nested, s.none = alternate, alternate.none
-	}
-	expressions, err := affineCalculator(data, len(names), alternate.components)
-	if err == nil && affineExpressionsFinite(expressions, input) {
-		s.expressions = expressions
-	} else {
-		s.program = program
-	}
-	inputs := make([]float64, len(names))
-	var outputs [4]float64
-	for i := range names {
-		inputs[i] = input[2*i]
-	}
-	if err := program.evaluate(inputs, outputs[:alternate.components]); err != nil {
-		return nil, err
+		s.nested = alternate
 	}
 	return s, nil
 }

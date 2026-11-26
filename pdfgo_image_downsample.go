@@ -247,9 +247,9 @@ func checkStreamTrailingSamples(ctx context.Context, reader io.Reader, warning f
 }
 
 // downsampleRawStreamContext 对常见单层通用流执行流式逐行盒式降采样，不分配全尺寸原始样本缓冲
-// 入参: ctx 取消上下文, filters 生效过滤器, parameters 对应参数, target 目标尺寸
-// 返回: image.Image 降采样图像, bool 是否已由流式路径处理, error 解码或取消错误
-func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, parameters Array, target image.Point) (image.Image, bool, error) {
+// 入参: ctx 取消上下文, filters 生效过滤器, parameters 对应参数, target 目标尺寸, maxBytes 流解压字节上限
+// 返回: image.Image 降采样图像, bool 是否已由流式路径处理, error 解码、超限或取消错误
+func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, parameters Array, target image.Point, maxBytes int64) (image.Image, bool, error) {
 	if target.X <= 0 || target.Y <= 0 {
 		return nil, false, nil
 	}
@@ -273,7 +273,10 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 	} else if len(filters) > 1 {
 		return nil, false, nil
 	}
-	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	streamMax, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maxBytes <= 0 || streamMax > 0 && streamMax < maxBytes {
+		maxBytes = streamMax
+	}
 	declaredBytes := int64(stride) * int64(i.Height)
 	var reader io.Reader
 	var flateCloser io.ReadCloser
@@ -321,11 +324,12 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 		if maxBytes > 0 && declaredBytes > maxBytes {
 			return nil, true, ErrStreamLimitExceeded
 		}
-		if err := checkBrotliLimits(i.Stream.Data, maxBytes); err != nil {
+		brotliInput, err := checkBrotliLimits(ctx, i.Stream.Data, maxBytes)
+		if err != nil {
 			return nil, true, err
 		}
 		brotliLargeWindow = maxBytes == 0 || maxBytes > 16<<20
-		brotliReader = acquireBrotliReaderWith(&contextInput{ctx: ctx, reader: bytes.NewReader(i.Stream.Data)}, brotliLargeWindow)
+		brotliReader = acquireBrotliReaderWith(&contextInput{ctx: ctx, reader: brotliInput}, brotliLargeWindow)
 		reader = &contextInput{ctx: ctx, reader: brotliReader}
 		isBrotli = true
 	case "RunLengthDecode":
@@ -349,7 +353,7 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 			releaseBrotliReaderWith(brotliReader, decodedBytes, brotliFailed, brotliLargeWindow)
 		}()
 	}
-	result, trailingErr, err := i.downsampleRawReaderContext(ctx, reader, components, stride, target, isFlate || isBrotli)
+	result, trailingErr, err := i.downsampleRawReaderContext(ctx, reader, components, stride, target, isFlate || isBrotli, maxBytes)
 	if canceled := ctx.Err(); canceled != nil {
 		return nil, true, canceled
 	}
@@ -393,14 +397,16 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 }
 
 // downsampleRawReaderContext 按目标网格逐行读取原始样本并做盒式区域平均
-// 入参: ctx 取消上下文, reader 原始样本流, components 分量数, stride 源行字节数, target 目标尺寸, allowChecksum 是否延迟处理末行校验和错误
-// 返回: image.Image 降采样样本图, error 末行校验和延迟错误, error 解码、内存或取消错误
-func (i *Image) downsampleRawReaderContext(ctx context.Context, reader io.Reader, components, stride int, target image.Point, allowChecksum bool) (image.Image, error, error) {
+// 入参: ctx 取消上下文, reader 原始样本流, components 分量数, stride 源行字节数, target 目标尺寸, allowChecksum 是否延迟处理末行校验和错误, maxBytes 流解压字节上限
+// 返回: image.Image 降采样样本图, error 末行校验和延迟错误, error 解码、内存、超限或取消错误
+func (i *Image) downsampleRawReaderContext(ctx context.Context, reader io.Reader, components, stride int, target image.Point, allowChecksum bool, maxBytes int64) (image.Image, error, error) {
 	srcW, srcH := i.Width, i.Height
 	target = boundedSampleSize(srcW, srcH, target)
 	dstW, dstH := target.X, target.Y
 	depth := i.BitsPerComponent
-	xStarts := downsampleBounds(srcW, dstW)
+	if _, _, err := imageCompositeBufferSize(dstW, components, 8, maxBytes); err != nil {
+		return nil, nil, err
+	}
 	var outGray *image.Gray
 	var outGray16 *image.Gray16
 	var outNRGBA *image.NRGBA
@@ -410,45 +416,48 @@ func (i *Image) downsampleRawReaderContext(ctx context.Context, reader io.Reader
 	rect := image.Rect(0, 0, dstW, dstH)
 	switch {
 	case components == 1 && depth <= 8:
-		if _, _, err := imageBufferSize(dstW, dstH, 1); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 1, maxBytes); err != nil {
 			return nil, nil, err
 		}
 		outGray = image.NewGray(rect)
 	case components == 1 && depth == 16:
-		if _, _, err := imageBufferSize(dstW, dstH, 2); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 2, maxBytes); err != nil {
 			return nil, nil, err
 		}
 		outGray16 = image.NewGray16(rect)
 	case components == 3 && depth == 8:
-		if _, _, err := imageBufferSize(dstW, dstH, 4); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 4, maxBytes); err != nil {
 			return nil, nil, err
 		}
 		outNRGBA = image.NewNRGBA(rect)
 	case components == 2 || components == 3:
-		if _, _, err := imageBufferSize(dstW, dstH, 8); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 8, maxBytes); err != nil {
 			return nil, nil, err
 		}
 		outNRGBA64 = image.NewNRGBA64(rect)
 	case components == 4:
 		outDepth := 16
+		pixelBytes := 8
 		if depth == 8 {
 			outDepth = 8
+			pixelBytes = 4
 		}
-		outStride, outBytes, err := imageSampleSize(dstW, dstH, 4, outDepth)
+		outStride, outBytes, err := imageCompositeBufferSize(dstW, dstH, pixelBytes, maxBytes)
 		if err != nil {
 			return nil, nil, err
 		}
 		outCMYK = &packedCMYKImage{data: make([]byte, outBytes), rect: rect, stride: outStride, depth: outDepth}
 	default:
-		outStride, outBytes, err := imageSampleSize(dstW, dstH, components, 16)
+		if components <= 0 || components > int(^uint(0)>>1)/2 {
+			return nil, nil, fmt.Errorf("image sample size exceeds platform buffer range")
+		}
+		outStride, outBytes, err := imageCompositeBufferSize(dstW, dstH, components*2, maxBytes)
 		if err != nil {
 			return nil, nil, err
 		}
 		outDeviceN = &packedDeviceNImage{data: make([]byte, outBytes), rect: rect, stride: outStride, depth: 16, channels: components}
 	}
-	if _, _, err := imageBufferSize(dstW, components, 8); err != nil {
-		return nil, nil, err
-	}
+	xStarts := downsampleBounds(srcW, dstW)
 	line := make([]byte, stride)
 	acc := make([]uint64, dstW*components)
 	maximum := uint64(1)<<depth - 1
@@ -604,14 +613,14 @@ func (i *Image) downsampleRawReaderContext(ctx context.Context, reader io.Reader
 }
 
 // downsampleYCbCr 直接在YCbCr采样平面执行盒式区域平均，并在需要时转换为RGB
-// 入参: ctx 取消上下文, src YCbCr图像, target 目标尺寸, convertRGB 是否执行YCbCr到RGB转换
-// 返回: *image.NRGBA 降采样后的三通道图像, error 内存或取消错误
-func downsampleYCbCr(ctx context.Context, src *image.YCbCr, target image.Point, convertRGB bool) (*image.NRGBA, error) {
+// 入参: ctx 取消上下文, src YCbCr图像, target 目标尺寸, convertRGB 是否执行YCbCr到RGB转换, maxBytes 流解压字节上限
+// 返回: *image.NRGBA 降采样后的三通道图像, error 内存、超限或取消错误
+func downsampleYCbCr(ctx context.Context, src *image.YCbCr, target image.Point, convertRGB bool, maxBytes int64) (*image.NRGBA, error) {
 	b := src.Bounds()
 	srcW, srcH := b.Dx(), b.Dy()
 	target = boundedSampleSize(srcW, srcH, target)
 	dstW, dstH := target.X, target.Y
-	if _, _, err := imageBufferSize(dstW, dstH, 4); err != nil {
+	if _, _, err := imageCompositeBufferSize(dstW, dstH, 4, maxBytes); err != nil {
 		return nil, err
 	}
 	out := image.NewNRGBA(image.Rect(0, 0, dstW, dstH))
@@ -795,16 +804,16 @@ func (s packedDeviceNASample) RGBA() (uint32, uint32, uint32, uint32) {
 }
 
 // downsampleDecodedImage 对已解码图像按目标尺寸执行盒式区域平均降采样，保留原始通道布局
-// 入参: ctx 取消上下文, src 源图像, target 目标尺寸
-// 返回: image.Image 降采样后的图像, error 缓冲或取消错误
-func downsampleDecodedImage(ctx context.Context, src image.Image, target image.Point) (image.Image, error) {
-	return downsampleDecodedImageMode(ctx, src, target, false)
+// 入参: ctx 取消上下文, src 源图像, target 目标尺寸, maxBytes 流解压字节上限
+// 返回: image.Image 降采样后的图像, error 缓冲、超限或取消错误
+func downsampleDecodedImage(ctx context.Context, src image.Image, target image.Point, maxBytes int64) (image.Image, error) {
+	return downsampleDecodedImageMode(ctx, src, target, false, maxBytes)
 }
 
 // downsampleDecodedImageMode 按预乘模式对已解码图像执行盒式区域平均降采样，保留原始通道布局
-// 入参: ctx 取消上下文, src 源图像, target 目标尺寸, premultiplied 内嵌透明样本是否已预乘
-// 返回: image.Image 降采样后的图像, error 缓冲或取消错误
-func downsampleDecodedImageMode(ctx context.Context, src image.Image, target image.Point, premultiplied bool) (image.Image, error) {
+// 入参: ctx 取消上下文, src 源图像, target 目标尺寸, premultiplied 内嵌透明样本是否已预乘, maxBytes 流解压字节上限
+// 返回: image.Image 降采样后的图像, error 缓冲、超限或取消错误
+func downsampleDecodedImageMode(ctx context.Context, src image.Image, target image.Point, premultiplied bool, maxBytes int64) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -818,15 +827,15 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 	if dstW >= srcW && dstH >= srcH {
 		return src, nil
 	}
-	xStarts := downsampleBounds(srcW, dstW)
 	rect := image.Rect(0, 0, dstW, dstH)
 	switch s := src.(type) {
 	case *image.YCbCr:
-		return downsampleYCbCr(ctx, s, target, true)
+		return downsampleYCbCr(ctx, s, target, true, maxBytes)
 	case *image.Gray:
-		if _, _, err := imageBufferSize(dstW, dstH, 1); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 1, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewGray(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -862,9 +871,10 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 		}
 		return out, nil
 	case *image.Gray16:
-		if _, _, err := imageBufferSize(dstW, dstH, 2); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 2, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewGray16(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -900,9 +910,10 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 		}
 		return out, nil
 	case *packedGrayImage:
-		if _, _, err := imageBufferSize(dstW, dstH, 1); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 1, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewGray(rect)
 		maximum := uint64(1)<<s.depth - 1
 		for dy := 0; dy < dstH; dy++ {
@@ -956,9 +967,10 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 		return out, nil
 	case *mappedGrayImage:
 		if s.byteExact {
-			if _, _, err := imageBufferSize(dstW, dstH, 1); err != nil {
+			if _, _, err := imageCompositeBufferSize(dstW, dstH, 1, maxBytes); err != nil {
 				return nil, err
 			}
+			xStarts := downsampleBounds(srcW, dstW)
 			out := image.NewGray(rect)
 			for dy := 0; dy < dstH; dy++ {
 				if err := ctx.Err(); err != nil {
@@ -994,9 +1006,10 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			}
 			return out, nil
 		}
-		if _, _, err := imageBufferSize(dstW, dstH, 2); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 2, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewGray16(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1032,9 +1045,10 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 		}
 		return out, nil
 	case *image.NRGBA:
-		if _, _, err := imageBufferSize(dstW, dstH, 4); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 4, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewNRGBA(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1081,9 +1095,10 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 		}
 		return out, nil
 	case *image.RGBA:
-		if _, _, err := imageBufferSize(dstW, dstH, 4); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 4, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewNRGBA(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1130,13 +1145,16 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 		return out, nil
 	case *packedCMYKImage:
 		outDepth := 16
+		pixelBytes := 8
 		if s.depth == 8 {
 			outDepth = 8
+			pixelBytes = 4
 		}
-		outStride, outBytes, err := imageSampleSize(dstW, dstH, 4, outDepth)
+		outStride, outBytes, err := imageCompositeBufferSize(dstW, dstH, pixelBytes, maxBytes)
 		if err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := &packedCMYKImage{data: make([]byte, outBytes), rect: rect, stride: outStride, depth: outDepth}
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1198,10 +1216,14 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 		}
 		return out, nil
 	case *packedDeviceNImage:
-		outStride, outBytes, err := imageSampleSize(dstW, dstH, s.channels, 16)
+		if s.channels <= 0 || s.channels > int(^uint(0)>>1)/2 {
+			return nil, fmt.Errorf("image sample size exceeds platform buffer range")
+		}
+		outStride, outBytes, err := imageCompositeBufferSize(dstW, dstH, s.channels*2, maxBytes)
 		if err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := &packedDeviceNImage{data: make([]byte, outBytes), rect: rect, stride: outStride, depth: 16, channels: s.channels}
 		sum := make([]uint64, s.channels)
 		for dy := 0; dy < dstH; dy++ {
@@ -1242,11 +1264,12 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 		}
 		return out, nil
 	case *jpxSampleImage:
-		return downsampleJPXImage(ctx, s, target, xStarts, premultiplied)
+		return downsampleJPXImage(ctx, s, target, premultiplied, maxBytes)
 	default:
-		if _, _, err := imageBufferSize(dstW, dstH, 8); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 8, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewNRGBA64(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1296,23 +1319,27 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 }
 
 // downsampleJPXImage 对已解码的JPEG2000分量图像执行盒式降采样，保留原始颜色通道及预乘语义
-// 入参: ctx 取消上下文, s JPEG2000样本图, target 目标尺寸, xStarts 水平区间边界, premultiplied 内嵌透明是否已预乘
-// 返回: image.Image 降采样后的样本图, error 缓冲或取消错误
-func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Point, xStarts []int, premultiplied bool) (image.Image, error) {
+// 入参: ctx 取消上下文, s JPEG2000样本图, target 目标尺寸, premultiplied 内嵌透明是否已预乘, maxBytes 流解压字节上限
+// 返回: image.Image 降采样后的样本图, error 缓冲、超限或取消错误
+func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Point, premultiplied bool, maxBytes int64) (image.Image, error) {
 	if s.rows != nil {
 		return s, nil
 	}
 	b := s.bounds
-	srcH := b.Dy()
+	srcW, srcH := b.Dx(), b.Dy()
 	dstW, dstH := target.X, target.Y
 	rect := image.Rect(0, 0, dstW, dstH)
 	channels := len(s.channels)
 	if channels > 4 {
 		if s.alpha >= 0 {
-			outStride, outBytes, err := imageSampleSize(dstW, dstH, channels+1, 16)
+			if channels >= int(^uint(0)>>1)/2 {
+				return nil, fmt.Errorf("image sample size exceeds platform buffer range")
+			}
+			outStride, outBytes, err := imageCompositeBufferSize(dstW, dstH, (channels+1)*2, maxBytes)
 			if err != nil {
 				return nil, err
 			}
+			xStarts := downsampleBounds(srcW, dstW)
 			out := &packedDeviceNAImage{data: make([]byte, outBytes), rect: rect, stride: outStride, channels: channels}
 			sum := make([]uint64, channels)
 			for dy := 0; dy < dstH; dy++ {
@@ -1373,10 +1400,14 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			}
 			return out, nil
 		}
-		outStride, outBytes, err := imageSampleSize(dstW, dstH, channels, 16)
+		if channels > int(^uint(0)>>1)/2 {
+			return nil, fmt.Errorf("image sample size exceeds platform buffer range")
+		}
+		outStride, outBytes, err := imageCompositeBufferSize(dstW, dstH, channels*2, maxBytes)
 		if err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := &packedDeviceNImage{data: make([]byte, outBytes), rect: rect, stride: outStride, depth: 16, channels: channels}
 		sum := make([]uint64, channels)
 		for dy := 0; dy < dstH; dy++ {
@@ -1418,10 +1449,11 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 	}
 	if s.cmyk {
 		if s.alpha >= 0 {
-			outStride, outBytes, err := imageSampleSize(dstW, dstH, 5, 16)
+			outStride, outBytes, err := imageCompositeBufferSize(dstW, dstH, 10, maxBytes)
 			if err != nil {
 				return nil, err
 			}
+			xStarts := downsampleBounds(srcW, dstW)
 			out := &packedCMYKAImage{data: make([]byte, outBytes), rect: rect, stride: outStride}
 			for dy := 0; dy < dstH; dy++ {
 				if err := ctx.Err(); err != nil {
@@ -1482,10 +1514,11 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			}
 			return out, nil
 		}
-		outStride, outBytes, err := imageSampleSize(dstW, dstH, 4, 16)
+		outStride, outBytes, err := imageCompositeBufferSize(dstW, dstH, 8, maxBytes)
 		if err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := &packedCMYKImage{data: make([]byte, outBytes), rect: rect, stride: outStride, depth: 16}
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1527,9 +1560,10 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 	}
 	if channels == 1 && s.alpha < 0 {
 		if imageByteExact(s) {
-			if _, _, err := imageBufferSize(dstW, dstH, 1); err != nil {
+			if _, _, err := imageCompositeBufferSize(dstW, dstH, 1, maxBytes); err != nil {
 				return nil, err
 			}
+			xStarts := downsampleBounds(srcW, dstW)
 			out := image.NewGray(rect)
 			for dy := 0; dy < dstH; dy++ {
 				if err := ctx.Err(); err != nil {
@@ -1564,9 +1598,10 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			}
 			return out, nil
 		}
-		if _, _, err := imageBufferSize(dstW, dstH, 2); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 2, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewGray16(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1602,9 +1637,10 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 		return out, nil
 	}
 	if s.alpha < 0 && imageByteExact(s) {
-		if _, _, err := imageBufferSize(dstW, dstH, 4); err != nil {
+		if _, _, err := imageCompositeBufferSize(dstW, dstH, 4, maxBytes); err != nil {
 			return nil, err
 		}
+		xStarts := downsampleBounds(srcW, dstW)
 		out := image.NewNRGBA(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1645,9 +1681,10 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 		}
 		return out, nil
 	}
-	if _, _, err := imageBufferSize(dstW, dstH, 8); err != nil {
+	if _, _, err := imageCompositeBufferSize(dstW, dstH, 8, maxBytes); err != nil {
 		return nil, err
 	}
+	xStarts := downsampleBounds(srcW, dstW)
 	out := image.NewNRGBA64(rect)
 	if s.alpha < 0 {
 		for dy := 0; dy < dstH; dy++ {
@@ -1779,9 +1816,9 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 }
 
 // downsampleIndexedImage 先按调色板展开索引样本再在颜色空间执行盒式降采样，禁止对索引值插值
-// 入参: ctx 取消上下文, src 索引样本图, palette 调色板, lower Decode起点, upper Decode终点, target 目标尺寸
-// 返回: image.Image 展开并降采样后的颜色图像, bool 调色板是否包含透明像素, error 缓冲或取消错误
-func downsampleIndexedImage(ctx context.Context, src image.Image, palette *imagePalette, lower, upper float64, target image.Point) (image.Image, bool, error) {
+// 入参: ctx 取消上下文, src 索引样本图, palette 调色板, lower Decode起点, upper Decode终点, target 目标尺寸, maxBytes 流解压字节上限
+// 返回: image.Image 展开并降采样后的颜色图像, bool 调色板是否包含透明像素, error 缓冲、超限或取消错误
+func downsampleIndexedImage(ctx context.Context, src image.Image, palette *imagePalette, lower, upper float64, target image.Point, maxBytes int64) (image.Image, bool, error) {
 	b := src.Bounds()
 	srcW, srcH := b.Dx(), b.Dy()
 	target = boundedSampleSize(srcW, srcH, target)
@@ -1795,6 +1832,13 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 		if c.R%257 != 0 || c.G%257 != 0 || c.B%257 != 0 || c.A%257 != 0 {
 			byteExact = false
 		}
+	}
+	pixelBytes := 8
+	if byteExact && !hasAlpha {
+		pixelBytes = 4
+	}
+	if _, _, err := imageCompositeBufferSize(dstW, dstH, pixelBytes, maxBytes); err != nil {
+		return nil, false, err
 	}
 	maxIndex := float64(len(palette.colors) - 1)
 	lookupColor := func(norm float64) color.NRGBA64 {
@@ -1818,9 +1862,6 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 	xStarts := downsampleBounds(srcW, dstW)
 	rect := image.Rect(0, 0, dstW, dstH)
 	if byteExact && !hasAlpha {
-		if _, _, err := imageBufferSize(dstW, dstH, 4); err != nil {
-			return nil, false, err
-		}
 		out := image.NewNRGBA(rect)
 		for dy := 0; dy < dstH; dy++ {
 			if err := ctx.Err(); err != nil {
@@ -1889,9 +1930,6 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 			}
 		}
 		return out, false, nil
-	}
-	if _, _, err := imageBufferSize(dstW, dstH, 8); err != nil {
-		return nil, false, err
 	}
 	out := image.NewNRGBA64(rect)
 	for dy := 0; dy < dstH; dy++ {

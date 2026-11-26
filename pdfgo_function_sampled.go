@@ -29,6 +29,20 @@ type sampledFunction struct {
 	sizes, strides, activeDims     []int
 	table                          tintFunction
 	order                          int
+	bytes                          int64
+}
+
+// sampledMemoryBytes 估算采样函数及其数据表占用的近似字节数
+// 入参: f 采样函数
+// 返回: int64 估算字节数
+func sampledMemoryBytes(f *sampledFunction) int64 {
+	if f == nil {
+		return 0
+	}
+	if f.bytes > 0 {
+		return f.bytes
+	}
+	return 256 + int64(len(f.table.samples))
 }
 
 // sampledSplineSpan 计算Catmull-Rom样条权重，边界使用线性外推的虚拟样本
@@ -64,13 +78,20 @@ func sampledSplineSpan(position float64, size int) ([4]int, [4]float64) {
 
 // readSampledFunctionContext 在本次取消上下文内解码和验证采样函数
 // 入参: ctx 取消上下文, stream 函数数据流, inputs 输入数量, outputs 输出数量
-// 返回: *sampledFunction 函数, error 格式、解码或取消错误
+// 返回: *sampledFunction 函数, error 格式、解码、超限或取消错误
 func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream, inputs, outputs int) (*sampledFunction, error) {
 	if ctx == nil || stream == nil || inputs <= 0 || outputs <= 0 {
 		return nil, fmt.Errorf("invalid sampled function evaluation")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	state, _ := ctx.Value(gradientParseStateKey{}).(*gradientParseState)
+	key := streamFunctionKey{stream: stream, inputs: inputs, outputs: outputs}
+	if state != nil {
+		if cached := state.sampled[key]; cached != nil {
+			return cached, nil
+		}
 	}
 	dict := stream.Dictionary
 	f := &sampledFunction{}
@@ -114,9 +135,19 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 	if order == Integer(3) {
 		f.order = 3
 	}
+	if state != nil {
+		if err := checkSampledSizesBudget(sizes, outputs, int(bits), state); err != nil {
+			return nil, err
+		}
+	}
 	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return nil, err
+	}
+	if state != nil {
+		if err := state.reserveBytes(int64(len(data))); err != nil {
+			return nil, err
+		}
 	}
 	f.table = tintFunction{samples: data, bits: int(bits), channels: outputs}
 	f.sizes, f.strides = make([]int, inputs), make([]int, inputs)
@@ -159,6 +190,7 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 		}
 	}
 	f.decode = f.bounds
+	customDecode := false
 	value, err = r.Resolve(dict["Decode"])
 	if err != nil {
 		return nil, err
@@ -171,9 +203,20 @@ func (r *Reader) readSampledFunctionContext(ctx context.Context, stream *Stream,
 		if !finiteFloats(f.decode) {
 			return nil, fmt.Errorf("invalid sampled function decode")
 		}
+		customDecode = true
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	f.bytes = 256 + int64(len(data)) + int64(len(f.domain)+len(f.encode)+len(f.bounds)+len(f.sizes)+len(f.strides)+len(f.activeDims))*8
+	if customDecode {
+		f.bytes += int64(len(f.decode)) * 8
+	}
+	if state != nil {
+		if state.sampled == nil {
+			state.sampled = make(map[streamFunctionKey]*sampledFunction)
+		}
+		state.sampled[key] = f
 	}
 	return f, nil
 }

@@ -100,7 +100,7 @@ func jpxReduction(ctx context.Context, data, stream []byte, size image.Point) (i
 	return decoder.Reduction(size)
 }
 
-// jpxSize 校验码流尺寸和分量缓冲，不依赖普通图像颜色模型或分配像素
+// jpxSize 校验码流尺寸和分量描述，不依赖普通图像颜色模型或分配像素
 // 入参: data 原始码流
 // 返回: int 宽度, int 高度, int 分量数, error 头部或平台范围错误
 func jpxSize(data []byte) (int, int, int, error) {
@@ -118,9 +118,6 @@ func jpxSize(data []byte) (int, int, int, error) {
 		return 0, 0, 0, fmt.Errorf("invalid JPEG2000 reference grid or platform range")
 	}
 	width, height := int(x-x0), int(y-y0)
-	if _, _, err := imageBufferSize(width, height, count*4); err != nil {
-		return 0, 0, 0, err
-	}
 	for n := 0; n < count; n++ {
 		if int(data[42+3*n]&127)+1 > 31 {
 			return 0, 0, 0, &UnsupportedError{Feature: "JPEG2000 component precision"}
@@ -130,6 +127,63 @@ func jpxSize(data []byte) (int, int, int, error) {
 		}
 	}
 	return width, height, count, nil
+}
+
+// jpxCheckSampleBudget 在解码前按码流分量步长与颜色通道数校验合成预算及平台缓冲上限
+// 入参: stream 原始码流, width 校验宽度, height 校验高度, streamCount 码流分量数, colorCount 生效颜色通道数, maxBytes 流解压字节上限
+// 返回: error 超限或平台缓冲范围错误
+func jpxCheckSampleBudget(stream []byte, width, height, streamCount, colorCount int, maxBytes int64) error {
+	if _, _, err := imageCompositeBufferSize(width, height, max(1, colorCount), maxBytes); err != nil {
+		return err
+	}
+	budget := imageCompositeBudget(maxBytes)
+	limit := int64(imageBufferLimit())
+	var total int64
+	for n := 0; n < streamCount; n++ {
+		bits := int(stream[42+3*n]&127) + 1
+		xStep := int64(stream[43+3*n])
+		yStep := int64(stream[44+3*n])
+		cw := (int64(width) + xStep - 1) / xStep
+		ch := (int64(height) + yStep - 1) / yStep
+		sampleBytes := int64(1)
+		if bits > 16 {
+			sampleBytes = 4
+		} else if bits > 8 {
+			sampleBytes = 2
+		}
+		if cw <= 0 || ch <= 0 || cw > math.MaxInt64/sampleBytes/ch {
+			if budget > 0 {
+				return fmt.Errorf("JPEG2000 %w", ErrStreamLimitExceeded)
+			}
+			return fmt.Errorf("image buffer size exceeds platform buffer range")
+		}
+		planeBytes := cw * ch * sampleBytes
+		if planeBytes > math.MaxInt64-total {
+			if budget > 0 {
+				return fmt.Errorf("JPEG2000 %w", ErrStreamLimitExceeded)
+			}
+			return fmt.Errorf("image buffer size exceeds platform buffer range")
+		}
+		total += planeBytes
+		if budget > 0 && total > budget {
+			return fmt.Errorf("JPEG2000 %w", ErrStreamLimitExceeded)
+		}
+		if total > limit {
+			return fmt.Errorf("image buffer size exceeds platform buffer range")
+		}
+	}
+	return nil
+}
+
+// wrapJPXError 将j2kgo资源上限错误统一映射为包装ErrStreamLimitExceeded的错误
+// 入参: err 原始错误
+// 返回: error 映射后的错误
+func wrapJPXError(err error) error {
+	var limitErr *j2kgo.LimitError
+	if errors.As(err, &limitErr) {
+		return fmt.Errorf("JPEG2000 %w: %w", ErrStreamLimitExceeded, err)
+	}
+	return err
 }
 
 // jpxComponentMapping 解析JP2调色板和直接通道映射，保留原始采样精度
@@ -461,9 +515,12 @@ func (i *Image) JPXLosslessContext(ctx context.Context) (bool, int, error) {
 	if err != nil {
 		return false, 0, err
 	}
-	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), &j2kgo.DecodeOptions{Workers: 1})
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	options := i.jpxDecodeOptions(false, maxBytes)
+	options.Workers = 1
+	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), options)
 	if err != nil {
-		return false, 0, err
+		return false, 0, wrapJPXError(err)
 	}
 	defer decoder.Close()
 	info := decoder.Info()
@@ -475,16 +532,23 @@ func (i *Image) JPXLosslessContext(ctx context.Context) (bool, int, error) {
 	}
 	lossless, err := decoder.Lossless(ctx)
 	if err != nil {
-		return false, 0, err
+		return false, 0, wrapJPXError(err)
 	}
 	return lossless, maxBitDepth, ctx.Err()
 }
 
-// jpxMaskMode 读取JPEG2000内嵌软遮罩模式
-// 返回: int 遮罩模式, error 参数错误
-func (i *Image) jpxMaskMode() (int, error) {
+// jpxMaskMode 在取消上下文内读取JPEG2000内嵌软遮罩模式
+// 入参: ctx 取消上下文
+// 返回: int 遮罩模式, error 参数或取消错误
+func (i *Image) jpxMaskMode(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	filters, _, err := i.Stream.filterChain(i.reader)
 	if err != nil {
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 	if len(filters) == 0 || filters[len(filters)-1] != Name("JPXDecode") {
@@ -498,7 +562,7 @@ func (i *Image) jpxMaskMode() (int, error) {
 	if !ok || mode < 0 || mode > 2 {
 		return 0, fmt.Errorf("invalid JPEG2000 SMaskInData")
 	}
-	return int(mode), nil
+	return int(mode), ctx.Err()
 }
 
 // ColorModel 返回非预乘颜色模型
@@ -846,20 +910,29 @@ func (r *Reader) jpxSpaceComponents(space Object) (int, bool) {
 	return 0, false
 }
 
-// jpxDefaults 读取JPEG2000颜色通道真实位深及容器颜色声明，按PDF标准选择回退空间
-// 入参: stream 图像流, explicitSpace 已解析的显式颜色空间
-// 返回: int 位深, Object 颜色空间, error 容器或颜色错误
-func (r *Reader) jpxDefaults(stream *Stream, explicitSpace Object) (int, Object, error) {
+// jpxDefaults 在取消上下文内读取JPEG2000颜色通道真实位深及容器颜色声明，按PDF标准选择回退空间
+// 入参: ctx 取消上下文, stream 图像流, explicitSpace 已解析的显式颜色空间
+// 返回: int 位深, Object 颜色空间, error 容器、颜色或取消错误
+func (r *Reader) jpxDefaults(ctx context.Context, stream *Stream, explicitSpace Object) (int, Object, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
 	filters, parameters, err := stream.filterChain(r)
 	if err != nil || len(filters) == 0 || filters[len(filters)-1] != Name("JPXDecode") {
 		return 0, nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
 	data := stream.Data
 	if len(filters) > 1 {
-		data, err = r.decodeStream(&Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": parameters[:len(parameters)-1]}, Data: data})
+		data, err = r.DecodeStreamContext(ctx, &Stream{Dictionary: Dictionary{"Filter": filters[:len(filters)-1], "DecodeParms": parameters[:len(parameters)-1]}, Data: data, maxStreamBytes: stream.maxStreamBytes, maxFilterChain: stream.maxFilterChain})
 		if err != nil {
 			return 0, nil, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
 	}
 	code, err := jpxCodestream(data)
 	if err != nil {
@@ -873,7 +946,7 @@ func (r *Reader) jpxDefaults(stream *Stream, explicitSpace Object) (int, Object,
 	if err != nil {
 		return 0, nil, err
 	}
-	space, _, err := r.jpxColorSpace(data, stream.Dictionary, count)
+	space, _, err := r.jpxColorSpace(ctx, data, stream.Dictionary, count)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -896,13 +969,16 @@ func (r *Reader) jpxDefaults(stream *Stream, explicitSpace Object) (int, Object,
 	for _, bits := range depths {
 		depth = max(depth, bits)
 	}
-	return depth, space, nil
+	return depth, space, ctx.Err()
 }
 
 // jpxColorSpace 按颜色声明优先级和近似程度选择空间，未支持时按通道数回退
-// 入参: data 容器数据, dict 图像字典, count 码流通道数
-// 返回: Object 颜色空间, bool 是否使用sYCC, error 容器错误
-func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object, bool, error) {
+// 入参: ctx 取消上下文, data 容器数据, dict 图像字典, count 码流通道数
+// 返回: Object 颜色空间, bool 是否使用sYCC, error 容器或取消错误
+func (r *Reader) jpxColorSpace(ctx context.Context, data []byte, dict Dictionary, count int) (Object, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	space, err := r.resolveOptional(dict["ColorSpace"])
 	if err != nil {
 		return nil, false, err
@@ -914,6 +990,9 @@ func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object,
 	var definitions []byte
 	if len(data) >= 12 && bytes.Equal(data[:12], []byte{0, 0, 0, 12, 'j', 'P', ' ', ' ', 13, 10, 135, 10}) {
 		err := walkJPXBoxes(data, func(name string, payload []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if name != "jp2h" {
 				return nil
 			}
@@ -950,6 +1029,9 @@ func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object,
 		return x[2] < y[2]
 	})
 	for _, specification := range specifications {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
 		switch specification[0] {
 		case 1:
 			if len(specification) < 7 {
@@ -977,8 +1059,10 @@ func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object,
 				continue
 			}
 			space := Array{Name("ICCBased"), &Stream{Dictionary: Dictionary{"N": components}, Data: profile, reader: r, cache: r.cache, hasWarning: r.warning != nil}}
-			if _, err := r.readICCColorSpace(space); err == nil {
+			if _, err := r.readICCSourceSpaceContext(ctx, space, false); err == nil {
 				return space, false, nil
+			} else if ctx.Err() != nil {
+				return nil, false, ctx.Err()
 			}
 		}
 	}
@@ -1007,26 +1091,24 @@ func (r *Reader) jpxColorSpace(data []byte, dict Dictionary, count int) (Object,
 	return fallback, false, nil
 }
 
-// jpxSamplesRowsContext 按PDF通道定义读取原始分量，行输出时保留区域解码器
-// 入参: ctx 取消上下文, data 编码数据, cmyk 四色空间, size 像素需求, rows 可选行解码资源
-// 返回: image.Image 分量图像, error 解码或取消错误
-func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk bool, size image.Point, rows *imageRowContext) (image.Image, error) {
+// jpxSamplesRowsContext 按PDF通道定义读取原始分量，行输出时保留区域解码器并执行流预算校验
+// 入参: ctx 取消上下文, data 编码数据, cmyk 四色空间, size 像素需求, rows 可选行解码资源, maxBytes 流解压字节上限
+// 返回: image.Image 分量图像, error 解码、超限或取消错误
+func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk bool, size image.Point, rows *imageRowContext, maxBytes int64) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	streamMax, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maxBytes <= 0 || streamMax > 0 && streamMax < maxBytes {
+		maxBytes = streamMax
 	}
 	stream, err := jpxCodestream(data)
 	if err != nil {
 		return nil, err
 	}
-	width, height, _, err := jpxSize(stream)
+	width, height, streamCount, err := jpxSize(stream)
 	if err != nil {
 		return nil, err
-	}
-	if width != i.Width || height != i.Height {
-		if i.Warning == nil {
-			return nil, fmt.Errorf("JPEG2000 dimensions differ from image dictionary")
-		}
-		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG2000 dimensions differ from image dictionary; using image data dimensions %dx%d", width, height)})
 	}
 	colorSpace := normalizeDeviceColorSpace(i.ColorSpace)
 	cmyk = cmyk || colorSpace == Name("DeviceCMYK")
@@ -1053,7 +1135,7 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 			count = int(n)
 		}
 	}
-	mode, err := i.jpxMaskMode()
+	mode, err := i.jpxMaskMode(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1061,19 +1143,39 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	if err != nil {
 		return nil, err
 	}
-	options := i.jpxDecodeOptions(true)
+	checkW, checkH := width, height
+	if size != (image.Point{}) && rows == nil {
+		dst := boundedSampleSize(width, height, size)
+		checkW, checkH = dst.X, dst.Y
+	}
+	if width != i.Width || height != i.Height {
+		if i.Warning == nil {
+			return nil, fmt.Errorf("JPEG2000 dimensions differ from image dictionary")
+		}
+		if err := jpxCheckSampleBudget(stream, checkW, checkH, streamCount, count, maxBytes); err != nil {
+			return nil, err
+		}
+		if width <= 0 || height <= 0 || width > jpegRecoveryPixelLimit/height {
+			return nil, fmt.Errorf("JPEG2000 dimension recovery exceeds sample budget")
+		}
+		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG2000 dimensions differ from image dictionary; using image data dimensions %dx%d", width, height)})
+	} else if err := jpxCheckSampleBudget(stream, checkW, checkH, streamCount, count, maxBytes); err != nil {
+		return nil, err
+	}
+	options := i.jpxDecodeOptions(true, maxBytes)
 	decoder, err := j2kgo.NewDecoder(ctx, bytes.NewReader(stream), options)
-	if err != nil && i.Warning != nil && ctx.Err() == nil {
+	var limitErr *j2kgo.LimitError
+	if err != nil && !errors.As(err, &limitErr) && i.Warning != nil && ctx.Err() == nil {
 		end := bytes.LastIndex(stream, []byte{255, 217}) + 2
 		if end > 2 && end < len(stream) {
-			if recovered, recoveredErr := j2kgo.NewDecoder(ctx, bytes.NewReader(stream[:end]), i.jpxDecodeOptions(false)); recoveredErr == nil {
+			if recovered, recoveredErr := j2kgo.NewDecoder(ctx, bytes.NewReader(stream[:end]), i.jpxDecodeOptions(false, maxBytes)); recoveredErr == nil {
 				i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG2000 has %d trailing bytes after a complete EOC; retaining all validated tile-parts", len(stream)-end)})
 				decoder, err = recovered, nil
 			}
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, wrapJPXError(err)
 	}
 	retained := false
 	defer func() {
@@ -1085,7 +1187,7 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	var rowReader *jpxRowReader
 	reduce, err := decoder.Reduction(size)
 	if err != nil {
-		return nil, err
+		return nil, wrapJPXError(err)
 	}
 	if rows != nil && reduce == 0 {
 		rowReader = newJPXRowReader(decoder)
@@ -1095,7 +1197,6 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	}
 	if err != nil && size != (image.Point{}) {
 		full := decoder.Info().Bounds
-		var limitErr *j2kgo.LimitError
 		for errors.As(err, &limitErr) {
 			shift := uint(reduce + 1)
 			if shift >= 31 {
@@ -1115,7 +1216,7 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, wrapJPXError(err)
 	}
 	info := raster.Info()
 	if rowReader != nil {
@@ -1161,7 +1262,7 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	}
 	var ycc bool
 	if !i.ImageMask {
-		_, ycc, err = i.reader.jpxColorSpace(data, i.Stream.Dictionary, len(components))
+		_, ycc, err = i.reader.jpxColorSpace(ctx, data, i.Stream.Dictionary, len(components))
 		if err != nil {
 			return nil, err
 		}
@@ -1183,15 +1284,32 @@ func (i *Image) jpxSamplesRowsContext(ctx context.Context, data []byte, cmyk boo
 	return out, nil
 }
 
-// jpxDecodeOptions 构造JPEG2000解码选项并透传并发上限
-// 入参: withWarning 是否附带诊断回调
+// jpxDecodeOptions 构造JPEG2000解码选项并透传并发与流内存预算上限
+// 入参: withWarning 是否附带诊断回调, maxBytes 流解压字节上限
 // 返回: *j2kgo.DecodeOptions 解码选项
-func (i *Image) jpxDecodeOptions(withWarning bool) *j2kgo.DecodeOptions {
+func (i *Image) jpxDecodeOptions(withWarning bool, maxBytes int64) *j2kgo.DecodeOptions {
 	workers := i.Workers
 	if workers <= 0 && i.reader != nil {
 		workers = i.reader.decodeWorkers
 	}
-	options := &j2kgo.DecodeOptions{Workers: workers}
+	platformLimit := uint64(imageBufferLimit())
+	maxInput := min(platformLimit, uint64(1<<30))
+	maxSamples := min(platformLimit, uint64(1<<30))
+	maxMemory := min(platformLimit, uint64(512<<20))
+	if budget := imageCompositeBudget(maxBytes); budget > 0 {
+		limit := min(platformLimit, uint64(budget))
+		maxInput = min(maxInput, limit)
+		maxSamples = min(maxSamples, limit)
+		maxMemory = min(maxMemory, limit)
+	}
+	options := &j2kgo.DecodeOptions{
+		Workers: workers,
+		Limits: j2kgo.Limits{
+			MaxInputBytes:  maxInput,
+			MaxSamples:     maxSamples,
+			MaxMemoryBytes: maxMemory,
+		},
+	}
 	if withWarning && i.Warning != nil {
 		options.Warning = func(err error) { i.Warning(Diagnostic{Message: err.Error()}) }
 	}

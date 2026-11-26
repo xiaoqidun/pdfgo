@@ -167,7 +167,8 @@ func shadingColorValues(space *ColorSpace, tint *deviceNSpace, lab *labSpace, in
 // 入参: source 渐变函数, tint 专色定义
 // 返回: *gradientFunction 备用颜色空间函数
 func deviceNColorFunction(source *gradientFunction, tint *deviceNSpace) *gradientFunction {
-	mapped := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+	baseBytes := int64(128) + source.bytes + deviceNMemoryBytes(tint)
+	mapped := &gradientFunction{bytes: baseBytes, calculate: func(x float64) ([4]float64, error) {
 		values, err := source.evaluate(x)
 		if err != nil {
 			return values, err
@@ -176,10 +177,12 @@ func deviceNColorFunction(source *gradientFunction, tint *deviceNSpace) *gradien
 	}}
 	if tint.expressions != nil && tint.lab == nil && tint.nested == nil {
 		mapped = iccGradientFunction(deviceNGradientFunction(source, tint.input, tint.output, tint.expressions), tint.alternate.profile)
+		mapped.bytes = max(mapped.bytes, baseBytes)
 	}
 	if tint.transform != nil && tint.lab == nil && tint.nested == nil {
 		composed := iccGradientFunction(composeGradientFunction(source, tint.transform), tint.alternate.profile)
 		mapped.linear = composed.linear
+		mapped.bytes = max(mapped.bytes, composed.bytes)
 	}
 	mapped.colorants, mapped.colorant = tint.colorants, gradientColorantFunction(source, tint.components)
 	return mapped
@@ -804,7 +807,7 @@ func (p *pageInterpreter) shadingStops(object, function Object, domain [2]float6
 			return nil, nil, nil, err
 		}
 		if separation.nested != nil {
-			f := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+			f := &gradientFunction{bytes: 128 + source.bytes + separationMemoryBytes(separation), calculate: func(x float64) ([4]float64, error) {
 				values, err := source.evaluate(x)
 				if err != nil {
 					return values, err

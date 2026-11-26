@@ -43,22 +43,14 @@ type annotationCaptionText struct {
 	shaper  *annotationShaper
 }
 
-// annotationChoiceVisibleText 截取横排列表可见选项，避免隐藏项触发字体解析或整形
-// 入参: ctx 取消上下文, text 首个可见项起的文字, state 默认文字状态, height 可用高度
-// 返回: string 可见项文字, error 行距或取消错误
-func annotationChoiceVisibleText(ctx context.Context, text string, state graphicsState, height float64) (string, error) {
-	size := state.fontSize
-	if size == 0 {
-		size = min(12, height)
-	}
-	leading := state.leading
-	if leading <= 0 {
-		leading = size * 1.2
-	}
+// annotationChoiceVisibleLines 按可用跨度与步距截取列表可见项，避免隐藏项触发字体解析或整形
+// 入参: ctx 取消上下文, text 首个可见项起的文字, span 可用跨度, leading 单项步距
+// 返回: string 可见项文字, error 步距或取消错误
+func annotationChoiceVisibleLines(ctx context.Context, text string, span, leading float64) (string, error) {
 	if leading <= 0 || math.IsNaN(leading) || math.IsInf(leading, 0) {
 		return "", fmt.Errorf("invalid choice field line spacing")
 	}
-	rows := math.Ceil(height / leading)
+	rows := math.Ceil(span / leading)
 	start := 0
 	for row := 1.0; ; row++ {
 		if err := ctx.Err(); err != nil {
@@ -74,6 +66,21 @@ func annotationChoiceVisibleText(ctx context.Context, text string, state graphic
 		}
 		start = end + 1
 	}
+}
+
+// annotationChoiceVisibleText 截取横排列表可见选项，避免隐藏项触发字体解析或整形
+// 入参: ctx 取消上下文, text 首个可见项起的文字, state 默认文字状态, height 可用高度
+// 返回: string 可见项文字, error 行距或取消错误
+func annotationChoiceVisibleText(ctx context.Context, text string, state graphicsState, height float64) (string, error) {
+	size := state.fontSize
+	if size == 0 {
+		size = min(12, height)
+	}
+	leading := state.leading
+	if leading <= 0 {
+		leading = size * 1.2
+	}
+	return annotationChoiceVisibleLines(ctx, text, height, leading)
 }
 
 // annotationLetters 将Unicode文本映射回原字体字符码，不替换缺失字形
@@ -496,7 +503,8 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 			writeAnnotationOperation(&content, "re f", frame.XMin, frame.YMin, fw, fh)
 		}
 	}
-	stroke, err := r.writeAnnotationStroke(ctx, &content, border, annotationRichContentLimit(r))
+	contentLimit := annotationRichContentLimit(r)
+	stroke, err := r.writeAnnotationStroke(ctx, &content, border, contentLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -533,19 +541,20 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 	resources = maps.Clone(resources)
 	stream := &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Real(w), Real(h)}, "Matrix": Array{Real(matrix[0]), Real(matrix[1]), Real(matrix[2]), Real(matrix[3]), Real(matrix[4]), Real(matrix[5])}, "Resources": resources}, reader: r, cache: r.cache, hasWarning: r.warning != nil}
 	if dict["FT"] == Name("Btn") && flags&(1<<16) == 0 {
-		if err := r.writeAnnotationToggleButton(ctx, annotation, mk, flags, frame, border, resources, &content, stroke); err != nil {
-			return nil, err
-		}
-		stream.Data = []byte(content.String())
-		return stream, nil
-	}
-	if dict["FT"] == Name("Btn") {
+		err = r.writeAnnotationToggleButton(ctx, annotation, mk, flags, frame, border, resources, &content, stroke)
+	} else if dict["FT"] == Name("Btn") {
 		err = r.writeAnnotationPushButton(ctx, annotation, mk, frame, border, resources, &content)
 	} else {
 		err = r.writeAnnotationText(ctx, annotation, mk, flags, frame, border, resources, &content)
 	}
 	if err != nil {
 		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if content.Len() > contentLimit {
+		return nil, fmt.Errorf("%w: widget appearance content limit exceeded", ErrStreamLimitExceeded)
 	}
 	stream.Data = []byte(content.String())
 	return stream, nil
@@ -767,8 +776,20 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if comb > 0 && utf8.RuneCountInString(text) > comb {
 		return fmt.Errorf("field value exceeds comb length")
 	}
-	if list && !p.state.font.Vertical {
-		text, err = annotationChoiceVisibleText(ctx, text, p.state, height)
+	if list {
+		if p.state.font.Vertical {
+			size := p.state.fontSize
+			if size == 0 {
+				size = min(12, width/p.state.hscale)
+			}
+			leading := p.state.leading
+			if leading <= 0 {
+				leading = size * p.state.hscale * 1.2
+			}
+			text, err = annotationChoiceVisibleLines(ctx, text, width, leading)
+		} else {
+			text, err = annotationChoiceVisibleText(ctx, text, p.state, height)
+		}
 		if err != nil {
 			return err
 		}
@@ -819,7 +840,12 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			fits := float64(len(lines)-1)*leading+candidate <= height
 			if comb > 0 {
 				fits = candidate <= height
-				for _, letter := range letters {
+				for i, letter := range letters {
+					if i&255 == 0 {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+					}
 					if !fits {
 						break
 					}

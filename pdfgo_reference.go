@@ -106,7 +106,7 @@ func (r *Reader) ReadReferenceXObject(object Object) (ReferenceXObject, error) {
 
 // WalkPageLabelRanges 按起始页面索引访问页标签定义，不生成整本标签
 // 入参: ctx 取消上下文, visit 区间访问函数
-// 返回: error 数字树、标签定义或访问错误
+// 返回: error 数字树、标签定义、超限或访问错误
 func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRange) error) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("invalid page label context")
@@ -129,6 +129,7 @@ func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRa
 		return err
 	}
 	first := true
+	budget := newTextStringBudget(r)
 	err = r.WalkNumberTree(ctx, root, func(index int64, object Object) error {
 		if index < 0 || first && index != 0 {
 			return fmt.Errorf("invalid page label range start")
@@ -160,7 +161,7 @@ func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRa
 				return fmt.Errorf("invalid page label style")
 			}
 		}
-		value, err = r.Resolve(dict["P"])
+		prefixRef, value, err := r.resolveIndirect(dict["P"])
 		if err != nil {
 			return err
 		}
@@ -169,7 +170,7 @@ func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRa
 			if !ok {
 				return fmt.Errorf("invalid page label prefix")
 			}
-			result.Prefix, err = DecodeTextString(prefix)
+			result.Prefix, err = budget.decodeString(prefixRef, prefix, "page label")
 			if err != nil {
 				return err
 			}

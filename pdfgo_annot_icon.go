@@ -97,7 +97,7 @@ func (r *Reader) iconAppearance(annotation Annotation) (*Stream, error) {
 	}
 	x, y := box.XMin, box.YMin
 	width, height := box.XMax-box.XMin, box.YMax-box.YMin
-	if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) || math.IsNaN(width) || math.IsInf(width, 0) || math.IsNaN(height) || math.IsInf(height, 0) {
+	if width <= 0 || height <= 0 || math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) || math.IsNaN(width) || math.IsInf(width, 0) || math.IsNaN(height) || math.IsInf(height, 0) {
 		return nil, fmt.Errorf("invalid annotation icon bounds")
 	}
 	if annotation.Subtype == "Text" {

@@ -324,7 +324,7 @@ func (p *pageInterpreter) displayHalftone(object Object) (*Halftone, error) {
 					}
 				} else {
 					candidate := &Halftone{Type: int(kind.(Integer)), Dictionary: dict, TransferFunction: transfer, reader: p.reader, cache: p.reader.cache}
-					identity, err := candidate.IdentityTransfer(p.reader)
+					identity, err := candidate.identityTransferContext(p.ctx, p.reader)
 					if err != nil {
 						if isFatalReaderError(err) {
 							return nil, err
@@ -618,46 +618,53 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 // 入参: reader 同源Fork视图或备用阅读器，同源时优先使用以保证并发安全
 // 返回: bool 是否恒等, error 函数解析或关闭错误
 func (h *Halftone) IdentityTransfer(reader *Reader) (bool, error) {
-	return h.identityTransfer(reader, 0)
+	return h.identityTransferContext(context.Background(), reader)
 }
 
-// identityTransfer 按所属阅读器检查网屏函数，限制手工定义的递归深度
-// 入参: reader 备用阅读器, depth 嵌套深度
-// 返回: bool 是否恒等, error 引用或递归错误
-func (h *Halftone) identityTransfer(reader *Reader, depth int) (bool, error) {
-	if h == nil {
-		return true, nil
-	}
-	if depth >= 32 {
-		return false, fmt.Errorf("halftone recursion limit exceeded")
-	}
-	if !reader.ownsObject(h.reader, h.cache) {
-		forked := h.reader.Fork(ForkOptions{})
-		defer forked.Close()
-		reader = forked
-	}
-	if reader == nil {
-		return false, fmt.Errorf("missing halftone reader")
-	}
-	if reader.closed {
-		return false, os.ErrClosed
-	}
-	if h.TransferFunction != nil {
-		function, _, err := reader.halftoneTransfer(h)
-		if err != nil {
+// identityTransferContext 在取消上下文内检查网屏及其分量是否仅使用恒等传递函数
+// 入参: ctx 取消上下文, reader 备用阅读器
+// 返回: bool 是否恒等, error 引用、递归、关闭或取消错误
+func (h *Halftone) identityTransferContext(ctx context.Context, reader *Reader) (bool, error) {
+	var check func(*Halftone, *Reader, int) (bool, error)
+	check = func(node *Halftone, r *Reader, depth int) (bool, error) {
+		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		if function != nil {
-			return false, nil
+		if node == nil {
+			return true, nil
 		}
-	}
-	for _, part := range h.Components {
-		identity, err := part.identityTransfer(reader, depth+1)
-		if err != nil || !identity {
-			return identity, err
+		if depth >= 32 {
+			return false, fmt.Errorf("halftone recursion limit exceeded")
 		}
+		if !r.ownsObject(node.reader, node.cache) {
+			forked := node.reader.Fork(ForkOptions{})
+			defer forked.Close()
+			r = forked
+		}
+		if r == nil {
+			return false, fmt.Errorf("missing halftone reader")
+		}
+		if r.closed {
+			return false, os.ErrClosed
+		}
+		if node.TransferFunction != nil {
+			function, _, err := r.halftoneTransferContext(ctx, node)
+			if err != nil {
+				return false, err
+			}
+			if function != nil {
+				return false, nil
+			}
+		}
+		for _, part := range node.Components {
+			identity, err := check(part, r, depth+1)
+			if err != nil || !identity {
+				return identity, err
+			}
+		}
+		return true, nil
 	}
-	return true, nil
+	return check(h, reader, 0)
 }
 
 // component 选择原生分量网屏，缺省使用Default且禁止嵌套类型5

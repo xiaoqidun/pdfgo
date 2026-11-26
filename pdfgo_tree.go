@@ -896,7 +896,7 @@ func (r *Reader) numberTreeLimits(obj Object) (int64, int64, bool, error) {
 
 // WalkEmbeddedFiles 枚举文档名称树中的附件，不解码数据、不读取外部文件
 // 入参: ctx 取消上下文, visit 名称树原始键和文件说明的访问函数
-// 返回: error 名称树、文件说明或访问错误
+// 返回: error 名称树、文件说明、超限或访问错误
 func (r *Reader) WalkEmbeddedFiles(ctx context.Context, visit func(string, FileSpecification) error) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("invalid embedded files context")
@@ -922,8 +922,9 @@ func (r *Reader) WalkEmbeddedFiles(ctx context.Context, visit func(string, FileS
 	if !ok {
 		return fmt.Errorf("invalid names dictionary")
 	}
+	budget := newTextStringBudget(r)
 	return r.WalkNameTree(ctx, names["EmbeddedFiles"], func(name string, object Object) error {
-		file, err := r.ReadFileSpecification(object)
+		file, err := r.readFileSpecificationContext(ctx, object, &budget, "embedded file")
 		if err != nil {
 			return err
 		}

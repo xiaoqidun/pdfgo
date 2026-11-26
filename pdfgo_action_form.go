@@ -16,7 +16,6 @@ package pdfgo
 
 import (
 	"context"
-	"errors"
 	"fmt"
 )
 
@@ -146,9 +145,6 @@ func (r *Reader) actionTargets(ctx context.Context, objects Array, annotations b
 		if text, ok := value.(String); ok {
 			name, err := budget.decodeString(ref, text, "action target")
 			if err != nil {
-				if errors.Is(err, ErrStreamLimitExceeded) {
-					return nil, err
-				}
 				return nil, wrapActionError(err)
 			}
 			result = append(result, ActionTarget{Name: name})

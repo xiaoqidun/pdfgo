@@ -28,18 +28,29 @@ type mappedGrayImage struct {
 	byteExact bool
 }
 
-// decodeGrayImageContext 应用灰度映射，紧凑样本保持延迟展开
-// 入参: ctx 取消上下文, samples 独立样本, lower 映射起点, upper 映射终点
-// 返回: image.Image 灰度图像，不支持的样本类型为空, error 尺寸或取消错误
-func decodeGrayImageContext(ctx context.Context, samples image.Image, lower, upper float64) (image.Image, error) {
+// decodeGrayImageContext 应用灰度映射，紧凑样本保持延迟展开并校验合成内存预算
+// 入参: ctx 取消上下文, samples 独立样本, lower 映射起点, upper 映射终点, maxBytes 流解压字节上限
+// 返回: image.Image 灰度图像，不支持的样本类型为空, error 尺寸、超限或取消错误
+func decodeGrayImageContext(ctx context.Context, samples image.Image, lower, upper float64, maxBytes int64) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if source, ok := samples.(*jpxSampleImage); ok && source.rows != nil {
-		return &rowGrayImage{source: source, lower: lower, upper: upper, byteExact: imageByteExact(source) && (lower == 0 && upper == 1 || lower == 1 && upper == 0)}, nil
-	}
 	bounds := samples.Bounds()
+	if source, ok := samples.(*jpxSampleImage); ok && source.rows != nil {
+		byteExact := imageByteExact(source) && (lower == 0 && upper == 1 || lower == 1 && upper == 0)
+		pixelBytes := 2
+		if byteExact {
+			pixelBytes = 1
+		}
+		if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), pixelBytes, maxBytes); err != nil {
+			return nil, err
+		}
+		return &rowGrayImage{source: source, lower: lower, upper: upper, byteExact: byteExact}, nil
+	}
 	if source, ok := samples.(*image.Gray16); ok {
+		if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), 2, maxBytes); err != nil {
+			return nil, err
+		}
 		if lower != 0 || upper != 1 {
 			for y := 0; y < bounds.Dy(); y++ {
 				if err := ctx.Err(); err != nil {
@@ -61,6 +72,9 @@ func decodeGrayImageContext(ctx context.Context, samples image.Image, lower, upp
 	switch value := samples.(type) {
 	case *image.Gray:
 		if lower == 0 && upper == 1 {
+			if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), 1, maxBytes); err != nil {
+				return nil, err
+			}
 			return value, nil
 		}
 		source = value
@@ -80,14 +94,14 @@ func decodeGrayImageContext(ctx context.Context, samples image.Image, lower, upp
 		lookup[n] = uint16(math.Round(math.Max(0, math.Min(1, functionValue(value, lower, upper))) * 65535))
 		byteExact = byteExact && lookup[n]%257 == 0
 	}
+	pixelBytes := 2
+	if byteExact {
+		pixelBytes = 1
+	}
+	if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), pixelBytes, maxBytes); err != nil {
+		return nil, err
+	}
 	if packed != nil {
-		pixelBytes := 2
-		if byteExact {
-			pixelBytes = 1
-		}
-		if _, _, err := imageBufferSize(bounds.Dx(), bounds.Dy(), pixelBytes); err != nil {
-			return nil, err
-		}
 		return &mappedGrayImage{source: packed, lookup: lookup, byteExact: byteExact}, nil
 	}
 	var out8 *image.Gray
@@ -95,9 +109,6 @@ func decodeGrayImageContext(ctx context.Context, samples image.Image, lower, upp
 	if byteExact {
 		out8 = source
 	} else {
-		if _, _, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 2); err != nil {
-			return nil, err
-		}
 		out16 = image.NewGray16(bounds)
 	}
 	for y := 0; y < bounds.Dy(); y++ {

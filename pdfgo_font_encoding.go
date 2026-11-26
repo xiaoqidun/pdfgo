@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"strconv"
@@ -253,14 +254,18 @@ emdash .notdef .notdef .notdef .notdef .notdef .notdef .notdef .notdef .notdef .
 
 // type1EncodingScanner 按词项读取Type1字体明文段
 type type1EncodingScanner struct {
+	ctx  context.Context
 	data []byte
 	pos  int
 }
 
 // type1BuiltInEncoding 读取嵌入Type1字体明文段中的内建编码表
-// 入参: program PFA或PFB字体数据
-// 返回: map[uint32]string 字码与字形名称, error 错误信息
-func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
+// 入参: ctx 取消上下文, program PFA或PFB字体数据
+// 返回: map[uint32]string 字码与字形名称, error 错误或取消信息
+func type1BuiltInEncoding(ctx context.Context, program []byte) (map[uint32]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(program) >= 6 && program[0] == 0x80 && program[1] == 1 {
 		length := binary.LittleEndian.Uint32(program[2:6])
 		if uint64(length) > uint64(len(program)-6) {
@@ -269,7 +274,12 @@ func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
 		header, rest := program[6:6+length], program[6+length:]
 		if len(rest) >= 2 && rest[0] == 0x80 && rest[1] == 1 {
 			header = bytes.Clone(header)
-			for len(rest) >= 2 && rest[0] == 0x80 && rest[1] == 1 {
+			for steps := 0; len(rest) >= 2 && rest[0] == 0x80 && rest[1] == 1; steps++ {
+				if steps&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				if len(rest) < 6 {
 					return nil, fmt.Errorf("truncated PFB header")
 				}
@@ -283,8 +293,20 @@ func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
 		}
 		program = header
 	}
-	scanner := type1EncodingScanner{data: program}
-	for token := scanner.next(); token != ""; token = scanner.next() {
+	scanner := type1EncodingScanner{ctx: ctx, data: program}
+	for steps := 0; ; steps++ {
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		token := scanner.next()
+		if token == "" {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			break
+		}
 		if token == "eexec" {
 			break
 		}
@@ -297,39 +319,66 @@ func type1BuiltInEncoding(program []byte) (map[uint32]string, error) {
 			for code, name := range pdfStandardNames {
 				names[uint32(code)] = name
 			}
-			return names, nil
+			return names, ctx.Err()
 		case "256":
 			if scanner.next() != "array" {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				return nil, fmt.Errorf("invalid Type1 encoding array")
 			}
 			names := make(map[uint32]string, 256)
 			for code := 0; code < 256; code++ {
 				names[uint32(code)] = ".notdef"
 			}
-			for token := scanner.next(); token != ""; token = scanner.next() {
+			for entrySteps := 0; ; entrySteps++ {
+				if entrySteps&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				token := scanner.next()
+				if token == "" {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					break
+				}
 				if token == "eexec" {
 					break
 				}
 				if token == "def" {
-					return names, nil
+					return names, ctx.Err()
 				}
 				if token != "dup" {
 					continue
 				}
 				code, err := strconv.Atoi(scanner.next())
 				if err != nil || code < 0 || code > 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					return nil, fmt.Errorf("invalid Type1 encoding code")
 				}
 				name := scanner.next()
 				if len(name) < 2 || name[0] != '/' || scanner.next() != "put" {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					return nil, fmt.Errorf("invalid Type1 encoding entry")
 				}
 				names[uint32(code)] = name[1:]
 			}
 			return nil, fmt.Errorf("incomplete Type1 encoding")
 		default:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return nil, &UnsupportedError{Feature: "Type1 built-in encoding"}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return nil, fmt.Errorf("Type1 font has no built-in encoding")
 }
@@ -344,14 +393,20 @@ func type1EncodingSpace(value byte) bool {
 // next 读取Type1明文段的下一个PostScript词项
 // 返回: string 词项
 func (s *type1EncodingScanner) next() string {
-	for s.pos < len(s.data) {
+	for steps := 0; s.pos < len(s.data); steps++ {
+		if steps&4095 == 0 && s.ctx != nil && s.ctx.Err() != nil {
+			return ""
+		}
 		c := s.data[s.pos]
 		if type1EncodingSpace(c) {
 			s.pos++
 			continue
 		}
 		if c == '%' {
-			for s.pos < len(s.data) && s.data[s.pos] != '\r' && s.data[s.pos] != '\n' {
+			for commentSteps := 0; s.pos < len(s.data) && s.data[s.pos] != '\r' && s.data[s.pos] != '\n'; commentSteps++ {
+				if commentSteps&4095 == 0 && s.ctx != nil && s.ctx.Err() != nil {
+					return ""
+				}
 				s.pos++
 			}
 			continue
@@ -365,7 +420,10 @@ func (s *type1EncodingScanner) next() string {
 	if s.data[s.pos] == '(' {
 		depth := 1
 		s.pos++
-		for s.pos < len(s.data) && depth > 0 {
+		for steps := 0; s.pos < len(s.data) && depth > 0; steps++ {
+			if steps&4095 == 0 && s.ctx != nil && s.ctx.Err() != nil {
+				return ""
+			}
 			switch s.data[s.pos] {
 			case '\\':
 				if s.pos+1 < len(s.data) {
@@ -381,7 +439,10 @@ func (s *type1EncodingScanner) next() string {
 		return string(s.data[start:s.pos])
 	}
 	if s.data[s.pos] == '<' && (s.pos+1 == len(s.data) || s.data[s.pos+1] != '<') {
-		for s.pos < len(s.data) && s.data[s.pos] != '>' {
+		for steps := 0; s.pos < len(s.data) && s.data[s.pos] != '>'; steps++ {
+			if steps&4095 == 0 && s.ctx != nil && s.ctx.Err() != nil {
+				return ""
+			}
 			s.pos++
 		}
 		if s.pos < len(s.data) {
@@ -396,7 +457,10 @@ func (s *type1EncodingScanner) next() string {
 	if s.data[s.pos] == '/' {
 		s.pos++
 	}
-	for s.pos < len(s.data) && !type1EncodingSpace(s.data[s.pos]) && bytes.IndexByte([]byte("[]{}%()/<>"), s.data[s.pos]) < 0 {
+	for steps := 0; s.pos < len(s.data) && !type1EncodingSpace(s.data[s.pos]) && bytes.IndexByte([]byte("[]{}%()/<>"), s.data[s.pos]) < 0; steps++ {
+		if steps&4095 == 0 && s.ctx != nil && s.ctx.Err() != nil {
+			return ""
+		}
 		s.pos++
 	}
 	return string(s.data[start:s.pos])

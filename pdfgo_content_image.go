@@ -35,6 +35,7 @@ type contentImageSamples struct {
 
 // inlineByteReader 限制解码器预读，避免读取内联图像后的内容操作符
 type inlineByteReader struct {
+	ctx  context.Context
 	data []byte
 	pos  int
 }
@@ -54,13 +55,14 @@ func inlineCCITTLength(ctx context.Context, data []byte, dict Dictionary, params
 	if depth != Integer(1) && !(depth == nil && dict["ImageMask"] == Boolean(true)) {
 		return 0, fmt.Errorf("invalid CCITT component depth")
 	}
-	source := &inlineByteReader{data: data}
+	source := &inlineByteReader{ctx: ctx, data: data}
 	parameters, _ := params.(Dictionary)
 	reader, endOfBlock, err := ccittImageReader(source, int(dict["Width"].(Integer)), int(dict["Height"].(Integer)), parameters)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := io.CopyN(io.Discard, &contextInput{ctx: ctx, reader: reader}, int64(length)); err != nil {
+	reader = &contextInput{ctx: ctx, reader: reader}
+	if _, err := io.CopyN(io.Discard, reader, int64(length)); err != nil {
 		return 0, err
 	}
 	if endOfBlock {
@@ -440,10 +442,15 @@ func (p *pageInterpreter) recoverLZWImage(image *Image) error {
 	return p.ctx.Err()
 }
 
-// Read 每次提供一个编码字节，并记录已消费长度
+// Read 每次提供一个编码字节，定期检查取消并记录已消费长度
 // 入参: p 目标缓冲区
-// 返回: int 字节数, error 读取错误
+// 返回: int 字节数, error 读取或取消错误
 func (r *inlineByteReader) Read(p []byte) (int, error) {
+	if r.ctx != nil && r.pos&255 == 0 {
+		if err := r.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
 	if len(p) == 0 {
 		return 0, nil
 	}

@@ -17,7 +17,6 @@ package pdfgo
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -159,9 +158,6 @@ func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (Ext
 		seen[id] = true
 		target, err := r.readEmbeddedTargetContext(ctx, dict, &budget, rawCache)
 		if err != nil {
-			if errors.Is(err, ErrStreamLimitExceeded) {
-				return result, err
-			}
 			return result, wrapActionError(err)
 		}
 		result.Target = append(result.Target, target)
@@ -331,9 +327,6 @@ func (r *Reader) ReadEmbeddedTargetFile(ctx context.Context, target EmbeddedTarg
 // 入参: ctx 取消上下文, dict 目标字典, budget 文本解码预算, rawCache 原始字节串缓存
 // 返回: EmbeddedTarget 路径一步, error 字段类型、组合、超限或取消错误
 func (r *Reader) readEmbeddedTargetContext(ctx context.Context, dict Dictionary, budget *textStringBudget, rawCache map[Reference][]byte) (EmbeddedTarget, error) {
-	if err := ctx.Err(); err != nil {
-		return EmbeddedTarget{}, err
-	}
 	var refs [4]Reference
 	var values [4]Object
 	for index, key := range []Name{"R", "N", "P", "A"} {
@@ -357,26 +350,25 @@ func (r *Reader) readEmbeddedTargetContext(ctx context.Context, dict Dictionary,
 		}
 		return result, ctx.Err()
 	}
+	cloneRaw := func(ref Reference, data String) String {
+		if ref != (Reference{}) && rawCache != nil {
+			if cached, exists := rawCache[ref]; exists {
+				return String(cached)
+			}
+			cloned := bytes.Clone(data)
+			rawCache[ref] = cloned
+			return String(cloned)
+		}
+		return String(bytes.Clone(data))
+	}
 	copyRaw := func(ref Reference, data String) (String, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if ref != (Reference{}) && rawCache != nil {
-			if cached, exists := rawCache[ref]; exists {
-				if err := budget.consume(int64(len(cached)), "embedded target"); err != nil {
-					return nil, err
-				}
-				return String(cached), nil
-			}
-		}
 		if err := budget.consume(int64(len(data)), "embedded target"); err != nil {
 			return nil, err
 		}
-		cloned := bytes.Clone(data)
-		if ref != (Reference{}) && rawCache != nil {
-			rawCache[ref] = cloned
-		}
-		return String(cloned), nil
+		return cloneRaw(ref, data), nil
 	}
 	if values[1] != nil {
 		name, ok := values[1].(String)
@@ -411,17 +403,7 @@ func (r *Reader) readEmbeddedTargetContext(ctx context.Context, dict Dictionary,
 						return result, err
 					}
 				}
-				if ref != (Reference{}) && rawCache != nil {
-					if cached, exists := rawCache[ref]; exists {
-						values[index+2] = String(cached)
-					} else {
-						cloned := bytes.Clone(value)
-						rawCache[ref] = cloned
-						values[index+2] = String(cloned)
-					}
-				} else {
-					values[index+2] = String(bytes.Clone(value))
-				}
+				values[index+2] = cloneRaw(ref, value)
 			} else {
 				copied, err := copyRaw(ref, value)
 				if err != nil {

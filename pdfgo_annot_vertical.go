@@ -264,17 +264,21 @@ func (v annotationVerticalText) position(content *strings.Builder, x, y float64)
 
 // columns 按显式换行和可用高度划分竖排文字，选择列表的每项独占一列
 // 入参: ctx 取消上下文, state 文字状态, size 字号
-// 返回: []annotationVerticalColumn 文字列, float64 文字块宽度, error 度量或取消错误
+// 返回: []annotationVerticalColumn 文字列, float64 文字块宽度, error 度量、超限或取消错误
 func (v annotationVerticalText) columns(ctx context.Context, state graphicsState, size float64) ([]annotationVerticalColumn, float64, error) {
 	var columns []annotationVerticalColumn
 	start, pen := 0, 0.0
 	var bounds Rectangle
-	appendColumn := func(end int) {
+	appendColumn := func(end int) error {
+		if len(columns) >= maxAnnotationRichLines {
+			return fmt.Errorf("%w: vertical text column limit exceeded", ErrStreamLimitExceeded)
+		}
 		if end == start {
 			bounds = Rectangle{-size * state.hscale / 2, 0, size * state.hscale / 2, 0}
 		}
 		columns = append(columns, annotationVerticalColumn{letters: v.letters[start:end], bounds: bounds})
 		start, pen = end, 0
+		return nil
 	}
 	wrap := v.multiline && v.comb == 0 && (v.choice == nil || v.choice.Combo)
 	for i, letter := range v.letters {
@@ -282,7 +286,9 @@ func (v annotationVerticalText) columns(ctx context.Context, state graphicsState
 			return nil, 0, err
 		}
 		if letter.text == '\n' {
-			appendColumn(i)
+			if err := appendColumn(i); err != nil {
+				return nil, 0, err
+			}
 			start = i + 1
 			continue
 		}
@@ -295,7 +301,9 @@ func (v annotationVerticalText) columns(ctx context.Context, state graphicsState
 			combined = Rectangle{min(bounds.XMin, box.XMin), min(bounds.YMin, box.YMin), max(bounds.XMax, box.XMax), max(bounds.YMax, box.YMax)}
 		}
 		if wrap && i > start && combined.YMax-combined.YMin > v.frame.YMax-v.frame.YMin {
-			appendColumn(i)
+			if err := appendColumn(i); err != nil {
+				return nil, 0, err
+			}
 			box, advance, err = annotationVerticalBounds(letter, state, size, 0)
 			if err != nil {
 				return nil, 0, err
@@ -304,7 +312,9 @@ func (v annotationVerticalText) columns(ctx context.Context, state graphicsState
 		}
 		bounds, pen = combined, pen+advance
 	}
-	appendColumn(len(v.letters))
+	if err := appendColumn(len(v.letters)); err != nil {
+		return nil, 0, err
+	}
 	total := 0.0
 	for i := range columns {
 		if err := ctx.Err(); err != nil {

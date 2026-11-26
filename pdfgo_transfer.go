@@ -154,7 +154,7 @@ func (r *Reader) DeviceTransfer(fallback *TransferFunction, halftone *Halftone, 
 		function, found := functions[part]
 		if !found {
 			var defined bool
-			function, defined, err = r.halftoneTransfer(part)
+			function, defined, err = r.halftoneTransferContext(context.Background(), part)
 			if err != nil {
 				return nil, err
 			}
@@ -219,7 +219,7 @@ func (r *Reader) ColorantTransfer(fallback *TransferFunction, halftone *Halftone
 				return nil, err
 			}
 		}
-		function, defined, err := r.halftoneTransfer(part)
+		function, defined, err := r.halftoneTransferContext(context.Background(), part)
 		if err != nil {
 			return nil, err
 		}
@@ -268,13 +268,6 @@ func (r *Reader) defaultColorantTransfer(ctx context.Context, h *Halftone, named
 		return fmt.Errorf("missing nonprimary default transfer function")
 	}
 	return nil
-}
-
-// halftoneTransfer 读取网屏的单通道覆盖函数，不接受图形状态的函数数组
-// 入参: h 网屏定义
-// 返回: *TransferFunction 覆盖函数, bool 是否显式定义, error 引用、函数或关闭错误
-func (r *Reader) halftoneTransfer(h *Halftone) (*TransferFunction, bool, error) {
-	return r.halftoneTransferContext(context.Background(), h)
 }
 
 // halftoneTransferContext 在取消上下文内读取网屏的单通道覆盖函数，跨文档网屏通过独立视图安全读取

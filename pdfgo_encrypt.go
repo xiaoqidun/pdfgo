@@ -143,21 +143,16 @@ func (r *Reader) openSecurity(password []byte) error {
 	if r.Trailer["Encrypt"] == nil {
 		return nil
 	}
-	unencrypted, err := collectUnencryptedRefs(r.Trailer, func(ref Reference) (Object, error) {
-		cached := r.cache.snapshot()
-		obj, err := r.Object(ref)
-		if err != nil {
-			r.cache.prune(cached)
-			return nil, err
-		}
-		if _, isStream := obj.(*Stream); isStream {
-			r.cache.prune(cached)
-		}
-		return obj, nil
-	})
+	cached := r.cache.snapshot()
+	unencrypted, err := collectUnencryptedRefs(r.Trailer, r.Object)
 	if err != nil {
+		r.cache.prune(cached)
 		return err
 	}
+	for ref := range unencrypted {
+		cached[ref] = true
+	}
+	r.cache.prune(cached)
 	object, err := r.Resolve(r.Trailer["Encrypt"])
 	if err != nil || object == nil {
 		return err

@@ -345,6 +345,9 @@ func (s *annotationShaper) lines(text string, state graphicsState, size, width f
 			continue
 		}
 		for start := 0; start < len(full.clusters); {
+			if len(lines) >= maxAnnotationRichLines {
+				return nil, fmt.Errorf("%w: shaped text line limit exceeded", ErrStreamLimitExceeded)
+			}
 			end, lastBreak := start, start
 			advance := 0.0
 			for end < len(full.clusters) {
@@ -378,9 +381,6 @@ func (s *annotationShaper) lines(text string, state graphicsState, size, width f
 					break
 				}
 				end--
-			}
-			if len(lines) >= maxAnnotationRichLines {
-				return nil, fmt.Errorf("%w: shaped text line limit exceeded", ErrStreamLimitExceeded)
 			}
 			lines = append(lines, line)
 			start = end

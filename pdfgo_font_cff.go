@@ -15,17 +15,23 @@
 package pdfgo
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
 	"strconv"
-	"strings"
 )
 
+// maxCFFRealLength 限制单个CFF十进制浮点字面量的最大字符数，防止异常输入引发巨量分配
+const maxCFFRealLength = 128
+
 // cffIndex 读取CFF索引，返回切片及索引之后的位置
-// 入参: data CFF数据, offset 索引起始位置
-// 返回: [][]byte 索引项, int 索引结束位置, error 错误信息
-func cffIndex(data []byte, offset int) ([][]byte, int, error) {
+// 入参: ctx 取消上下文, data CFF数据, offset 索引起始位置
+// 返回: [][]byte 索引项, int 索引结束位置, error 错误或取消信息
+func cffIndex(ctx context.Context, data []byte, offset int) ([][]byte, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	if offset < 0 || offset > len(data)-2 {
 		return nil, 0, fmt.Errorf("truncated CFF index")
 	}
@@ -50,6 +56,11 @@ func cffIndex(data []byte, offset int) ([][]byte, int, error) {
 	}
 	var previous uint64
 	for n := 0; n <= count; n++ {
+		if n&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+		}
 		v := readOffset(n)
 		if v < 1 || v-1 > uint64(len(data)-base) || n > 0 && v < previous {
 			return nil, 0, fmt.Errorf("invalid CFF index range")
@@ -62,20 +73,33 @@ func cffIndex(data []byte, offset int) ([][]byte, int, error) {
 	items := make([][]byte, count)
 	start := base
 	for n := range items {
+		if n&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+		}
 		end := base + int(readOffset(n+1)-1)
 		items[n] = data[start:end]
 		start = end
 	}
-	return items, start, nil
+	return items, start, ctx.Err()
 }
 
 // cffDictionary 读取CFF字典数值及双字节操作符
-// 入参: data 字典数据
-// 返回: map[int][]float64 操作符及数值列表, error 错误信息
-func cffDictionary(data []byte) (map[int][]float64, error) {
+// 入参: ctx 取消上下文, data 字典数据
+// 返回: map[int][]float64 操作符及数值列表, error 错误或取消信息
+func cffDictionary(ctx context.Context, data []byte) (map[int][]float64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	result := map[int][]float64{}
 	var values []float64
-	for p := 0; p < len(data); {
+	for p, steps := 0, 0; p < len(data); steps++ {
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		b := data[p]
 		p++
 		var value float64
@@ -108,23 +132,44 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 			value = float64(int32(binary.BigEndian.Uint32(data[p:])))
 			p += 4
 		case b == 30:
-			var text strings.Builder
+			var buf [maxCFFRealLength]byte
+			size := 0
 			ended := false
 			for p < len(data) && !ended {
 				v := data[p]
 				p++
-				for _, n := range []byte{v >> 4, v & 15} {
+				for _, n := range [2]byte{v >> 4, v & 15} {
 					switch {
 					case n < 10:
-						text.WriteByte('0' + n)
+						if size >= len(buf) {
+							return nil, fmt.Errorf("invalid CFF real")
+						}
+						buf[size] = '0' + n
+						size++
 					case n == 10:
-						text.WriteByte('.')
+						if size >= len(buf) {
+							return nil, fmt.Errorf("invalid CFF real")
+						}
+						buf[size] = '.'
+						size++
 					case n == 11:
-						text.WriteByte('E')
+						if size >= len(buf) {
+							return nil, fmt.Errorf("invalid CFF real")
+						}
+						buf[size] = 'E'
+						size++
 					case n == 12:
-						text.WriteString("E-")
+						if size+2 > len(buf) {
+							return nil, fmt.Errorf("invalid CFF real")
+						}
+						buf[size], buf[size+1] = 'E', '-'
+						size += 2
 					case n == 14:
-						text.WriteByte('-')
+						if size >= len(buf) {
+							return nil, fmt.Errorf("invalid CFF real")
+						}
+						buf[size] = '-'
+						size++
 					case n == 15:
 						ended = true
 					default:
@@ -139,7 +184,7 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 				}
 			}
 			var err error
-			value, err = strconv.ParseFloat(text.String(), 64)
+			value, err = strconv.ParseFloat(string(buf[:size]), 64)
 			if !ended || err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
 				return nil, fmt.Errorf("invalid CFF real")
 			}
@@ -166,14 +211,14 @@ func cffDictionary(data []byte) (map[int][]float64, error) {
 	if len(values) != 0 {
 		return nil, fmt.Errorf("unused CFF dictionary operands")
 	}
-	return result, nil
+	return result, ctx.Err()
 }
 
 // cffFontMappingWithGlyphMap 读取CFF字形选择，非CID程序优先使用明确的CIDToGIDMap
-// 入参: data CFF数据, composite 复合字体, encoding 基础编码, differences 编码差异, programType 容器类型, glyphMap 原始CID到GID表
-// 返回: map[uint32]uint16 字形映射, map[uint32]string 字形名称, error 结构错误
-func cffFontMappingWithGlyphMap(data []byte, composite bool, encoding Name, differences map[uint32]string, programType Name, glyphMap []byte) (map[uint32]uint16, map[uint32]string, error) {
-	dict, stringsIndex, chars, err := cffFontData(data)
+// 入参: ctx 取消上下文, data CFF数据, composite 复合字体, encoding 基础编码, differences 编码差异, programType 容器类型, glyphMap 原始CID到GID表
+// 返回: map[uint32]uint16 字形映射, map[uint32]string 字形名称, error 结构或取消错误
+func cffFontMappingWithGlyphMap(ctx context.Context, data []byte, composite bool, encoding Name, differences map[uint32]string, programType Name, glyphMap []byte) (map[uint32]uint16, map[uint32]string, error) {
+	dict, stringsIndex, chars, err := cffFontData(ctx, data)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -187,35 +232,53 @@ func cffFontMappingWithGlyphMap(data []byte, composite bool, encoding Name, diff
 			break
 		}
 	}
+	if !composite && cidKeyed {
+		return nil, nil, fmt.Errorf("CID-keyed CFF font requires composite font")
+	}
 	if composite && !cidKeyed {
 		glyphs := make(map[uint32]uint16, len(chars))
 		if glyphMap != nil {
 			for cid := 0; cid < len(glyphMap)/2 && cid <= 65535; cid++ {
+				if cid&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, nil, err
+					}
+				}
 				gid := binary.BigEndian.Uint16(glyphMap[cid*2:])
 				if gid != 0 && int(gid) < len(chars) {
 					glyphs[uint32(cid)] = gid
 				}
 			}
-			return glyphs, nil, nil
+			return glyphs, nil, ctx.Err()
 		}
 		for gid := range chars {
+			if gid&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, nil, err
+				}
+			}
 			glyphs[uint32(gid)] = uint16(gid)
 		}
-		return glyphs, nil, nil
+		return glyphs, nil, ctx.Err()
 	}
-	charset, err := cffCharset(data, dict, len(chars))
+	charset, err := cffCharset(ctx, data, dict, len(chars))
 	if err != nil {
 		return nil, nil, err
 	}
 	bySID := make(map[uint32]uint16, len(charset))
 	for gid, sid := range charset {
+		if gid&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+		}
 		bySID[uint32(sid)] = uint16(gid)
 	}
 	if composite {
 		if len(dict[1230]) != 3 {
 			return nil, nil, fmt.Errorf("CID CFF lacks ROS")
 		}
-		return bySID, nil, nil
+		return bySID, nil, ctx.Err()
 	}
 	encodingOffset := 0
 	if encoding == "" {
@@ -313,6 +376,11 @@ func cffFontMappingWithGlyphMap(data []byte, composite bool, encoding Name, diff
 	if encoding != "" || len(differences) > 0 {
 		byName := map[string]uint16{}
 		for gid, sid := range charset {
+			if gid&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, nil, err
+				}
+			}
 			if int(sid) < len(cffStandardNames) {
 				byName[cffStandardNames[sid]] = uint16(gid)
 			} else if int(sid)-len(cffStandardNames) < len(stringsIndex) {
@@ -357,35 +425,38 @@ func cffFontMappingWithGlyphMap(data []byte, composite bool, encoding Name, diff
 			glyphNames[code] = name
 		}
 	}
-	return mapping, glyphNames, nil
+	return mapping, glyphNames, ctx.Err()
 }
 
 // cffFontData 读取单字体CFF的顶层字典、字符串及字形程序
-// 入参: data CFF字体数据
-// 返回: map[int][]float64 顶层字典, [][]byte 字符串, [][]byte 字形程序, error 错误信息
-func cffFontData(data []byte) (map[int][]float64, [][]byte, [][]byte, error) {
+// 入参: ctx 取消上下文, data CFF字体数据
+// 返回: map[int][]float64 顶层字典, [][]byte 字符串, [][]byte 字形程序, error 错误或取消信息
+func cffFontData(ctx context.Context, data []byte) (map[int][]float64, [][]byte, [][]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
 	if len(data) < 4 || data[0] != 1 || data[2] < 4 || data[3] < 1 || data[3] > 4 {
 		return nil, nil, nil, fmt.Errorf("invalid CFF header")
 	}
-	names, end, err := cffIndex(data, int(data[2]))
+	names, end, err := cffIndex(ctx, data, int(data[2]))
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	if len(names) != 1 {
 		return nil, nil, nil, &UnsupportedError{Feature: "CFF font set"}
 	}
-	tops, end, err := cffIndex(data, end)
+	tops, end, err := cffIndex(ctx, data, end)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	if len(tops) != 1 {
 		return nil, nil, nil, fmt.Errorf("invalid CFF top dictionary count")
 	}
-	stringsIndex, _, err := cffIndex(data, end)
+	stringsIndex, _, err := cffIndex(ctx, data, end)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	dict, err := cffDictionary(tops[0])
+	dict, err := cffDictionary(ctx, tops[0])
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -408,14 +479,14 @@ func cffFontData(data []byte) (map[int][]float64, [][]byte, [][]byte, error) {
 	if charOffset == 0 {
 		return nil, nil, nil, fmt.Errorf("missing CFF charstrings")
 	}
-	chars, _, err := cffIndex(data, charOffset)
+	chars, _, err := cffIndex(ctx, data, charOffset)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	if len(chars) == 0 {
 		return nil, nil, nil, fmt.Errorf("empty CFF charstrings")
 	}
-	return dict, stringsIndex, chars, nil
+	return dict, stringsIndex, chars, ctx.Err()
 }
 
 // cffOffset 读取顶层字典的预定义值或数据偏移
@@ -433,9 +504,12 @@ func cffOffset(data []byte, dict map[int][]float64, op, fallback int) (int, erro
 }
 
 // cffCharset 按CFF规范第13节及附录C读取字形标识
-// 入参: data CFF数据, dict 顶层字典, count 字形数
-// 返回: []uint16 SID或CID列表, error 错误信息
-func cffCharset(data []byte, dict map[int][]float64, count int) ([]uint16, error) {
+// 入参: ctx 取消上下文, data CFF数据, dict 顶层字典, count 字形数
+// 返回: []uint16 SID或CID列表, error 错误或取消信息
+func cffCharset(ctx context.Context, data []byte, dict map[int][]float64, count int) ([]uint16, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	offset, err := cffOffset(data, dict, 15, 0)
 	if err != nil {
 		return nil, err
@@ -462,7 +536,7 @@ func cffCharset(data []byte, dict map[int][]float64, count int) ([]uint16, error
 			}
 			copy(charset, predefined)
 		}
-		return charset, nil
+		return charset, ctx.Err()
 	}
 	if offset >= len(data) {
 		return nil, fmt.Errorf("invalid CFF charset offset")
@@ -473,6 +547,11 @@ func cffCharset(data []byte, dict map[int][]float64, count int) ([]uint16, error
 	}
 	seen := map[uint16]bool{0: true}
 	for gid := 1; gid < count; {
+		if gid&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if pos+2 > len(data) {
 			return nil, fmt.Errorf("truncated CFF charset")
 		}
@@ -497,6 +576,11 @@ func cffCharset(data []byte, dict map[int][]float64, count int) ([]uint16, error
 			return nil, fmt.Errorf("invalid CFF charset range")
 		}
 		for n := 0; n < run; n++ {
+			if n&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			sid := uint16(first + n)
 			if seen[sid] {
 				return nil, fmt.Errorf("duplicate CFF charset identifier")
@@ -506,5 +590,5 @@ func cffCharset(data []byte, dict map[int][]float64, count int) ([]uint16, error
 			gid++
 		}
 	}
-	return charset, nil
+	return charset, ctx.Err()
 }

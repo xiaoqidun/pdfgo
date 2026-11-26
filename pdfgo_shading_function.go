@@ -39,14 +39,31 @@ type gradientFunctionKey struct {
 	channels int
 }
 
+// streamFunctionKey 标识单次解析中按流指针与输入输出维度复用的函数条目
+type streamFunctionKey struct {
+	stream  *Stream
+	inputs  int
+	outputs int
+}
+
+// cachedCalculator 保存单次解析复用的多分量计算器函数与仿射快路径
+type cachedCalculator struct {
+	input       []float64
+	output      []float64
+	expressions []affineValue
+	program     *calculatorFunction
+}
+
 // gradientParseState 保存单次渐变函数解析的节点、停点与解码字节预算及间接引用记忆表
 type gradientParseState struct {
-	nodes     int
-	stops     int
-	bytes     int64
-	limit     int64
-	functions map[gradientFunctionKey]*gradientFunction
-	vectors   map[gradientFunctionKey]*gradientVector
+	nodes       int
+	stops       int
+	bytes       int64
+	limit       int64
+	functions   map[gradientFunctionKey]*gradientFunction
+	vectors     map[gradientFunctionKey]*gradientVector
+	sampled     map[streamFunctionKey]*sampledFunction
+	calculators map[streamFunctionKey]*cachedCalculator
 }
 
 // withGradientParseBudget 在上下文中附着单次颜色或着色解析共享的渐变函数预算与记忆表
@@ -123,35 +140,33 @@ func (s *gradientParseState) reserveBytes(size int64) error {
 	return nil
 }
 
-// checkGradientSampledBudget 解码一维采样流前按样本数和位宽预检累计字节预算
-// 入参: dict 采样函数字典, outputs 输出分量数, state 解析状态
+// checkSampledSizesBudget 解码前按多维采样尺寸和位宽预检累计字节预算
+// 入参: sizes 各维度样本数, outputs 输出分量数, bits 每样本位数, state 解析状态
 // 返回: error 预算超限错误
-func (r *Reader) checkGradientSampledBudget(dict Dictionary, outputs int, state *gradientParseState) error {
-	if state.limit <= 0 {
+func checkSampledSizesBudget(sizes []float64, outputs, bits int, state *gradientParseState) error {
+	if state == nil || state.limit <= 0 {
 		return nil
 	}
-	sizes, err := r.numberArray(dict["Size"], 1)
-	if err != nil || !finiteFloats(sizes) {
-		return nil
-	}
-	bits, err := r.number(dict["BitsPerSample"])
-	if err != nil || bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 12 && bits != 16 && bits != 24 && bits != 32 {
-		return nil
-	}
-	if sizes[0] < 1 || sizes[0] > float64(math.MaxInt64) || math.Trunc(sizes[0]) != sizes[0] {
-		return nil
-	}
-	remaining := uint64(state.limit - state.bytes)
+	remaining := uint64(max(int64(0), state.limit-state.bytes))
 	limitBits := remaining * 8
 	if remaining > math.MaxUint64/8 {
 		limitBits = math.MaxUint64
 	}
-	perSample := uint64(outputs) * uint64(bits)
-	if uint64(sizes[0]) > limitBits/perSample {
-		return fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
+	totalBits := uint64(outputs) * uint64(bits)
+	if totalBits == 0 {
+		return nil
 	}
-	needed := (uint64(sizes[0])*perSample-1)/8 + 1
-	if needed > remaining {
+	for _, size := range sizes {
+		if size < 1 || size > float64(math.MaxInt64) || math.Trunc(size) != size {
+			return nil
+		}
+		s := uint64(size)
+		if s > limitBits/totalBits {
+			return fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
+		}
+		totalBits *= s
+	}
+	if (totalBits-1)/8+1 > remaining {
 		return fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
 	}
 	return nil
@@ -494,6 +509,9 @@ func (r *Reader) readGradientFunctionState(ctx context.Context, object Object, c
 	if depth >= 32 {
 		return nil, fmt.Errorf("gradient function recursion limit exceeded")
 	}
+	if ctx.Value(gradientParseStateKey{}) != state {
+		ctx = context.WithValue(ctx, gradientParseStateKey{}, state)
+	}
 	state.nodes++
 	if state.nodes > maxGradientFunctionNodes {
 		return nil, fmt.Errorf("gradient function complexity limit exceeded")
@@ -572,19 +590,9 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		return nil, err
 	}
 	if kind == Integer(0) || kind == Integer(2) {
-		if kind == Integer(0) {
-			if err := r.checkGradientSampledBudget(dict, channels, state); err != nil {
-				return nil, err
-			}
-		}
 		tint, err := r.readTintFunction(ctx, v, channels)
 		if err != nil {
 			return nil, err
-		}
-		if tint.sampled {
-			if err := state.reserveBytes(int64(len(tint.samples))); err != nil {
-				return nil, err
-			}
 		}
 		f := &gradientFunction{bytes: 256 + int64(len(tint.samples)), value: func(x float64) (values [4]float64) {
 			tint.colorInto(x, values[:channels])

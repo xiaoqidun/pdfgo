@@ -125,7 +125,7 @@ func (r *Reader) remapICCAlternate(ctx context.Context, object Array, resources 
 		}
 	}
 	if cause != nil {
-		if ctx.Err() != nil || r.warning == nil || errors.Is(cause, errICCSourceProfileClass) {
+		if ctx.Err() != nil || r.warning == nil || isFatalReaderError(cause) || errors.Is(cause, errICCSourceProfileClass) {
 			return nil, cause
 		}
 		if state.iccV5 == nil {
@@ -207,12 +207,12 @@ func (r *Reader) remapICCAlternate(ctx context.Context, object Array, resources 
 // 入参: ctx 取消上下文, stream 配置流, count 源分量数, effective 是否已重映射, cause 配置错误
 // 返回: *iccColorSpace 备用变换, error 严格校验、备用空间或取消错误
 func (r *Reader) recoverICCAlternate(ctx context.Context, stream *Stream, count int, effective bool, cause error) (*iccColorSpace, error) {
-	if ctx.Err() != nil || r.warning == nil || errors.Is(cause, errICCSourceProfileClass) {
+	if ctx.Err() != nil || r.warning == nil || isFatalReaderError(cause) || errors.Is(cause, errICCSourceProfileClass) {
 		return nil, cause
 	}
 	space, err := r.readICCAlternate(ctx, stream, count, effective)
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || isFatalReaderError(err) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("%w; ICC alternate: %v", cause, err)
@@ -237,7 +237,7 @@ func (r *Reader) iccAlternateObject(stream *Stream, count int) (Object, error) {
 
 // readICCAlternate 编译同分量备用空间，不预先转换原始分量或共享配置缓存
 // 入参: ctx 取消上下文, stream 配置流, count 源分量数, effective 是否已按资源校验并替换
-// 返回: *iccColorSpace 备用源变换, error 定义、分量或取消错误
+// 返回: *iccColorSpace 备用源变换, error 定义、分量、预算或取消错误
 func (r *Reader) readICCAlternate(ctx context.Context, stream *Stream, count int, effective bool) (*iccColorSpace, error) {
 	object, err := r.iccAlternateObject(stream, count)
 	if err != nil {

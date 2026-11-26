@@ -25,6 +25,9 @@ type patternColorSpace struct {
 	convert    func([]float64, Name) (Paint, error)
 	invisible  bool
 	blending   *ColorSpace
+	separation *separationSpace
+	deviceN    *deviceNSpace
+	palette    *imagePalette
 }
 
 // readPatternBaseContext 在取消上下文内读取无色图案的设备、校准、索引或专色空间
@@ -53,56 +56,74 @@ func (r *Reader) readPatternColorSpaceContext(ctx context.Context, object Object
 			if err != nil {
 				return nil, err
 			}
-			return &patternColorSpace{1, func(values []float64, intent Name) (Paint, error) {
-				paint, err := space.paint(values[0], intent)
-				paint.Alpha = 1
-				return paint, err
-			}, space.name == "None" || space.none, nil}, nil
+			return &patternColorSpace{
+				components: 1,
+				convert: func(values []float64, intent Name) (Paint, error) {
+					paint, err := space.paint(values[0], intent)
+					paint.Alpha = 1
+					return paint, err
+				},
+				invisible:  space.name == "None" || space.none,
+				separation: space,
+			}, nil
 		case Name("DeviceN"):
 			space, err := r.readDeviceNSpaceContext(ctx, array, effective, r.colorProfileDepth)
 			if err != nil {
 				return nil, err
 			}
-			return &patternColorSpace{space.components, func(values []float64, intent Name) (Paint, error) {
-				paint, err := space.paint(values, intent)
-				paint.Alpha = 1
-				return paint, err
-			}, space.none, nil}, nil
+			return &patternColorSpace{
+				components: space.components,
+				convert: func(values []float64, intent Name) (Paint, error) {
+					paint, err := space.paint(values, intent)
+					paint.Alpha = 1
+					return paint, err
+				},
+				invisible: space.none,
+				deviceN:   space,
+			}, nil
 		case Name("Lab"):
 			lab, err := r.readLab(array)
 			if err != nil {
 				return nil, err
 			}
 			space := &graphicsColorSpace{lab: lab, displaySpace: ColorSpace{Model: "DeviceRGB", mapped: true}}
-			return &patternColorSpace{3, func(values []float64, _ Name) (Paint, error) {
-				paint, err := space.paint(values)
-				paint.Alpha = 1
-				return paint, err
-			}, false, nil}, nil
+			return &patternColorSpace{
+				components: 3,
+				convert: func(values []float64, _ Name) (Paint, error) {
+					paint, err := space.paint(values)
+					paint.Alpha = 1
+					return paint, err
+				},
+			}, nil
 		case Name("Indexed"):
 			image := &Image{reader: r, ColorSpace: array, Stream: &Stream{Dictionary: Dictionary{}}, Warning: r.warning, effectiveColorSpace: effective}
 			palette, err := image.paletteContext(ctx)
 			if err != nil {
 				return nil, err
 			}
-			return &patternColorSpace{1, func(values []float64, intent Name) (Paint, error) {
-				index := int(math.Round(math.Max(0, math.Min(float64(len(palette.colors)-1), values[0]))))
-				color := palette.colors[index]
-				paint := Paint{SourceSpace: "Indexed", RGB: [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}, Alpha: float64(color.A) / 65535, None: color.A == 0, Space: palette.space, Values: palette.values[index], Process: palette.process}
-				if palette.colorants != nil {
-					paint.Colorant = newColorantPaint(palette.colorants, palette.tints[index])
-				}
-				if palette.space != nil {
-					if palette.space.Model == "DeviceCMYK" && palette.space.profile == nil {
-						cmyk := paint.Values
-						paint.CMYK = &cmyk
+			return &patternColorSpace{
+				components: 1,
+				convert: func(values []float64, intent Name) (Paint, error) {
+					index := int(math.Round(math.Max(0, math.Min(float64(len(palette.colors)-1), values[0]))))
+					color := palette.colors[index]
+					paint := Paint{SourceSpace: "Indexed", RGB: [3]float64{float64(color.R) / 65535, float64(color.G) / 65535, float64(color.B) / 65535}, Alpha: float64(color.A) / 65535, None: color.A == 0, Space: palette.space, Values: palette.values[index], Process: palette.process}
+					if palette.colorants != nil {
+						paint.Colorant = newColorantPaint(palette.colorants, palette.tints[index])
 					}
-					var err error
-					paint.RGB, err = palette.space.SRGB(paint.Values[:palette.space.Components()], intent)
-					return paint, err
-				}
-				return paint, nil
-			}, palette.colors[0].A == 0, nil}, nil
+					if palette.space != nil {
+						if palette.space.Model == "DeviceCMYK" && palette.space.profile == nil {
+							cmyk := paint.Values
+							paint.CMYK = &cmyk
+						}
+						var err error
+						paint.RGB, err = palette.space.SRGB(paint.Values[:palette.space.Components()], intent)
+						return paint, err
+					}
+					return paint, nil
+				},
+				invisible: palette.colors[0].A == 0,
+				palette:   palette,
+			}, nil
 		}
 	}
 	space, err := r.readEffectiveColorSpaceContext(ctx, object, effective)
@@ -113,26 +134,31 @@ func (r *Reader) readPatternColorSpaceContext(ctx context.Context, object Object
 	if array, ok := object.(Array); ok && len(array) != 0 {
 		source, _ = array[0].(Name)
 	}
-	return &patternColorSpace{space.Components(), func(values []float64, intent Name) (Paint, error) {
-		if space.profile != nil && space.profile.alternate != nil {
-			paint, err := space.profile.paint(values, intent)
-			paint.Alpha = 1
-			return paint, err
-		}
-		paint := Paint{SourceSpace: source, Space: space, Alpha: 1}
-		if space.profile != nil {
-			paint.Values = space.profile.normalize(values)
-		} else {
-			for i, value := range values {
-				paint.Values[i] = math.Max(0, math.Min(1, value))
+	return &patternColorSpace{
+		components: space.Components(),
+		convert: func(values []float64, intent Name) (Paint, error) {
+			if space.profile != nil && space.profile.alternate != nil {
+				paint, err := space.profile.paint(values, intent)
+				paint.Alpha = 1
+				return paint, err
 			}
-		}
-		var err error
-		paint.RGB, err = space.SRGB(paint.Values[:space.Components()], intent)
-		if space.Model == "DeviceCMYK" && !space.Calibrated() {
-			values := paint.Values
-			paint.CMYK = &values
-		}
-		return paint, err
-	}, space.profile != nil && space.profile.alternate != nil && space.profile.alternate.invisible, space}, nil
+			paint := Paint{SourceSpace: source, Space: space, Alpha: 1}
+			if space.profile != nil {
+				paint.Values = space.profile.normalize(values)
+			} else {
+				for i, value := range values {
+					paint.Values[i] = math.Max(0, math.Min(1, value))
+				}
+			}
+			var err error
+			paint.RGB, err = space.SRGB(paint.Values[:space.Components()], intent)
+			if space.Model == "DeviceCMYK" && !space.Calibrated() {
+				values := paint.Values
+				paint.CMYK = &values
+			}
+			return paint, err
+		},
+		invisible: space.profile != nil && space.profile.alternate != nil && space.profile.alternate.invisible,
+		blending:  space,
+	}, nil
 }

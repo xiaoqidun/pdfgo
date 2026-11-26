@@ -183,7 +183,7 @@ func (r *Reader) applyNChannelProcess(ctx context.Context, space Array, tint *de
 		return nil
 	}
 	tint.alternate, tint.lab = output, lab
-	tint.nested, tint.none = nil, false
+	tint.nested, tint.none = nil, output.profile != nil && output.profile.alternate != nil && output.profile.alternate.invisible
 	tint.process = &ProcessColorants{Space: output, Channels: make([]int, tint.components)}
 	tint.input, tint.output = gradientUnitBounds(tint.components), gradientUnitBounds(output.Components())
 	if lab != nil {

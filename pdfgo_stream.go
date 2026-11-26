@@ -794,155 +794,890 @@ func releaseZlibReader(reader io.ReadCloser) {
 	}
 }
 
-// checkBrotliLimits 依据RFC 7932及RFC 9841预检Brotli窗口及块长度，防止解码器提前分配超限环形缓冲
-// 入参: data 压缩数据, maxBytes 解码字节上限，非正数表示不限制
-// 返回: error 超限时返回ErrStreamLimitExceeded
-func checkBrotliLimits(data []byte, maxBytes int64) error {
-	if maxBytes <= 0 || len(data) == 0 {
-		return nil
+// brotliBitReader 按LSB优先读取Brotli比特流，用于元块头及压缩块边界预检
+type brotliBitReader struct {
+	data      []byte
+	bitPos    int64
+	totalBits int64
+}
+
+// brotliHuffman 保存Brotli规范霍夫曼表，用于预检跳过非末尾压缩块
+type brotliHuffman struct {
+	single    bool
+	singleSym uint16
+	maxLen    int
+	count     [16]int
+	firstCode [16]int
+	firstSym  [16]int
+	symbols   []uint16
+}
+
+// brotliSkipStatus 表示压缩元块预检跳过的状态结果
+type brotliSkipStatus uint8
+
+// brotliSkipDone 等常量表示压缩元块预检跳过的结果状态
+const (
+	brotliSkipDone brotliSkipStatus = iota
+	brotliSkipUnsupported
+	brotliSkipTruncated
+	brotliSkipCorrupt
+)
+
+// brotliCodeLenOrder 等常量表对应RFC 7932霍夫曼码长、块长、插入复制长度及大窗口距离上限定义
+var (
+	brotliCodeLenOrder     = [18]byte{1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	brotliCodeLenPrefixLen = [16]byte{2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4}
+	brotliCodeLenPrefixVal = [16]byte{0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5}
+	brotliBlockLenOffset   = [26]uint32{1, 5, 9, 13, 17, 25, 33, 41, 49, 65, 81, 97, 113, 145, 177, 209, 241, 305, 369, 497, 753, 1265, 2289, 4337, 8433, 16625}
+	brotliBlockLenExtra    = [26]uint{2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 24}
+	brotliInsBase          = [24]uint32{0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210, 22594}
+	brotliInsExtra         = [24]uint{0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24}
+	brotliCopyBase         = [24]uint32{2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326, 582, 1094, 2118}
+	brotliCopyExtra        = [24]uint{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24}
+	brotliCmdInsRange      = [11]uint8{0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16}
+	brotliCmdCopyRange     = [11]uint8{0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16}
+	brotliMaxDistSymBound  = [4]uint32{0, 4, 12, 28}
+	brotliMaxDistSymDiff   = [4]uint32{73, 126, 228, 424}
+)
+
+// readBits 从比特流中顺序读取指定位数的无符号整数
+// 入参: n 需读取的位数
+// 返回: uint32 读取结果, bool 输入比特是否足够
+func (r *brotliBitReader) readBits(n uint) (uint32, bool) {
+	if int64(n) > r.totalBits-r.bitPos {
+		return 0, false
 	}
-	totalBits := int64(len(data)) * 8
-	var bitPos int64
-	readBits := func(n uint) (uint32, bool) {
-		if int64(n) > totalBits-bitPos {
-			return 0, false
-		}
-		var value uint32
-		for i := range n {
-			value |= uint32((data[bitPos>>3]>>uint(bitPos&7))&1) << i
-			bitPos++
-		}
-		return value, true
+	var value uint32
+	for i := range n {
+		value |= uint32((r.data[r.bitPos>>3]>>uint(r.bitPos&7))&1) << i
+		r.bitPos++
 	}
-	b0, _ := readBits(1)
-	var wbits uint32
-	if b0 == 0 {
-		wbits = 16
-	} else {
-		b1, ok := readBits(3)
+	return value, true
+}
+
+// peekBits 预读最多指定位数而不推进位偏移
+// 入参: n 最大预读位数
+// 返回: uint32 预读值, uint 实际可读位数
+func (r *brotliBitReader) peekBits(n uint) (uint32, uint) {
+	avail := r.totalBits - r.bitPos
+	if avail <= 0 {
+		return 0, 0
+	}
+	if int64(n) > avail {
+		n = uint(avail)
+	}
+	var value uint32
+	for i := range n {
+		pos := r.bitPos + int64(i)
+		value |= uint32((r.data[pos>>3]>>uint(pos&7))&1) << i
+	}
+	return value, n
+}
+
+// readVarLenUint8 按RFC 7932规则解码0至255变长整数
+// 返回: uint32 解码值, bool 输入比特是否足够
+func (r *brotliBitReader) readVarLenUint8() (uint32, bool) {
+	b, ok := r.readBits(1)
+	if !ok {
+		return 0, false
+	}
+	if b == 0 {
+		return 0, true
+	}
+	n, ok := r.readBits(3)
+	if !ok {
+		return 0, false
+	}
+	if n == 0 {
+		return 1, true
+	}
+	v, ok := r.readBits(uint(n))
+	if !ok {
+		return 0, false
+	}
+	return (1 << n) + v, true
+}
+
+// buildBrotliHuffman 按各符号码长构造规范霍夫曼解码表
+// 入参: lengths 各符号码长切片, allowSingle 是否允许单符号零位码长
+// 返回: brotliHuffman 霍夫曼表, bool 码长分布是否合法
+func buildBrotliHuffman(lengths []byte, allowSingle bool) (brotliHuffman, bool) {
+	var h brotliHuffman
+	total := 0
+	var onlySym uint16
+	for sym, l := range lengths {
+		if l == 0 {
+			continue
+		}
+		if l > 15 {
+			return brotliHuffman{}, false
+		}
+		h.count[l]++
+		if int(l) > h.maxLen {
+			h.maxLen = int(l)
+		}
+		onlySym = uint16(sym)
+		total++
+	}
+	if total == 0 {
+		return brotliHuffman{}, false
+	}
+	if total == 1 && allowSingle {
+		return brotliHuffman{single: true, singleSym: onlySym}, true
+	}
+	left := 1
+	for l := 1; l <= 15; l++ {
+		left = (left << 1) - h.count[l]
+		if left < 0 {
+			return brotliHuffman{}, false
+		}
+	}
+	if left != 0 {
+		return brotliHuffman{}, false
+	}
+	h.symbols = make([]uint16, total)
+	var next [16]int
+	code := 0
+	offset := 0
+	for l := 1; l <= h.maxLen; l++ {
+		h.firstCode[l] = code
+		h.firstSym[l] = offset
+		next[l] = offset
+		code = (code + h.count[l]) << 1
+		offset += h.count[l]
+	}
+	for sym, l := range lengths {
+		if l != 0 {
+			h.symbols[next[l]] = uint16(sym)
+			next[l]++
+		}
+	}
+	return h, true
+}
+
+// decode 从比特流解码单个规范霍夫曼符号
+// 入参: r 比特读取器
+// 返回: uint32 符号值, bool 输入比特足够且码字有效, bool 是否遇到输入截断
+func (h *brotliHuffman) decode(r *brotliBitReader) (uint32, bool, bool) {
+	if h.single {
+		return uint32(h.singleSym), true, false
+	}
+	code := 0
+	for l := 1; l <= h.maxLen; l++ {
+		bit, ok := r.readBits(1)
 		if !ok {
-			return nil
+			return 0, false, true
+		}
+		code = (code << 1) | int(bit)
+		diff := code - h.firstCode[l]
+		if diff >= 0 && diff < h.count[l] {
+			return uint32(h.symbols[h.firstSym[l]+diff]), true, false
+		}
+	}
+	return 0, false, false
+}
+
+// readBrotliHuffman 解析简单或复杂霍夫曼前缀码表
+// 入参: r 比特读取器, alphabetSize 字母表大小, maxSymbol 允许最大符号上限
+// 返回: brotliHuffman 霍夫曼表, bool 是否合法, bool 是否输入截断
+func readBrotliHuffman(r *brotliBitReader, alphabetSize, maxSymbol uint32) (brotliHuffman, bool, bool) {
+	alphabetSize &= 0x7ff
+	hskip, ok := r.readBits(2)
+	if !ok {
+		return brotliHuffman{}, false, true
+	}
+	if hskip == 1 {
+		nsym, ok := r.readBits(2)
+		if !ok {
+			return brotliHuffman{}, false, true
+		}
+		maxBits := uint(bits.Len32(alphabetSize - 1))
+		var syms [4]uint32
+		for i := uint32(0); i <= nsym; i++ {
+			v, ok := r.readBits(maxBits)
+			if !ok {
+				return brotliHuffman{}, false, true
+			}
+			if v >= maxSymbol {
+				return brotliHuffman{}, false, false
+			}
+			for j := uint32(0); j < i; j++ {
+				if syms[j] == v {
+					return brotliHuffman{}, false, false
+				}
+			}
+			syms[i] = v
+		}
+		if nsym == 0 {
+			return brotliHuffman{single: true, singleSym: uint16(syms[0])}, true, false
+		}
+		lengths := make([]byte, maxSymbol)
+		switch nsym {
+		case 1:
+			lengths[syms[0]], lengths[syms[1]] = 1, 1
+		case 2:
+			lengths[syms[0]], lengths[syms[1]], lengths[syms[2]] = 1, 2, 2
+		case 3:
+			treeSelect, ok := r.readBits(1)
+			if !ok {
+				return brotliHuffman{}, false, true
+			}
+			if treeSelect == 0 {
+				lengths[syms[0]], lengths[syms[1]], lengths[syms[2]], lengths[syms[3]] = 2, 2, 2, 2
+			} else {
+				lengths[syms[0]], lengths[syms[1]], lengths[syms[2]], lengths[syms[3]] = 1, 2, 3, 3
+			}
+		}
+		tree, ok := buildBrotliHuffman(lengths, false)
+		return tree, ok, false
+	}
+	var clLengths [18]byte
+	space := uint32(32)
+	numCodes := 0
+	for i := int(hskip); i < 18; i++ {
+		ix, avail := r.peekBits(4)
+		need := uint(brotliCodeLenPrefixLen[ix&0xf])
+		if need > avail {
+			return brotliHuffman{}, false, true
+		}
+		r.bitPos += int64(need)
+		v := brotliCodeLenPrefixVal[ix&0xf]
+		clLengths[brotliCodeLenOrder[i]] = v
+		if v != 0 {
+			space -= 32 >> v
+			numCodes++
+			if space-1 >= 32 {
+				break
+			}
+		}
+	}
+	if numCodes != 1 && space != 0 {
+		return brotliHuffman{}, false, false
+	}
+	clTree, ok := buildBrotliHuffman(clLengths[:], true)
+	if !ok {
+		return brotliHuffman{}, false, false
+	}
+	lengths := make([]byte, maxSymbol)
+	symbol := uint32(0)
+	symSpace := uint32(32768)
+	prevLen := uint32(8)
+	repeat := uint32(0)
+	repeatLen := uint32(0)
+	for symbol < maxSymbol && symSpace > 0 {
+		codeLen, valid, truncated := clTree.decode(r)
+		if !valid {
+			return brotliHuffman{}, false, truncated
+		}
+		if codeLen < 16 {
+			repeat = 0
+			if codeLen != 0 {
+				lengths[symbol] = byte(codeLen)
+				prevLen = codeLen
+				if 32768>>codeLen > symSpace {
+					return brotliHuffman{}, false, false
+				}
+				symSpace -= 32768 >> codeLen
+			}
+			symbol++
+			continue
+		}
+		extraBits := uint(3)
+		newLen := uint32(0)
+		if codeLen == 16 {
+			newLen = prevLen
+			extraBits = 2
+		}
+		if repeatLen != newLen {
+			repeat = 0
+			repeatLen = newLen
+		}
+		oldRepeat := repeat
+		if repeat > 0 {
+			repeat = (repeat - 2) << extraBits
+		}
+		delta, ok := r.readBits(extraBits)
+		if !ok {
+			return brotliHuffman{}, false, true
+		}
+		repeat += delta + 3
+		add := repeat - oldRepeat
+		if add > maxSymbol-symbol {
+			return brotliHuffman{}, false, false
+		}
+		if repeatLen != 0 {
+			cost := add << (15 - repeatLen)
+			if cost > symSpace {
+				return brotliHuffman{}, false, false
+			}
+			for range add {
+				lengths[symbol] = byte(repeatLen)
+				symbol++
+			}
+			symSpace -= cost
+		} else {
+			symbol += add
+		}
+	}
+	if symSpace != 0 {
+		return brotliHuffman{}, false, false
+	}
+	tree, ok := buildBrotliHuffman(lengths, false)
+	return tree, ok, false
+}
+
+// decodeBrotliContextMap 解码字面量或距离上下文映射表
+// 入参: r 比特读取器, size 映射表长度
+// 返回: []byte 上下文映射, uint32 霍夫曼树数量, bool 是否合法, bool 是否输入截断
+func decodeBrotliContextMap(r *brotliBitReader, size uint32) ([]byte, uint32, bool, bool) {
+	numTrees, ok := r.readVarLenUint8()
+	if !ok {
+		return nil, 0, false, true
+	}
+	numTrees++
+	cmap := make([]byte, size)
+	if numTrees <= 1 {
+		return cmap, 1, true, false
+	}
+	useRLE, ok := r.readBits(1)
+	if !ok {
+		return nil, 0, false, true
+	}
+	var maxRLE uint32
+	if useRLE != 0 {
+		v, ok := r.readBits(4)
+		if !ok {
+			return nil, 0, false, true
+		}
+		maxRLE = v + 1
+	}
+	tree, valid, truncated := readBrotliHuffman(r, numTrees+maxRLE, numTrees+maxRLE)
+	if !valid {
+		return nil, 0, false, truncated
+	}
+	for idx := uint32(0); idx < size; {
+		code, valid, truncated := tree.decode(r)
+		if !valid {
+			return nil, 0, false, truncated
+		}
+		if code == 0 {
+			cmap[idx] = 0
+			idx++
+		} else if code > maxRLE {
+			cmap[idx] = byte(code - maxRLE)
+			idx++
+		} else {
+			reps, ok := r.readBits(uint(code))
+			if !ok {
+				return nil, 0, false, true
+			}
+			reps += 1 << code
+			if reps > size-idx {
+				return nil, 0, false, false
+			}
+			idx += reps
+		}
+	}
+	imtf, ok := r.readBits(1)
+	if !ok {
+		return nil, 0, false, true
+	}
+	if imtf != 0 {
+		var mtf [256]byte
+		for i := range mtf {
+			mtf[i] = byte(i)
+		}
+		for i, v := range cmap {
+			idx := int(v)
+			val := mtf[idx]
+			cmap[i] = val
+			copy(mtf[1:idx+1], mtf[:idx])
+			mtf[0] = val
+		}
+	}
+	return cmap, numTrees, true, false
+}
+
+// skipBrotliCompressedBlock 在不分配环形缓冲的前提下步进跳过压缩元块，定位后续元块边界
+// 入参: ctx 取消上下文, r 比特读取器, mlen 当前块声明字节数, pos 累计输出位置, maxBackward 最大后向距离, distRB 距离环缓冲, distRBIdx 距离环索引, largeWindow 是否大窗口模式
+// 返回: brotliSkipStatus 跳过状态结果, error 取消错误
+func skipBrotliCompressedBlock(ctx context.Context, r *brotliBitReader, mlen, pos, maxBackward int64, distRB *[4]int, distRBIdx *int, largeWindow bool) (brotliSkipStatus, error) {
+	var numTypes [3]uint32
+	var blockLen [3]uint32
+	var typeTree [3]brotliHuffman
+	var lenTree [3]brotliHuffman
+	blockRB := [3][2]uint32{{1, 0}, {1, 0}, {1, 0}}
+	failStatus := func(truncated bool) brotliSkipStatus {
+		if truncated {
+			return brotliSkipTruncated
+		}
+		return brotliSkipCorrupt
+	}
+	readBlockLen := func(k int) (uint32, brotliSkipStatus) {
+		code, valid, truncated := lenTree[k].decode(r)
+		if !valid || code >= 26 {
+			return 0, failStatus(truncated)
+		}
+		extra, ok := r.readBits(brotliBlockLenExtra[code])
+		if !ok {
+			return 0, brotliSkipTruncated
+		}
+		return brotliBlockLenOffset[code] + extra, brotliSkipDone
+	}
+	for k := range 3 {
+		nt, ok := r.readVarLenUint8()
+		if !ok {
+			return brotliSkipTruncated, nil
+		}
+		numTypes[k] = nt + 1
+		blockLen[k] = 1 << 24
+		if numTypes[k] >= 2 {
+			var valid, truncated bool
+			var status brotliSkipStatus
+			typeTree[k], valid, truncated = readBrotliHuffman(r, numTypes[k]+2, numTypes[k]+2)
+			if !valid {
+				return failStatus(truncated), nil
+			}
+			lenTree[k], valid, truncated = readBrotliHuffman(r, 26, 26)
+			if !valid {
+				return failStatus(truncated), nil
+			}
+			blockLen[k], status = readBlockLen(k)
+			if status != brotliSkipDone {
+				return status, nil
+			}
+		}
+	}
+	distBits, ok := r.readBits(6)
+	if !ok {
+		return brotliSkipTruncated, nil
+	}
+	npostfix := distBits & 3
+	ndirect := (distBits >> 2) << npostfix
+	numDirectCodes := 16 + ndirect
+	postfixMask := (1 << npostfix) - 1
+	if int64(numTypes[0])*2 > r.totalBits-r.bitPos {
+		return brotliSkipTruncated, nil
+	}
+	r.bitPos += int64(numTypes[0]) * 2
+	litMap, numLitTrees, valid, truncated := decodeBrotliContextMap(r, numTypes[0]<<6)
+	if !valid {
+		return failStatus(truncated), nil
+	}
+	var litTrivial [256]bool
+	for t := uint32(0); t < numTypes[0]; t++ {
+		base := t << 6
+		sample := litMap[base]
+		trivial := true
+		for j := uint32(1); j < 64; j++ {
+			if litMap[base+j] != sample {
+				trivial = false
+				break
+			}
+		}
+		litTrivial[t] = trivial
+	}
+	distMap, numDistTrees, valid, truncated := decodeBrotliContextMap(r, numTypes[2]<<2)
+	if !valid {
+		return failStatus(truncated), nil
+	}
+	maxDistBits := uint32(24)
+	if largeWindow {
+		maxDistBits = 62
+	}
+	numDistCodes := 16 + ndirect + (maxDistBits << (npostfix + 1))
+	maxDistSym := numDistCodes
+	if largeWindow {
+		postfix := uint32(1) << npostfix
+		if ndirect < brotliMaxDistSymBound[npostfix] {
+			maxDistSym = ndirect + brotliMaxDistSymDiff[npostfix] + postfix
+		} else if ndirect > brotliMaxDistSymBound[npostfix]+postfix {
+			maxDistSym = ndirect + brotliMaxDistSymDiff[npostfix]
+		} else {
+			maxDistSym = brotliMaxDistSymBound[npostfix] + brotliMaxDistSymDiff[npostfix] + postfix
+		}
+	}
+	litTrees := make([]brotliHuffman, numLitTrees)
+	for i := range litTrees {
+		litTrees[i], valid, truncated = readBrotliHuffman(r, 256, 256)
+		if !valid {
+			return failStatus(truncated), nil
+		}
+	}
+	cmdTrees := make([]brotliHuffman, numTypes[1])
+	for i := range cmdTrees {
+		cmdTrees[i], valid, truncated = readBrotliHuffman(r, 704, 704)
+		if !valid {
+			return failStatus(truncated), nil
+		}
+	}
+	distTrees := make([]brotliHuffman, numDistTrees)
+	for i := range distTrees {
+		distTrees[i], valid, truncated = readBrotliHuffman(r, numDistCodes, maxDistSym)
+		if !valid {
+			return failStatus(truncated), nil
+		}
+	}
+	switchBlock := func(k int) brotliSkipStatus {
+		if numTypes[k] <= 1 {
+			return brotliSkipCorrupt
+		}
+		bt, valid, truncated := typeTree[k].decode(r)
+		if !valid {
+			return failStatus(truncated)
+		}
+		bl, status := readBlockLen(k)
+		if status != brotliSkipDone {
+			return status
+		}
+		blockLen[k] = bl
+		if bt == 1 {
+			bt = blockRB[k][1] + 1
+		} else if bt == 0 {
+			bt = blockRB[k][0]
+		} else {
+			bt -= 2
+		}
+		if bt >= numTypes[k] {
+			bt -= numTypes[k]
+		}
+		blockRB[k][0], blockRB[k][1] = blockRB[k][1], bt
+		return brotliSkipDone
+	}
+	const maxSkipOps = 1 << 20
+	remaining := mlen
+	ops := 0
+	for remaining > 0 {
+		if ops&4095 == 0 {
+			if err := ctx.Err(); err != nil {
+				return brotliSkipUnsupported, err
+			}
+		}
+		ops++
+		if ops > maxSkipOps {
+			return brotliSkipUnsupported, nil
+		}
+		if blockLen[1] == 0 {
+			if status := switchBlock(1); status != brotliSkipDone {
+				return status, nil
+			}
+		}
+		cmdCode, valid, truncated := cmdTrees[blockRB[1][1]].decode(r)
+		if !valid || cmdCode >= 704 {
+			return failStatus(truncated), nil
+		}
+		blockLen[1]--
+		group := cmdCode >> 6
+		insCode := uint32(brotliCmdInsRange[group]) + ((cmdCode >> 3) & 7)
+		copyCode := uint32(brotliCmdCopyRange[group]) + (cmdCode & 7)
+		insExtra, ok := r.readBits(brotliInsExtra[insCode])
+		if !ok {
+			return brotliSkipTruncated, nil
+		}
+		copyExtra, ok := r.readBits(brotliCopyExtra[copyCode])
+		if !ok {
+			return brotliSkipTruncated, nil
+		}
+		insLen := brotliInsBase[insCode] + insExtra
+		copyLen := brotliCopyBase[copyCode] + copyExtra
+		if int64(insLen) > remaining {
+			return brotliSkipCorrupt, nil
+		}
+		remaining -= int64(insLen)
+		for insLeft := insLen; insLeft > 0; {
+			if ops&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return brotliSkipUnsupported, err
+				}
+			}
+			ops++
+			if ops > maxSkipOps {
+				return brotliSkipUnsupported, nil
+			}
+			if blockLen[0] == 0 {
+				if status := switchBlock(0); status != brotliSkipDone {
+					return status, nil
+				}
+			}
+			litType := blockRB[0][1]
+			if !litTrivial[litType] && pos > 0 {
+				return brotliSkipUnsupported, nil
+			}
+			litTree := &litTrees[litMap[litType<<6]]
+			if litTree.single && litTrivial[litType] {
+				step := min(insLeft, blockLen[0])
+				insLeft -= step
+				blockLen[0] -= step
+				pos += int64(step)
+				continue
+			}
+			if _, valid, truncated := litTree.decode(r); !valid {
+				return failStatus(truncated), nil
+			}
+			insLeft--
+			blockLen[0]--
+			pos++
+		}
+		if remaining == 0 {
+			return brotliSkipDone, nil
+		}
+		var dist int
+		if cmdCode < 128 {
+			*distRBIdx--
+			dist = distRB[*distRBIdx&3]
+		} else {
+			if blockLen[2] == 0 {
+				if status := switchBlock(2); status != brotliSkipDone {
+					return status, nil
+				}
+			}
+			distCtx := min(uint32(3), copyCode)
+			dc, valid, truncated := distTrees[distMap[(blockRB[2][1]<<2)|distCtx]].decode(r)
+			if !valid {
+				return failStatus(truncated), nil
+			}
+			blockLen[2]--
+			if dc == 0 {
+				*distRBIdx--
+				dist = distRB[*distRBIdx&3]
+			} else if dc < 16 {
+				shift := dc << 1
+				idx := (*distRBIdx + int(uint32(0xAAAFFF1B)>>shift)) & 3
+				delta := int(uint32(0xFA5FA500)>>shift) & 3
+				dist = distRB[idx]
+				if shift&3 != 0 {
+					dist += delta
+				} else {
+					dist -= delta
+					if dist <= 0 {
+						return brotliSkipCorrupt, nil
+					}
+				}
+			} else if dc < numDirectCodes {
+				dist = int(dc) - 15
+			} else {
+				d := dc - numDirectCodes
+				postfix := int(d) & postfixMask
+				d >>= npostfix
+				nbits := uint((d >> 1) + 1)
+				extra, ok := r.readBits(nbits)
+				if !ok {
+					return brotliSkipTruncated, nil
+				}
+				offset := ((2 + int(d&1)) << nbits) - 4
+				dist = int(ndirect) + ((offset + int(extra)) << npostfix) + postfix + 1
+			}
+		}
+		maxDist := min(pos, maxBackward)
+		if int64(dist) > maxDist {
+			return brotliSkipUnsupported, nil
+		}
+		distRB[*distRBIdx&3] = dist
+		*distRBIdx++
+		if int64(copyLen) > remaining {
+			return brotliSkipCorrupt, nil
+		}
+		pos += int64(copyLen)
+		remaining -= int64(copyLen)
+	}
+	return brotliSkipDone, nil
+}
+
+// checkBrotliLimits 依据RFC 7932及RFC 9841预检Brotli窗口及全链元块长度，并在必要时无损封顶窗口位数
+// 入参: ctx 取消上下文, data 压缩数据, maxBytes 解码字节上限，非正数表示不限制
+// 返回: io.Reader 受控解码输入流, error 超限、截断、损坏或取消错误
+func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Reader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if maxBytes <= 0 || len(data) == 0 {
+		return bytes.NewReader(data), nil
+	}
+	r := &brotliBitReader{data: data, totalBits: int64(len(data)) * 8}
+	b0, _ := r.readBits(1)
+	var wbits uint32
+	wbitsWidth := 0
+	isLargeWindow := false
+	if b0 == 0 {
+		wbits, wbitsWidth = 16, 1
+	} else {
+		b1, ok := r.readBits(3)
+		if !ok {
+			return bytes.NewReader(data), nil
 		}
 		if b1 != 0 {
-			wbits = 17 + b1
+			wbits, wbitsWidth = 17+b1, 4
 		} else {
-			b2, ok := readBits(3)
+			b2, ok := r.readBits(3)
 			if !ok {
-				return nil
+				return bytes.NewReader(data), nil
 			}
 			switch b2 {
 			case 0:
-				wbits = 17
+				wbits, wbitsWidth = 17, 7
 			case 1:
-				b3, ok := readBits(1)
+				b3, ok := r.readBits(1)
 				if !ok || b3 == 1 {
-					return nil
+					return bytes.NewReader(data), nil
 				}
-				w, ok := readBits(6)
+				w, ok := r.readBits(6)
 				if !ok || w < 10 || w > 30 {
-					return nil
+					return bytes.NewReader(data), nil
 				}
-				wbits = w
+				wbits, wbitsWidth, isLargeWindow = w, 14, true
 			default:
-				wbits = 8 + b2
+				wbits, wbitsWidth = 8+b2, 7
 			}
 		}
 	}
 	if wbits > 24 && int64(1)<<(wbits-1) >= maxBytes {
-		return ErrStreamLimitExceeded
+		return nil, ErrStreamLimitExceeded
 	}
+	capWindow := func() io.Reader {
+		need := uint64(math.MaxUint64)
+		if uint64(maxBytes) <= math.MaxUint64-17 {
+			need = uint64(maxBytes) + 17
+		}
+		capped := uint32(bits.Len64(need - 1))
+		if wbitsWidth == 4 {
+			target := max(uint32(18), capped)
+			if target < wbits {
+				first := (data[0] & 0xf0) | byte(((target-17)<<1)|1)
+				return io.MultiReader(bytes.NewReader([]byte{first}), bytes.NewReader(data[1:]))
+			}
+		}
+		return bytes.NewReader(data)
+	}
+	maxBackward := (int64(1) << wbits) - 16
+	distRB := [4]int{16, 15, 11, 4}
+	distRBIdx := 0
 	var totalOut int64
 	for {
-		isLast, ok := readBits(1)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		isLast, ok := r.readBits(1)
 		if !ok {
-			return nil
+			return capWindow(), nil
 		}
 		if isLast != 0 {
-			isLastEmpty, ok := readBits(1)
-			if !ok || isLastEmpty != 0 {
-				return nil
+			isLastEmpty, ok := r.readBits(1)
+			if !ok {
+				return capWindow(), nil
+			}
+			if isLastEmpty != 0 {
+				return capWindow(), nil
 			}
 		}
-		nibblesCode, ok := readBits(2)
+		nibblesCode, ok := r.readBits(2)
 		if !ok {
-			return nil
+			return capWindow(), nil
 		}
 		if nibblesCode == 3 {
-			reserved, ok := readBits(1)
+			reserved, ok := r.readBits(1)
 			if !ok || reserved != 0 {
-				return nil
+				return capWindow(), nil
 			}
-			skipBytes, ok := readBits(2)
+			skipBytes, ok := r.readBits(2)
 			if !ok {
-				return nil
+				return capWindow(), nil
 			}
 			var skipLen int64
 			if skipBytes != 0 {
 				var raw uint32
 				for i := uint32(0); i < skipBytes; i++ {
-					b, ok := readBits(8)
+					b, ok := r.readBits(8)
 					if !ok {
-						return nil
+						return capWindow(), nil
 					}
 					if i+1 == skipBytes && skipBytes > 1 && b == 0 {
-						return nil
+						return capWindow(), nil
 					}
 					raw |= b << (i * 8)
 				}
 				skipLen = int64(raw) + 1
 			}
-			if rem := uint((8 - bitPos&7) & 7); rem != 0 {
-				pad, ok := readBits(rem)
+			if rem := uint((8 - r.bitPos&7) & 7); rem != 0 {
+				pad, ok := r.readBits(rem)
 				if !ok || pad != 0 {
-					return nil
+					return capWindow(), nil
 				}
 			}
-			if skipLen > (totalBits-bitPos)/8 {
-				return nil
+			if skipLen > (r.totalBits-r.bitPos)/8 {
+				return nil, io.ErrUnexpectedEOF
 			}
-			bitPos += skipLen * 8
+			r.bitPos += skipLen * 8
 			if isLast != 0 {
-				return nil
+				return capWindow(), nil
 			}
 			continue
 		}
 		nibbles := nibblesCode + 4
 		var mlenMinus1 uint32
 		for i := uint32(0); i < nibbles; i++ {
-			nib, ok := readBits(4)
+			nib, ok := r.readBits(4)
 			if !ok {
-				return nil
+				return capWindow(), nil
 			}
 			if i+1 == nibbles && nibbles > 4 && nib == 0 {
-				return nil
+				return capWindow(), nil
 			}
 			mlenMinus1 |= nib << (i * 4)
 		}
 		mlen := int64(mlenMinus1) + 1
 		var uncompressed uint32
 		if isLast == 0 {
-			uncompressed, ok = readBits(1)
+			uncompressed, ok = r.readBits(1)
 			if !ok {
-				return nil
+				return capWindow(), nil
 			}
 		}
 		if mlen > maxBytes-totalOut {
-			return ErrStreamLimitExceeded
+			return nil, ErrStreamLimitExceeded
 		}
+		blockPos := totalOut
 		totalOut += mlen
-		if isLast != 0 || uncompressed == 0 {
-			return nil
-		}
-		if rem := uint((8 - bitPos&7) & 7); rem != 0 {
-			pad, ok := readBits(rem)
-			if !ok || pad != 0 {
-				return nil
+		if isLast != 0 {
+			if totalOut > 1<<20 && int64(len(data)) < totalOut/1024 {
+				status, err := skipBrotliCompressedBlock(ctx, r, mlen, blockPos, maxBackward, &distRB, &distRBIdx, isLargeWindow)
+				if err != nil {
+					return nil, err
+				}
+				if status == brotliSkipTruncated {
+					return nil, io.ErrUnexpectedEOF
+				}
+				if status == brotliSkipCorrupt {
+					return nil, fmt.Errorf("corrupt brotli stream")
+				}
 			}
+			return capWindow(), nil
 		}
-		if mlen > (totalBits-bitPos)/8 {
-			return nil
+		if uncompressed != 0 {
+			if rem := uint((8 - r.bitPos&7) & 7); rem != 0 {
+				pad, ok := r.readBits(rem)
+				if !ok || pad != 0 {
+					return capWindow(), nil
+				}
+			}
+			if mlen > (r.totalBits-r.bitPos)/8 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			r.bitPos += mlen * 8
+			continue
 		}
-		bitPos += mlen * 8
+		status, err := skipBrotliCompressedBlock(ctx, r, mlen, blockPos, maxBackward, &distRB, &distRBIdx, isLargeWindow)
+		if err != nil {
+			return nil, err
+		}
+		if status == brotliSkipTruncated {
+			return nil, io.ErrUnexpectedEOF
+		}
+		if status == brotliSkipCorrupt {
+			return nil, fmt.Errorf("corrupt brotli stream")
+		}
+		if status != brotliSkipDone {
+			return capWindow(), nil
+		}
 	}
 }
 
@@ -1034,13 +1769,6 @@ func (r *Reader) DecodeStreamContext(ctx context.Context, stream *Stream) ([]byt
 		return nil, fmt.Errorf("stream belongs to another reader")
 	}
 	return stream.decodeWith(ctx, r, r.warning, 0)
-}
-
-// decodeStream 使用当前阅读器及默认背景上下文解码通用流过滤器
-// 入参: stream 数据流
-// 返回: []byte 独立解码数据, error 解码错误
-func (r *Reader) decodeStream(stream *Stream) ([]byte, error) {
-	return r.DecodeStreamContext(context.Background(), stream)
 }
 
 // Decode 解码通用流过滤器（图像专用过滤器由图像接口处理），手工构造流须提供直接参数；经Reader.Fork共享后不再调用原Warning回调，源阅读器关闭后返回os.ErrClosed
@@ -1158,14 +1886,18 @@ func (s *Stream) decodeWithLimit(ctx context.Context, reader *Reader, warning fu
 			}
 		case "BrotliDecode":
 			encoded := data
-			if err := checkBrotliLimits(encoded, maxBytes); err != nil {
-				if limit > 0 {
-					return nil, fmt.Errorf("stream recovery %w", err)
+			brotliInput, checkErr := checkBrotliLimits(ctx, encoded, maxBytes)
+			if checkErr != nil {
+				if errors.Is(checkErr, ErrStreamLimitExceeded) {
+					if limit > 0 {
+						return nil, fmt.Errorf("stream recovery %w", checkErr)
+					}
+					return nil, fmt.Errorf("Brotli %w", checkErr)
 				}
-				return nil, fmt.Errorf("Brotli %w", err)
+				return nil, checkErr
 			}
 			largeWindow := maxBytes == 0 || maxBytes > 16<<20
-			reader := acquireBrotliReaderWith(&contextInput{ctx: ctx, reader: bytes.NewReader(encoded)}, largeWindow)
+			reader := acquireBrotliReaderWith(&contextInput{ctx: ctx, reader: brotliInput}, largeWindow)
 			input := limitStreamReader(&contextInput{ctx: ctx, reader: reader}, maxBytes)
 			data, err = readAllEstimated(input, estimateFlateCapacity(len(encoded), maxBytes))
 			exceeded := maxBytes > 0 && int64(len(data)) > maxBytes

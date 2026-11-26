@@ -33,6 +33,9 @@ const maxCMapCodespaceRanges = 4096
 // maxCIDReverseSteps 限制CID到字符码反查允许检验的最大候选步数，防止重复覆盖区间耗尽CPU
 const maxCIDReverseSteps = 1 << 20
 
+// maxSpaceSecondBucketEntries 限制编码范围二级分桶索引允许分配的最大槽位总数
+const maxSpaceSecondBucketEntries = 65536
+
 // CIDMap 保存字符码到CID的映射
 type CIDMap map[string]uint16
 
@@ -68,21 +71,30 @@ type cidMappedRange struct {
 	invalid bool
 }
 
+// cidSecondBucket 保存大首字节桶按次字节划分的有序范围索引
+type cidSecondBucket struct {
+	bySecond [256][]uint16
+}
+
 // cidCMap 保存编码范围、字形选择和只读继承关系
 type cidCMap struct {
-	ranges       []cidMappedRange
-	spaces       []cidCodeRange
-	spaceByFirst [256][]uint16
-	minSpace     uint8
-	notdef       []cidNotdefRange
-	notdefFlat   bool
-	registry     string
-	ordering     string
-	vertical     bool
-	modeSet      bool
-	use          Name
-	base         *cidCMap
-	recovered    bool
+	ranges          []cidMappedRange
+	spaces          []cidCodeRange
+	spaceByFirst    [256][]uint16
+	spaceMinByFirst [256]uint8
+	spaceSingle     [256]uint16
+	spaceSecondMask *[256][4]uint64
+	spaceSecond     map[byte]*cidSecondBucket
+	minSpace        uint8
+	notdef          []cidNotdefRange
+	notdefFlat      bool
+	registry        string
+	ordering        string
+	vertical        bool
+	modeSet         bool
+	use             Name
+	base            *cidCMap
+	recovered       bool
 }
 
 // makeCIDCodeRange 将原始编码范围压缩为固定字节值类型以便去重和比较
@@ -96,11 +108,15 @@ func makeCIDCodeRange(first, last String) cidCodeRange {
 	return entry
 }
 
-// buildSpaceIndex 重建分桶索引与最小编码长度，加速首字节判定与范围扫描
+// buildSpaceIndex 重建分桶索引、最小编码长度及大桶二级次字节索引，加速范围匹配与剪枝
 // 入参: ctx 取消上下文
 // 返回: error 取消错误
 func (c *cidCMap) buildSpaceIndex(ctx context.Context) error {
 	c.spaceByFirst = [256][]uint16{}
+	c.spaceMinByFirst = [256]uint8{}
+	c.spaceSingle = [256]uint16{}
+	c.spaceSecondMask = nil
+	c.spaceSecond = nil
 	c.minSpace = 0
 	if len(c.spaces) == 0 {
 		return ctx.Err()
@@ -120,6 +136,12 @@ func (c *cidCMap) buildSpaceIndex(ctx context.Context) error {
 		total += hi - lo + 1
 		for b := lo; b <= hi; b++ {
 			counts[b]++
+			if c.spaceMinByFirst[b] == 0 || space.size < c.spaceMinByFirst[b] {
+				c.spaceMinByFirst[b] = space.size
+			}
+			if space.size == 1 && c.spaceSingle[b] == 0 {
+				c.spaceSingle[b] = uint16(i + 1)
+			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -143,6 +165,68 @@ func (c *cidCMap) buildSpaceIndex(ctx context.Context) error {
 		for b := int(space.first[0]); b <= int(space.last[0]); b++ {
 			c.spaceByFirst[b] = append(c.spaceByFirst[b], idx)
 		}
+	}
+	secondUsed := 0
+	for b0, bucket := range c.spaceByFirst {
+		if len(bucket) <= 16 {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if c.spaceSecondMask == nil {
+			c.spaceSecondMask = new([256][4]uint64)
+		}
+		var secCounts [256]int
+		secTotal := 0
+		for i, idx := range bucket {
+			if i&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			space := c.spaces[idx]
+			if space.size < 2 {
+				continue
+			}
+			lo, hi := int(space.first[1]), int(space.last[1])
+			secTotal += hi - lo + 1
+			for b1 := lo; b1 <= hi; b1++ {
+				c.spaceSecondMask[b0][b1>>6] |= 1 << (b1 & 63)
+				secCounts[b1]++
+			}
+		}
+		if secTotal == 0 || secTotal > maxSpaceSecondBucketEntries-secondUsed {
+			continue
+		}
+		if c.spaceSecond == nil {
+			c.spaceSecond = make(map[byte]*cidSecondBucket)
+		}
+		secBacking := make([]uint16, secTotal)
+		sb := &cidSecondBucket{}
+		secOffset := 0
+		for b1, n := range secCounts {
+			if n > 0 {
+				sb.bySecond[b1] = secBacking[secOffset : secOffset : secOffset+n]
+				secOffset += n
+			}
+		}
+		for i, idx := range bucket {
+			if i&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			space := c.spaces[idx]
+			if space.size < 2 {
+				continue
+			}
+			for b1 := int(space.first[1]); b1 <= int(space.last[1]); b1++ {
+				sb.bySecond[b1] = append(sb.bySecond[b1], idx)
+			}
+		}
+		c.spaceSecond[byte(b0)] = sb
+		secondUsed += secTotal
 	}
 	return ctx.Err()
 }
@@ -659,6 +743,10 @@ func (c *cidCMap) inherit() {
 		if len(c.spaces) == 0 {
 			c.spaces = c.base.spaces
 			c.spaceByFirst = c.base.spaceByFirst
+			c.spaceMinByFirst = c.base.spaceMinByFirst
+			c.spaceSingle = c.base.spaceSingle
+			c.spaceSecondMask = c.base.spaceSecondMask
+			c.spaceSecond = c.base.spaceSecond
 			c.minSpace = c.base.minSpace
 		} else {
 			seen := make(map[cidCodeRange]struct{}, len(c.spaces)+len(c.base.spaces))
@@ -694,21 +782,90 @@ func (c *cidCMap) inherit() {
 // 入参: ctx 取消上下文, data 剩余字符串
 // 返回: int 字节数, bool 是否有效字符码, error 取消错误
 func (c *cidCMap) nextContext(ctx context.Context, data []byte) (int, bool, error) {
+	return c.nextWithSteps(ctx, data, nil, 0)
+}
+
+// nextWithSteps 按一二级分桶与位图剪枝匹配字符码，可选累计范围扫描步数上限
+// 入参: ctx 取消上下文, data 剩余字符串, steps 累计步数计数器，可为空, limit 最大步数上限
+// 返回: int 字节数, bool 是否有效字符码, error 超限或取消错误
+func (c *cidCMap) nextWithSteps(ctx context.Context, data []byte, steps *int, limit int) (int, bool, error) {
 	if len(data) == 0 {
 		return 0, false, ctx.Err()
 	}
-	bucket := c.spaceByFirst[data[0]]
+	b0 := data[0]
+	bucket := c.spaceByFirst[b0]
 	if len(bucket) == 0 {
 		if c.minSpace != 0 {
 			return min(int(c.minSpace), len(data)), false, nil
 		}
 		return min(5, len(data)), false, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	singleIdx := int(c.spaceSingle[b0]) - 1
+	if len(data) == 1 {
+		if singleIdx >= 0 {
+			return 1, true, nil
+		}
+		return 1, false, nil
+	}
+	if c.spaceSecondMask != nil && len(bucket) > 16 {
+		b1 := data[1]
+		if c.spaceSecondMask[b0][b1>>6]&(1<<(b1&63)) == 0 {
+			if singleIdx >= 0 {
+				return 1, true, nil
+			}
+			return min(int(c.spaceMinByFirst[b0]), len(data)), false, nil
+		}
+		if sb := c.spaceSecond[b0]; sb != nil {
+			sub := sb.bySecond[b1]
+			length, longest := 5, -1
+			for i, idx := range sub {
+				if i&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return 0, false, err
+					}
+				}
+				if singleIdx >= 0 && int(idx) > singleIdx {
+					return 1, true, nil
+				}
+				if i > 0 && steps != nil {
+					*steps++
+					if *steps > limit {
+						return 0, false, fmt.Errorf("%w: CID CMap reverse lookup limit exceeded", ErrStreamLimitExceeded)
+					}
+				}
+				space := c.spaces[idx]
+				size := int(space.size)
+				matched := 2
+				for matched < size && matched < len(data) && data[matched] >= space.first[matched] && data[matched] <= space.last[matched] {
+					matched++
+				}
+				if matched == size {
+					return matched, true, nil
+				}
+				if matched > longest || matched == longest && size < length {
+					length, longest = size, matched
+				}
+			}
+			if singleIdx >= 0 {
+				return 1, true, nil
+			}
+			return min(length, len(data)), false, nil
+		}
+	}
 	length, longest := 5, -1
 	for i, idx := range bucket {
 		if i&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return 0, false, err
+			}
+		}
+		if i > 0 && steps != nil {
+			*steps++
+			if *steps > limit {
+				return 0, false, fmt.Errorf("%w: CID CMap reverse lookup limit exceeded", ErrStreamLimitExceeded)
 			}
 		}
 		space := c.spaces[idx]
@@ -907,7 +1064,7 @@ func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16, skip Unicod
 						continue
 					}
 				}
-				n, valid, err := c.nextContext(ctx, data)
+				n, valid, err := c.nextWithSteps(ctx, data, &steps, maxCIDReverseSteps)
 				if err != nil {
 					return nil, err
 				}
@@ -1094,6 +1251,10 @@ func finalizeCIDCMapChain(ctx context.Context, mapping *cidCMap, owned []*cidCMa
 		if node != mapping {
 			node.spaces = nil
 			node.spaceByFirst = [256][]uint16{}
+			node.spaceMinByFirst = [256]uint8{}
+			node.spaceSingle = [256]uint16{}
+			node.spaceSecondMask = nil
+			node.spaceSecond = nil
 			node.notdef = nil
 		}
 	}
@@ -1284,7 +1445,17 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 		return nil, err
 	}
 	var mapping UnicodeMap
+	var baseStreamName Name
 	if base != nil {
+		if baseStream, ok := base.(*Stream); ok && baseStream != nil {
+			nameVal, err := r.Resolve(baseStream.Dictionary["CMapName"])
+			if err != nil {
+				return nil, err
+			}
+			if name, ok := nameVal.(Name); ok {
+				baseStreamName = name
+			}
+		}
 		mapping, err = r.readUnicodeCMapContext(ctx, useRaw, activeRefs, activeStreams, depth+1)
 		if err != nil {
 			return nil, err
@@ -1296,7 +1467,7 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 	if err != nil {
 		return nil, err
 	}
-	if err := parseUnicodeMapIntoContext(ctx, mapping, data, nil); err != nil {
+	if err := parseUnicodeMapIntoContext(ctx, mapping, data, nil, baseStreamName); err != nil {
 		return nil, err
 	}
 	return mapping, nil

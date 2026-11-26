@@ -58,43 +58,53 @@ func (r *Reader) OptionalContentVisible(object Object) (bool, error) {
 	return r.optionalContentVisibleContext(context.Background(), object)
 }
 
-// optionalContentVisibleContext 按文档默认配置及取消上下文判断可选内容可见性
-// 入参: ctx 取消上下文, object OCG引用或OCMD字典
-// 返回: bool 是否可见, error 配置、表达式、超限或取消错误
-func (r *Reader) optionalContentVisibleContext(ctx context.Context, object Object) (bool, error) {
+// newOptionalContentEvaluator 初始化文档默认配置的可选内容求值器，文档无OCProperties时返回空值
+// 入参: ctx 取消上下文
+// 返回: *optionalContentEvaluator 求值器, bool 文档是否声明可选内容配置, error 配置或取消错误
+func (r *Reader) newOptionalContentEvaluator(ctx context.Context) (*optionalContentEvaluator, bool, error) {
 	if r == nil {
-		return false, fmt.Errorf("invalid reader")
+		return nil, false, fmt.Errorf("invalid reader")
 	}
 	if ctx == nil {
-		return false, fmt.Errorf("invalid optional content context")
+		return nil, false, fmt.Errorf("invalid optional content context")
 	}
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if r.closed {
-		return false, os.ErrClosed
+		return nil, false, os.ErrClosed
 	}
 	root, err := r.optionalDictionary(r.Trailer["Root"])
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	properties, err := r.optionalDictionary(root["OCProperties"])
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if properties == nil {
-		return true, nil
+		return nil, false, nil
 	}
 	config, err := r.optionalDictionary(properties["D"])
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
-	evaluator := optionalContentEvaluator{
+	return &optionalContentEvaluator{
 		reader: r,
 		ctx:    ctx,
 		config: config,
 		memo:   map[optionalContentKey]bool{},
 		active: map[optionalContentKey]bool{},
+	}, true, nil
+}
+
+// optionalContentVisibleContext 按文档默认配置及取消上下文判断可选内容可见性
+// 入参: ctx 取消上下文, object OCG引用或OCMD字典
+// 返回: bool 是否可见, error 配置、表达式、超限或取消错误
+func (r *Reader) optionalContentVisibleContext(ctx context.Context, object Object) (bool, error) {
+	evaluator, hasOC, err := r.newOptionalContentEvaluator(ctx)
+	if err != nil || !hasOC {
+		return !hasOC && err == nil, err
 	}
 	return evaluator.eval(object, 0)
 }
@@ -165,6 +175,9 @@ func (e *optionalContentEvaluator) eval(object Object, depth int) (bool, error) 
 		return false, err
 	}
 	if hasKey {
+		if len(e.memo) >= maxOptionalContentSteps {
+			clear(e.memo)
+		}
 		e.memo[key] = result
 	}
 	return result, nil
@@ -349,7 +362,7 @@ func (e *optionalContentEvaluator) intents(object Object) ([]Name, error) {
 }
 
 // loadGroupStates 懒加载默认配置的基础状态与显式开关列表，规范化间接引用链
-// 返回: error 配置或取消错误
+// 返回: error 配置、超限或取消错误
 func (e *optionalContentEvaluator) loadGroupStates() error {
 	if e.stateReady {
 		return nil
@@ -379,6 +392,12 @@ func (e *optionalContentEvaluator) loadGroupStates() error {
 		if !ok {
 			return fmt.Errorf("invalid optional content state list")
 		}
+		if err := e.ctx.Err(); err != nil {
+			return err
+		}
+		if len(list) > maxOptionalContentSteps-e.steps {
+			return fmt.Errorf("%w: optional content evaluation step limit exceeded", ErrStreamLimitExceeded)
+		}
 		on := key == "ON"
 		for i, item := range list {
 			if i&255 == 0 {
@@ -386,6 +405,7 @@ func (e *optionalContentEvaluator) loadGroupStates() error {
 					return err
 				}
 			}
+			e.steps++
 			if _, ok := item.(Reference); !ok {
 				return fmt.Errorf("invalid optional content group reference")
 			}
@@ -401,10 +421,16 @@ func (e *optionalContentEvaluator) loadGroupStates() error {
 }
 
 // loadDictStates 为直接传入的OCG字典按指针建立开关索引
-// 返回: error 引用解析或取消错误
+// 返回: error 引用解析、超限或取消错误
 func (e *optionalContentEvaluator) loadDictStates() error {
 	if e.dictReady {
 		return nil
+	}
+	if err := e.ctx.Err(); err != nil {
+		return err
+	}
+	if len(e.groupStates) > maxOptionalContentSteps-e.steps {
+		return fmt.Errorf("%w: optional content evaluation step limit exceeded", ErrStreamLimitExceeded)
 	}
 	dictStates := map[uintptr]bool{}
 	index := 0
@@ -415,6 +441,7 @@ func (e *optionalContentEvaluator) loadDictStates() error {
 			}
 		}
 		index++
+		e.steps++
 		resolved, err := e.reader.Resolve(ref)
 		if err != nil {
 			return err
@@ -498,9 +525,9 @@ func (e *optionalContentEvaluator) groupState(currentRef Reference, group Dictio
 	return e.baseState, nil
 }
 
-// optionalVisible 使用调用方状态或默认配置判断可选内容是否绘制
+// optionalVisible 使用调用方状态或页面级缓存的默认配置求值器判断可选内容是否绘制
 // 入参: object 可选内容属性
-// 返回: bool 是否可见, error 配置或取消错误
+// 返回: bool 是否可见, error 配置、超限或取消错误
 func (p *pageInterpreter) optionalVisible(object Object) (bool, error) {
 	if err := p.ctx.Err(); err != nil {
 		return false, err
@@ -515,5 +542,22 @@ func (p *pageInterpreter) optionalVisible(object Object) (bool, error) {
 	if p.visitor.OptionalContent != nil {
 		return p.visitor.OptionalContent(object)
 	}
-	return p.reader.optionalContentVisibleContext(p.ctx, object)
+	walk := p.ensureWalkState()
+	if walk.ocReader != p.reader {
+		evaluator, hasOC, err := p.reader.newOptionalContentEvaluator(p.ctx)
+		if err != nil {
+			return false, err
+		}
+		walk.ocReader = p.reader
+		walk.ocEvaluator = evaluator
+		walk.ocNone = !hasOC
+	}
+	if walk.ocNone {
+		return true, p.ctx.Err()
+	}
+	evaluator := walk.ocEvaluator
+	evaluator.ctx = p.ctx
+	evaluator.steps = 0
+	clear(evaluator.active)
+	return evaluator.eval(object, 0)
 }

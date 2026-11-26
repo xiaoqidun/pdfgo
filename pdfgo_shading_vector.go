@@ -135,6 +135,9 @@ func (r *Reader) readGradientVectorState(ctx context.Context, object Object, cha
 	if channels < 1 || depth >= 32 {
 		return nil, fmt.Errorf("invalid gradient vector dimensions or recursion")
 	}
+	if ctx.Value(gradientParseStateKey{}) != state {
+		ctx = context.WithValue(ctx, gradientParseStateKey{}, state)
+	}
 	if channels <= 4 {
 		function, err := r.readGradientFunctionState(ctx, object, channels, depth, state)
 		if err != nil {
@@ -247,19 +250,9 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 	var evaluate func(float64, []float64) error
 	switch kind {
 	case Integer(0), Integer(2):
-		if kind == Integer(0) {
-			if err := r.checkGradientSampledBudget(dict, channels, state); err != nil {
-				return nil, err
-			}
-		}
 		tint, err := r.readTintFunction(ctx, value, channels)
 		if err != nil {
 			return nil, err
-		}
-		if tint.sampled {
-			if err := state.reserveBytes(int64(len(tint.samples))); err != nil {
-				return nil, err
-			}
 		}
 		f.bytes = 256 + int64(len(tint.samples)) + int64(channels)*64
 		evaluate = func(x float64, out []float64) error { tint.colorInto(x, out); return nil }

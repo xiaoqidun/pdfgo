@@ -115,7 +115,7 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 				}
 				font, letter, err := selection.letter(ch)
 				if err != nil {
-					if keepZero {
+					if keepZero || isFatalReaderError(err) {
 						return nil, err
 					}
 					font, letters, err := fonts.selectText(run.style, run.text)

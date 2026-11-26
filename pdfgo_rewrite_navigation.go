@@ -75,6 +75,33 @@ func navigationURI(value string) (String, error) {
 	return String(result.String()), nil
 }
 
+// normalizeOutlineRefs 将大纲修改映射中的间接引用链规范化为最终目录项对象引用
+// 入参: r 关联阅读器, source 原始大纲修改映射
+// 返回: map[Reference]T 规范化后的映射, error 引用循环或冲突错误
+func normalizeOutlineRefs[T any](r *Reader, source map[Reference]T) (map[Reference]T, error) {
+	if len(source) == 0 {
+		return nil, nil
+	}
+	normalized := make(map[Reference]T, len(source))
+	for ref, value := range source {
+		target := ref
+		if ref.Number > 0 && ref.Generation >= 0 && ref.Generation <= 65535 {
+			resolved, err := r.resolveIndirectReference(ref)
+			if err != nil {
+				return nil, err
+			}
+			if resolved != (Reference{}) {
+				target = resolved
+			}
+		}
+		if _, exists := normalized[target]; exists {
+			return nil, fmt.Errorf("conflicting PDF outline replacement")
+		}
+		normalized[target] = value
+	}
+	return normalized, nil
+}
+
 // navigationReplacements 校验导航修改并按实际层级更新大纲节点
 // 入参: ctx 取消上下文, options 替换配置, result 已有替换对象, resources 动作资源
 // 返回: map[AnnotationLocation]linkNavigation 链接导航修改, error 页面、目标或大纲错误
@@ -89,8 +116,20 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 			return nil, fmt.Errorf("conflicting PDF link actions and destination")
 		}
 	}
-	for ref, actions := range options.OutlineActions {
-		if _, exists := options.OutlineDestinations[ref]; exists {
+	outlineDestinations, err := normalizeOutlineRefs(r, options.OutlineDestinations)
+	if err != nil {
+		return nil, err
+	}
+	outlineTitles, err := normalizeOutlineRefs(r, options.OutlineTitles)
+	if err != nil {
+		return nil, err
+	}
+	outlineActions, err := normalizeOutlineRefs(r, options.OutlineActions)
+	if err != nil {
+		return nil, err
+	}
+	for ref, actions := range outlineActions {
+		if _, exists := outlineDestinations[ref]; exists {
 			return nil, fmt.Errorf("conflicting PDF outline actions and destination")
 		}
 		for _, action := range actions {
@@ -132,15 +171,18 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 		}
 		links[location] = linkNavigation{action: action, replaceActions: true}
 	}
-	if len(options.OutlineDestinations) == 0 && len(options.OutlineTitles) == 0 && len(options.OutlineActions) == 0 {
+	if len(outlineDestinations) == 0 && len(outlineTitles) == 0 && len(outlineActions) == 0 {
 		return links, nil
 	}
 	catalog, err := r.catalogDictionary()
 	if err != nil {
 		return nil, err
 	}
-	root, ok := catalog["Outlines"].(Reference)
-	if !ok {
+	root, err := r.resolveIndirectReference(catalog["Outlines"])
+	if err != nil {
+		return nil, err
+	}
+	if root == (Reference{}) {
 		return nil, fmt.Errorf("PDF outline root is not indirect")
 	}
 	parents := []Reference{root}
@@ -152,9 +194,9 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 		parent := parents[level]
 		parents = append(parents[:level+1], item.Reference)
 		originalParent, _ := item.Dictionary["Parent"].(Reference)
-		dest, changeDest := options.OutlineDestinations[item.Reference]
-		title, changeTitle := options.OutlineTitles[item.Reference]
-		actions, changeActions := options.OutlineActions[item.Reference]
+		dest, changeDest := outlineDestinations[item.Reference]
+		title, changeTitle := outlineTitles[item.Reference]
+		actions, changeActions := outlineActions[item.Reference]
 		if !changeDest && !changeTitle && !changeActions && originalParent == parent {
 			return nil
 		}
@@ -199,7 +241,7 @@ func (r *Reader) navigationReplacements(ctx context.Context, options RewriteOpti
 	if err != nil {
 		return nil, err
 	}
-	if destCount != len(options.OutlineDestinations) || titleCount != len(options.OutlineTitles) || actionCount != len(options.OutlineActions) {
+	if destCount != len(outlineDestinations) || titleCount != len(outlineTitles) || actionCount != len(outlineActions) {
 		return nil, fmt.Errorf("PDF outline replacement is not in the outline tree")
 	}
 	return links, nil

@@ -226,19 +226,34 @@ func (r *Reader) ReadSound(object Object) (Sound, error) {
 // 入参: object 文件说明字典、字符串或间接引用
 // 返回: FileSpecification 文件说明, error 结构或文本编码错误
 func (r *Reader) ReadFileSpecification(object Object) (FileSpecification, error) {
-	value, err := r.Resolve(object)
+	return r.readFileSpecificationContext(context.Background(), object, nil, "")
+}
+
+// readFileSpecificationContext 在取消上下文和可选文本预算内解析文件说明，复用共享间接文本字符串
+// 入参: ctx 取消上下文, object 文件说明字典、字符串或间接引用, budget 可选文本预算，空值直接解码, label 超限错误标签
+// 返回: FileSpecification 文件说明, error 结构、编码、超限或取消错误
+func (r *Reader) readFileSpecificationContext(ctx context.Context, object Object, budget *textStringBudget, label string) (FileSpecification, error) {
+	if err := ctx.Err(); err != nil {
+		return FileSpecification{}, err
+	}
+	ref, value, err := r.resolveIndirect(object)
 	if err != nil {
 		return FileSpecification{}, err
 	}
 	if name, ok := value.(String); ok {
-		decoded, err := DecodeTextString(name)
+		var decoded string
+		if budget != nil {
+			decoded, err = budget.decodeString(ref, name, label)
+		} else {
+			decoded, err = DecodeTextString(name)
+		}
 		return FileSpecification{Name: decoded}, err
 	}
 	dict, ok := value.(Dictionary)
 	if !ok {
 		return FileSpecification{}, fmt.Errorf("invalid file specification")
 	}
-	return r.readFileSpecificationDict(dict, nil, "")
+	return r.readFileSpecificationDict(dict, budget, label)
 }
 
 // readFileSpecificationDict 解析文件说明字典字段并在配置预算时复用间接文本字符串

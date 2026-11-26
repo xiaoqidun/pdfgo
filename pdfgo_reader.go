@@ -59,6 +59,7 @@ type Reader struct {
 	destinations       map[string]Object
 	legacyDestinations Dictionary
 	fonts              map[Reference]*Font
+	fontCacheBytes     int64
 	halftones          map[Reference]*Halftone
 	halftoneCacheBytes int64
 	colorProfiles      map[[32]byte]*iccColorSpace
@@ -748,6 +749,7 @@ func (r *Reader) Close() error {
 	r.destinations = nil
 	r.legacyDestinations = nil
 	r.fonts = nil
+	r.fontCacheBytes = 0
 	r.halftones = nil
 	r.halftoneCacheBytes = 0
 	r.colorProfiles = nil

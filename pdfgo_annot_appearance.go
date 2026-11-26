@@ -283,7 +283,7 @@ func (r *Reader) writeAnnotationColor(content *strings.Builder, values Array, st
 
 // linkAppearanceContext 在取消上下文与内容流上限内按链接的颜色和边框属性生成缺省外观
 // 入参: ctx 取消上下文, annotation 链接注解
-// 返回: *Stream 外观流, error 属性、未支持的边框、超限或取消错误
+// 返回: *Stream 外观流, error 边界、属性、超限或取消错误
 func (r *Reader) linkAppearanceContext(ctx context.Context, annotation Annotation) (*Stream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

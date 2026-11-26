@@ -77,6 +77,8 @@ func (r *Reader) movieActions(ctx context.Context, options RewriteOptions, added
 	}
 	var err error
 	if len(refs) != 0 || len(titles) != 0 {
+		budget := newTextStringBudget(r)
+		seenTitles := make(map[Reference]bool)
 		err = r.WalkPages(ctx, func(_ int, page *Page) error {
 			value, err := r.Resolve(page.Dictionary["Annots"])
 			if err != nil || value == nil {
@@ -95,7 +97,7 @@ func (r *Reader) movieActions(ctx context.Context, options RewriteOptions, added
 				if !selected && len(titles) == 0 {
 					continue
 				}
-				value, err := r.Resolve(object)
+				annotRef, value, err := r.resolveIndirect(object)
 				if err != nil {
 					return err
 				}
@@ -116,12 +118,18 @@ func (r *Reader) movieActions(ctx context.Context, options RewriteOptions, added
 				if len(titles) == 0 {
 					continue
 				}
-				value, err = r.Resolve(dict["T"])
+				if annotRef != (Reference{}) {
+					if seenTitles[annotRef] {
+						continue
+					}
+					seenTitles[annotRef] = true
+				}
+				titleRef, value, err := r.resolveIndirect(dict["T"])
 				if err != nil {
 					return err
 				}
 				if text, ok := value.(String); ok {
-					title, err := DecodeTextString(text)
+					title, err := budget.decodeString(titleRef, text, "movie")
 					if err != nil {
 						return err
 					}

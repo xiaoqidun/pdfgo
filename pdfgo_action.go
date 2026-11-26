@@ -29,17 +29,15 @@ const maxActionWalkSteps = 65536
 // ErrInvalidAction 表示已识别的动作结构或参数错误，不包含资源读取和取消错误
 var ErrInvalidAction = errors.New("invalid action")
 
-// wrapActionError 将动作解析期产生的结构或参数错误统一包装为ErrInvalidAction，保留读取、取消、关闭及未支持错误
+// wrapActionError 将动作解析期产生的结构或参数错误统一包装为ErrInvalidAction，保留读取、认证、超限、取消、关闭及未支持错误
 // 入参: err 原始错误
 // 返回: error 包装后的错误
 func wrapActionError(err error) error {
-	if err == nil || errors.Is(err, ErrInvalidAction) || errors.Is(err, os.ErrClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err == nil || errors.Is(err, ErrInvalidAction) || isFatalReaderError(err) {
 		return err
 	}
-	var readErr *ReadError
 	var unsupported *UnsupportedError
-	var security *objectSecurityError
-	if errors.As(err, &readErr) || errors.As(err, &unsupported) || errors.As(err, &security) {
+	if errors.As(err, &unsupported) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrInvalidAction, err)
@@ -84,6 +82,11 @@ func (r *Reader) WalkActions(ctx context.Context, object Object, visit func(Acti
 	stack := []actionFrame{{object: object}}
 	active := map[uintptr]bool{}
 	activeRefs := map[Reference]bool{}
+	type normalizedAction struct {
+		source Dictionary
+		dict   Dictionary
+	}
+	var normalized map[uintptr]normalizedAction
 	steps := 0
 	for len(stack) > 0 {
 		if err := ctx.Err(); err != nil {
@@ -139,9 +142,20 @@ func (r *Reader) WalkActions(ctx context.Context, object Object, visit func(Acti
 		if !ok || name == "" {
 			return fmt.Errorf("%w: invalid action type", ErrInvalidAction)
 		}
-		cloned := maps.Clone(dict)
-		cloned["S"] = name
-		if err := visit(ActionInfo{Type: name, Dictionary: cloned}); err != nil {
+		infoDict := dict
+		if dict["S"] != name {
+			if cached, exists := normalized[id]; exists {
+				infoDict = cached.dict
+			} else {
+				infoDict = maps.Clone(dict)
+				infoDict["S"] = name
+				if normalized == nil {
+					normalized = make(map[uintptr]normalizedAction)
+				}
+				normalized[id] = normalizedAction{source: dict, dict: infoDict}
+			}
+		}
+		if err := visit(ActionInfo{Type: name, Dictionary: infoDict}); err != nil {
 			return err
 		}
 		next, err := r.Resolve(dict["Next"])

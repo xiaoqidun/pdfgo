@@ -74,12 +74,14 @@ type type1FontMetrics struct {
 	widths         map[string]float64
 }
 
-// cffFontMetrics 保存CFF字形、子程序和私有字宽，仅解释实际使用的字形
+// cffFontMetrics 保存CFF字形、子程序、私有字宽以及并发安全的字宽缓存，仅解释实际使用的字形
 type cffFontMetrics struct {
+	mu                         sync.RWMutex
 	chars, locals, globals     [][]byte
 	matrix                     Matrix
 	kind                       int
 	defaultWidth, nominalWidth float64
+	widths                     map[uint16]float64
 }
 
 // readType1FontMetrics 读取PFA或PFB的矩阵及字形索引，不执行字形指令
@@ -125,7 +127,7 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 		}
 		data = header
 	}
-	scanner := type1EncodingScanner{data: data}
+	scanner := type1EncodingScanner{ctx: ctx, data: data}
 	var matrix Matrix
 	matrixFound := false
 	for {
@@ -134,6 +136,9 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 		}
 		token := scanner.next()
 		if token == "" {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return nil, fmt.Errorf("Type1 metrics lack eexec data")
 		}
 		if token == "eexec" {
@@ -148,17 +153,26 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 		case "{":
 			close = "}"
 		default:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return nil, fmt.Errorf("invalid Type1 metric matrix")
 		}
 		for i := range matrix {
 			value, err := strconv.ParseFloat(scanner.next(), 64)
 			if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				return nil, fmt.Errorf("invalid Type1 metric matrix value")
 			}
 			matrix[i] = value
 		}
 		determinant := matrix[0]*matrix[3] - matrix[1]*matrix[2]
 		if scanner.next() != close || math.IsInf(determinant, 0) || math.IsNaN(determinant) || determinant == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return nil, fmt.Errorf("invalid Type1 metric matrix")
 		}
 		matrixFound = true
@@ -218,7 +232,7 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 	if err != nil {
 		return nil, err
 	}
-	scanner = type1EncodingScanner{data: plain}
+	scanner = type1EncodingScanner{ctx: ctx, data: plain}
 	lenIV := 4
 	subrs := map[int][]byte{}
 	glyphs := map[string][]byte{}
@@ -229,18 +243,27 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 		}
 		token := scanner.next()
 		if token == "" || token == "closefile" {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			break
 		}
 		switch token {
 		case "/lenIV":
 			lenIV, err = strconv.Atoi(scanner.next())
 			if err != nil || lenIV < -1 || lenIV > len(plain) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				return nil, fmt.Errorf("invalid Type1 metric lenIV")
 			}
 		case "/Subrs", "/CharStrings":
 			section = token
 			count, err := strconv.Atoi(scanner.next())
 			if err != nil || count < 0 || count > len(plain) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				return nil, fmt.Errorf("invalid Type1 metric dictionary size")
 			}
 		case "def", "ND", "|-":
@@ -257,6 +280,9 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 			}
 			index, err := strconv.Atoi(scanner.next())
 			if err != nil || index < 0 || index > len(plain) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				return nil, fmt.Errorf("invalid Type1 metric subroutine index")
 			}
 			raw, err := scanner.type1MetricBinary()
@@ -418,9 +444,14 @@ func readCFFFontMetrics(ctx context.Context, data []byte) (*cffFontMetrics, erro
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	dict, _, chars, err := cffFontData(data)
+	dict, _, chars, err := cffFontData(ctx, data)
 	if err != nil {
 		return nil, err
+	}
+	for operator := 1230; operator <= 1238; operator++ {
+		if _, present := dict[operator]; present {
+			return nil, fmt.Errorf("CID-keyed CFF font requires composite font")
+		}
 	}
 	metrics := &cffFontMetrics{chars: chars, kind: 2, matrix: Matrix{.001, 0, 0, .001, 0, 0}}
 	if values := dict[1207]; values != nil {
@@ -431,12 +462,12 @@ func readCFFFontMetrics(ctx context.Context, data []byte) (*cffFontMetrics, erro
 	}
 	pos := int(data[2])
 	for range 3 {
-		_, pos, err = cffIndex(data, pos)
+		_, pos, err = cffIndex(ctx, data, pos)
 		if err != nil {
 			return nil, err
 		}
 	}
-	metrics.globals, _, err = cffIndex(data, pos)
+	metrics.globals, _, err = cffIndex(ctx, data, pos)
 	if err != nil {
 		return nil, err
 	}
@@ -448,7 +479,7 @@ func readCFFFontMetrics(ctx context.Context, data []byte) (*cffFontMetrics, erro
 		if size > len(data)-offset {
 			return nil, fmt.Errorf("truncated CFF metric private dictionary")
 		}
-		private, err := cffDictionary(data[offset : offset+size])
+		private, err := cffDictionary(ctx, data[offset:offset+size])
 		if err != nil {
 			return nil, err
 		}
@@ -468,7 +499,7 @@ func readCFFFontMetrics(ctx context.Context, data []byte) (*cffFontMetrics, erro
 			if err != nil {
 				return nil, err
 			}
-			metrics.locals, _, err = cffIndex(data, offset+relative)
+			metrics.locals, _, err = cffIndex(ctx, data, offset+relative)
 			if err != nil {
 				return nil, err
 			}
@@ -698,13 +729,23 @@ func (m *type1FontMetrics) glyphWidth(ctx context.Context, name string) (float64
 }
 
 // type1MetricBinary 按声明长度读取二进制字形，不解释数据中的词项
-// 返回: []byte 原始字形数据, error 长度或分隔符错误
+// 返回: []byte 原始字形数据, error 长度、分隔符或取消错误
 func (s *type1EncodingScanner) type1MetricBinary() ([]byte, error) {
 	length, err := strconv.Atoi(s.next())
 	if err != nil || length < 0 {
+		if s.ctx != nil {
+			if err := s.ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		return nil, fmt.Errorf("invalid Type1 metric charstring length")
 	}
 	if token := s.next(); token != "RD" && token != "-|" {
+		if s.ctx != nil {
+			if err := s.ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		return nil, fmt.Errorf("missing Type1 metric charstring data")
 	}
 	if s.pos >= len(s.data) || !type1EncodingSpace(s.data[s.pos]) {
@@ -719,12 +760,21 @@ func (s *type1EncodingScanner) type1MetricBinary() ([]byte, error) {
 	return raw, nil
 }
 
-// glyphWidth 从所选CFF字形读取实际字宽，不按字体名称替代度量
+// glyphWidth 从所选CFF字形按需读取并缓存实际字宽，不按字体名称替代度量
 // 入参: ctx 取消上下文, gid 实际字形编号
 // 返回: float64 千分之一横向字宽, error 度量或取消错误
 func (m *cffFontMetrics) glyphWidth(ctx context.Context, gid uint16) (float64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if int(gid) >= len(m.chars) {
 		return 0, fmt.Errorf("invalid CFF metric glyph index")
+	}
+	m.mu.RLock()
+	cached, ok := m.widths[gid]
+	m.mu.RUnlock()
+	if ok {
+		return cached, nil
 	}
 	steps := 0
 	args := make([]float64, 0, 48)
@@ -761,6 +811,15 @@ func (m *cffFontMetrics) glyphWidth(ctx context.Context, gid uint16) (float64, e
 	if y != 0 {
 		return 0, &UnsupportedError{Feature: "nonhorizontal CFF glyph metrics"}
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	if m.widths == nil {
+		m.widths = make(map[uint16]float64)
+	}
+	m.widths[gid] = x
+	m.mu.Unlock()
 	return x, nil
 }
 

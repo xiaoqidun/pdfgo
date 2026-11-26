@@ -277,7 +277,7 @@ func (r *Reader) optimizeJPXImage(ctx context.Context, stream *Stream, options C
 	if err != nil || source.ImageMask {
 		return stream, ctx.Err()
 	}
-	embeddedMask, err := source.jpxMaskMode()
+	embeddedMask, err := source.jpxMaskMode(ctx)
 	if err != nil || embeddedMask != 0 {
 		return stream, ctx.Err()
 	}
@@ -769,6 +769,113 @@ func (r *Reader) resolveOptimizationObjectRef(value Object, cached map[Reference
 	}
 }
 
+// walkImageAlternates 遍历图像Alternates备用图像数组并回调有效备用图像流引用，检测循环、超深与损坏结构
+// 入参: ctx 取消上下文, stream 主图像流, rootRef 主图像引用, resolveObjectRef 间接引用解析函数, visit 备用图像引用回调
+// 返回: bool 遍历是否出现环路, bool 结构是否完整可解析, error 回调、致命读取或取消错误
+func (r *Reader) walkImageAlternates(ctx context.Context, stream *Stream, rootRef Reference, resolveObjectRef func(Object) (Object, Reference, error), visit func(Reference) error) (bool, bool, error) {
+	if stream == nil || stream.Dictionary["Alternates"] == nil {
+		return false, true, nil
+	}
+	type altNode struct {
+		stream *Stream
+		depth  int
+	}
+	seen := make(map[Reference]bool)
+	if rootRef.Number > 0 {
+		seen[rootRef] = true
+	}
+	queue := []altNode{{stream: stream, depth: 0}}
+	cyclic := false
+	for i := 0; i < len(queue); i++ {
+		if err := ctx.Err(); err != nil {
+			return cyclic, false, err
+		}
+		cur := queue[i]
+		if cur.stream == nil || cur.stream.Dictionary["Alternates"] == nil {
+			continue
+		}
+		if cur.depth >= 32 {
+			return cyclic, false, nil
+		}
+		altObj, _, err := resolveObjectRef(cur.stream.Dictionary["Alternates"])
+		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return cyclic, false, err
+			}
+			return cyclic, false, nil
+		}
+		if altObj == nil {
+			continue
+		}
+		alts, ok := altObj.(Array)
+		if !ok {
+			return cyclic, false, nil
+		}
+		for _, entry := range alts {
+			if err := ctx.Err(); err != nil {
+				return cyclic, false, err
+			}
+			dictObj, _, err := resolveObjectRef(entry)
+			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return cyclic, false, err
+				}
+				return cyclic, false, nil
+			}
+			if dictObj == nil {
+				continue
+			}
+			dict, ok := dictObj.(Dictionary)
+			if !ok {
+				return cyclic, false, nil
+			}
+			imgObj, imgRef, err := resolveObjectRef(dict["Image"])
+			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return cyclic, false, err
+				}
+				return cyclic, false, nil
+			}
+			imgStream, ok := imgObj.(*Stream)
+			if !ok || imgStream == nil {
+				return cyclic, false, nil
+			}
+			sub, _, err := resolveObjectRef(imgStream.Dictionary["Subtype"])
+			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return cyclic, false, err
+				}
+				return cyclic, false, nil
+			}
+			if sub != Name("Image") {
+				return cyclic, false, nil
+			}
+			if imgRef.Number > 0 {
+				if seen[imgRef] {
+					if cur.depth > 0 || imgRef == rootRef {
+						cyclic = true
+					}
+					continue
+				}
+				if len(seen) >= 4096 {
+					return cyclic, false, nil
+				}
+				seen[imgRef] = true
+				if err := visit(imgRef); err != nil {
+					return cyclic, false, err
+				}
+			}
+			if imgStream.Dictionary["Alternates"] != nil {
+				if len(queue) >= 4096 {
+					return cyclic, false, nil
+				}
+				queue = append(queue, altNode{stream: imgStream, depth: cur.depth + 1})
+			}
+		}
+	}
+	return cyclic, true, ctx.Err()
+}
+
 // imageOutputSizes 汇总页面、表单、注释外观、媒体、渲染动作及平铺图案中的图片最大显示尺寸，Type3字形图仅禁降采样
 // 入参: ctx 取消上下文, dpi 分辨率上限
 // 返回: map[Reference]image.Point 图片像素上限, error 取消或致命读取错误
@@ -803,6 +910,19 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 	}
 	errUnsafe := errors.New("global unsafe")
 	errPlacementLimit := errors.New("image placement limit exceeded")
+	markImageUnsafe := func(stream *Stream, ref Reference, target map[Reference]bool) (bool, error) {
+		if ref.Number > 0 {
+			target[ref] = true
+		}
+		_, ok, err := r.walkImageAlternates(ctx, stream, ref, resolveObjectRef, func(altRef Reference) error {
+			target[altRef] = true
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+		return ok, nil
+	}
 	var markResourcesUnsafe func(Dictionary, map[Reference]bool, map[Reference]bool, int) (bool, error)
 	markResourcesUnsafe = func(res Dictionary, target map[Reference]bool, visited map[Reference]bool, depth int) (bool, error) {
 		if err := ctx.Err(); err != nil {
@@ -851,8 +971,12 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 					}
 					switch subtype {
 					case Name("Image"):
-						if ref.Number > 0 {
-							target[ref] = true
+						ok, err := markImageUnsafe(stream, ref, target)
+						if err != nil {
+							return false, err
+						}
+						if !ok {
+							return false, nil
 						}
 					case Name("Form"):
 						if ref.Number > 0 && visited[ref] {
@@ -1256,8 +1380,14 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 					}
 					continue
 				}
-				if sub == Name("Image") && xref.Number > 0 {
-					target[xref] = true
+				if sub == Name("Image") {
+					ok, err := markImageUnsafe(s, xref, target)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return errUnsafe
+					}
 				} else if sub == Name("Form") {
 					fResVal, err := r.Resolve(s.Dictionary["Resources"])
 					if err != nil {
@@ -1309,6 +1439,34 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		old := sizes[ref]
 		sizes[ref] = image.Pt(max(old.X, max(1, int(w))), max(old.Y, max(1, int(h))))
 		return true
+	}
+	recordImagePlacement := func(stream *Stream, ref Reference, matrix Matrix, collector map[imagePlacementKey]struct{}, localUnsafe map[Reference]bool) error {
+		if !recordPlacement(ref, matrix, collector, localUnsafe) {
+			return errPlacementLimit
+		}
+		var altRefs []Reference
+		cyclic, ok, err := r.walkImageAlternates(ctx, stream, ref, resolveObjectRef, func(altRef Reference) error {
+			altRefs = append(altRefs, altRef)
+			if !recordPlacement(altRef, matrix, collector, localUnsafe) {
+				return errPlacementLimit
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if cyclic {
+			if ref.Number > 0 {
+				localUnsafe[ref] = true
+			}
+			for _, altRef := range altRefs {
+				localUnsafe[altRef] = true
+			}
+		}
+		if !ok {
+			return errUnsafe
+		}
+		return nil
 	}
 	applyCachedForm := func(entry *cachedFormImages, parentMatrix Matrix, budget *int, collector map[imagePlacementKey]struct{}, localUnsafe map[Reference]bool) error {
 		if entry.opaqueError {
@@ -1609,8 +1767,8 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 				}
 				switch subtype {
 				case Name("Image"):
-					if !recordPlacement(ref, matrix, collector, localUnsafe) {
-						return errPlacementLimit
+					if err := recordImagePlacement(stream, ref, matrix, collector, localUnsafe); err != nil {
+						return err
 					}
 				case Name("Form"):
 					formMatrix := Matrix{1, 0, 0, 1, 0, 0}
@@ -1826,16 +1984,21 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		}
 		switch sub {
 		case Name("Image"):
-			if ref.Number <= 0 {
-				return nil
-			}
 			if unbounded || !rectValid || targetRect.XMin == targetRect.XMax || targetRect.YMin == targetRect.YMax {
-				unsafe[ref] = true
+				ok, err := markImageUnsafe(stream, ref, unsafe)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return errUnsafe
+				}
 				return nil
 			}
 			w := math.Abs(targetRect.XMax - targetRect.XMin)
 			h := math.Abs(targetRect.YMax - targetRect.YMin)
-			recordPlacement(ref, Matrix{unit * w, 0, 0, unit * h, 0, 0}, nil, unsafe)
+			if err := recordImagePlacement(stream, ref, Matrix{unit * w, 0, 0, unit * h, 0, 0}, nil, unsafe); err != nil {
+				return err
+			}
 		case Name("Form"):
 			if unbounded {
 				res, err := resolveFormResources(stream, page.Resources)
@@ -1872,8 +2035,12 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			}
 			switch sub {
 			case Name("Image"):
-				if ref.Number > 0 {
-					unsafe[ref] = true
+				ok, err := markImageUnsafe(v, ref, unsafe)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return errUnsafe
 				}
 			case Name("Form"):
 				clipRes, err := resolveFormResources(v, pageRes)
@@ -2584,6 +2751,20 @@ func (r *Reader) imageDefaultColorResources(ctx context.Context, refs []Referenc
 	active := make(map[Reference]bool)
 	budget := 100000
 	overflow := false
+	recordImage := func(stream *Stream, ref Reference, defs Dictionary) {
+		record(ref, defs)
+		_, ok, err := r.walkImageAlternates(ctx, stream, ref, resolveObjectRef, func(altRef Reference) error {
+			record(altRef, defs)
+			return nil
+		})
+		if err != nil {
+			fatalErr = err
+			return
+		}
+		if !ok {
+			overflow = true
+		}
+	}
 	var walkRes func(Dictionary, int)
 	walkStreamRes := func(stream *Stream, ref Reference, inheritedRes Dictionary, nextDepth int) {
 		if canonical, aliased := aliases[ref]; aliased {
@@ -2684,7 +2865,7 @@ func (r *Reader) imageDefaultColorResources(ctx context.Context, refs []Referenc
 					}
 					switch sub {
 					case Name("Image"):
-						record(ref, defs)
+						recordImage(stream, ref, defs)
 					case Name("Form"):
 						walkStreamRes(stream, ref, res, depth+1)
 					}
@@ -2810,7 +2991,8 @@ func (r *Reader) imageDefaultColorResources(ctx context.Context, refs []Referenc
 			if fatalErr != nil {
 				return fatalErr
 			}
-			record(ref, defs)
+			recordImage(stream, ref, defs)
+			return fatalErr
 		case Name("Form"):
 			walkStreamRes(stream, ref, pageRes, 0)
 			return fatalErr

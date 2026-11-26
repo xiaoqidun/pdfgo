@@ -28,6 +28,15 @@ import (
 // maxClipPaths 限制单个图形状态允许累计的最大裁剪路径数量
 const maxClipPaths = 4096
 
+// maxMarkedContentDepth 限制单个内容流允许嵌套的最大标记内容深度
+const maxMarkedContentDepth = 1024
+
+// maxFormExpansions 限制单次遍历允许展开的表单XObject总次数
+const maxFormExpansions = 65536
+
+// maxDashElements 限制单个虚线样式允许包含的最大线段数
+const maxDashElements = 4096
+
 // Matrix 表示PDF二维仿射矩阵，使用列向量坐标约定
 type Matrix [6]float64
 
@@ -144,8 +153,11 @@ type TextMark struct {
 	maskGroup             *Stream
 	blendingSpace         *ColorSpace
 	opaqueGroup           bool
+	uncoloredPattern      bool
+	uncoloredType3        bool
 	patternMatrix         Matrix
 	bounds                Rectangle
+	walk                  *pageWalkState
 }
 
 // TextObject 保留文字对象身份，Knockout为真时整段挖空，为假时逐字合成
@@ -272,6 +284,29 @@ type markedContentState struct {
 	sequence    *ContentSequence
 }
 
+// actualTextPointerKey 按底层字节切片指针与长度标识直接共享的ActualText对象
+type actualTextPointerKey struct {
+	ptr    uintptr
+	length int
+}
+
+// cachedActualText 保存已解码ActualText及其源字节串强引用以防GC复用地址
+type cachedActualText struct {
+	raw     String
+	decoded string
+}
+
+// pageWalkState 维护单次遍历跨表单与Type3共享的展开计数、文本预算与可选内容求值缓存
+type pageWalkState struct {
+	formExpansions   int
+	textBudget       textStringBudget
+	textBudgetReader *Reader
+	textPtrCache     map[actualTextPointerKey]cachedActualText
+	ocEvaluator      *optionalContentEvaluator
+	ocReader         *Reader
+	ocNone           bool
+}
+
 // pageInterpreter 按内容顺序解释页面或表单
 type pageInterpreter struct {
 	reader                 *Reader
@@ -317,6 +352,35 @@ type pageInterpreter struct {
 	blendingSpace          *ColorSpace
 	forms                  *formCache
 	content                *formContent
+	walk                   *pageWalkState
+}
+
+// ensureWalkState 返回当前遍历共享状态，未初始化时按需创建
+// 返回: *pageWalkState 遍历共享状态
+func (p *pageInterpreter) ensureWalkState() *pageWalkState {
+	if p.walk == nil {
+		p.walk = &pageWalkState{}
+	}
+	return p.walk
+}
+
+// dashCycleValid 校验非空虚线数组元素非负有限且总周期为正有限值，周期性检查取消
+// 入参: ctx 取消上下文, dash 虚线线段长度数组
+// 返回: bool 周期是否有效, error 取消错误
+func dashCycleValid(ctx context.Context, dash []float64) (bool, error) {
+	sum := 0.0
+	for i, value := range dash {
+		if i&255 == 0 && ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+		}
+		if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+			return false, nil
+		}
+		sum += value
+	}
+	return sum > 0 && !math.IsInf(sum, 0) && !math.IsNaN(sum), nil
 }
 
 // Identity 返回单位矩阵
@@ -405,6 +469,7 @@ func (p *pageInterpreter) resetTransient() {
 	p.tilings = nil
 	p.shadingPatterns = nil
 	p.forms, p.content = nil, nil
+	p.walk = nil
 }
 
 // matrixProductDifference 补偿乘积相减的舍入残差，检查溢出、下溢及严重相消
@@ -779,6 +844,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 		return err
 	}
 	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: page.CropBox}
+	interpreter.ensureWalkState()
 	interpreter.blendingSpace = groupSpace
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: Identity(), hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10}}
@@ -913,6 +979,10 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	interpreter.maskGroup = mark.maskGroup
 	interpreter.blendingSpace = mark.blendingSpace
 	interpreter.opaqueGroup = mark.opaqueGroup
+	interpreter.uncoloredPattern = mark.uncoloredPattern
+	interpreter.uncoloredType3 = mark.uncoloredType3
+	interpreter.walk = mark.walk
+	interpreter.ensureWalkState()
 	interpreter.patternMatrix = mark.patternMatrix
 	if interpreter.patternMatrix == (Matrix{}) {
 		interpreter.patternMatrix = Identity()
@@ -951,6 +1021,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 // 入参: data 解码后的内容流
 // 返回: error 错误信息
 func (p *pageInterpreter) run(data []byte) error {
+	p.ensureWalkState()
 	p.tilings = nil
 	p.shadingPatterns = nil
 	defer func() {
@@ -980,6 +1051,9 @@ func (p *pageInterpreter) run(data []byte) error {
 			}
 		}
 		for len(p.marked) != 0 {
+			if err := p.ctx.Err(); err != nil {
+				return err
+			}
 			if err := p.markedContent(Operation{Operator: "EMC", Offset: int64(len(data))}); err != nil {
 				return err
 			}
@@ -1040,6 +1114,9 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 				return err
 			}
 			if op.Operator == "BMC" || op.Operator == "BDC" {
+				if len(p.marked) >= maxMarkedContentDepth {
+					return fmt.Errorf("%w: marked content depth limit exceeded", ErrStreamLimitExceeded)
+				}
 				p.marked = append(p.marked, markedContentState{hidden: p.hidden, previous: p.replacement, sequence: p.sequence})
 			}
 			return p.ctx.Err()
@@ -1085,11 +1162,14 @@ func (p *pageInterpreter) markedContent(op Operation) error {
 			}
 		}
 		if op.Operator == "BMC" || op.Operator == "BDC" {
+			if len(p.marked) >= maxMarkedContentDepth {
+				return fmt.Errorf("%w: marked content depth limit exceeded", ErrStreamLimitExceeded)
+			}
 			if op.Operator == "BDC" && mark.Tag == "Span" {
 				var err error
 				mark.Replacement, err = p.replacementText(mark.Properties)
 				if err != nil {
-					if p.visitor.Warning == nil || p.ctx.Err() != nil {
+					if p.visitor.Warning == nil || isFatalReaderError(err) {
 						return err
 					}
 					p.visitor.Warning(Diagnostic{Offset: op.Offset, Message: "invalid PDF ActualText ignored: " + err.Error()})
@@ -1183,7 +1263,7 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return nil
 		}
 		p.type3Metrics = true
-		p.uncoloredType3 = op.Operator == "d1"
+		p.uncoloredType3 = p.uncoloredType3 || op.Operator == "d1"
 		if op.Operator == "d1" {
 			bounds := transformedBounds(Rectangle{v[2], v[3], v[4], v[5]}, p.state.matrix)
 			if !rectFinite(bounds) {
@@ -1252,6 +1332,9 @@ func (p *pageInterpreter) operation(op Operation) error {
 			p.state.style.Dash, p.state.style.DashPhase = nil, 0
 			return p.operationWarning(op, "invalid dash pattern; solid line default used")
 		}
+		if len(values) > maxDashElements {
+			return fmt.Errorf("%w: dash array length limit exceeded", ErrStreamLimitExceeded)
+		}
 		dash, err := numbers(values, len(values))
 		if err != nil {
 			if p.visitor.Warning == nil {
@@ -1261,7 +1344,12 @@ func (p *pageInterpreter) operation(op Operation) error {
 			return p.operationWarning(op, "invalid dash pattern; solid line default used")
 		}
 		sum := 0.0
-		for _, n := range dash {
+		for i, n := range dash {
+			if i&255 == 0 && p.ctx != nil {
+				if err := p.ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if n < 0 {
 				if p.visitor.Warning == nil {
 					return fmt.Errorf("negative dash")
@@ -1277,6 +1365,13 @@ func (p *pageInterpreter) operation(op Operation) error {
 			}
 			p.state.style.Dash, p.state.style.DashPhase = nil, 0
 			return p.operationWarning(op, "empty dash cycle; solid line default used")
+		}
+		if len(dash) > 0 && (math.IsInf(sum, 0) || math.IsNaN(sum)) {
+			if p.visitor.Warning == nil {
+				return fmt.Errorf("nonfinite dash cycle")
+			}
+			p.state.style.Dash, p.state.style.DashPhase = nil, 0
+			return p.operationWarning(op, "nonfinite dash cycle; solid line default used")
 		}
 		phase, err := numbers(a[1:], 1)
 		if err != nil {
@@ -1393,18 +1488,34 @@ func (p *pageInterpreter) operation(op Operation) error {
 					var scaledDash []float64
 					finite := !math.IsNaN(lineWidth) && !math.IsInf(lineWidth, 0) && !math.IsNaN(dashPhase) && !math.IsInf(dashPhase, 0)
 					if finite && len(style.Dash) != 0 {
-						scaledDash = make([]float64, len(style.Dash))
-						sum := 0.0
-						for n, value := range style.Dash {
-							scaledDash[n] = value * sx
-							if math.IsNaN(scaledDash[n]) || math.IsInf(scaledDash[n], 0) {
-								finite = false
-								break
+						if sx == 1 {
+							var err error
+							finite, err = dashCycleValid(p.ctx, style.Dash)
+							if err != nil {
+								return err
 							}
-							sum += scaledDash[n]
-						}
-						if sum == 0 || math.IsInf(sum, 0) {
-							finite = false
+							if finite {
+								scaledDash = style.Dash
+							}
+						} else {
+							scaledDash = make([]float64, len(style.Dash))
+							sum := 0.0
+							for n, value := range style.Dash {
+								if n&255 == 0 && p.ctx != nil {
+									if err := p.ctx.Err(); err != nil {
+										return err
+									}
+								}
+								scaledDash[n] = value * sx
+								if scaledDash[n] < 0 || math.IsNaN(scaledDash[n]) || math.IsInf(scaledDash[n], 0) {
+									finite = false
+									break
+								}
+								sum += scaledDash[n]
+							}
+							if sum == 0 || math.IsInf(sum, 0) || math.IsNaN(sum) {
+								finite = false
+							}
 						}
 					}
 					if finite {
@@ -1414,6 +1525,21 @@ func (p *pageInterpreter) operation(op Operation) error {
 					}
 				}
 				if !uniform {
+					if len(style.Dash) != 0 {
+						validDash, err := dashCycleValid(p.ctx, style.Dash)
+						if err != nil {
+							return err
+						}
+						if !validDash {
+							if p.visitor.Warning == nil {
+								return fmt.Errorf("nonfinite dash cycle")
+							}
+							style.Dash, style.DashPhase = nil, 0
+							if err := p.operationWarning(op, "nonfinite dash cycle; solid line default used"); err != nil {
+								return err
+							}
+						}
+					}
 					strokeMatrix = Matrix{m[0], m[1], m[2], m[3], 0, 0}
 					if _, ok := strokeMatrix.Inverse(); !ok {
 						if p.visitor.Warning == nil {
@@ -2001,8 +2127,11 @@ func (p *pageInterpreter) showText(data []byte) error {
 			mark.maskGroup = p.maskGroup
 			mark.blendingSpace = p.blendingSpace
 			mark.opaqueGroup = p.opaqueGroup
+			mark.uncoloredPattern = p.uncoloredPattern
+			mark.uncoloredType3 = p.uncoloredType3
 			mark.patternMatrix = p.patternMatrix
 			mark.bounds = p.bounds
+			mark.walk = p.walk
 		}
 		mark.depth = p.depth
 		mark.glyphStreams = p.glyphStreams
@@ -2124,6 +2253,9 @@ func (p *pageInterpreter) xobject(a []Object) error {
 // 入参: stream 图像数据流
 // 返回: error 解析或访问错误
 func (p *pageInterpreter) image(stream *Stream) error {
+	if err := p.ctx.Err(); err != nil {
+		return err
+	}
 	if p.hidden {
 		return nil
 	}
@@ -2131,7 +2263,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 	if err != nil || !visible {
 		return err
 	}
-	image, err := p.reader.ReadImageWithResources(stream, p.resources)
+	image, err := p.reader.ReadImageWithResourcesContext(p.ctx, stream, p.resources)
 	if err != nil {
 		return err
 	}
@@ -2148,7 +2280,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 		if image.Mask != nil || image.SoftMask != nil || image.ImageMask {
 			return &UnsupportedError{Feature: "masked image in isolated group"}
 		}
-		soft, err := image.HasSoftMask()
+		soft, err := image.HasSoftMaskContext(p.ctx)
 		if err != nil {
 			return err
 		}
@@ -2170,7 +2302,7 @@ func (p *pageInterpreter) image(stream *Stream) error {
 	p.sealClips()
 	style := p.state.style
 	if style.SoftMask != nil {
-		soft, err := image.HasSoftMask()
+		soft, err := image.HasSoftMaskContext(p.ctx)
 		if err != nil {
 			return err
 		}
@@ -2262,6 +2394,11 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 	if p.depth >= 1024 {
 		return fmt.Errorf("form recursion limit exceeded")
 	}
+	walkState := p.ensureWalkState()
+	walkState.formExpansions++
+	if walkState.formExpansions > maxFormExpansions {
+		return fmt.Errorf("%w: form expansion limit exceeded", ErrStreamLimitExceeded)
+	}
 	visible, err := p.optionalVisible(stream.Dictionary["OC"])
 	if err != nil || !visible {
 		return err
@@ -2301,6 +2438,7 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 	p.sealClips()
 	child := *p
 	child.resetTransient()
+	child.walk = walkState
 	child.sequence = p.sequence
 	child.replacement = p.replacement
 	child.opaqueGroup = p.opaqueGroup
@@ -2681,8 +2819,16 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				}
 			}
 			if arr, ok := values[0].(Array); ok {
+				if len(arr) > maxDashElements {
+					return fmt.Errorf("%w: dash array length limit exceeded", ErrStreamLimitExceeded)
+				}
 				resolved := make(Array, len(arr))
 				for i := range arr {
+					if i&255 == 0 && p.ctx != nil {
+						if err := p.ctx.Err(); err != nil {
+							return err
+						}
+					}
 					resolved[i], err = p.reader.Resolve(arr[i])
 					if err != nil {
 						return err
@@ -2759,7 +2905,7 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 				return err
 			}
 		case "BM":
-			mode, err := p.reader.readBlendMode(value)
+			mode, err := p.reader.readBlendMode(p.ctx, value)
 			if err != nil {
 				return err
 			}
@@ -2865,15 +3011,20 @@ func (p *pageInterpreter) applyExtState(dict Dictionary) error {
 	return nil
 }
 
-// readBlendMode 读取标准混合模式，数组按优先顺序选择支持的名称
-// 入参: value 名称或名称数组
-// 返回: Name 标准模式, error 无效类型
-func (r *Reader) readBlendMode(value Object) (Name, error) {
+// readBlendMode 读取标准混合模式，数组按优先顺序选择支持的名称并周期性检查取消
+// 入参: ctx 取消上下文, value 名称或名称数组
+// 返回: Name 标准模式, error 无效类型或取消错误
+func (r *Reader) readBlendMode(ctx context.Context, value Object) (Name, error) {
 	values, array := value.(Array)
 	if !array {
 		values = Array{value}
 	}
-	for _, item := range values {
+	for i, item := range values {
+		if i&255 == 0 && ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+		}
 		item, err := r.Resolve(item)
 		if err != nil {
 			return "", err

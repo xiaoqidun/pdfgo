@@ -176,6 +176,9 @@ type shadingByteTracker struct {
 	alternates  map[*tintAlternate]bool
 	profiles    map[*iccColorSpace]bool
 	halftones   map[*Halftone]bool
+	palettes    map[*imagePalette]bool
+	sampled     map[*sampledFunction]bool
+	programs    map[*calculatorFunction]bool
 }
 
 // shadingPaintBytes 估算着色画刷及其底层函数、专色、色彩配置和图案状态的完整内存占用
@@ -189,12 +192,12 @@ func shadingPaintBytes(paint Paint) int64 {
 // 入参: paint 着色画刷, seen 节点去重表
 // 返回: int64 估算字节数
 func shadingPaintBytesWith(paint Paint, seen *shadingByteTracker) int64 {
-	size := colorSpaceMemoryBytes(paint.Space, seen)
+	size := colorSpaceMemoryBytes(paint.Space, seen) + colorantPaintBytes(paint.Colorant, seen)
+	if paint.Process != nil {
+		size += colorSpaceMemoryBytes(paint.Process.Space, seen) + int64(len(paint.Process.Channels))*8
+	}
 	if paint.Shading != nil {
-		size += 256 + shadingPaintBytesWith(paint.Shading.Paint, seen) + shadingStyleBytes(paint.Shading.Style, seen)
-		if paint.Shading.Background != nil {
-			size += colorSpaceMemoryBytes(paint.Shading.Background.Space, seen)
-		}
+		size += 256 + shadingPaintBytesWith(paint.Shading.Paint, seen) + shadingStyleBytes(paint.Shading.Style, seen) + backgroundPaintBytes(paint.Shading.Background, seen)
 		return size
 	}
 	if m := paint.Mesh; m != nil {
@@ -217,6 +220,34 @@ func shadingPaintBytesWith(paint Paint, seen *shadingByteTracker) int64 {
 		return size + 256 + coordinateFunctionBytes(f.function) + tintMemoryBytes(f.tint, seen) + colorSpaceMemoryBytes(f.Space, seen)
 	}
 	return size + 256
+}
+
+// colorantPaintBytes 按指针去重估算专色画刷及其色料空间的内存占用
+// 入参: c 专色画刷, seen 节点去重表
+// 返回: int64 估算字节数
+func colorantPaintBytes(c *ColorantPaint, seen *shadingByteTracker) int64 {
+	if c == nil {
+		return 0
+	}
+	size := int64(64) + colorantSpaceBytes(c.Space, seen)
+	if len(c.Tints) > len(c.values) {
+		size += int64(len(c.Tints)) * 8
+	}
+	return size
+}
+
+// backgroundPaintBytes 按指针去重估算着色背景画刷的空间、色料与过程通道内存占用
+// 入参: bg 背景画刷, seen 节点去重表
+// 返回: int64 估算字节数
+func backgroundPaintBytes(bg *Paint, seen *shadingByteTracker) int64 {
+	if bg == nil {
+		return 0
+	}
+	size := int64(128) + colorSpaceMemoryBytes(bg.Space, seen) + colorantPaintBytes(bg.Colorant, seen)
+	if bg.Process != nil {
+		size += colorSpaceMemoryBytes(bg.Process.Space, seen) + int64(len(bg.Process.Channels))*8
+	}
+	return size
 }
 
 // shadingStyleBytes 估算着色图案状态持有的网屏、传递函数、软蒙版及颜色转换内存
@@ -264,21 +295,53 @@ func halftoneTreeBytes(h *Halftone, seen *shadingByteTracker) int64 {
 	return halftoneMemoryBytesSeen(h, seen.halftones)
 }
 
-// colorSpaceMemoryBytes 按指针去重估算颜色空间所持ICC配置的内存占用
+// colorSpaceMemoryBytes 按指针去重估算颜色空间所持ICC配置及其备用空间的内存占用
 // 入参: space 颜色空间, seen 节点去重表
 // 返回: int64 估算字节数
 func colorSpaceMemoryBytes(space *ColorSpace, seen *shadingByteTracker) int64 {
 	if space == nil || space.profile == nil {
 		return 0
 	}
-	if seen.profiles == nil {
-		seen.profiles = make(map[*iccColorSpace]bool)
-	}
-	if seen.profiles[space.profile] {
+	return iccProfileMemoryBytes(space.profile, seen)
+}
+
+// imagePaletteBytes 按指针去重估算索引色调色板及其基础空间和色料定义的内存占用
+// 入参: p 索引色调色板, seen 节点去重表
+// 返回: int64 估算字节数
+func imagePaletteBytes(p *imagePalette, seen *shadingByteTracker) int64 {
+	if p == nil {
 		return 0
 	}
-	seen.profiles[space.profile] = true
-	return iccProfileCacheBytes(space.profile)
+	if seen.palettes == nil {
+		seen.palettes = make(map[*imagePalette]bool)
+	}
+	if seen.palettes[p] {
+		return 0
+	}
+	seen.palettes[p] = true
+	size := int64(128) + int64(len(p.values))*32 + int64(len(p.colors))*8 + int64(len(p.tints))*24
+	for _, tint := range p.tints {
+		size += int64(len(tint)) * 8
+	}
+	size += colorSpaceMemoryBytes(p.space, seen) + colorantSpaceBytes(p.colorants, seen)
+	if p.process != nil {
+		size += colorSpaceMemoryBytes(p.process.Space, seen) + int64(len(p.process.Channels))*8
+	}
+	return size
+}
+
+// deviceNMemoryBytes 估算专色空间及其采样表、计算器、嵌套备用与色料定义的内存占用
+// 入参: tint 专色空间定义
+// 返回: int64 估算字节数
+func deviceNMemoryBytes(tint *deviceNSpace) int64 {
+	return tintMemoryBytes(tint, &shadingByteTracker{})
+}
+
+// separationMemoryBytes 估算分色空间及其备用变换和色料定义的内存占用
+// 入参: s 分色空间定义
+// 返回: int64 估算字节数
+func separationMemoryBytes(s *separationSpace) int64 {
+	return separationSpaceBytes(s, &shadingByteTracker{})
 }
 
 // gradientFunctionMemoryBytes 按指针去重估算一维渐变函数及其关联色料空间的内存占用
@@ -342,10 +405,31 @@ func tintMemoryBytes(tint *deviceNSpace, seen *shadingByteTracker) int64 {
 		return 0
 	}
 	seen.tints[tint] = true
-	size := int64(256) + int64(len(tint.input)+len(tint.output))*8 + int64(len(tint.expressions))*48 + int64(len(tint.processInputs))*8
-	size += colorSpaceMemoryBytes(tint.alternate, seen) + gradientFunctionMemoryBytes(tint.transform, seen) + calculatorProgramBytes(tint.program)
+	size := int64(256) + int64(len(tint.input)+len(tint.output))*8 + int64(len(tint.processInputs))*8
+	for _, expr := range tint.expressions {
+		size += 24 + int64(len(expr))*8
+	}
+	size += colorSpaceMemoryBytes(tint.alternate, seen) + gradientFunctionMemoryBytes(tint.transform, seen)
+	if tint.program != nil {
+		if seen.programs == nil {
+			seen.programs = make(map[*calculatorFunction]bool)
+		}
+		if !seen.programs[tint.program] {
+			seen.programs[tint.program] = true
+			size += calculatorProgramBytes(tint.program)
+		}
+	}
 	if tint.sampled != nil {
-		size += 256 + int64(len(tint.sampled.table.samples))
+		if seen.sampled == nil {
+			seen.sampled = make(map[*sampledFunction]bool)
+		}
+		if !seen.sampled[tint.sampled] {
+			seen.sampled[tint.sampled] = true
+			size += sampledMemoryBytes(tint.sampled)
+		}
+	}
+	if tint.process != nil {
+		size += colorSpaceMemoryBytes(tint.process.Space, seen) + int64(len(tint.process.Channels))*8
 	}
 	return size + tintAlternateBytes(tint.nested, seen) + colorantSpaceBytes(tint.colorants, seen)
 }
@@ -364,7 +448,7 @@ func separationSpaceBytes(s *separationSpace, seen *shadingByteTracker) int64 {
 		return 0
 	}
 	seen.separations[s] = true
-	return 256 + colorSpaceMemoryBytes(s.space, seen) + gradientFunctionMemoryBytes(s.transform, seen) + tintAlternateBytes(s.nested, seen) + colorantSpaceBytes(s.colorants, seen)
+	return 256 + colorSpaceMemoryBytes(s.space, seen) + iccProfileMemoryBytes(s.icc, seen) + gradientFunctionMemoryBytes(s.transform, seen) + tintAlternateBytes(s.nested, seen) + colorantSpaceBytes(s.colorants, seen)
 }
 
 // colorantSpaceBytes 按指针去重估算色料空间及其独立过程色与专色表内存
@@ -541,6 +625,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if paint.None {
 		return paint, nil
 	}
+	var bgParsed int64
 	result := paint
 	if object != nil {
 		definition, ok := shading.(Dictionary)
@@ -556,6 +641,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 			return Paint{}, err
 		}
 		if value != nil {
+			beforeBg := gradientParsedBytes(child.ctx)
 			space, err := child.shadingColorSpace(definition["ColorSpace"])
 			if err != nil {
 				return Paint{}, err
@@ -572,6 +658,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 			if err != nil {
 				return Paint{}, err
 			}
+			bgParsed = gradientParsedBytes(child.ctx) - beforeBg
 			background = &color
 		}
 		result = Paint{Alpha: 1, Shading: &ShadingPattern{Paint: paint, Style: child.state.style, Background: background}}
@@ -581,9 +668,10 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	}
 	cost := int64(256)
 	if !streamBudgeted {
-		cost = max(shadingPaintBytes(result), extBytes+paintParsed)
+		cost = max(shadingPaintBytes(result), extBytes+paintParsed+bgParsed)
 	} else if result.Shading != nil {
-		cost += max(shadingStyleBytes(result.Shading.Style, &shadingByteTracker{}), extBytes)
+		seen := &shadingByteTracker{}
+		cost += max(shadingStyleBytes(result.Shading.Style, seen), extBytes) + max(backgroundPaintBytes(result.Shading.Background, seen), bgParsed)
 	}
 	if len(p.shadingPatterns.byPattern) < 1024 && cost <= budget-p.shadingPatterns.bytes {
 		if p.shadingPatterns.byPattern == nil {

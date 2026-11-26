@@ -269,10 +269,16 @@ func (r *Reader) newAnnotationRichFonts(ctx context.Context, resources Dictionar
 			return nil, err
 		}
 		family, err := r.annotationRichResourceFamily(ctx, fonts[other])
+		if err != nil {
+			if isFatalReaderError(err) {
+				return nil, err
+			}
+			continue
+		}
 		if canceled := ctx.Err(); canceled != nil {
 			return nil, canceled
 		}
-		if err != nil || !families[strings.ToLower(family)] {
+		if !families[strings.ToLower(family)] {
 			continue
 		}
 		font, err := r.ReadFontContext(ctx, fonts[other])
@@ -455,9 +461,9 @@ func (s *annotationRichFonts) add(name Name, font *Font) (*annotationRichFont, e
 // 入参: style 文字样式, ch 字符
 // 返回: *annotationRichFont 字体, annotationLetter 编码, error 未覆盖的字体或字形
 func (s *annotationRichFonts) selectLetter(style annotationRichStyle, ch rune) (*annotationRichFont, annotationLetter, error) {
-	font, err := s.selectFont(style, func(entry *annotationRichFont) bool {
+	font, err := s.selectFont(style, func(entry *annotationRichFont) (bool, error) {
 		_, ok := entry.letters[ch]
-		return ok
+		return ok, nil
 	})
 	if err != nil {
 		return nil, annotationLetter{}, err
@@ -473,19 +479,26 @@ func (s *annotationRichFonts) selectLetter(style annotationRichStyle, ch rune) (
 // 返回: *annotationRichFont 字体, []annotationLetter 编码, error 字体、编码或取消错误
 func (s *annotationRichFonts) selectText(style annotationRichStyle, text string) (*annotationRichFont, []annotationLetter, error) {
 	encoded := make(map[*annotationRichFont][]annotationLetter)
-	font, err := s.selectFont(style, func(entry *annotationRichFont) bool {
+	font, err := s.selectFont(style, func(entry *annotationRichFont) (bool, error) {
 		letters, found := encoded[entry]
 		if !found {
-			letters, _ = annotationLetters(s.ctx, entry.font, text)
+			var letterErr error
+			letters, letterErr = annotationLetters(s.ctx, entry.font, text)
+			if letterErr != nil {
+				if isFatalReaderError(letterErr) {
+					return false, letterErr
+				}
+				letters = nil
+			}
 			encoded[entry] = letters
 		}
-		return letters != nil
+		return letters != nil, nil
 	})
-	if canceled := s.ctx.Err(); canceled != nil {
-		return nil, nil, canceled
-	}
 	if err != nil {
 		return nil, nil, err
+	}
+	if canceled := s.ctx.Err(); canceled != nil {
+		return nil, nil, canceled
 	}
 	if font == nil {
 		return nil, nil, &UnsupportedError{Feature: "rich text fonts cannot encode source text"}
@@ -496,7 +509,7 @@ func (s *annotationRichFonts) selectText(style annotationRichStyle, text string)
 // selectFont 按字体家族、样式优先级和编码覆盖选择字体
 // 入参: style 文字样式, covered 编码覆盖检查
 // 返回: *annotationRichFont 匹配字体，未找到时为空, error 字体或取消错误
-func (s *annotationRichFonts) selectFont(style annotationRichStyle, covered func(*annotationRichFont) bool) (*annotationRichFont, error) {
+func (s *annotationRichFonts) selectFont(style annotationRichStyle, covered func(*annotationRichFont) (bool, error)) (*annotationRichFont, error) {
 	if err := s.ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -513,7 +526,11 @@ func (s *annotationRichFonts) selectFont(style annotationRichStyle, covered func
 	}
 	if len(families) == 0 {
 		if style.weight == 0 && style.italic == nil && style.stretch == 0 {
-			if covered(s.base) {
+			ok, err := covered(s.base)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
 				return s.base, nil
 			}
 			return nil, nil
@@ -560,13 +577,31 @@ func (s *annotationRichFonts) selectFont(style annotationRichStyle, covered func
 			if best == nil || widthRank < bestWidth || widthRank == bestWidth && weightRank < bestWeight {
 				best, bestWidth, bestWeight = entry, widthRank, weightRank
 			} else if widthRank == bestWidth && weightRank == bestWeight {
-				if !covered(best) || covered(entry) && entry.font.Vertical == s.base.font.Vertical && best.font.Vertical != s.base.font.Vertical {
+				bestOK, err := covered(best)
+				if err != nil {
+					return nil, err
+				}
+				if !bestOK {
 					best = entry
+				} else if entry.font.Vertical == s.base.font.Vertical && best.font.Vertical != s.base.font.Vertical {
+					entryOK, err := covered(entry)
+					if err != nil {
+						return nil, err
+					}
+					if entryOK {
+						best = entry
+					}
 				}
 			}
 		}
-		if best != nil && covered(best) {
-			return best, nil
+		if best != nil {
+			ok, err := covered(best)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				return best, nil
+			}
 		}
 	}
 	return nil, nil

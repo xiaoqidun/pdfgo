@@ -574,7 +574,7 @@ func (i *Image) HasMask() (bool, error) {
 	if i.Stream == nil {
 		return false, fmt.Errorf("missing image stream")
 	}
-	mode, err := i.jpxMaskMode()
+	mode, err := i.jpxMaskMode(context.Background())
 	if err != nil || mode != 0 {
 		return mode != 0, err
 	}
@@ -585,6 +585,19 @@ func (i *Image) HasMask() (bool, error) {
 // HasSoftMask 判断显式及JPEG2000内嵌软遮罩，不将硬遮罩当作软遮罩
 // 返回: bool 是否具有软遮罩, error 引用或遮罩参数错误
 func (i *Image) HasSoftMask() (bool, error) {
+	return i.HasSoftMaskContext(context.Background())
+}
+
+// HasSoftMaskContext 在取消上下文内判断显式及JPEG2000内嵌软遮罩，不将硬遮罩当作软遮罩
+// 入参: ctx 取消上下文
+// 返回: bool 是否具有软遮罩, error 引用、遮罩参数或取消错误
+func (i *Image) HasSoftMaskContext(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		return false, fmt.Errorf("invalid image context")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if i == nil {
 		return false, fmt.Errorf("missing image")
 	}
@@ -594,15 +607,21 @@ func (i *Image) HasSoftMask() (bool, error) {
 	if i.Stream == nil {
 		return false, fmt.Errorf("missing image stream")
 	}
-	mode, err := i.jpxMaskMode()
+	mode, err := i.jpxMaskMode(ctx)
 	if err != nil || mode != 0 {
 		return mode != 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 	if i.SoftMask == nil {
 		return false, nil
 	}
 	value, err := i.reader.resolveOptional(i.SoftMask)
-	return value != nil && value != Name("None"), err
+	if err != nil {
+		return false, err
+	}
+	return value != nil && value != Name("None"), ctx.Err()
 }
 
 // ColorModel 返回透明图像的非预乘颜色模型
@@ -754,9 +773,10 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 		data = append(data, globals...)
 		data = append(data, encoded...)
 	}
-	config, err := jbig2.DecodeConfigWithOptions(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, i.jbig2DecodeOptions(ctx))
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	config, err := jbig2.DecodeConfigWithOptions(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, i.jbig2DecodeOptions(ctx, maxBytes))
 	if err != nil {
-		return nil, err
+		return nil, wrapJBIG2Error(err)
 	}
 	if config.Width != i.Width || config.Height != i.Height {
 		return nil, fmt.Errorf("JBIG2 dimensions differ from image dictionary")
@@ -807,23 +827,39 @@ func (i *Image) encodedFileContext(ctx context.Context, terminal Name) ([]byte, 
 // 入参: object 图像对象或引用
 // 返回: *Image 图像描述, error 错误信息
 func (r *Reader) ReadImage(object Object) (*Image, error) {
-	return r.readImage(object, nil)
+	return r.readImage(context.Background(), object, nil)
 }
 
 // ReadImageWithResources 读取图像并按当前资源解析颜色空间及默认设备色
 // 入参: object 图像对象或引用, resources 当前资源字典
 // 返回: *Image 图像描述, error 图像或颜色空间错误
 func (r *Reader) ReadImageWithResources(object Object, resources Dictionary) (*Image, error) {
+	return r.ReadImageWithResourcesContext(context.Background(), object, resources)
+}
+
+// ReadImageWithResourcesContext 在取消上下文内读取图像并按当前资源解析颜色空间及默认设备色
+// 入参: ctx 取消上下文, object 图像对象或引用, resources 当前资源字典
+// 返回: *Image 图像描述, error 图像、颜色空间或取消错误
+func (r *Reader) ReadImageWithResourcesContext(ctx context.Context, object Object, resources Dictionary) (*Image, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("invalid image context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if resources == nil {
 		resources = Dictionary{}
 	}
-	return r.readImage(object, resources)
+	return r.readImage(ctx, object, resources)
 }
 
-// readImage 读取图像XObject描述，并在给定资源时先解析颜色空间再推导JPX默认位深
-// 入参: object 图像对象或引用, resources 可选当前资源字典
-// 返回: *Image 图像描述, error 图像或颜色空间错误
-func (r *Reader) readImage(object Object, resources Dictionary) (*Image, error) {
+// readImage 在取消上下文内读取图像XObject描述，并在给定资源时先解析颜色空间再推导JPX默认位深
+// 入参: ctx 取消上下文, object 图像对象或引用, resources 可选当前资源字典
+// 返回: *Image 图像描述, error 图像、颜色空间或取消错误
+func (r *Reader) readImage(ctx context.Context, object Object, resources Dictionary) (*Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	resolved, err := r.Resolve(object)
 	if err != nil {
 		return nil, err
@@ -857,7 +893,10 @@ func (r *Reader) readImage(object Object, resources Dictionary) (*Image, error) 
 		width, height := 0, 0
 		var encodedErr error
 		if r.warning != nil {
-			width, height, encodedErr = r.encodedImageDimensions(stream)
+			width, height, encodedErr = r.encodedImageDimensions(ctx, stream)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 		if r.warning != nil && encodedErr == nil && width > 0 && height > 0 {
 			w, h = int64(width), int64(height)
@@ -894,7 +933,7 @@ func (r *Reader) readImage(object Object, resources Dictionary) (*Image, error) 
 		}
 		space = normalizeDeviceColorSpace(space)
 		if resources != nil && space != nil {
-			space, err = r.resourceColorSpace(space, resources)
+			space, err = r.resourceColorSpaceContext(ctx, space, resources)
 			if err != nil {
 				return nil, err
 			}
@@ -906,7 +945,7 @@ func (r *Reader) readImage(object Object, resources Dictionary) (*Image, error) 
 	var embeddedSpace Object
 	var jpxDepth int
 	if !mask {
-		jpxDepth, embeddedSpace, err = r.jpxDefaults(stream, space)
+		jpxDepth, embeddedSpace, err = r.jpxDefaults(ctx, stream, space)
 		if err != nil {
 			return nil, err
 		}
@@ -916,7 +955,7 @@ func (r *Reader) readImage(object Object, resources Dictionary) (*Image, error) 
 		if space == nil {
 			space = embeddedSpace
 			if resources != nil {
-				space, err = r.resourceColorSpace(space, resources)
+				space, err = r.resourceColorSpaceContext(ctx, space, resources)
 				if err != nil {
 					return nil, err
 				}
@@ -924,6 +963,9 @@ func (r *Reader) readImage(object Object, resources Dictionary) (*Image, error) 
 				effectiveColorSpace = true
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if jpxDepth == 0 && (dict["BitsPerComponent"] != nil || !mask) {
 		bits, err = readInteger("BitsPerComponent")
@@ -1266,7 +1308,7 @@ func (i *Image) jpxChannelDepths(ctx context.Context, components int, indexed bo
 	if err != nil {
 		return nil, err
 	}
-	mode, err := i.jpxMaskMode()
+	mode, err := i.jpxMaskMode(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1290,13 +1332,13 @@ func (i *Image) DecodeSamples() (image.Image, error) {
 // 入参: ctx 取消上下文
 // 返回: image.Image 独立原始样本, error 解码或取消错误
 func (i *Image) DecodeSamplesContext(ctx context.Context) (image.Image, error) {
-	return i.decodeSamplesRowsContext(ctx, image.Point{}, nil)
+	return i.decodeSamplesRowsContext(ctx, image.Point{}, nil, 0)
 }
 
-// decodeSamplesRowsContext 解码原始样本，行输出时为JPEG2000保留有界解码窗口
-// 入参: ctx 取消上下文, size 像素需求, rows 可选行解码资源
-// 返回: image.Image 原始样本, error 解码或取消错误
-func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, rows *imageRowContext) (image.Image, error) {
+// decodeSamplesRowsContext 解码原始样本，行输出时为JPEG2000保留有界解码窗口并执行流预算校验
+// 入参: ctx 取消上下文, size 像素需求, rows 可选行解码资源, maxBytes 流解压字节上限
+// 返回: image.Image 原始样本, error 解码、超限或取消错误
+func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, rows *imageRowContext, maxBytes int64) (image.Image, error) {
 	if ctx == nil || i == nil || i.Stream == nil {
 		return nil, fmt.Errorf("invalid image context")
 	}
@@ -1308,6 +1350,10 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	}
 	if i.Width <= 0 || i.Height <= 0 {
 		return nil, fmt.Errorf("invalid image dimensions")
+	}
+	streamMax, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maxBytes <= 0 || streamMax > 0 && streamMax < maxBytes {
+		maxBytes = streamMax
 	}
 	filters, parameters, err := i.Stream.filterChain(i.reader)
 	if err != nil {
@@ -1347,7 +1393,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 		}
 	}
 	if terminal == "" && target != (image.Point{}) {
-		result, handled, err := i.downsampleRawStreamContext(ctx, filters, parameters, target)
+		result, handled, err := i.downsampleRawStreamContext(ctx, filters, parameters, target, maxBytes)
 		if handled {
 			return result, err
 		}
@@ -1367,7 +1413,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 				if recErr != nil || target == (image.Point{}) {
 					return recovered, recErr
 				}
-				return downsampleDecodedImage(ctx, recovered, target)
+				return downsampleDecodedImage(ctx, recovered, target, maxBytes)
 			}
 			return nil, err
 		}
@@ -1388,7 +1434,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 		if i.BitsPerComponent != 1 {
 			return nil, fmt.Errorf("invalid JBIG2 component depth")
 		}
-		if _, _, err := imageBufferSize(i.Width, i.Height, 1); err != nil {
+		if _, _, err := imageCompositeBufferSize(i.Width, i.Height, 1, maxBytes); err != nil {
 			return nil, err
 		}
 		globalsObj := terminalParams["JBIG2Globals"]
@@ -1404,24 +1450,24 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 		if _, err := i.validateJBIG2FileHeader(data, globalsObj != nil); err != nil {
 			return nil, err
 		}
-		opts := i.jbig2DecodeOptions(ctx)
+		opts := i.jbig2DecodeOptions(ctx, maxBytes)
 		var parsedGlobals *jbig2.Globals
 		if globalsObj != nil {
 			parsedGlobals, err = i.jbig2GlobalsParsed(ctx, globalsObj, opts)
 			if err != nil {
-				return nil, err
+				return nil, wrapJBIG2Error(err)
 			}
 		}
 		decoder, err := jbig2.NewDecoderWithParsedGlobalsAndOptions(&contextInput{ctx: ctx, reader: bytes.NewReader(data)}, parsedGlobals, opts)
 		if err != nil {
-			return nil, err
+			return nil, wrapJBIG2Error(err)
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		result, err = decoder.Decode()
 		if err != nil {
-			return nil, err
+			return nil, wrapJBIG2Error(err)
 		}
 		bounds := result.Bounds()
 		if i.Warning != nil && (bounds.Dx() != i.Width || bounds.Dy() != i.Height) {
@@ -1440,10 +1486,10 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 		}
 	case "JPXDecode":
 		cmyk := normalizeDeviceColorSpace(i.ColorSpace) == Name("DeviceCMYK")
-		result, err = i.jpxSamplesRowsContext(ctx, data, cmyk, size, rows)
+		result, err = i.jpxSamplesRowsContext(ctx, data, cmyk, size, rows, maxBytes)
 		downsampled = size.X > 0 && size.Y > 0
 	default:
-		result, err = i.rawSamplesSize(ctx, data, target)
+		result, err = i.rawSamplesSize(ctx, data, target, maxBytes)
 		downsampled = target != (image.Point{})
 	}
 	if canceled := ctx.Err(); canceled != nil {
@@ -1458,7 +1504,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	if !downsampled && target != (image.Point{}) {
 		dst := boundedSampleSize(result.Bounds().Dx(), result.Bounds().Dy(), target)
 		if dst.X < result.Bounds().Dx() || dst.Y < result.Bounds().Dy() {
-			result, err = downsampleDecodedImage(ctx, result, dst)
+			result, err = downsampleDecodedImage(ctx, result, dst, maxBytes)
 			if err != nil {
 				return nil, err
 			}
@@ -1647,20 +1693,56 @@ func (i *Image) jbig2GlobalsParsed(ctx context.Context, obj Object, opts *jbig2.
 	return parsed, nil
 }
 
-// jbig2DecodeOptions 构造带上下文取消与像素内存上限的JBIG2解码选项
-// 入参: ctx 取消上下文
+// jbig2DecodeOptions 构造带上下文取消与流像素内存上限的JBIG2解码选项
+// 入参: ctx 取消上下文, maxBytes 流解压字节上限
 // 返回: *jbig2.DecodeOptions 解码选项
-func (i *Image) jbig2DecodeOptions(ctx context.Context) *jbig2.DecodeOptions {
+func (i *Image) jbig2DecodeOptions(ctx context.Context, maxBytes int64) *jbig2.DecodeOptions {
+	streamMax, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maxBytes <= 0 || streamMax > 0 && streamMax < maxBytes {
+		maxBytes = streamMax
+	}
 	platformLimit := uint64(imageBufferLimit())
-	maxPixels := uint64(jpegRecoveryPixelLimit)
-	if i.Width > 0 && i.Height > 0 && uint64(i.Width) <= platformLimit/uint64(i.Height) {
-		declared := uint64(i.Width) * uint64(i.Height)
-		if declared > maxPixels {
-			maxPixels = declared
+	var declared uint64
+	if i.Width > 0 && i.Height > 0 {
+		if uint64(i.Width) <= platformLimit/uint64(i.Height) {
+			declared = uint64(i.Width) * uint64(i.Height)
+		} else {
+			declared = platformLimit
 		}
 	}
+	const strictPixelFloor uint64 = 1 << 20
+	if budget := imageCompositeBudget(maxBytes); budget > 0 {
+		limit := min(platformLimit, uint64(budget))
+		var maxPixels uint64
+		var maxMemory uint64
+		if i.Warning == nil {
+			maxPixels = min(limit, max(declared, strictPixelFloor))
+			maxMemory = min(limit, max(maxPixels*2, uint64(8<<20)))
+		} else {
+			maxPixels = min(limit, max(declared, uint64(jpegRecoveryPixelLimit)))
+			maxMemory = limit
+		}
+		return &jbig2.DecodeOptions{
+			Context: ctx,
+			Limits: jbig2.Limits{
+				MaxInputBytes:        limit,
+				MaxDecompressedBytes: limit,
+				MaxSegmentBytes:      limit,
+				MaxPixels:            maxPixels,
+				MaxMemoryBytes:       maxMemory,
+			},
+		}
+	}
+	maxPixels := max(declared, uint64(jpegRecoveryPixelLimit))
+	if i.Warning == nil {
+		maxPixels = max(declared, strictPixelFloor)
+	}
 	maxPixels = min(maxPixels, min(platformLimit, uint64(1<<30)))
-	maxMemory := min(platformLimit, max(maxPixels*2, uint64(256<<20)))
+	maxMemoryFloor := uint64(256 << 20)
+	if i.Warning == nil {
+		maxMemoryFloor = uint64(16 << 20)
+	}
+	maxMemory := min(platformLimit, max(maxPixels*2, maxMemoryFloor))
 	maxMemory = min(maxMemory, uint64(512<<20))
 	return &jbig2.DecodeOptions{
 		Context: ctx,
@@ -1672,6 +1754,16 @@ func (i *Image) jbig2DecodeOptions(ctx context.Context) *jbig2.DecodeOptions {
 			MaxMemoryBytes:       maxMemory,
 		},
 	}
+}
+
+// wrapJBIG2Error 将jbig2资源上限错误统一映射为包装ErrStreamLimitExceeded的错误
+// 入参: err 原始错误
+// 返回: error 映射后的错误
+func wrapJBIG2Error(err error) error {
+	if errors.Is(err, jbig2.ErrLimitExceeded) {
+		return fmt.Errorf("JBIG2 %w: %w", ErrStreamLimitExceeded, err)
+	}
+	return err
 }
 
 // RGBA 返回不透明的设备色预览，原始分量由图像解码流程解释
@@ -1901,9 +1993,12 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			}
 		}
 	}
-	embeddedMask, err := i.jpxMaskMode()
+	embeddedMask, err := i.jpxMaskMode(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if embeddedMask == 2 && palette != nil {
+		return nil, fmt.Errorf("invalid Matte for Indexed image")
 	}
 	intent, err := i.renderingIntent()
 	if err != nil {
@@ -2003,11 +2098,17 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	var inverted bool
 	if embeddedMask == 0 {
 		var soft bool
-		maskImage, keys, soft, matte, err = i.prepareMask(ctx, components, channelDepths)
+		maskImage, keys, soft, matte, err = i.prepareMask(ctx, components, channelDepths, palette != nil)
 		if err != nil {
 			return nil, err
 		}
 		inverted = !soft
+	}
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maskImage != nil {
+		if maskMax, _ := effectiveStreamLimits(maskImage.reader, maskImage.Stream); maskMax > 0 && (maxBytes == 0 || maskMax < maxBytes) {
+			maxBytes = maskMax
+		}
 	}
 	fullW, fullH := i.Width, i.Height
 	if maskImage != nil {
@@ -2052,7 +2153,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	if palette != nil || len(keys) != 0 {
 		sampleSize = image.Point{}
 	}
-	samples, err := i.decodeSamplesRowsContext(ctx, sampleSize, rows)
+	samples, err := i.decodeSamplesRowsContext(ctx, sampleSize, rows, maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -2071,7 +2172,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		if sb.Dx() > outSize.X || sb.Dy() > outSize.Y {
 			dst := boundedSampleSize(sb.Dx(), sb.Dy(), outSize)
 			var expanded image.Image
-			expanded, sampleHasAlpha, err = downsampleIndexedImage(ctx, samples, palette, ranges[0], ranges[1], dst)
+			expanded, sampleHasAlpha, err = downsampleIndexedImage(ctx, samples, palette, ranges[0], ranges[1], dst, maxBytes)
 			if err != nil {
 				return nil, err
 			}
@@ -2095,14 +2196,14 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		}
 		if palette == nil && len(keys) == 0 && (samples.Bounds().Dx() > bounds.Dx() || samples.Bounds().Dy() > bounds.Dy()) {
 			dst := boundedSampleSize(samples.Bounds().Dx(), samples.Bounds().Dy(), bounds.Size())
-			samples, err = downsampleDecodedImageMode(ctx, samples, dst, embeddedMask == 2)
+			samples, err = downsampleDecodedImageMode(ctx, samples, dst, embeddedMask == 2, maxBytes)
 			if err != nil {
 				return nil, err
 			}
 		}
 		if mask != nil && (mask.source.Bounds().Dx() > bounds.Dx() || mask.source.Bounds().Dy() > bounds.Dy()) {
 			dst := boundedSampleSize(mask.source.Bounds().Dx(), mask.source.Bounds().Dy(), bounds.Size())
-			scaledMask, err := downsampleDecodedImage(ctx, mask.source, dst)
+			scaledMask, err := downsampleDecodedImage(ctx, mask.source, dst, maxBytes)
 			if err != nil {
 				return nil, err
 			}
@@ -2113,7 +2214,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
 	}
 	if target == nil && (i.ColorSpace == Name("DeviceGray") && !i.ImageMask || rows != nil && i.ImageMask) && embeddedMask == 0 && mask == nil && len(keys) == 0 && len(matte) == 0 {
-		gray, err := decodeGrayImageContext(ctx, samples, ranges[0], ranges[1])
+		gray, err := decodeGrayImageContext(ctx, samples, ranges[0], ranges[1], maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -2130,12 +2231,6 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	}
 	if mask != nil {
 		mask.bounds = bounds
-	}
-	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
-	if maskImage != nil {
-		if maskMax, _ := effectiveStreamLimits(maskImage.reader, maskImage.Stream); maskMax > 0 && (maxBytes == 0 || maskMax < maxBytes) {
-			maxBytes = maskMax
-		}
 	}
 	if target == nil && calibrated == nil && lab == nil && profile == nil && separation == nil && deviceN == nil && components != 4 && len(keys) == 0 && len(matte) == 0 && defaultDecode {
 		byteExact := imageByteExact(samples)
@@ -2412,12 +2507,12 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				inputs[c] = functionValue(inputs[c], ranges[c*2], ranges[c*2+1])
 				if palette == nil {
 					inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], inputs[c]))
-				}
-				if len(matte) != 0 {
-					if alpha == 0 {
-						inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], matte[c]))
-					} else {
-						inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], matte[c]+(inputs[c]-matte[c])*65535/float64(alpha)))
+					if len(matte) != 0 {
+						if alpha == 0 {
+							inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], matte[c]))
+						} else {
+							inputs[c] = math.Max(limits[c*2], math.Min(limits[c*2+1], matte[c]+(inputs[c]-matte[c])*65535/float64(alpha)))
+						}
 					}
 				}
 			}
@@ -2814,9 +2909,9 @@ func (i *Image) paletteContext(ctx context.Context) (*imagePalette, error) {
 }
 
 // prepareMask 解析有效外部遮罩描述、色键和预混合底色，不提前解码遮罩像素
-// 入参: ctx 取消上下文, components 原始图像分量数, channelDepths 可选各通道位深
+// 入参: ctx 取消上下文, components 原始图像分量数, channelDepths 可选各通道位深, indexed 是否索引色图像
 // 返回: *Image 遮罩图像描述, []float64 色键范围, bool 是否软遮罩, []float64 预混合底色, error 错误信息
-func (i *Image) prepareMask(ctx context.Context, components int, channelDepths []int) (*Image, []float64, bool, []float64, error) {
+func (i *Image) prepareMask(ctx context.Context, components int, channelDepths []int, indexed bool) (*Image, []float64, bool, []float64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -2876,7 +2971,7 @@ func (i *Image) prepareMask(ctx context.Context, components int, channelDepths [
 			object = &copyStream
 		}
 	}
-	mask, err := i.reader.ReadImage(object)
+	mask, err := i.reader.readImage(ctx, object, nil)
 	if err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -2899,6 +2994,9 @@ func (i *Image) prepareMask(ctx context.Context, components int, channelDepths [
 		return nil, nil, false, nil, err
 	}
 	if value != nil {
+		if indexed {
+			return nil, nil, false, nil, fmt.Errorf("invalid Matte for Indexed image")
+		}
 		if !soft || mask.Width != i.Width || mask.Height != i.Height {
 			return nil, nil, false, nil, fmt.Errorf("invalid image Matte array")
 		}
@@ -3055,15 +3153,19 @@ func (i *Image) rawSampleComponents() (int, error) {
 // 入参: ctx 取消上下文, data 独立原始样本字节
 // 返回: image.Image 样本图像, error 错误信息
 func (i *Image) rawSamples(ctx context.Context, data []byte) (image.Image, error) {
-	return i.rawSamplesSize(ctx, data, image.Point{})
+	return i.rawSamplesSize(ctx, data, image.Point{}, 0)
 }
 
-// rawSamplesSize 将独立原始样本解释为图像，有目标尺寸时直接按行盒式降采样
-// 入参: ctx 取消上下文, data 独立原始样本字节, target 目标尺寸限制
+// rawSamplesSize 将独立原始样本解释为图像，有目标尺寸时直接按行盒式降采样并校核流预算
+// 入参: ctx 取消上下文, data 独立原始样本字节, target 目标尺寸限制, maxBytes 流解压字节上限
 // 返回: image.Image 样本图像, error 错误信息
-func (i *Image) rawSamplesSize(ctx context.Context, data []byte, target image.Point) (image.Image, error) {
+func (i *Image) rawSamplesSize(ctx context.Context, data []byte, target image.Point, maxBytes int64) (image.Image, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	streamMax, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maxBytes <= 0 || streamMax > 0 && streamMax < maxBytes {
+		maxBytes = streamMax
 	}
 	components, err := i.rawSampleComponents()
 	if err != nil {
@@ -3096,7 +3198,7 @@ func (i *Image) rawSamplesSize(ctx context.Context, data []byte, target image.Po
 	if target.X > 0 && target.Y > 0 {
 		dst := boundedSampleSize(i.Width, i.Height, target)
 		if dst.X < i.Width || dst.Y < i.Height {
-			result, _, err := i.downsampleRawReaderContext(ctx, bytes.NewReader(data), components, stride, dst, false)
+			result, _, err := i.downsampleRawReaderContext(ctx, bytes.NewReader(data), components, stride, dst, false, maxBytes)
 			return result, err
 		}
 	}
@@ -3106,7 +3208,6 @@ func (i *Image) rawSamplesSize(ctx context.Context, data []byte, target image.Po
 	if components == 4 {
 		return &packedCMYKImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
 	}
-	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
 	if components == 3 && i.BitsPerComponent == 8 {
 		if _, _, err := imageCompositeBufferSize(i.Width, i.Height, 4, maxBytes); err != nil {
 			return nil, err

@@ -52,14 +52,46 @@ type separationCacheKey struct {
 	effective bool
 }
 
-// colorParseState 保存单次颜色空间解析的节点预算及配置流、备用空间与分色缓存
+// colorParseState 保存单次颜色空间解析的节点与ICC内存预算及配置流、备用空间与分色缓存
 type colorParseState struct {
 	nodes        int
+	iccBytes     int64
+	iccSeen      *shadingByteTracker
 	iccV5        map[iccStreamKey]bool
 	iccSpaces    map[iccStreamKey]*iccColorSpace
 	iccAltSpaces map[iccAltCacheKey]*iccColorSpace
 	iccRecover   map[iccStreamKey]bool
 	separations  map[separationCacheKey]*separationSpace
+}
+
+// colorParseICCLimit 计算单次颜色空间解析允许累计驻留的ICC字节上限
+// 入参: r 文档阅读器
+// 返回: int64 驻留字节上限
+func colorParseICCLimit(r *Reader) int64 {
+	limit := maxICCLUTBytes * 2
+	if maxBytes, _ := effectiveStreamLimits(r, nil); maxBytes > 0 && maxBytes < maxICCLUTBytes {
+		limit = max(maxBytes*2, 4096)
+	}
+	return limit
+}
+
+// reserveICC 将新增独立ICC配置的近似驻留内存计入单次颜色空间解析预算
+// 入参: r 文档阅读器, space 已解析ICC配置
+// 返回: error 超出驻留预算时返回包装ErrStreamLimitExceeded的错误
+func (s *colorParseState) reserveICC(r *Reader, space *iccColorSpace) error {
+	if space == nil {
+		return nil
+	}
+	if s.iccSeen == nil {
+		s.iccSeen = &shadingByteTracker{}
+	}
+	size := iccProfileMemoryBytes(space, s.iccSeen)
+	limit := colorParseICCLimit(r)
+	if size > limit-s.iccBytes {
+		return fmt.Errorf("%w: ICC color space memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	s.iccBytes += size
+	return nil
 }
 
 // consumeColorParseNode 复用或建立单次颜色空间解析状态并扣减节点预算
@@ -678,13 +710,6 @@ func (r *Reader) iccProfileStream(object Array) (*Stream, Integer, error) {
 	return stream, count, nil
 }
 
-// readICCColorSpace 读取内容流使用的ICC颜色空间
-// 入参: object ICCBased颜色空间数组
-// 返回: *iccColorSpace 颜色变换, error 解析错误
-func (r *Reader) readICCColorSpace(object Array) (*iccColorSpace, error) {
-	return r.readICCSourceSpaceContext(context.Background(), object, false)
-}
-
 // readICCSourceSpaceContext 在取消上下文内读取原始或已按资源校验的ICC源空间
 // 入参: ctx 取消上下文, object ICCBased数组, effective 是否已按资源校验并替换
 // 返回: *iccColorSpace 源颜色变换, error 配置、备用定义、预算或取消错误
@@ -717,12 +742,15 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 	if cached := state.iccAltSpaces[altKey]; cached != nil {
 		return cached.withRanges(ranges), nil
 	}
-	cacheAlt := func(base *iccColorSpace) *iccColorSpace {
+	cacheAlt := func(base *iccColorSpace) (*iccColorSpace, error) {
+		if err := state.reserveICC(r, base); err != nil {
+			return nil, err
+		}
 		if state.iccAltSpaces == nil {
 			state.iccAltSpaces = make(map[iccAltCacheKey]*iccColorSpace)
 		}
 		state.iccAltSpaces[altKey] = base
-		return base.withRanges(ranges)
+		return base.withRanges(ranges), nil
 	}
 	loadAlt := func() (*iccColorSpace, error) {
 		ctx = withGradientParseBudget(ctx, r)
@@ -730,7 +758,7 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 		if err != nil {
 			return nil, err
 		}
-		return cacheAlt(base), nil
+		return cacheAlt(base)
 	}
 	if state.iccV5[streamKey] || state.iccRecover[streamKey] {
 		return loadAlt()
@@ -741,7 +769,7 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 		space, err = r.readICCProfileData(data, int(count))
 	}
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || isFatalReaderError(err) {
 			return nil, err
 		}
 		ctx = withGradientParseBudget(ctx, r)
@@ -753,7 +781,7 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 			state.iccRecover = make(map[iccStreamKey]bool)
 		}
 		state.iccRecover[streamKey] = true
-		return cacheAlt(base), nil
+		return cacheAlt(base)
 	}
 	if space == nil {
 		if state.iccV5 == nil {
@@ -761,6 +789,9 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 		}
 		state.iccV5[streamKey] = true
 		return loadAlt()
+	}
+	if err := state.reserveICC(r, space); err != nil {
+		return nil, err
 	}
 	if state.iccSpaces == nil {
 		state.iccSpaces = make(map[iccStreamKey]*iccColorSpace)
@@ -809,10 +840,27 @@ func (r *Reader) readICCProfileData(data []byte, count int) (*iccColorSpace, err
 	return space, nil
 }
 
-// iccProfileCacheBytes 估算单个已解析ICC配置在缓存中占用的近似字节数
+// iccProfileCacheBytes 估算单个已解析ICC配置及其备用空间在缓存中占用的近似字节数
 // 入参: space 已解析的ICC配置
 // 返回: int64 估算字节数
 func iccProfileCacheBytes(space *iccColorSpace) int64 {
+	return iccProfileMemoryBytes(space, &shadingByteTracker{})
+}
+
+// iccProfileMemoryBytes 按指针去重估算ICC配置及其嵌套备用空间的近似内存占用
+// 入参: space 已解析的ICC配置, seen 节点去重表
+// 返回: int64 估算字节数
+func iccProfileMemoryBytes(space *iccColorSpace, seen *shadingByteTracker) int64 {
+	if space == nil {
+		return 0
+	}
+	if seen.profiles == nil {
+		seen.profiles = make(map[*iccColorSpace]bool)
+	}
+	if seen.profiles[space] {
+		return 0
+	}
+	seen.profiles[space] = true
 	size := int64(256) + int64(len(space.data))
 	if space.rgb != nil {
 		seenSamples := make(map[*uint16]bool, len(space.rgb.curves))
@@ -850,6 +898,9 @@ func iccProfileCacheBytes(space *iccColorSpace) int64 {
 		} else {
 			size += space.inverse.tagBytes
 		}
+	}
+	if space.alternate != nil {
+		size += colorSpaceMemoryBytes(space.alternateBlending, seen) + separationSpaceBytes(space.alternate.separation, seen) + tintMemoryBytes(space.alternate.deviceN, seen) + imagePaletteBytes(space.alternate.palette, seen)
 	}
 	return size
 }

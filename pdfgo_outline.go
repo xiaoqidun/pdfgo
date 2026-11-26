@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"reflect"
 )
 
 // OutlineItem 保存目录标题、显示样式及原始跳转声明，不执行动作
@@ -37,7 +38,7 @@ type OutlineItem struct {
 // WalkOutlines 按先序访问文档目录，包括折叠节点的子项，不限制层级
 // 配置Warning时跳过损坏、循环或格式异常的目录根及目录项，保留可访问条目并记录诊断
 // 入参: ctx 取消上下文, visit 零基层级和目录项的访问函数
-// 返回: error 目录结构、文本、循环、读取、解密、认证或访问错误
+// 返回: error 目录结构、文本、循环、超限、读取、解密、认证或访问错误
 func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) error) error {
 	if r == nil || ctx == nil {
 		return fmt.Errorf("invalid outline context")
@@ -55,7 +56,7 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 	if err != nil {
 		return err
 	}
-	value, err := r.Resolve(catalog["Outlines"])
+	rootRef, value, err := r.resolveIndirect(catalog["Outlines"])
 	if err != nil {
 		if !r.recoverAuxiliary(err) {
 			return err
@@ -66,7 +67,7 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 		return nil
 	}
 	outlines, ok := value.(Dictionary)
-	if !ok {
+	if !ok || outlines == nil {
 		err := fmt.Errorf("invalid outlines dictionary")
 		if !r.recoverAuxiliary(err) {
 			return err
@@ -78,7 +79,18 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 		level  int
 	}
 	stack := []entry{{outlines["First"], 0}}
-	seen := map[Reference]bool{}
+	seenRefs := map[Reference]bool{}
+	seenDicts := map[uintptr]Dictionary{}
+	if rawRoot, ok := catalog["Outlines"].(Reference); ok {
+		seenRefs[rawRoot] = true
+	}
+	if rootRef != (Reference{}) {
+		seenRefs[rootRef] = true
+	}
+	if id := reflect.ValueOf(outlines).Pointer(); id != 0 {
+		seenDicts[id] = outlines
+	}
+	budget := newTextStringBudget(r)
 	for len(stack) > 0 {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -96,33 +108,51 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 			}
 			continue
 		}
-		if seen[ref] {
+		if seenRefs[ref] {
 			err := fmt.Errorf("repeated outline item")
 			if !r.recoverAuxiliary(err) {
 				return err
 			}
 			continue
 		}
-		seen[ref] = true
-		value, err := r.Resolve(ref)
+		seenRefs[ref] = true
+		targetRef, value, err := r.resolveIndirect(ref)
 		if err != nil {
 			if !r.recoverAuxiliary(err) {
 				return err
 			}
 			continue
 		}
+		if targetRef != ref && seenRefs[targetRef] {
+			err := fmt.Errorf("repeated outline item")
+			if !r.recoverAuxiliary(err) {
+				return err
+			}
+			continue
+		}
+		seenRefs[targetRef] = true
 		if value == nil {
 			continue
 		}
 		dict, ok := value.(Dictionary)
-		if !ok {
+		if !ok || dict == nil {
 			err := fmt.Errorf("invalid outline item")
 			if !r.recoverAuxiliary(err) {
 				return err
 			}
 			continue
 		}
-		title, err := r.Resolve(dict["Title"])
+		if id := reflect.ValueOf(dict).Pointer(); id != 0 {
+			if _, exists := seenDicts[id]; exists {
+				err := fmt.Errorf("repeated outline item")
+				if !r.recoverAuxiliary(err) {
+					return err
+				}
+				continue
+			}
+			seenDicts[id] = dict
+		}
+		titleRef, title, err := r.resolveIndirect(dict["Title"])
 		if err != nil {
 			if !r.recoverAuxiliary(err) {
 				return err
@@ -139,8 +169,8 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 			stack = append(stack, entry{dict["Next"], next.level})
 			continue
 		}
-		item := OutlineItem{Reference: ref, Dictionary: dict, Destination: dict["Dest"], Action: dict["A"]}
-		item.Title, err = DecodeTextString(text)
+		item := OutlineItem{Reference: targetRef, Dictionary: dict, Destination: dict["Dest"], Action: dict["A"]}
+		item.Title, err = budget.decodeString(titleRef, text, "outline")
 		if err != nil {
 			if !r.recoverAuxiliary(err) {
 				return err

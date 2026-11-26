@@ -140,6 +140,12 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 	if err := r.writeAnnotationText(ctx, annotation, nil, 0, frame, border, resources, &content); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if content.Len() > contentLimit {
+		return nil, fmt.Errorf("%w: free text appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	local := annotation
 	local.Rect = Rectangle{0, 0, w, h}
 	return r.annotationAppearance(local, content.String(), resources)

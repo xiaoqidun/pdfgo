@@ -492,11 +492,8 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 				return cached, nil
 			}
 		}
-		file, err := r.ReadFileSpecification(object)
+		file, err := r.readFileSpecificationContext(ctx, object, &budget, "rich media")
 		if err != nil {
-			return FileSpecification{}, err
-		}
-		if err := budget.consume(int64(len(file.Name))+int64(len(file.Description)), "rich media"); err != nil {
 			return FileSpecification{}, err
 		}
 		if ref != (Reference{}) {

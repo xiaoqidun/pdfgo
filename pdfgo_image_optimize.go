@@ -96,7 +96,11 @@ func OptimizeImage(ctx context.Context, data []byte, options CompressionOptions,
 			return best, nil
 		}
 	}
-	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/4 {
+	pixelBytes := int64(4)
+	if cmykSource {
+		pixelBytes = 8
+	}
+	if int64(config.Width)*int64(config.Height) > optimizationBufferLimit/pixelBytes || frame.sampleSize(optimizationBufferLimit/8) != nil {
 		return best, nil
 	}
 	img, err := jpeg.Decode(&contextInput{ctx: ctx, reader: bytes.NewReader(data)})

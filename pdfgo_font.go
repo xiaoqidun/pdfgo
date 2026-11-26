@@ -27,6 +27,12 @@ import (
 	"golang.org/x/text/encoding/charmap"
 )
 
+// maxFontCacheEntries 限制单个Reader常驻缓存的字体最大条数
+const maxFontCacheEntries = 256
+
+// maxFontCacheBytes 限制单个Reader常驻缓存的字体总字节上限
+const maxFontCacheBytes int64 = 128 << 20
+
 // Font 保存PDF字体程序、字符映射及字宽（不依赖渲染后端），可由阅读器缓存共享，所有字段及切片均只读
 // Vertical为true时采用竖排度量（字形仍以横排原点描述）；Recovered表示已诊断恢复，Dictionary仍保留原始声明
 // BoundingBox为非Type3描述符边界，FallbackBoundingBox为未内嵌标准字体AFM保守边界（千分之一文字空间，不用于排版）
@@ -650,7 +656,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		r.warning(Diagnostic{Message: "invalid PDF base font name; embedded glyph program retained"})
 	}
 	if (subtype == Name("Type1") || subtype == Name("MMType1")) && font.ProgramType == "FontFile" && font.encoding == "" {
-		builtIn, err := type1BuiltInEncoding(font.Program)
+		builtIn, err := type1BuiltInEncoding(ctx, font.Program)
 		if err != nil {
 			return nil, err
 		}
@@ -717,7 +723,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		if !font.composite && font.encoding != "" && font.encoding != "WinAnsiEncoding" && font.encoding != "MacRomanEncoding" && font.encoding != "MacExpertEncoding" && font.encoding != "StandardEncoding" {
 			return nil, &UnsupportedError{Feature: "external CFF encoding"}
 		}
-		font.cffGlyphs, font.cffNames, err = cffFontMappingWithGlyphMap(cffProgram, font.composite, font.encoding, font.differences, font.ProgramType, font.glyphMap)
+		font.cffGlyphs, font.cffNames, err = cffFontMappingWithGlyphMap(ctx, cffProgram, font.composite, font.encoding, font.differences, font.ProgramType, font.glyphMap)
 		if err != nil {
 			return nil, err
 		}
@@ -871,12 +877,80 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		return nil, err
 	}
 	if indirect {
-		if r.fonts == nil {
-			r.fonts = map[Reference]*Font{}
-		}
-		r.fonts[ref] = font
+		r.cacheFont(ref, font)
 	}
 	return font, nil
+}
+
+// fontMemoryBytes 估算单个已解析字体对象的近似常驻内存字节数
+// 入参: f 字体资源
+// 返回: int64 估算字节数
+func fontMemoryBytes(f *Font) int64 {
+	if f == nil {
+		return 0
+	}
+	cost := int64(512) + int64(len(f.Name)) + int64(len(f.Subtype)) + int64(len(f.Program)) + int64(len(f.ProgramType)) + int64(len(f.coreName)) + int64(len(f.encoding)) + int64(len(f.cmapEncoding)) + int64(len(f.glyphMap)) + int64(len(f.simpleCmap))
+	cost += int64(len(f.Dictionary)+len(f.type3Procs)+len(f.type3Resources)) * 64
+	cost += int64(len(f.widths))*24 + int64(len(f.cidWidths.ranges))*24 + int64(len(f.verticals.ranges))*40 + int64(len(f.cffGlyphs))*16
+	for k, v := range f.Unicode {
+		cost += 64 + int64(len(k)) + int64(len(v))
+	}
+	for k, v := range f.cidUnicode {
+		cost += 64 + int64(len(k)) + int64(len(v))
+	}
+	for _, name := range f.cffNames {
+		cost += 48 + int64(len(name))
+	}
+	for _, name := range f.differences {
+		cost += 48 + int64(len(name))
+	}
+	for current := f.cidMap; current != nil; current = current.base {
+		cost += 512 + int64(len(current.ranges))*32 + int64(len(current.spaces))*16 + int64(len(current.notdef))*32 + int64(len(current.registry)) + int64(len(current.ordering))
+		for _, bucket := range current.spaceByFirst {
+			cost += int64(len(bucket)) * 2
+		}
+		if current.spaceSecondMask != nil {
+			cost += 8192
+		}
+		for _, sb := range current.spaceSecond {
+			if sb == nil {
+				continue
+			}
+			cost += 6144
+			for _, sub := range sb.bySecond {
+				cost += int64(len(sub)) * 2
+			}
+		}
+	}
+	if f.ttfMetrics != nil {
+		cost += 64 + int64(len(f.ttfMetrics.hmtx))
+	}
+	if f.post != nil {
+		f.post.mu.RLock()
+		cost += 64 + int64(len(f.post.glyphs))*48
+		f.post.mu.RUnlock()
+	}
+	if f.programMetrics != nil {
+		cost += 128
+	}
+	return cost
+}
+
+// cacheFont 在条目数与总字节上限内缓存已解析字体，超限时清空旧缓存
+// 入参: ref 字体间接引用, font 已解析字体
+func (r *Reader) cacheFont(ref Reference, font *Font) {
+	cost := fontMemoryBytes(font)
+	if cost > maxFontCacheBytes {
+		return
+	}
+	if r.fonts == nil {
+		r.fonts = make(map[Reference]*Font)
+	} else if len(r.fonts) >= maxFontCacheEntries || cost > maxFontCacheBytes-r.fontCacheBytes {
+		clear(r.fonts)
+		r.fontCacheBytes = 0
+	}
+	r.fonts[ref] = font
+	r.fontCacheBytes += cost
 }
 
 // fontFlags 读取字体描述符的整数标志，支持间接对象

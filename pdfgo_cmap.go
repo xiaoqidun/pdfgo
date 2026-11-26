@@ -82,16 +82,16 @@ func ParseUnicodeMapContext(ctx context.Context, data []byte) (UnicodeMap, error
 // 返回: UnicodeMap 独立映射, error 解析或取消错误
 func parseUnicodeMapContext(ctx context.Context, data []byte, active map[Name]bool) (UnicodeMap, error) {
 	result := UnicodeMap{}
-	if err := parseUnicodeMapIntoContext(ctx, result, data, active); err != nil {
+	if err := parseUnicodeMapIntoContext(ctx, result, data, active, ""); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-// parseUnicodeMapIntoContext 读取映射及命名继承并增量写入目标表，检查取消、总条目与总字节上限
-// 入参: ctx 取消上下文, target 目标映射, data 映射数据, active 当前命名继承链
+// parseUnicodeMapIntoContext 读取映射并增量写入目标表，跳过已由流字典UseCMap加载的同名父流继承
+// 入参: ctx 取消上下文, target 目标映射, data 映射数据, active 当前命名继承链, baseStreamName 已由流字典UseCMap加载的父流CMapName
 // 返回: error 解析、超限或取消错误
-func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []byte, active map[Name]bool) error {
+func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []byte, active map[Name]bool, baseStreamName Name) error {
 	p := objectParser{data: data}
 	var inherited UnicodeMap
 	var localWritten map[string]bool
@@ -175,11 +175,15 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 			if name == "" || hasUseCMap {
 				return p.fail("invalid ToUnicode CMap inheritance")
 			}
+			hasUseCMap = true
+			if baseStreamName != "" && name == baseStreamName {
+				name = ""
+				continue
+			}
 			loaded, err := loadUnicodeCMapContext(ctx, name, active)
 			if err != nil {
 				return err
 			}
-			hasUseCMap = true
 			if !wroteLocal {
 				totalBytes, err = copyUnicodeMapContext(ctx, target, loaded)
 				if err != nil {

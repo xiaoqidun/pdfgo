@@ -106,8 +106,18 @@ func (r *Reader) ignoredTintSpace(space Array) error {
 // 入参: ctx 取消上下文, object 颜色空间, effective 是否已按资源校验并替换
 // 返回: bool 是否不产生输出, error 色料、变换或取消错误
 func (r *Reader) colorSpaceNoneContext(ctx context.Context, object Object, effective bool) (bool, error) {
+	return r.colorSpaceNoneDepth(ctx, object, effective, 0)
+}
+
+// colorSpaceNoneDepth 在嵌套深度上限内判断颜色空间是否完全不产生输出
+// 入参: ctx 取消上下文, object 颜色空间, effective 是否已按资源校验并替换, depth 嵌套深度
+// 返回: bool 是否不产生输出, error 色料、变换、递归或取消错误
+func (r *Reader) colorSpaceNoneDepth(ctx context.Context, object Object, effective bool, depth int) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
+	}
+	if depth >= 64 {
+		return false, fmt.Errorf("color space recursion limit exceeded")
 	}
 	object, err := r.resolveColorSpace(object)
 	if err != nil {
@@ -162,14 +172,14 @@ func (r *Reader) colorSpaceNoneContext(ctx context.Context, object Object, effec
 			return false, err
 		}
 		if family := colorSpaceFamily(alternate); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
-			space, err := r.readSeparationSpaceContext(ctx, array, effective, 0)
+			space, err := r.readSeparationSpaceContext(ctx, array, effective, depth)
 			if err != nil {
 				return false, err
 			}
 			return space.none, nil
 		}
 	case Name("DeviceN"):
-		_, none, err := r.deviceNColorants(array)
+		names, none, err := r.deviceNColorants(array)
 		if err != nil {
 			return false, err
 		}
@@ -181,11 +191,91 @@ func (r *Reader) colorSpaceNoneContext(ctx context.Context, object Object, effec
 			return false, err
 		}
 		if family := colorSpaceFamily(alternate); family == "ICCBased" || effective && (family == "Separation" || family == "DeviceN") {
-			space, err := r.readDeviceNSpaceContext(ctx, array, effective, 0)
+			space, err := r.readDeviceNSpaceContext(ctx, array, effective, depth)
 			if err != nil {
 				return false, err
 			}
 			return space.none, nil
+		}
+		if len(array) == 5 {
+			value, err := r.Resolve(array[4])
+			if err != nil {
+				return false, err
+			}
+			if attrs, ok := value.(Dictionary); ok {
+				subtype, err := r.Resolve(attrs["Subtype"])
+				if err != nil {
+					return false, err
+				}
+				if subtype == Name("NChannel") {
+					procVal, err := r.Resolve(attrs["Process"])
+					if err != nil {
+						return false, err
+					}
+					if process, ok := procVal.(Dictionary); ok {
+						compVal, err := r.Resolve(process["Components"])
+						if err != nil {
+							return false, err
+						}
+						if components, ok := compVal.(Array); ok {
+							channels := make(map[Name]bool, len(components)+4)
+							for i, item := range components {
+								if i&255 == 0 {
+									if err := ctx.Err(); err != nil {
+										return false, err
+									}
+								}
+								v, err := r.Resolve(item)
+								if err != nil {
+									return false, err
+								}
+								if name, ok := v.(Name); ok {
+									channels[name] = true
+								}
+							}
+							procSpace, err := r.resolveColorSpace(process["ColorSpace"])
+							if err != nil {
+								return false, err
+							}
+							cmyk := normalizeDeviceColorSpace(procSpace) == Name("DeviceCMYK")
+							if !cmyk {
+								if iccArr, ok := procSpace.(Array); ok && len(iccArr) == 2 && iccArr[0] == Name("ICCBased") {
+									_, count, err := r.iccProfileStream(iccArr)
+									if err != nil && isFatalReaderError(err) {
+										return false, err
+									}
+									if err == nil && count == 4 {
+										cmyk = true
+									}
+								}
+							}
+							if cmyk {
+								for _, name := range [...]Name{"Cyan", "Magenta", "Yellow", "Black"} {
+									channels[name] = true
+								}
+							}
+							allProcess := true
+							for _, name := range names {
+								if !channels[name] {
+									allProcess = false
+									break
+								}
+							}
+							if allProcess {
+								procNone, err := r.colorSpaceNoneDepth(ctx, procSpace, false, depth+1)
+								if err != nil || !procNone {
+									return false, err
+								}
+								space, err := r.readDeviceNSpaceContext(ctx, array, effective, depth)
+								if err != nil {
+									return false, err
+								}
+								return space.none, nil
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 	return false, nil

@@ -336,18 +336,27 @@ func jpegMetadataProfileContext(ctx context.Context, data []byte, stripColor boo
 	return metadata, profile, frame, adobe, tagged, true, ctx.Err()
 }
 
-// encodedImageDimensions 只读取单层JPEG或JPEG2000图像头，不为无效字典推测尺寸
-// 入参: stream 图像编码流
-// 返回: int 编码宽度, int 编码高度, error 不可确定的尺寸或编码错误
-func (r *Reader) encodedImageDimensions(stream *Stream) (int, int, error) {
+// encodedImageDimensions 在取消上下文内只读取单层JPEG或JPEG2000图像头，不为无效字典推测尺寸
+// 入参: ctx 取消上下文, stream 图像编码流
+// 返回: int 编码宽度, int 编码高度, error 不可确定的尺寸、编码或取消错误
+func (r *Reader) encodedImageDimensions(ctx context.Context, stream *Stream) (int, int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
 	filters, _, err := stream.filterChain(r)
 	if err != nil {
+		return 0, 0, err
+	}
+	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
 	if len(filters) == 1 {
 		switch filters[0] {
 		case Name("DCTDecode"):
-			config, err := jpeg.DecodeConfig(bytes.NewReader(stream.Data))
+			config, err := jpeg.DecodeConfig(&contextInput{ctx: ctx, reader: bytes.NewReader(stream.Data)})
+			if err := ctx.Err(); err != nil {
+				return 0, 0, err
+			}
 			if err == nil && (config.Height <= 0 || config.Width <= 0 || config.Width > jpegRecoveryPixelLimit/config.Height) {
 				return 0, 0, fmt.Errorf("JPEG dimension recovery exceeds sample budget")
 			}
@@ -355,6 +364,9 @@ func (r *Reader) encodedImageDimensions(stream *Stream) (int, int, error) {
 		case Name("JPXDecode"):
 			data, err := jpxCodestream(stream.Data)
 			if err != nil {
+				return 0, 0, err
+			}
+			if err := ctx.Err(); err != nil {
 				return 0, 0, err
 			}
 			width, height, _, err := jpxSize(data)
@@ -548,7 +560,7 @@ func (i *Image) jpegSamplesSizeContext(ctx context.Context, data []byte, params 
 	if cmyk, ok := result.(*image.CMYK); ok {
 		out := &packedCMYKImage{data: cmyk.Pix, rect: cmyk.Rect, stride: cmyk.Stride, depth: 8}
 		if downscale {
-			scaled, err := downsampleDecodedImage(ctx, out, dst)
+			scaled, err := downsampleDecodedImage(ctx, out, dst, maxBytes)
 			if err != nil {
 				return nil, err
 			}
@@ -566,22 +578,22 @@ func (i *Image) jpegSamplesSizeContext(ctx context.Context, data []byte, params 
 	}
 	if components != 3 {
 		if downscale {
-			return downsampleDecodedImage(ctx, result, dst)
+			return downsampleDecodedImage(ctx, result, dst, maxBytes)
 		}
 		return result, nil
 	}
 	ycbcr, rawYCbCr := result.(*image.YCbCr)
 	if downscale && rawYCbCr {
-		return downsampleYCbCr(ctx, ycbcr, dst, transform)
+		return downsampleYCbCr(ctx, ycbcr, dst, transform, maxBytes)
 	}
 	if transform == rawYCbCr {
 		if downscale {
-			return downsampleDecodedImage(ctx, result, dst)
+			return downsampleDecodedImage(ctx, result, dst, maxBytes)
 		}
 		return result, nil
 	}
 	if downscale {
-		result, err = downsampleDecodedImage(ctx, result, dst)
+		result, err = downsampleDecodedImage(ctx, result, dst, maxBytes)
 		if err != nil {
 			return nil, err
 		}

@@ -217,7 +217,7 @@ func (f *Font) glyphResourceMapping(ctx context.Context) ([]uint16, Dictionary, 
 		}
 		return ids, info, "CIDFontType2", nil
 	}
-	dict, stringsIndex, chars, err := cffFontData(cff)
+	dict, stringsIndex, chars, err := cffFontData(ctx, cff)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -238,7 +238,7 @@ func (f *Font) glyphResourceMapping(ctx context.Context) ([]uint16, Dictionary, 
 			}
 		}
 		info["Supplement"] = Integer(ros[2])
-		ids, err = cffCharset(cff, dict, len(chars))
+		ids, err = cffCharset(ctx, cff, dict, len(chars))
 		if err != nil {
 			return nil, nil, "", err
 		}
