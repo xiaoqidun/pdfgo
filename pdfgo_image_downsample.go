@@ -324,11 +324,11 @@ func (i *Image) downsampleRawStreamContext(ctx context.Context, filters, paramet
 		if maxBytes > 0 && declaredBytes > maxBytes {
 			return nil, true, ErrStreamLimitExceeded
 		}
-		brotliInput, err := checkBrotliLimits(ctx, i.Stream.Data, maxBytes)
+		brotliInput, largeWindow, err := checkBrotliLimits(ctx, i.Stream.Data, maxBytes)
 		if err != nil {
 			return nil, true, err
 		}
-		brotliLargeWindow = maxBytes == 0 || maxBytes > 16<<20
+		brotliLargeWindow = largeWindow
 		brotliReader = acquireBrotliReaderWith(&contextInput{ctx: ctx, reader: brotliInput}, brotliLargeWindow)
 		reader = &contextInput{ctx: ctx, reader: brotliReader}
 		isBrotli = true

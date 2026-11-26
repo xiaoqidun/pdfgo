@@ -16,8 +16,10 @@ package pdfgo
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"unicode/utf8"
 )
 
@@ -67,8 +69,102 @@ func (f *Font) GlyphMapContext(ctx context.Context) (map[rune]uint16, error) {
 			mapping[ch] = glyph.ID
 		}
 	}
+	if f.composite && f.cidMap != nil && isPredefinedUnicodeCMap(f.encoding) {
+		if err := f.fillPredefinedGlyphMap(ctx, mapping); err != nil {
+			return nil, err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return mapping, nil
+}
+
+// fillPredefinedGlyphMap 补充预定义Unicode编码复合字体的单字符字形映射，保留显式ToUnicode与字符集映射优先
+// 入参: ctx 取消上下文, mapping 已收集的字符到字形编号映射
+// 返回: error 取消错误
+func (f *Font) fillPredefinedGlyphMap(ctx context.Context, mapping map[rune]uint16) error {
+	validCIDs, maxCID, err := f.validCIDRange(ctx)
+	if err != nil {
+		return err
+	}
+	return f.cidMap.walkValidCIDs(ctx, validCIDs, maxCID, func(raw []byte, cid uint16) error {
+		if len(f.Unicode) != 0 {
+			if _, overridden := f.Unicode[string(raw)]; overridden {
+				return nil
+			}
+		}
+		if len(f.cidUnicode) != 0 {
+			var key [2]byte
+			key[0], key[1] = byte(cid>>8), byte(cid)
+			if _, overridden := f.cidUnicode[string(key[:])]; overridden {
+				return nil
+			}
+		}
+		text, ok := predefinedCodeUnicode(f.encoding, raw)
+		if !ok {
+			return nil
+		}
+		ch, size := utf8.DecodeRuneInString(text)
+		if size != len(text) {
+			return nil
+		}
+		if _, exists := mapping[ch]; exists {
+			return nil
+		}
+		id := cid
+		if f.cffGlyphs != nil {
+			id = f.cffGlyphs[uint32(cid)]
+		} else if f.glyphMap != nil {
+			id = binary.BigEndian.Uint16(f.glyphMap[int(cid)*2:])
+		}
+		mapping[ch] = id
+		return nil
+	})
+}
+
+// validCIDRange 提取内嵌复合字体的有效非零CID集合或连续上界，避免枚举无效CID区间
+// 入参: ctx 取消上下文
+// 返回: []uint16 升序有效CID（nil表示使用1至maxCID连续区间）, uint16 连续上界, error 取消错误
+func (f *Font) validCIDRange(ctx context.Context) ([]uint16, uint16, error) {
+	if f.cffGlyphs != nil {
+		cids := make([]uint16, 0, len(f.cffGlyphs))
+		index := 0
+		for cid, gid := range f.cffGlyphs {
+			if index&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, 0, err
+				}
+			}
+			index++
+			if cid != 0 && cid <= 65535 && gid != 0 {
+				cids = append(cids, uint16(cid))
+			}
+		}
+		slices.Sort(cids)
+		return cids, 0, ctx.Err()
+	}
+	if f.glyphMap != nil {
+		limit := min(65536, len(f.glyphMap)/2)
+		cids := make([]uint16, 0, min(limit, 256))
+		for cid := 1; cid < limit; cid++ {
+			if cid&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, 0, err
+				}
+			}
+			id := binary.BigEndian.Uint16(f.glyphMap[cid*2:])
+			if id != 0 && (f.glyphCount == 0 || uint32(id) < f.glyphCount) {
+				cids = append(cids, uint16(cid))
+			}
+		}
+		return cids, 0, ctx.Err()
+	}
+	if f.glyphCount == 0 {
+		return nil, 65535, ctx.Err()
+	}
+	if f.glyphCount <= 1 {
+		return nil, 0, ctx.Err()
+	}
+	return nil, uint16(min(uint32(65535), f.glyphCount-1)), ctx.Err()
 }

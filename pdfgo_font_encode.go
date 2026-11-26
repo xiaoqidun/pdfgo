@@ -185,10 +185,36 @@ func (f *Font) EncodeContext(ctx context.Context, text string) ([]byte, error) {
 // 入参: ctx 取消上下文, wanted 所需字符
 // 返回: []string 候选字符码, error 超限或取消错误
 func (f *Font) characterCodes(ctx context.Context, wanted map[rune]bool) ([]string, error) {
-	return f.encodingCodes(ctx, func(value string) bool {
+	codes, err := f.encodingCodes(ctx, func(value string) bool {
 		ch, n := utf8.DecodeRuneInString(value)
 		return n == len(value) && wanted[ch]
 	}, !f.composite)
+	if err != nil || !f.composite || f.cidMap == nil || !isPredefinedUnicodeCMap(f.encoding) {
+		return codes, err
+	}
+	var predefined []string
+	for ch := range wanted {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		code, ok := predefinedUnicodeCode(f.encoding, ch)
+		if !ok {
+			continue
+		}
+		if _, overridden := f.Unicode[code]; overridden {
+			continue
+		}
+		cid, mapped, err := f.cidMap.mappedCID(ctx, []byte(code))
+		if err != nil {
+			return nil, err
+		}
+		if !mapped || len(f.Program) != 0 && !f.hasCIDGlyph(uint32(cid)) {
+			continue
+		}
+		predefined = append(predefined, code)
+	}
+	slices.Sort(predefined)
+	return append(codes, predefined...), ctx.Err()
 }
 
 // encodingCodes 收集符合条件的字符码，复合字体沿标准字符集反查CID
@@ -353,23 +379,8 @@ func (f *Font) encodingGlyph(ctx context.Context, code string) (Glyph, bool, err
 		return Glyph{}, false, nil
 	}
 	if f.cidMap != nil {
-		data := []byte(code)
-		n, valid, err := f.cidMap.nextContext(ctx, data)
-		if err != nil {
+		if _, mapped, err := f.cidMap.mappedCID(ctx, []byte(code)); err != nil || !mapped {
 			return Glyph{}, false, err
-		}
-		if !valid || n != len(data) {
-			return Glyph{}, false, nil
-		}
-		mapped := false
-		for current := f.cidMap; current != nil; current = current.base {
-			if cid, found := current.mapped(data); found {
-				mapped = cid != 0
-				break
-			}
-		}
-		if !mapped {
-			return Glyph{}, false, nil
 		}
 	}
 	glyphs, err := f.DecodeContext(ctx, []byte(code))
@@ -377,6 +388,9 @@ func (f *Font) encodingGlyph(ctx context.Context, code string) (Glyph, bool, err
 		return Glyph{}, false, err
 	}
 	if len(glyphs) != 1 || glyphs[0].HasID && glyphs[0].ID == 0 || glyphs[0].Name == ".notdef" {
+		return Glyph{}, false, nil
+	}
+	if !glyphs[0].HasID && f.Subtype == Name("TrueType") && f.simpleGlyphName(glyphs[0].Code, nil) == ".notdef" {
 		return Glyph{}, false, nil
 	}
 	return glyphs[0], true, nil

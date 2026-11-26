@@ -1485,13 +1485,16 @@ func skipBrotliCompressedBlock(ctx context.Context, r *brotliBitReader, mlen, po
 
 // checkBrotliLimits 依据RFC 7932及RFC 9841预检Brotli窗口及全链元块长度，并在必要时无损封顶窗口位数
 // 入参: ctx 取消上下文, data 压缩数据, maxBytes 解码字节上限，非正数表示不限制
-// 返回: io.Reader 受控解码输入流, error 超限、截断、损坏或取消错误
-func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Reader, error) {
+// 返回: io.Reader 受控解码输入流, bool 是否检测到14位大窗口扩展头, error 超限、截断、损坏或取消错误
+func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Reader, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if maxBytes <= 0 || len(data) == 0 {
-		return bytes.NewReader(data), nil
+	if len(data) == 0 {
+		return bytes.NewReader(data), false, nil
+	}
+	if maxBytes <= 0 {
+		return bytes.NewReader(data), data[0] == 0x11, nil
 	}
 	r := &brotliBitReader{data: data, totalBits: int64(len(data)) * 8}
 	b0, _ := r.readBits(1)
@@ -1503,14 +1506,14 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 	} else {
 		b1, ok := r.readBits(3)
 		if !ok {
-			return bytes.NewReader(data), nil
+			return bytes.NewReader(data), false, nil
 		}
 		if b1 != 0 {
 			wbits, wbitsWidth = 17+b1, 4
 		} else {
 			b2, ok := r.readBits(3)
 			if !ok {
-				return bytes.NewReader(data), nil
+				return bytes.NewReader(data), false, nil
 			}
 			switch b2 {
 			case 0:
@@ -1518,20 +1521,17 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 			case 1:
 				b3, ok := r.readBits(1)
 				if !ok || b3 == 1 {
-					return bytes.NewReader(data), nil
+					return bytes.NewReader(data), false, nil
 				}
 				w, ok := r.readBits(6)
 				if !ok || w < 10 || w > 30 {
-					return bytes.NewReader(data), nil
+					return bytes.NewReader(data), false, nil
 				}
 				wbits, wbitsWidth, isLargeWindow = w, 14, true
 			default:
 				wbits, wbitsWidth = 8+b2, 7
 			}
 		}
-	}
-	if wbits > 24 && int64(1)<<(wbits-1) >= maxBytes {
-		return nil, ErrStreamLimitExceeded
 	}
 	capWindow := func() io.Reader {
 		need := uint64(math.MaxUint64)
@@ -1545,6 +1545,12 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 				first := (data[0] & 0xf0) | byte(((target-17)<<1)|1)
 				return io.MultiReader(bytes.NewReader([]byte{first}), bytes.NewReader(data[1:]))
 			}
+		} else if wbitsWidth == 14 {
+			target := max(uint32(10), capped)
+			if target < wbits {
+				header := [2]byte{data[0], (data[1] & 0xc0) | byte(target)}
+				return io.MultiReader(bytes.NewReader(header[:]), bytes.NewReader(data[2:]))
+			}
 		}
 		return bytes.NewReader(data)
 	}
@@ -1554,33 +1560,33 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 	var totalOut int64
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		isLast, ok := r.readBits(1)
 		if !ok {
-			return capWindow(), nil
+			return capWindow(), isLargeWindow, nil
 		}
 		if isLast != 0 {
 			isLastEmpty, ok := r.readBits(1)
 			if !ok {
-				return capWindow(), nil
+				return capWindow(), isLargeWindow, nil
 			}
 			if isLastEmpty != 0 {
-				return capWindow(), nil
+				return capWindow(), isLargeWindow, nil
 			}
 		}
 		nibblesCode, ok := r.readBits(2)
 		if !ok {
-			return capWindow(), nil
+			return capWindow(), isLargeWindow, nil
 		}
 		if nibblesCode == 3 {
 			reserved, ok := r.readBits(1)
 			if !ok || reserved != 0 {
-				return capWindow(), nil
+				return capWindow(), isLargeWindow, nil
 			}
 			skipBytes, ok := r.readBits(2)
 			if !ok {
-				return capWindow(), nil
+				return capWindow(), isLargeWindow, nil
 			}
 			var skipLen int64
 			if skipBytes != 0 {
@@ -1588,10 +1594,10 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 				for i := uint32(0); i < skipBytes; i++ {
 					b, ok := r.readBits(8)
 					if !ok {
-						return capWindow(), nil
+						return capWindow(), isLargeWindow, nil
 					}
 					if i+1 == skipBytes && skipBytes > 1 && b == 0 {
-						return capWindow(), nil
+						return capWindow(), isLargeWindow, nil
 					}
 					raw |= b << (i * 8)
 				}
@@ -1600,15 +1606,15 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 			if rem := uint((8 - r.bitPos&7) & 7); rem != 0 {
 				pad, ok := r.readBits(rem)
 				if !ok || pad != 0 {
-					return capWindow(), nil
+					return capWindow(), isLargeWindow, nil
 				}
 			}
 			if skipLen > (r.totalBits-r.bitPos)/8 {
-				return nil, io.ErrUnexpectedEOF
+				return nil, false, io.ErrUnexpectedEOF
 			}
 			r.bitPos += skipLen * 8
 			if isLast != 0 {
-				return capWindow(), nil
+				return capWindow(), isLargeWindow, nil
 			}
 			continue
 		}
@@ -1617,10 +1623,10 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 		for i := uint32(0); i < nibbles; i++ {
 			nib, ok := r.readBits(4)
 			if !ok {
-				return capWindow(), nil
+				return capWindow(), isLargeWindow, nil
 			}
 			if i+1 == nibbles && nibbles > 4 && nib == 0 {
-				return capWindow(), nil
+				return capWindow(), isLargeWindow, nil
 			}
 			mlenMinus1 |= nib << (i * 4)
 		}
@@ -1629,11 +1635,11 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 		if isLast == 0 {
 			uncompressed, ok = r.readBits(1)
 			if !ok {
-				return capWindow(), nil
+				return capWindow(), isLargeWindow, nil
 			}
 		}
 		if mlen > maxBytes-totalOut {
-			return nil, ErrStreamLimitExceeded
+			return nil, false, ErrStreamLimitExceeded
 		}
 		blockPos := totalOut
 		totalOut += mlen
@@ -1641,42 +1647,42 @@ func checkBrotliLimits(ctx context.Context, data []byte, maxBytes int64) (io.Rea
 			if totalOut > 1<<20 && int64(len(data)) < totalOut/1024 {
 				status, err := skipBrotliCompressedBlock(ctx, r, mlen, blockPos, maxBackward, &distRB, &distRBIdx, isLargeWindow)
 				if err != nil {
-					return nil, err
+					return nil, false, err
 				}
 				if status == brotliSkipTruncated {
-					return nil, io.ErrUnexpectedEOF
+					return nil, false, io.ErrUnexpectedEOF
 				}
 				if status == brotliSkipCorrupt {
-					return nil, fmt.Errorf("corrupt brotli stream")
+					return nil, false, fmt.Errorf("corrupt brotli stream")
 				}
 			}
-			return capWindow(), nil
+			return capWindow(), isLargeWindow, nil
 		}
 		if uncompressed != 0 {
 			if rem := uint((8 - r.bitPos&7) & 7); rem != 0 {
 				pad, ok := r.readBits(rem)
 				if !ok || pad != 0 {
-					return capWindow(), nil
+					return capWindow(), isLargeWindow, nil
 				}
 			}
 			if mlen > (r.totalBits-r.bitPos)/8 {
-				return nil, io.ErrUnexpectedEOF
+				return nil, false, io.ErrUnexpectedEOF
 			}
 			r.bitPos += mlen * 8
 			continue
 		}
 		status, err := skipBrotliCompressedBlock(ctx, r, mlen, blockPos, maxBackward, &distRB, &distRBIdx, isLargeWindow)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if status == brotliSkipTruncated {
-			return nil, io.ErrUnexpectedEOF
+			return nil, false, io.ErrUnexpectedEOF
 		}
 		if status == brotliSkipCorrupt {
-			return nil, fmt.Errorf("corrupt brotli stream")
+			return nil, false, fmt.Errorf("corrupt brotli stream")
 		}
 		if status != brotliSkipDone {
-			return capWindow(), nil
+			return capWindow(), isLargeWindow, nil
 		}
 	}
 }
@@ -1886,7 +1892,7 @@ func (s *Stream) decodeWithLimit(ctx context.Context, reader *Reader, warning fu
 			}
 		case "BrotliDecode":
 			encoded := data
-			brotliInput, checkErr := checkBrotliLimits(ctx, encoded, maxBytes)
+			brotliInput, largeWindow, checkErr := checkBrotliLimits(ctx, encoded, maxBytes)
 			if checkErr != nil {
 				if errors.Is(checkErr, ErrStreamLimitExceeded) {
 					if limit > 0 {
@@ -1896,7 +1902,6 @@ func (s *Stream) decodeWithLimit(ctx context.Context, reader *Reader, warning fu
 				}
 				return nil, checkErr
 			}
-			largeWindow := maxBytes == 0 || maxBytes > 16<<20
 			reader := acquireBrotliReaderWith(&contextInput{ctx: ctx, reader: brotliInput}, largeWindow)
 			input := limitStreamReader(&contextInput{ctx: ctx, reader: reader}, maxBytes)
 			data, err = readAllEstimated(input, estimateFlateCapacity(len(encoded), maxBytes))

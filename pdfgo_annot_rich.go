@@ -130,7 +130,9 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 				current = stack[len(stack)-1]
 			}
 			parent := current
-			if len(stack) != 0 {
+			if len(stack) == 0 {
+				parent.rise = 0
+			} else {
 				current.decoration = 0
 			}
 			switch token.Name.Local {
@@ -165,7 +167,7 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 					if err != nil {
 						return nil, err
 					}
-				case attr.Name.Space == "xmlns" || attr.Name.Local == "xmlns", attr.Name.Space == "http://www.xfa.org/schema/xfa-data/1.0" && (attr.Name.Local == "contentType" || attr.Name.Local == "APIVersion" || attr.Name.Local == "spec"):
+				case attr.Name.Space == "xmlns" || attr.Name.Local == "xmlns", (attr.Name.Space == "http://www.xfa.org/schema/xfa-data/1.0/" || attr.Name.Space == "http://www.xfa.org/schema/xfa-data/1.0") && (attr.Name.Local == "contentType" || attr.Name.Local == "APIVersion" || attr.Name.Local == "spec"):
 				default:
 					return nil, &UnsupportedError{Feature: "rich text attribute " + attr.Name.Local}
 				}

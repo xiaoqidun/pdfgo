@@ -2124,7 +2124,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	var mask *imageResample
 	if maskImage != nil {
 		maskSize := image.Point{}
-		if outSize != (image.Point{}) {
+		if outSize != (image.Point{}) && len(matte) != 0 {
 			maskSize = boundedSampleSize(maskImage.Width, maskImage.Height, outSize)
 		}
 		decoded, err := maskImage.decodeImageRows(ctx, nil, false, maskSize, nil, rows)
@@ -2149,8 +2149,9 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			mask = &imageResample{source: decoded, bounds: decoded.Bounds(), interpolate: maskImage.Interpolate}
 		}
 	}
+	deferScale := outSize != (image.Point{}) && (mask != nil && len(matte) == 0 || len(keys) != 0 || palette != nil && embeddedMask != 0)
 	sampleSize := outSize
-	if palette != nil || len(keys) != 0 {
+	if deferScale || palette != nil {
 		sampleSize = image.Point{}
 	}
 	samples, err := i.decodeSamplesRowsContext(ctx, sampleSize, rows, maxBytes)
@@ -2167,7 +2168,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		}
 	}
 	sampleHasAlpha := false
-	if outSize != (image.Point{}) && palette != nil && len(keys) == 0 && embeddedMask == 0 && len(matte) == 0 {
+	if outSize != (image.Point{}) && !deferScale && palette != nil && len(keys) == 0 && embeddedMask == 0 && len(matte) == 0 {
 		sb := samples.Bounds()
 		if sb.Dx() > outSize.X || sb.Dy() > outSize.Y {
 			dst := boundedSampleSize(sb.Dx(), sb.Dy(), outSize)
@@ -2187,7 +2188,8 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		}
 	}
 	bounds := samples.Bounds()
-	if outSize != (image.Point{}) {
+	var scaleTarget image.Point
+	if outSize != (image.Point{}) && !deferScale {
 		if mask == nil {
 			targetSize := boundedSampleSize(bounds.Dx(), bounds.Dy(), outSize)
 			bounds = image.Rect(0, 0, targetSize.X, targetSize.Y)
@@ -2210,8 +2212,16 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			mask.source = scaledMask
 			mask.bounds = scaledMask.Bounds()
 		}
-	} else if mask != nil {
-		bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
+	} else {
+		if mask != nil {
+			bounds = image.Rect(0, 0, max(bounds.Dx(), mask.Bounds().Dx()), max(bounds.Dy(), mask.Bounds().Dy()))
+		}
+		if deferScale {
+			candidate := scaledImageSize(bounds.Dx(), bounds.Dy(), size)
+			if candidate.X < bounds.Dx() || candidate.Y < bounds.Dy() {
+				scaleTarget = candidate
+			}
+		}
 	}
 	if target == nil && (i.ColorSpace == Name("DeviceGray") && !i.ImageMask || rows != nil && i.ImageMask) && embeddedMask == 0 && mask == nil && len(keys) == 0 && len(matte) == 0 {
 		gray, err := decodeGrayImageContext(ctx, samples, ranges[0], ranges[1], maxBytes)
@@ -2249,13 +2259,25 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		if !byteExact {
 			pixelBytes = 8
 		}
+		composed := &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: imageSampleMaximum(bits), byteExact: byteExact, embedded: embeddedMask != 0 || sampleHasAlpha}
+		if scaleTarget != (image.Point{}) {
+			if mask != nil {
+				if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), pixelBytes, maxBytes); err != nil {
+					return nil, err
+				}
+			}
+			return downsamplePremultipliedImage(ctx, composed, scaleTarget, maxBytes)
+		}
 		if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), pixelBytes, maxBytes); err != nil {
 			return nil, err
 		}
-		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: imageSampleMaximum(bits), byteExact: byteExact, embedded: embeddedMask != 0 || sampleHasAlpha}, nil
+		return composed, nil
 	}
 	var out *image.NRGBA64
 	var encoder *pngImageEncoder
+	var xStarts []int
+	var scaleAcc [][4]uint64
+	scaleDY, scaleY0, scaleY1 := 0, 0, 0
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -2283,6 +2305,19 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				}
 				out.Pix, out.Stride = make([]byte, stride), stride
 			}
+		} else if scaleTarget != (image.Point{}) {
+			if mask != nil {
+				if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), 8, maxBytes); err != nil {
+					return nil, err
+				}
+			}
+			if _, _, err := imageCompositeBufferSize(scaleTarget.X, max(scaleTarget.Y, 4), 8, maxBytes); err != nil {
+				return nil, err
+			}
+			out = image.NewNRGBA64(image.Rect(0, 0, scaleTarget.X, scaleTarget.Y))
+			xStarts = downsampleBounds(bounds.Dx(), scaleTarget.X)
+			scaleAcc = make([][4]uint64, scaleTarget.X)
+			scaleY1 = int(int64(bounds.Dy()) / int64(scaleTarget.Y))
 		} else {
 			if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), 8, maxBytes); err != nil {
 				return nil, err
@@ -2421,7 +2456,11 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				return nil, err
 			}
 		}
+		scaleDX := 0
 		for x := 0; x < bounds.Dx(); x++ {
+			if scaleAcc != nil && x == xStarts[scaleDX+1] {
+				scaleDX++
+			}
 			if x&4095 == 0 {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -2483,7 +2522,13 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				if mask != nil || embeddedMask != 0 {
 					pixel.A = uint16(uint32(pixel.A) * uint32(alpha) / 65535)
 				}
-				if encoder != nil {
+				if scaleAcc != nil {
+					a := uint64(pixel.A)
+					scaleAcc[scaleDX][0] += uint64(pixel.R) * a
+					scaleAcc[scaleDX][1] += uint64(pixel.G) * a
+					scaleAcc[scaleDX][2] += uint64(pixel.B) * a
+					scaleAcc[scaleDX][3] += a
+				} else if encoder != nil {
 					out.SetNRGBA64(x, 0, pixel)
 				} else {
 					out.SetNRGBA64(x, y, pixel)
@@ -2631,10 +2676,38 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			if mask != nil || embeddedMask != 0 {
 				pixel.A = uint16(uint32(pixel.A) * uint32(alpha) / 65535)
 			}
-			if encoder != nil {
+			if scaleAcc != nil {
+				a := uint64(pixel.A)
+				scaleAcc[scaleDX][0] += uint64(pixel.R) * a
+				scaleAcc[scaleDX][1] += uint64(pixel.G) * a
+				scaleAcc[scaleDX][2] += uint64(pixel.B) * a
+				scaleAcc[scaleDX][3] += a
+			} else if encoder != nil {
 				out.SetNRGBA64(x, 0, pixel)
 			} else {
 				out.SetNRGBA64(x, y, pixel)
+			}
+		}
+		if scaleAcc != nil && y+1 == scaleY1 {
+			rowsCount := uint64(scaleY1 - scaleY0)
+			for dx := 0; dx < scaleTarget.X; dx++ {
+				sumA := scaleAcc[dx][3]
+				if sumA == 0 {
+					continue
+				}
+				count := uint64(xStarts[dx+1]-xStarts[dx]) * rowsCount
+				out.SetNRGBA64(dx, scaleDY, color.NRGBA64{
+					R: uint16((scaleAcc[dx][0] + sumA/2) / sumA),
+					G: uint16((scaleAcc[dx][1] + sumA/2) / sumA),
+					B: uint16((scaleAcc[dx][2] + sumA/2) / sumA),
+					A: uint16((sumA + count/2) / count),
+				})
+			}
+			scaleDY++
+			if scaleDY < scaleTarget.Y {
+				clear(scaleAcc)
+				scaleY0 = scaleY1
+				scaleY1 = int(int64(scaleDY+1) * int64(bounds.Dy()) / int64(scaleTarget.Y))
 			}
 		}
 		if encoder != nil {
@@ -2663,6 +2736,82 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 		return nil, nil
 	}
 	return out, nil
+}
+
+// downsamplePremultipliedImage 按预乘透明度面积加权将设备样本图像缩放到目标尺寸
+// 入参: ctx 取消上下文, src 设备样本源图像, target 目标尺寸, maxBytes 流解压字节上限
+// 返回: image.Image 缩放后的非预乘图像, error 缓冲、超限或取消错误
+func downsamplePremultipliedImage(ctx context.Context, src *deviceSampleImage, target image.Point, maxBytes int64) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	b := src.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	dstW, dstH := target.X, target.Y
+	pixelBytes, shift := 8, uint(0)
+	if src.byteExact {
+		pixelBytes, shift = 4, 8
+	}
+	if _, _, err := imageCompositeBufferSize(dstW, dstH, pixelBytes, maxBytes); err != nil {
+		return nil, err
+	}
+	xStarts := downsampleBounds(srcW, dstW)
+	rect := image.Rect(0, 0, dstW, dstH)
+	var out8 *image.NRGBA
+	var out16 *image.NRGBA64
+	if src.byteExact {
+		out8 = image.NewNRGBA(rect)
+	} else {
+		out16 = image.NewNRGBA64(rect)
+	}
+	for dy := 0; dy < dstH; dy++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
+		var row8 []byte
+		if out8 != nil {
+			row8 = out8.Pix[dy*out8.Stride:]
+		}
+		for dx := 0; dx < dstW; dx++ {
+			if dx&255 == 255 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			x0, x1 := xStarts[dx], xStarts[dx+1]
+			var sumR, sumG, sumB, sumA uint64
+			for sy := y0; sy < y1; sy++ {
+				for sx := x0; sx < x1; sx++ {
+					if (sx-x0)&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
+					p := src.NRGBA64At(b.Min.X+sx, b.Min.Y+sy)
+					a := uint64(p.A >> shift)
+					sumR += uint64(p.R>>shift) * a
+					sumG += uint64(p.G>>shift) * a
+					sumB += uint64(p.B>>shift) * a
+					sumA += a
+				}
+			}
+			if sumA == 0 {
+				continue
+			}
+			count := uint64(x1-x0) * uint64(y1-y0)
+			r, g, bl, a := (sumR+sumA/2)/sumA, (sumG+sumA/2)/sumA, (sumB+sumA/2)/sumA, (sumA+count/2)/count
+			if out8 != nil {
+				row8[dx*4], row8[dx*4+1], row8[dx*4+2], row8[dx*4+3] = uint8(r), uint8(g), uint8(bl), uint8(a)
+			} else {
+				out16.SetNRGBA64(dx, dy, color.NRGBA64{R: uint16(r), G: uint16(g), B: uint16(bl), A: uint16(a)})
+			}
+		}
+	}
+	if out8 != nil {
+		return out8, ctx.Err()
+	}
+	return out16, ctx.Err()
 }
 
 // paletteContext 在取消上下文内解析索引色查找表，保留原始索引样本供Decode和色键遮罩使用

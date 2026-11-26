@@ -1472,3 +1472,121 @@ func (r *Reader) readUnicodeCMapContext(ctx context.Context, object Object, acti
 	}
 	return mapping, nil
 }
+
+// mappedCID 检查原始字符码在编码范围内是否映射到有效非零CID，不回退未定义替代
+// 入参: ctx 取消上下文, raw 原始字符码
+// 返回: uint16 有效非零CID, bool 是否存在有效映射, error 取消错误
+func (c *cidCMap) mappedCID(ctx context.Context, raw []byte) (uint16, bool, error) {
+	n, valid, err := c.nextContext(ctx, raw)
+	if err != nil || !valid || n != len(raw) {
+		return 0, false, err
+	}
+	for current := c; current != nil; current = current.base {
+		if cid, found := current.mapped(raw); found {
+			return cid, cid != 0, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// walkValidCIDs 按派生优先顺序遍历有效非零CID对应的合法字符码，跳过被子层覆盖或超出编码范围的条目
+// 入参: ctx 取消上下文, validCIDs 升序有效CID列表（nil表示使用1至maxCID连续区间）, maxCID 连续有效CID上界, fn 回调函数
+// 返回: error 回调或取消错误
+func (c *cidCMap) walkValidCIDs(ctx context.Context, validCIDs []uint16, maxCID uint16, fn func(raw []byte, cid uint16) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if validCIDs != nil && len(validCIDs) == 0 || validCIDs == nil && maxCID == 0 {
+		return nil
+	}
+	var validFirst [5][256]bool
+	for _, space := range c.spaces {
+		if space.size >= 1 && space.size <= 4 {
+			for b := int(space.first[0]); b <= int(space.last[0]); b++ {
+				validFirst[space.size][b] = true
+			}
+		}
+	}
+	var upper []*cidCMap
+	steps := 0
+	for current := c; current != nil; current = current.base {
+		for _, entry := range current.ranges {
+			if steps&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			steps++
+			if entry.invalid {
+				continue
+			}
+			size := int(entry.first >> 32)
+			if size < 1 || size > 4 {
+				continue
+			}
+			shift := uint((size - 1) * 8)
+			firstB0, lastB0 := int(byte(entry.first>>shift)), int(byte(entry.last>>shift))
+			hasValidFirst := false
+			for b := firstB0; b <= lastB0; b++ {
+				if validFirst[size][b] {
+					hasValidFirst = true
+					break
+				}
+			}
+			if !hasValidFirst {
+				continue
+			}
+			entryStart := uint32(entry.cid)
+			entryEnd := entryStart + uint32(entry.last-entry.first)
+			emit := func(cid uint16) error {
+				if steps&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				steps++
+				code := entry.first + uint64(cid-entry.cid)
+				if !validFirst[size][byte(code>>shift)] {
+					return nil
+				}
+				var rawBuf [4]byte
+				for i := 0; i < size; i++ {
+					rawBuf[size-i-1] = byte(code >> (i * 8))
+				}
+				raw := rawBuf[:size]
+				for _, parent := range upper {
+					if parent.mappedRange(raw) != nil {
+						return nil
+					}
+				}
+				n, valid, err := c.nextContext(ctx, raw)
+				if err != nil || !valid || n != size {
+					return err
+				}
+				return fn(raw, cid)
+			}
+			if validCIDs != nil {
+				start, _ := slices.BinarySearch(validCIDs, max(entry.cid, 1))
+				for idx := start; idx < len(validCIDs); idx++ {
+					cid := validCIDs[idx]
+					if uint32(cid) > entryEnd {
+						break
+					}
+					if err := emit(cid); err != nil {
+						return err
+					}
+				}
+			} else {
+				lo := max(entryStart, 1)
+				hi := min(entryEnd, uint32(maxCID))
+				for cid := lo; cid <= hi; cid++ {
+					if err := emit(uint16(cid)); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		upper = append(upper, current)
+	}
+	return ctx.Err()
+}

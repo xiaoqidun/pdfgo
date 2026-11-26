@@ -184,22 +184,94 @@ func (r *Reader) openSecurity(password []byte) error {
 	if !vok || !rok || !(v == 1 && (revision == 2 || revision == 3) || v == 2 && revision == 3 || v == 4 && revision == 4) {
 		return &UnsupportedError{Feature: "PDF encryption revision"}
 	}
-	defaultLength := int64(40)
+	s := &standardSecurity{info: EncryptionInfo{Revision: int(revision)}, encryptMetadata: true, streamFilter: "V2", stringFilter: "V2", embeddedFilter: "V2", unencrypted: unencrypted}
+	if v == 4 {
+		metaObj, err := r.Resolve(dict["EncryptMetadata"])
+		if err != nil {
+			return err
+		}
+		if metaObj != nil {
+			b, ok := metaObj.(Boolean)
+			if !ok {
+				return fmt.Errorf("invalid EncryptMetadata")
+			}
+			s.encryptMetadata = bool(b)
+		}
+		filters, err := r.securityFilters(dict["CF"])
+		if err != nil {
+			return err
+		}
+		s.filters = filters
+		for _, entry := range []struct {
+			name  Name
+			value *Name
+		}{{"StmF", &s.streamFilter}, {"StrF", &s.stringFilter}} {
+			*entry.value = "Identity"
+			value, err := r.Resolve(dict[entry.name])
+			if err != nil {
+				return err
+			}
+			if value != nil {
+				filterName, ok := value.(Name)
+				if !ok {
+					return fmt.Errorf("invalid %s crypt filter", entry.name)
+				}
+				*entry.value = filterName
+			}
+		}
+		s.embeddedFilter = s.streamFilter
+		effObj, err := r.Resolve(dict["EFF"])
+		if err != nil {
+			return err
+		}
+		if effObj != nil {
+			effName, ok := effObj.(Name)
+			if !ok {
+				return fmt.Errorf("invalid embedded file crypt filter")
+			}
+			s.embeddedFilter = effName
+		}
+	}
 	lengthObj, err := r.Resolve(dict["Length"])
 	if err != nil {
 		return err
 	}
-	if v == 4 && r.warning != nil && lengthObj == nil {
-		defaultLength = 128
-		r.warning(Diagnostic{Message: "missing V4 encryption Length; authenticating with the 128-bit default"})
-	}
-	length := defaultLength
+	length := int64(40)
 	if lengthObj != nil {
 		n, ok := lengthObj.(Integer)
 		if !ok {
 			return fmt.Errorf("Length is not an integer")
 		}
 		length = int64(n)
+	} else if v == 4 {
+		length = 128
+		for _, name := range []Name{s.streamFilter, s.stringFilter, s.embeddedFilter} {
+			if name == "Identity" {
+				continue
+			}
+			cf, ok := s.filters[name].(Dictionary)
+			if !ok {
+				continue
+			}
+			method, _ := cf["CFM"].(Name)
+			if cf["CFM"] == nil || method == "None" {
+				continue
+			}
+			if cfLenObj := cf["Length"]; cfLenObj != nil {
+				cfLen, ok := cfLenObj.(Integer)
+				if !ok {
+					return fmt.Errorf("invalid crypt filter key length")
+				}
+				if cfLen < 5 || cfLen > 16 {
+					return fmt.Errorf("invalid encryption key length")
+				}
+				length = int64(cfLen) * 8
+				break
+			}
+			if method == "AESV2" {
+				break
+			}
+		}
 	}
 	if length < 40 || length > 128 || length%8 != 0 || v == 1 && length != 40 {
 		return fmt.Errorf("invalid encryption key length")
@@ -235,52 +307,7 @@ func (r *Reader) openSecurity(password []byte) error {
 	if !ok {
 		return fmt.Errorf("invalid encryption file identifier")
 	}
-	s := &standardSecurity{info: EncryptionInfo{Revision: int(revision), Permissions: uint32(permissions)}, encryptMetadata: true, streamFilter: "V2", stringFilter: "V2", embeddedFilter: "V2", unencrypted: unencrypted}
-	if v == 4 {
-		metaObj, err := r.Resolve(dict["EncryptMetadata"])
-		if err != nil {
-			return err
-		}
-		if metaObj != nil {
-			b, ok := metaObj.(Boolean)
-			if !ok {
-				return fmt.Errorf("invalid EncryptMetadata")
-			}
-			s.encryptMetadata = bool(b)
-		}
-		filters, err := r.securityFilters(dict["CF"])
-		if err != nil {
-			return err
-		}
-		s.filters = filters
-		for _, entry := range []struct {
-			name  Name
-			value *Name
-		}{{"StmF", &s.streamFilter}, {"StrF", &s.stringFilter}} {
-			*entry.value = "Identity"
-			value, err := r.Resolve(dict[entry.name])
-			if err != nil {
-				return err
-			}
-			if value != nil {
-				*entry.value, ok = value.(Name)
-				if !ok {
-					return fmt.Errorf("invalid %s crypt filter", entry.name)
-				}
-			}
-		}
-		s.embeddedFilter = s.streamFilter
-		effObj, err := r.Resolve(dict["EFF"])
-		if err != nil {
-			return err
-		}
-		if effObj != nil {
-			s.embeddedFilter, ok = effObj.(Name)
-			if !ok {
-				return fmt.Errorf("invalid embedded file crypt filter")
-			}
-		}
-	}
+	s.info.Permissions = uint32(permissions)
 	n := int(length / 8)
 	key := s.authenticateUser(password, owner, user, id, n)
 	ownerKey := md5.Sum(padPassword(password))

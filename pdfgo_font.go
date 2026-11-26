@@ -22,9 +22,8 @@ import (
 	"math"
 	"os"
 	"strings"
+	"unicode/utf16"
 	"unicode/utf8"
-
-	"golang.org/x/text/encoding/charmap"
 )
 
 // maxFontCacheEntries 限制单个Reader常驻缓存的字体最大条数
@@ -113,6 +112,49 @@ func predefinedCodeUnicode(name Name, raw []byte) (string, bool) {
 	if strings.Contains(encoding, "-UTF32-") && len(raw) == 4 {
 		value := rune(codeNumber(raw))
 		return string(value), utf8.ValidRune(value)
+	}
+	return "", false
+}
+
+// isPredefinedUnicodeCMap 判断名称是否属于以Unicode编码命名的官方CMap
+// 入参: name 官方编码名称
+// 返回: bool 是否为预定义Unicode CMap
+func isPredefinedUnicodeCMap(name Name) bool {
+	encoding := string(name)
+	return strings.HasPrefix(encoding, "Uni") && (strings.Contains(encoding, "-UCS2-") || strings.Contains(encoding, "-UTF16-") || strings.Contains(encoding, "-UTF8-") || strings.Contains(encoding, "-UTF32-"))
+}
+
+// predefinedUnicodeCode 将单字符按以Unicode编码命名的官方CMap反向编码为原始字符码
+// 入参: name 官方编码名称, ch Unicode字符
+// 返回: string 原始字符码, bool 是否为有效Unicode编码
+func predefinedUnicodeCode(name Name, ch rune) (string, bool) {
+	if !utf8.ValidRune(ch) {
+		return "", false
+	}
+	encoding := string(name)
+	if !strings.HasPrefix(encoding, "Uni") {
+		return "", false
+	}
+	if strings.Contains(encoding, "-UCS2-") {
+		if ch > 0xFFFF {
+			return "", false
+		}
+		return string([]byte{byte(ch >> 8), byte(ch)}), true
+	}
+	if strings.Contains(encoding, "-UTF16-") {
+		if ch <= 0xFFFF {
+			return string([]byte{byte(ch >> 8), byte(ch)}), true
+		}
+		r1, r2 := utf16.EncodeRune(ch)
+		return string([]byte{byte(r1 >> 8), byte(r1), byte(r2 >> 8), byte(r2)}), true
+	}
+	if strings.Contains(encoding, "-UTF8-") {
+		var buf [utf8.UTFMax]byte
+		n := utf8.EncodeRune(buf[:], ch)
+		return string(buf[:n]), true
+	}
+	if strings.Contains(encoding, "-UTF32-") {
+		return string([]byte{byte(ch >> 24), byte(ch >> 16), byte(ch >> 8), byte(ch)}), true
 	}
 	return "", false
 }
@@ -1056,37 +1098,7 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		}
 		name := ""
 		if !f.composite && !(f.simpleCmap != nil && f.symbolic) {
-			var mapped bool
-			name, mapped = f.differences[code]
-			if f.cffNames != nil {
-				name, mapped = f.cffNames[code]
-			}
-			if !mapped && f.encoding == "" && (f.cffNames != nil || f.Subtype == "Type3") {
-				name, mapped = ".notdef", true
-			}
-			if !mapped {
-				encoding := pdfStandardNames
-				if core != nil && f.encoding == "" {
-					encoding = core.names[:]
-				}
-				switch f.encoding {
-				case Name("WinAnsiEncoding"):
-					encoding = pdfWinAnsiNames
-				case Name("MacRomanEncoding"):
-					encoding = pdfMacRomanNames
-				case Name("MacExpertEncoding"):
-					encoding = pdfMacExpertNames[:]
-				case "", Name("StandardEncoding"):
-				default:
-					encoding = nil
-				}
-				if int(code) < len(encoding) {
-					name = encoding[code]
-				}
-				if name == "" {
-					name = ".notdef"
-				}
-			}
+			name = f.simpleGlyphName(code, core)
 		}
 		if type1Metrics != nil {
 			if _, exists := type1Metrics.glyphs[name]; !exists {
@@ -1105,12 +1117,12 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 				}
 			}
 		}
-		if core != nil {
+		if core != nil && name != "" {
 			if _, exists := core.widths[name]; !exists {
 				name = ".notdef"
 			}
 		}
-		if name == ".notdef" && (f.Subtype == "Type1" || f.Subtype == "MMType1") {
+		if name == ".notdef" && !f.composite {
 			ok = true
 		}
 		if !ok && f.cffGlyphs != nil {
@@ -1131,10 +1143,6 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 			}
 			if f.Subtype == Name("Type3") {
 				text = ""
-			} else if f.encoding == Name("WinAnsiEncoding") {
-				text = string(charmap.Windows1252.DecodeByte(raw[0]))
-			} else if core == nil && raw[0] >= 32 && raw[0] <= 126 && (f.encoding == "" || f.encoding == Name("StandardEncoding")) {
-				text = string(rune(raw[0]))
 			} else {
 				return nil, &UnsupportedError{Feature: "unmapped simple font character"}
 			}
@@ -1244,6 +1252,44 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		return nil, err
 	}
 	return glyphs, nil
+}
+
+// simpleGlyphName 解析非符号简单字体字符码对应的字形名称，未知外部编码返回空字符串
+// 入参: code 字符码, core 标准14字体度量，可为空
+// 返回: string 字形名称
+func (f *Font) simpleGlyphName(code uint32, core *coreFontMetrics) string {
+	name, mapped := f.differences[code]
+	if f.cffNames != nil {
+		name, mapped = f.cffNames[code]
+	}
+	if !mapped && f.encoding == "" && (f.cffNames != nil || f.Subtype == "Type3") {
+		return ".notdef"
+	}
+	if mapped {
+		return name
+	}
+	encoding := pdfStandardNames
+	if core != nil && f.encoding == "" {
+		encoding = core.names[:]
+	}
+	switch f.encoding {
+	case Name("WinAnsiEncoding"):
+		encoding = pdfWinAnsiNames
+	case Name("MacRomanEncoding"):
+		encoding = pdfMacRomanNames
+	case Name("MacExpertEncoding"):
+		encoding = pdfMacExpertNames[:]
+	case "", Name("StandardEncoding"):
+	default:
+		encoding = nil
+	}
+	if int(code) < len(encoding) {
+		name = encoding[code]
+	}
+	if encoding != nil && name == "" {
+		return ".notdef"
+	}
+	return name
 }
 
 // resolvedSimpleGlyphContext 查找并校验简单TrueType字体的字形编号，越界编号归一为.notdef
