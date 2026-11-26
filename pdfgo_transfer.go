@@ -215,7 +215,7 @@ func (r *Reader) ColorantTransfer(fallback *TransferFunction, halftone *Halftone
 	}
 	if part != nil && part.Type != 0 {
 		if halftone.Type == 5 && !primary {
-			if err := r.defaultColorantTransfer(halftone, nil); err != nil {
+			if err := r.defaultColorantTransfer(context.Background(), halftone, nil); err != nil {
 				return nil, err
 			}
 		}
@@ -241,9 +241,12 @@ func (r *Reader) ColorantTransfer(fallback *TransferFunction, halftone *Halftone
 }
 
 // defaultColorantTransfer 检查非主色设备必需的类型5默认传递函数
-// 入参: h 分量网屏, named 设备命名网屏
-// 返回: error 默认网屏或函数错误
-func (r *Reader) defaultColorantTransfer(h *Halftone, named map[string]*Halftone) error {
+// 入参: ctx 取消上下文, h 分量网屏, named 设备命名网屏
+// 返回: error 默认网屏、函数或取消错误
+func (r *Reader) defaultColorantTransfer(ctx context.Context, h *Halftone, named map[string]*Halftone) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	part := h.Components["Default"]
 	if part == nil {
 		return fmt.Errorf("missing default halftone component")
@@ -257,7 +260,7 @@ func (r *Reader) defaultColorantTransfer(h *Halftone, named map[string]*Halftone
 	if part.Type == 0 {
 		return nil
 	}
-	_, defined, err := r.halftoneTransfer(part)
+	_, defined, err := r.halftoneTransferContext(ctx, part)
 	if err != nil {
 		return err
 	}
@@ -269,13 +272,29 @@ func (r *Reader) defaultColorantTransfer(h *Halftone, named map[string]*Halftone
 
 // halftoneTransfer 读取网屏的单通道覆盖函数，不接受图形状态的函数数组
 // 入参: h 网屏定义
-// 返回: *TransferFunction 覆盖函数, bool 是否显式定义, error 引用或函数错误
+// 返回: *TransferFunction 覆盖函数, bool 是否显式定义, error 引用、函数或关闭错误
 func (r *Reader) halftoneTransfer(h *Halftone) (*TransferFunction, bool, error) {
+	return r.halftoneTransferContext(context.Background(), h)
+}
+
+// halftoneTransferContext 在取消上下文内读取网屏的单通道覆盖函数，跨文档网屏通过独立视图安全读取
+// 入参: ctx 取消上下文, h 网屏定义
+// 返回: *TransferFunction 覆盖函数, bool 是否显式定义, error 引用、函数、关闭或取消错误
+func (r *Reader) halftoneTransferContext(ctx context.Context, h *Halftone) (*TransferFunction, bool, error) {
 	if h == nil || h.Type == 0 || h.TransferFunction == nil {
 		return nil, false, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	if !r.ownsObject(h.reader, h.cache) {
-		r = h.reader
+		r = h.reader.Fork(ForkOptions{})
+	}
+	if r == nil {
+		return nil, false, fmt.Errorf("missing halftone reader")
+	}
+	if r.closed {
+		return nil, false, os.ErrClosed
 	}
 	value, err := r.Resolve(h.TransferFunction)
 	if err != nil || value == nil {
@@ -284,7 +303,7 @@ func (r *Reader) halftoneTransfer(h *Halftone) (*TransferFunction, bool, error) 
 	if _, array := value.(Array); array {
 		return nil, false, fmt.Errorf("invalid halftone transfer function")
 	}
-	function, err := r.ReadTransferFunction(value)
+	function, err := r.readTransferFunctionContext(ctx, value)
 	return function, true, err
 }
 

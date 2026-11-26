@@ -15,9 +15,66 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"slices"
 )
+
+// textStringBudget 在单次批量读取中缓存共享间接文本字符串并限制累计解码字节数
+type textStringBudget struct {
+	limit int64
+	used  int64
+	cache map[Reference]string
+}
+
+// newTextStringBudget 创建受流解压上限和十六兆字节双重约束的文本解码预算
+// 入参: reader 关联阅读器
+// 返回: textStringBudget 文本解码预算
+func newTextStringBudget(reader *Reader) textStringBudget {
+	return textStringBudget{limit: int64(annotationRichContentLimit(reader))}
+}
+
+// consume 累计逻辑文本字节数，超过上限时返回超限错误
+// 入参: size 新增字节数, label 场景描述
+// 返回: error 超限错误
+func (b *textStringBudget) consume(size int64, label string) error {
+	if size < 0 || size > b.limit-b.used {
+		return fmt.Errorf("%w: %s text size limit exceeded", ErrStreamLimitExceeded, label)
+	}
+	b.used += size
+	return nil
+}
+
+// decodeString 按间接引用复用已解码文本字符串并执行字节预算控制
+// 入参: ref 文本对象最终间接引用, data 原始PDF字符串, label 场景描述
+// 返回: string 解码文本, error 解码或超限错误
+func (b *textStringBudget) decodeString(ref Reference, data String, label string) (string, error) {
+	if ref != (Reference{}) {
+		if cached, ok := b.cache[ref]; ok {
+			if err := b.consume(int64(len(cached)), label); err != nil {
+				return "", err
+			}
+			return cached, nil
+		}
+	}
+	if len(data) > 3 && int64((len(data)-3)/2) > b.limit-b.used {
+		return "", fmt.Errorf("%w: %s text size limit exceeded", ErrStreamLimitExceeded, label)
+	}
+	text, err := DecodeTextString(data)
+	if err != nil {
+		return "", err
+	}
+	if err := b.consume(int64(len(text)), label); err != nil {
+		return "", err
+	}
+	if ref != (Reference{}) {
+		if b.cache == nil {
+			b.cache = make(map[Reference]string)
+		}
+		b.cache[ref] = text
+	}
+	return text, nil
+}
 
 // ChoiceOption 保存选择字段的导出值和显示文字
 type ChoiceOption struct {
@@ -38,20 +95,23 @@ type ChoiceField struct {
 
 // ReadChoiceField 读取选择字段，区分显示文字和导出值，不执行交互动作
 // 入参: annotation 字段控件
-// 返回: ChoiceField 选择状态, error 字段或选项错误
+// 返回: ChoiceField 选择状态, error 字段、选项或超限错误
 func (r *Reader) ReadChoiceField(annotation Annotation) (ChoiceField, error) {
 	field, err := r.ReadField(annotation)
 	if err != nil {
 		return ChoiceField{}, err
 	}
-	return r.readChoiceField(field)
+	return r.readChoiceFieldContext(context.Background(), field)
 }
 
-// readChoiceField 解码已合并继承属性的选择字段
-// 入参: field 字段属性
-// 返回: ChoiceField 选择状态, error 数据不一致错误
-func (r *Reader) readChoiceField(field Dictionary) (ChoiceField, error) {
+// readChoiceFieldContext 在取消上下文和文本预算内解码已合并继承属性的选择字段
+// 入参: ctx 取消上下文, field 字段属性
+// 返回: ChoiceField 选择状态, error 数据不一致、超限或取消错误
+func (r *Reader) readChoiceFieldContext(ctx context.Context, field Dictionary) (ChoiceField, error) {
 	var result ChoiceField
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if field["FT"] != Name("Ch") {
 		return result, fmt.Errorf("not a choice field")
 	}
@@ -74,31 +134,62 @@ func (r *Reader) readChoiceField(field Dictionary) (ChoiceField, error) {
 	if value != nil && !ok {
 		return result, fmt.Errorf("invalid choice options")
 	}
+	budget := newTextStringBudget(r)
+	var pairCache map[Reference]ChoiceOption
 	result.Options = make([]ChoiceOption, 0, len(options))
 	byValue := make(map[string]int, len(options))
 	for i, object := range options {
-		value, err := r.Resolve(object)
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		ref, value, err := r.resolveIndirect(object)
 		if err != nil {
 			return result, err
 		}
+		if ref != (Reference{}) {
+			if cached, exists := pairCache[ref]; exists {
+				if err := budget.consume(int64(len(cached.Value))+int64(len(cached.Label)), "choice field"); err != nil {
+					return result, err
+				}
+				result.Options = append(result.Options, cached)
+				if _, seen := byValue[cached.Value]; seen {
+					byValue[cached.Value] = -1
+				} else {
+					byValue[cached.Value] = i
+				}
+				continue
+			}
+		}
+		var export, label string
 		pair, isPair := value.(Array)
-		if isPair && len(pair) != 2 {
-			return result, fmt.Errorf("invalid choice option pair")
-		}
-		a, b := value, value
 		if isPair {
-			a, b = pair[0], pair[1]
-		}
-		export, err := r.choiceString(a)
-		if err != nil {
-			return result, err
-		}
-		label := export
-		if isPair {
-			label, err = r.choiceString(b)
+			if len(pair) != 2 {
+				return result, fmt.Errorf("invalid choice option pair")
+			}
+			export, err = r.choiceString(ctx, pair[0], &budget)
 			if err != nil {
 				return result, err
 			}
+			label, err = r.choiceString(ctx, pair[1], &budget)
+			if err != nil {
+				return result, err
+			}
+			if ref != (Reference{}) {
+				if pairCache == nil {
+					pairCache = make(map[Reference]ChoiceOption)
+				}
+				pairCache[ref] = ChoiceOption{export, label}
+			}
+		} else {
+			text, ok := value.(String)
+			if !ok {
+				return result, fmt.Errorf("invalid choice text string")
+			}
+			export, err = budget.decodeString(ref, text, "choice field")
+			if err != nil {
+				return result, err
+			}
+			label = export
 		}
 		result.Options = append(result.Options, ChoiceOption{export, label})
 		if _, exists := byValue[export]; exists {
@@ -107,7 +198,8 @@ func (r *Reader) readChoiceField(field Dictionary) (ChoiceField, error) {
 			byValue[export] = i
 		}
 	}
-	value, err = r.Resolve(field["V"])
+	rawValue := field["V"]
+	value, err = r.Resolve(rawValue)
 	if err != nil {
 		return result, err
 	}
@@ -115,13 +207,16 @@ func (r *Reader) readChoiceField(field Dictionary) (ChoiceField, error) {
 	if value != nil {
 		values, array := value.(Array)
 		if !array {
-			values = Array{value}
+			values = Array{rawValue}
 		}
 		if len(values) > 1 && !result.MultiSelect {
 			return result, fmt.Errorf("multiple values in single choice field")
 		}
 		for _, object := range values {
-			text, err := r.choiceString(object)
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
+			text, err := r.choiceString(ctx, object, &budget)
 			if err != nil {
 				return result, err
 			}
@@ -143,6 +238,9 @@ func (r *Reader) readChoiceField(field Dictionary) (ChoiceField, error) {
 		previous := Integer(-1)
 		selectedValues := make([]string, 0, len(indices))
 		for _, object := range indices {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
 			value, err := r.Resolve(object)
 			if err != nil {
 				return result, err
@@ -168,6 +266,9 @@ func (r *Reader) readChoiceField(field Dictionary) (ChoiceField, error) {
 		}
 	} else {
 		for _, text := range result.Values {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
 			index, found := byValue[text]
 			if !found {
 				if text == "" || result.Editable {
@@ -198,14 +299,17 @@ func (r *Reader) readChoiceField(field Dictionary) (ChoiceField, error) {
 		}
 		result.TopIndex = int(top)
 	}
-	return result, nil
+	return result, ctx.Err()
 }
 
-// choiceString 解码选择字段中的文本字符串
-// 入参: object 字符串或引用
-// 返回: string Unicode文字, error 类型或编码错误
-func (r *Reader) choiceString(object Object) (string, error) {
-	value, err := r.Resolve(object)
+// choiceString 在文本预算内解码选择字段中的文本字符串并复用共享引用
+// 入参: ctx 取消上下文, object 字符串或引用, budget 文本解码预算
+// 返回: string Unicode文字, error 类型、编码、超限或取消错误
+func (r *Reader) choiceString(ctx context.Context, object Object, budget *textStringBudget) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	ref, value, err := r.resolveIndirect(object)
 	if err != nil {
 		return "", err
 	}
@@ -213,5 +317,5 @@ func (r *Reader) choiceString(object Object) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("invalid choice text string")
 	}
-	return DecodeTextString(text)
+	return budget.decodeString(ref, text, "choice field")
 }

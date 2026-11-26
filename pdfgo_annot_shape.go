@@ -399,7 +399,10 @@ func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pa
 	if size == 0 {
 		low, high := 0.0, height
 		for range 32 {
-			candidate := (low + high) / 2
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			candidate := low + (high-low)/2
 			lines, err := s.lines(v.text, state, candidate, width, v.multiline)
 			if err != nil {
 				return err
@@ -420,12 +423,15 @@ func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pa
 		}
 		size = low
 	}
-	if size <= 0 {
+	if size <= 0 || math.IsNaN(size) || math.IsInf(size, 0) {
 		return fmt.Errorf("invalid shaped font size")
 	}
 	leading := state.leading
 	if leading <= 0 {
 		leading = size * 1.2
+	}
+	if leading <= 0 || math.IsNaN(leading) || math.IsInf(leading, 0) {
+		return fmt.Errorf("invalid shaped text line spacing")
 	}
 	text := v.text
 	if list {
@@ -478,8 +484,12 @@ func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pa
 			}
 			row := selected - v.choice.TopIndex
 			if row >= 0 && row < len(lines) {
+				top := v.frame.YMax - float64(row+1)*leading
+				if !finiteFloats([]float64{v.frame.XMin, top, width, leading}) {
+					return fmt.Errorf("shaped list selection background exceeds coordinate range")
+				}
 				content.WriteString("q 0.153 0.392 0.714 rg\n")
-				writeAnnotationOperation(content, "re f Q", v.frame.XMin, v.frame.YMax-float64(row+1)*leading, width, leading)
+				writeAnnotationOperation(content, "re f Q", v.frame.XMin, top, width, leading)
 				if content.Len() > limit {
 					return fmt.Errorf("%w: shaped text appearance content limit exceeded", ErrStreamLimitExceeded)
 				}

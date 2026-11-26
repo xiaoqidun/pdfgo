@@ -143,6 +143,9 @@ func (s *deviceNSpace) values(tints ...float64) ([4]float64, error) {
 				value := math.Max(s.input[2*j], math.Min(s.input[2*j+1], math.Max(0, math.Min(1, tints[j]))))
 				values[c] += coefficient * value
 			}
+			if math.IsNaN(values[c]) || math.IsInf(values[c], 0) {
+				return [4]float64{}, fmt.Errorf("nonfinite DeviceN tint result")
+			}
 		}
 		values = clipGradientValue(values, s.output)
 	}
@@ -322,8 +325,10 @@ func (r *Reader) readMultiDeviceN(ctx context.Context, space Array, effective bo
 	if alternate.separation != nil || alternate.deviceN != nil {
 		s.nested, s.none = alternate, alternate.none
 	}
-	s.expressions, err = affineCalculator(data, len(names), alternate.components)
-	if err != nil {
+	expressions, err := affineCalculator(data, len(names), alternate.components)
+	if err == nil && affineExpressionsFinite(expressions, input) {
+		s.expressions = expressions
+	} else {
 		s.program = program
 	}
 	inputs := make([]float64, len(names))
@@ -335,6 +340,32 @@ func (r *Reader) readMultiDeviceN(ctx context.Context, space Array, effective bo
 		return nil, err
 	}
 	return s, nil
+}
+
+// affineExpressionsFinite 验证多输入仿射表达式在有效定义域内的累计上下界均不溢出为非有限值
+// 入参: expressions 仿射表达式列表, input 函数定义域边界
+// 返回: bool 是否可安全使用仿射快速路径
+func affineExpressionsFinite(expressions []affineValue, input []float64) bool {
+	for _, expression := range expressions {
+		lowSum, highSum := expression[0], expression[0]
+		if math.IsNaN(lowSum) || math.IsInf(lowSum, 0) {
+			return false
+		}
+		for j, coefficient := range expression[1:] {
+			lo := math.Max(input[2*j], math.Min(input[2*j+1], 0))
+			hi := math.Max(input[2*j], math.Min(input[2*j+1], 1))
+			a, b := coefficient*lo, coefficient*hi
+			if math.IsNaN(a) || math.IsInf(a, 0) || math.IsNaN(b) || math.IsInf(b, 0) {
+				return false
+			}
+			lowSum += min(a, b)
+			highSum += max(a, b)
+			if math.IsNaN(lowSum) || math.IsInf(lowSum, 0) || math.IsNaN(highSum) || math.IsInf(highSum, 0) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // readDeviceNAlternateContext 在取消上下文内读取专色备用空间，Lab在着色求值后转换为RGB

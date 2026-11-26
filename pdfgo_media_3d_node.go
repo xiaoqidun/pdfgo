@@ -15,6 +15,7 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -31,9 +32,20 @@ type ThreeDNode struct {
 
 // ReadThreeDNode 按PDF标准表312读取三维节点，不修改原始字典
 // 入参: object 节点字典或引用
-// 返回: ThreeDNode 节点参数, error 类型、数值或引用错误
+// 返回: ThreeDNode 节点参数, error 类型、数值、超限或引用错误
 func (r *Reader) ReadThreeDNode(object Object) (ThreeDNode, error) {
+	budget := newTextStringBudget(r)
+	return r.readThreeDNode(context.Background(), object, &budget)
+}
+
+// readThreeDNode 在取消上下文和文本预算内按PDF标准表312读取三维节点，不修改原始字典
+// 入参: ctx 取消上下文, object 节点字典或引用, budget 文本解码预算
+// 返回: ThreeDNode 节点参数, error 类型、数值、超限、引用或取消错误
+func (r *Reader) readThreeDNode(ctx context.Context, object Object, budget *textStringBudget) (ThreeDNode, error) {
 	result := ThreeDNode{}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	dict, err := r.mediaDictionary(object, false)
 	if err != nil {
 		return result, err
@@ -43,7 +55,7 @@ func (r *Reader) ReadThreeDNode(object Object) (ThreeDNode, error) {
 	if err := r.threeDName(dict, "Type", &typeName, "3DNode"); err != nil {
 		return result, err
 	}
-	value, err := r.Resolve(dict["N"])
+	nameRef, value, err := r.resolveIndirect(dict["N"])
 	if err != nil {
 		return result, err
 	}
@@ -51,7 +63,7 @@ func (r *Reader) ReadThreeDNode(object Object) (ThreeDNode, error) {
 	if !ok {
 		return result, fmt.Errorf("invalid 3D node name")
 	}
-	result.Name, err = DecodeTextString(name)
+	result.Name, err = budget.decodeString(nameRef, name, "3D node")
 	if err != nil {
 		return result, err
 	}
@@ -99,5 +111,5 @@ func (r *Reader) ReadThreeDNode(object Object) (ThreeDNode, error) {
 		}
 		result.Matrix = &matrix
 	}
-	return result, nil
+	return result, ctx.Err()
 }

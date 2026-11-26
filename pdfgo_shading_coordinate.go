@@ -106,15 +106,64 @@ func (f *coordinateFunction) evaluate(point [2]float64, out []float64) error {
 	return nil
 }
 
+// coordinateFunctionState 保存单次二维函数着色解析的节点预算、解码字节预算及间接引用记忆表
+type coordinateFunctionState struct {
+	nodes  int
+	bytes  int64
+	limit  int64
+	cached map[Reference]*coordinateFunction
+}
+
+// coordinateFunctionBytes 估算二维函数及其去重分量的采样内存占用
+// 入参: f 二维函数定义
+// 返回: int64 估算字节数
+func coordinateFunctionBytes(f *coordinateFunction) int64 {
+	if f == nil {
+		return 0
+	}
+	seen := make(map[*coordinateFunction]bool)
+	var walk func(*coordinateFunction) int64
+	walk = func(node *coordinateFunction) int64 {
+		if node == nil || seen[node] {
+			return 0
+		}
+		seen[node] = true
+		size := int64(256)
+		if node.sampled != nil {
+			size += int64(len(node.sampled.table.samples))
+		}
+		for _, part := range node.parts {
+			size += walk(part)
+		}
+		return size
+	}
+	return walk(f)
+}
+
 // readCoordinateFunctionContext 在本次取消上下文内读取二维函数及独立分量
 // 入参: ctx 取消上下文, object 函数或函数数组, outputs 输出分量数, domain 着色定义域
-// 返回: *coordinateFunction 函数定义, error 格式、解码或取消错误
+// 返回: *coordinateFunction 函数定义, error 格式、解码、预算或取消错误
 func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Object, outputs int, domain Rectangle) (*coordinateFunction, error) {
-	if ctx == nil {
-		return nil, fmt.Errorf("invalid coordinate function context")
-	}
+	limit, _ := effectiveStreamLimits(r, nil)
+	return r.readCoordinateFunctionState(ctx, object, outputs, domain, true, &coordinateFunctionState{limit: limit})
+}
+
+// readCoordinateFunctionState 携带节点预算、解码预算与间接引用记忆表解析二维函数
+// 入参: ctx 取消上下文, object 函数或函数数组, outputs 输出分量数, domain 着色定义域, allowArray 是否允许函数数组, state 解析状态
+// 返回: *coordinateFunction 函数定义, error 格式、解码、预算或取消错误
+func (r *Reader) readCoordinateFunctionState(ctx context.Context, object Object, outputs int, domain Rectangle, allowArray bool, state *coordinateFunctionState) (*coordinateFunction, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	state.nodes++
+	if state.nodes > maxGradientFunctionNodes {
+		return nil, fmt.Errorf("%w: coordinate function node limit exceeded", ErrStreamLimitExceeded)
+	}
+	ref, isRef := object.(Reference)
+	if !allowArray && isRef {
+		if cached := state.cached[ref]; cached != nil {
+			return cached, nil
+		}
 	}
 	value, err := r.Resolve(object)
 	if err != nil {
@@ -122,19 +171,15 @@ func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Objec
 	}
 	f := &coordinateFunction{outputs: outputs}
 	if array, ok := value.(Array); ok {
+		if !allowArray {
+			return nil, fmt.Errorf("nested coordinate function array")
+		}
 		if len(array) != outputs {
 			return nil, fmt.Errorf("invalid coordinate function count")
 		}
 		f.parts = make([]*coordinateFunction, outputs)
 		for i, item := range array {
-			item, err = r.Resolve(item)
-			if err != nil {
-				return nil, err
-			}
-			if _, nested := item.(Array); nested {
-				return nil, fmt.Errorf("nested coordinate function array")
-			}
-			f.parts[i], err = r.readCoordinateFunctionContext(ctx, item, 1, domain)
+			f.parts[i], err = r.readCoordinateFunctionState(ctx, item, 1, domain, false, state)
 			if err != nil {
 				return nil, err
 			}
@@ -169,11 +214,28 @@ func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Objec
 	}
 	switch kind {
 	case Integer(0):
+		if state.limit > 0 {
+			if err := r.checkCoordinateSampledBudget(dict, outputs, state); err != nil {
+				return nil, err
+			}
+		}
 		f.sampled, err = r.readSampledFunctionContext(ctx, stream, 2, outputs)
+		if err == nil {
+			cost := int64(len(f.sampled.table.samples))
+			if state.limit > 0 && cost > state.limit-state.bytes {
+				return nil, fmt.Errorf("%w: coordinate function memory limit exceeded", ErrStreamLimitExceeded)
+			}
+			state.bytes += cost
+		}
 	case Integer(4):
 		var data []byte
 		data, err = r.DecodeStreamContext(ctx, stream)
 		if err == nil {
+			cost := int64(len(data))
+			if state.limit > 0 && cost > state.limit-state.bytes {
+				return nil, fmt.Errorf("%w: coordinate function memory limit exceeded", ErrStreamLimitExceeded)
+			}
+			state.bytes += cost
 			f.program, err = newCalculatorFunction(data, r.warning)
 		}
 	default:
@@ -185,12 +247,50 @@ func (r *Reader) readCoordinateFunctionContext(ctx context.Context, object Objec
 	if err != nil {
 		return nil, err
 	}
+	if !allowArray && isRef {
+		if state.cached == nil {
+			state.cached = make(map[Reference]*coordinateFunction)
+		}
+		state.cached[ref] = f
+	}
 	return f, nil
+}
+
+// checkCoordinateSampledBudget 解码前按采样维数和位宽预检累计采样字节预算
+// 入参: dict 采样函数字典, outputs 输出分量数, state 解析状态
+// 返回: error 预算超限错误
+func (r *Reader) checkCoordinateSampledBudget(dict Dictionary, outputs int, state *coordinateFunctionState) error {
+	sizes, err := r.numberArray(dict["Size"], 2)
+	if err != nil || !finiteFloats(sizes) {
+		return nil
+	}
+	bits, err := r.number(dict["BitsPerSample"])
+	if err != nil || bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 12 && bits != 16 && bits != 24 && bits != 32 {
+		return nil
+	}
+	remaining := uint64(state.limit - state.bytes)
+	if sizes[0] < 1 || sizes[1] < 1 || sizes[0] > float64(math.MaxInt64) || sizes[1] > float64(math.MaxInt64) || math.Trunc(sizes[0]) != sizes[0] || math.Trunc(sizes[1]) != sizes[1] {
+		return nil
+	}
+	s0, s1 := uint64(sizes[0]), uint64(sizes[1])
+	limitBits := remaining * 8
+	if remaining > math.MaxUint64/8 {
+		limitBits = math.MaxUint64
+	}
+	perSample := uint64(outputs) * uint64(bits)
+	if s0 > limitBits/perSample || s1 > limitBits/(s0*perSample) {
+		return fmt.Errorf("%w: coordinate function memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	needed := (s0*s1*perSample-1)/8 + 1
+	if needed > remaining {
+		return fmt.Errorf("%w: coordinate function memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	return nil
 }
 
 // functionShading 解析函数着色的定义域、颜色空间及双层坐标变换
 // 入参: shading 着色字典, matrix 着色坐标到页面的变换
-// 返回: Paint 函数画刷, error 格式或能力错误
+// 返回: Paint 函数画刷, error 格式、能力、超限或取消错误
 func (p *pageInterpreter) functionShading(shading Dictionary, matrix Matrix) (Paint, error) {
 	g := &FunctionGradient{Domain: Rectangle{0, 0, 1, 1}, Matrix: matrix, PatternMatrix: matrix, Intent: p.state.style.RenderingIntent}
 	value, err := p.reader.Resolve(shading["Domain"])

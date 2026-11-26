@@ -186,7 +186,7 @@ func (r *Reader) writeAnnotationToggleButton(ctx context.Context, annotation Ann
 		writeAnnotationCircle(content, w/2, h/2, radius*.5)
 		content.WriteString("f\n")
 	} else {
-		content.WriteString("0 G\n")
+		content.WriteString("0 G [] 0 d\n")
 		writeAnnotationOperation(content, "w", math.Max(1, math.Min(w, h)*.08))
 		content.WriteString("1 J 1 j\n")
 		writeAnnotationOperation(content, "m", w*.2, h*.5)
@@ -485,7 +485,7 @@ func (r *Reader) writeAnnotationButtonIcon(icon *Stream, fit annotationIconFit, 
 	}
 	objects[name] = icon
 	resources["XObject"] = objects
-	content.WriteString("q\n")
+	content.WriteString("q\n0 g 0 G 1 w [] 0 d\n")
 	writeAnnotationOperation(content, "re W n", frame.XMin, frame.YMin, w, h)
 	writeAnnotationOperation(content, "cm", sx, 0, 0, sy, x, y)
 	content.WriteString("/" + escapeAnnotationName(name) + " Do\nQ\n")

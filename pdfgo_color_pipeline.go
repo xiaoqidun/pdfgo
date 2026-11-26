@@ -31,10 +31,10 @@ type iccPipeline struct {
 	reverse bool
 }
 
-// parseICCPipeline 解析ICC.1第10.12、10.13节的多阶段查找表
-// 入参: data 标签数据
-// 返回: *iccLUT 颜色变换, error 格式错误
-func parseICCPipeline(data []byte) (*iccLUT, error) {
+// parseICCPipeline 解析ICC.1第10.12、10.13节的多阶段查找表并约束展开内存
+// 入参: data 标签数据, budget 剩余字节预算指针
+// 返回: *iccLUT 颜色变换, error 格式或预算错误
+func parseICCPipeline(data []byte, budget *int64) (*iccLUT, error) {
 	if len(data) < 32 || string(data[:4]) != "mAB " && string(data[:4]) != "mBA " {
 		return nil, fmt.Errorf("invalid ICC pipeline header")
 	}
@@ -58,14 +58,24 @@ func parseICCPipeline(data []byte) (*iccLUT, error) {
 		aCount, bCount = s.output, s.input
 	}
 	var err error
+	curveSets := make(map[int][]iccToneCurve, 3)
+	curveCache := make(map[int]iccToneCurve)
 	curvesAt := func(offset, count int) ([]iccToneCurve, error) {
+		if cached := curveSets[offset]; len(cached) >= count {
+			return cached[:count], nil
+		}
 		end := len(data)
 		for _, boundary := range []int{offsets[1], offsets[3]} {
 			if boundary > offset && boundary < end {
 				end = boundary
 			}
 		}
-		return iccEmbeddedCurves(data[offset:end], count)
+		curves, err := iccEmbeddedCurves(data, offset, end, count, budget, curveCache)
+		if err != nil {
+			return nil, err
+		}
+		curveSets[offset] = curves
+		return curves, nil
 	}
 	s.b, err = curvesAt(offsets[0], bCount)
 	if err != nil {
@@ -112,6 +122,9 @@ func parseICCPipeline(data []byte) (*iccLUT, error) {
 				return nil, fmt.Errorf("overlapping ICC pipeline CLUT")
 			}
 		}
+		if err := iccReserveLUTBytes(budget, int64(count)); err != nil {
+			return nil, err
+		}
 		s.values = make([]float64, count)
 		for n := range s.values {
 			if width == 1 {
@@ -124,43 +137,60 @@ func parseICCPipeline(data []byte) (*iccLUT, error) {
 	return &iccLUT{input: make([][]float64, s.input), output: make([][]float64, s.output), precision: 16, pipeline: s}, nil
 }
 
-// iccEmbeddedCurves 按曲线自身长度读取四字节对齐的连续曲线，允许共享数据
-// 入参: data 曲线数据, count 曲线数
-// 返回: []iccToneCurve 色调曲线, error 格式错误
-func iccEmbeddedCurves(data []byte, count int) ([]iccToneCurve, error) {
+// iccEmbeddedCurves 按曲线自身长度读取四字节对齐的连续曲线，按偏移去重并纳入字节预算
+// 入参: data 标签数据, offset 起始偏移, end 边界终点, count 曲线数, budget 剩余字节预算指针, seen 已解析曲线偏移缓存
+// 返回: []iccToneCurve 色调曲线, error 格式或预算错误
+func iccEmbeddedCurves(data []byte, offset, end, count int, budget *int64, seen map[int]iccToneCurve) ([]iccToneCurve, error) {
 	curves := make([]iccToneCurve, count)
+	pos := offset
 	for n := range curves {
-		if len(data) < 12 {
+		cur := data[pos:end]
+		if len(cur) < 12 {
 			return nil, fmt.Errorf("truncated ICC embedded curve")
 		}
 		length := uint64(12)
-		switch string(data[:4]) {
+		var samples uint64
+		switch string(cur[:4]) {
 		case "curv":
-			length += 2 * uint64(binary.BigEndian.Uint32(data[8:]))
+			samples = uint64(binary.BigEndian.Uint32(cur[8:]))
+			if samples > uint64(len(cur)-12)/2 {
+				return nil, fmt.Errorf("truncated ICC embedded curve")
+			}
+			length += 2 * samples
 		case "para":
 			counts := [...]int{1, 3, 4, 5, 7}
-			kind := int(binary.BigEndian.Uint16(data[8:]))
+			kind := int(binary.BigEndian.Uint16(cur[8:]))
 			if kind >= len(counts) {
 				return nil, fmt.Errorf("invalid ICC embedded parametric curve")
 			}
 			length += uint64(4 * counts[kind])
 		default:
-			return nil, &UnsupportedError{Feature: "ICC embedded curve type " + string(data[:4])}
+			return nil, &UnsupportedError{Feature: "ICC embedded curve type " + string(cur[:4])}
 		}
-		if length > uint64(len(data)) {
+		if length > uint64(len(cur)) {
 			return nil, fmt.Errorf("truncated ICC embedded curve")
 		}
-		curve, err := iccCurve(data[:length])
-		if err != nil {
-			return nil, err
+		curve, cached := seen[pos]
+		if !cached {
+			if samples > 1 {
+				if err := iccReserveBytes(budget, int64(2*samples)); err != nil {
+					return nil, err
+				}
+			}
+			var err error
+			curve, err = iccCurve(cur[:length])
+			if err != nil {
+				return nil, err
+			}
+			seen[pos] = curve
 		}
 		curves[n] = curve
 		if n+1 < count {
 			length = (length + 3) &^ 3
-			if length > uint64(len(data)) {
+			if length > uint64(len(cur)) {
 				return nil, fmt.Errorf("truncated ICC curve padding")
 			}
-			data = data[length:]
+			pos += int(length)
 		}
 	}
 	return curves, nil

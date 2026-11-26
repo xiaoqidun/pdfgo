@@ -853,6 +853,14 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 	}
 	refs = slices.DeleteFunc(refs, func(ref Reference) bool { return out.aliases[ref].Number != 0 })
+	var fontUpdates map[Reference]*Stream
+	var fontTags map[Reference]string
+	if options.Compression.Mode != CompressionUnchanged {
+		fontUpdates, fontTags, err = r.optimizationFontUpdates(ctx, fontGlyphs, originalCache, workers)
+		if err != nil {
+			return report, err
+		}
+	}
 	ownedSMask := make(map[Reference]Reference)
 	deferredSMask := make(map[Reference]bool)
 	smaskCache := make(map[Reference]smaskOptInfo)
@@ -888,7 +896,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			countRefs(metadata[ref], 0)
 		}
 		for _, ref := range refs {
-			if !isStream[ref] || lossless[ref] || colorConflicts[ref] || exactData[ref] || lazyImages[ref] != nil || replacements[ref] != nil {
+			if !isStream[ref] || lossless[ref] || colorConflicts[ref] || exactData[ref] || lazyImages[ref] != nil || replacements[ref] != nil || fontUpdates[ref] != nil {
 				continue
 			}
 			dict, ok := metadata[ref].(Dictionary)
@@ -902,7 +910,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			if canonical, aliased := out.aliases[smaskRef]; aliased {
 				smaskRef = canonical
 			}
-			if smaskRef == ref || !isStream[smaskRef] || refCounts[smaskRef] != 1 || exactData[smaskRef] || lazyImages[smaskRef] != nil || replacements[smaskRef] != nil {
+			if smaskRef == ref || !isStream[smaskRef] || refCounts[smaskRef] != 1 || exactData[smaskRef] || lazyImages[smaskRef] != nil || replacements[smaskRef] != nil || fontUpdates[smaskRef] != nil {
 				continue
 			}
 			smaskDict, ok := metadata[smaskRef].(Dictionary)
@@ -911,14 +919,6 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			}
 			ownedSMask[ref] = smaskRef
 			deferredSMask[smaskRef] = true
-		}
-	}
-	var fontUpdates map[Reference]*Stream
-	var fontTags map[Reference]string
-	if options.Compression.Mode != CompressionUnchanged {
-		fontUpdates, fontTags, err = r.optimizationFontUpdates(ctx, fontGlyphs, originalCache, workers)
-		if err != nil {
-			return report, err
 		}
 	}
 	slices.SortFunc(refs, compareReference)

@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 )
 
@@ -27,6 +28,40 @@ func imageBufferLimit() int {
 		maximum = min(maximum, uint64(1<<32-1))
 	}
 	return int(maximum)
+}
+
+// imageCompositeBudget 根据流解压上限派生合成图像输出缓冲预算，零值表示不额外封顶
+// 入参: maxBytes 流解压字节上限
+// 返回: int64 合成输出字节预算
+func imageCompositeBudget(maxBytes int64) int64 {
+	if maxBytes <= 0 {
+		return 0
+	}
+	const softFloor int64 = 64 << 20
+	quad := int64(math.MaxInt64)
+	if maxBytes <= math.MaxInt64/4 {
+		quad = maxBytes * 4
+	}
+	oct := int64(math.MaxInt64)
+	if maxBytes <= math.MaxInt64/8 {
+		oct = maxBytes * 8
+	}
+	return min(oct, max(quad, softFloor))
+}
+
+// imageCompositeBufferSize 校验合成图像的流预算与平台缓冲上限，拦截异尺寸遮罩膨胀
+// 入参: width 输出宽度, height 输出高度, pixelBytes 单像素字节数, maxBytes 流解压字节上限
+// 返回: int 行字节数, int 缓冲字节数, error 超限或平台尺寸错误
+func imageCompositeBufferSize(width, height, pixelBytes int, maxBytes int64) (int, int, error) {
+	if width <= 0 || height <= 0 || pixelBytes <= 0 {
+		return 0, 0, fmt.Errorf("image buffer size exceeds platform buffer range")
+	}
+	if budget := imageCompositeBudget(maxBytes); budget > 0 {
+		if int64(width) > budget/int64(pixelBytes)/int64(height) {
+			return 0, 0, fmt.Errorf("%w: composite image buffer exceeds limit", ErrStreamLimitExceeded)
+		}
+	}
+	return imageBufferSize(width, height, pixelBytes)
 }
 
 // imageBufferSize 按实际像素字节数计算缓冲，乘法前校验平台缓冲范围

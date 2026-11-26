@@ -2122,6 +2122,12 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	if mask != nil {
 		mask.bounds = bounds
 	}
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if maskImage != nil {
+		if maskMax, _ := effectiveStreamLimits(maskImage.reader, maskImage.Stream); maskMax > 0 && (maxBytes == 0 || maskMax < maxBytes) {
+			maxBytes = maskMax
+		}
+	}
 	if target == nil && calibrated == nil && lab == nil && profile == nil && separation == nil && deviceN == nil && components != 4 && len(keys) == 0 && len(matte) == 0 && defaultDecode {
 		byteExact := imageByteExact(samples)
 		if mask != nil {
@@ -2133,6 +2139,15 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 					byteExact = false
 					break
 				}
+			}
+		}
+		if mask != nil {
+			pixelBytes := 4
+			if !byteExact {
+				pixelBytes = 8
+			}
+			if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), pixelBytes, maxBytes); err != nil {
+				return nil, err
 			}
 		}
 		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: imageSampleMaximum(bits), byteExact: byteExact, embedded: embeddedMask != 0 || sampleHasAlpha}, nil
@@ -2148,6 +2163,11 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			if mask == nil && embeddedMask == 0 && len(keys) == 0 && palette == nil && (deviceN == nil || !deviceN.none) && (separation == nil || separation.name != "None" && !separation.none) && (profile == nil || profile.alternate == nil || !profile.alternate.invisible) {
 				channels, kind = 3, 2
 			}
+			if mask != nil {
+				if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), channels*2, maxBytes); err != nil {
+					return nil, err
+				}
+			}
 			encoder, err = newPNGImageEncoder(ctx, writer, bounds, 16, channels, kind)
 			if err != nil {
 				return nil, err
@@ -2162,7 +2182,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				out.Pix, out.Stride = make([]byte, stride), stride
 			}
 		} else {
-			if _, _, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 8); err != nil {
+			if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), 8, maxBytes); err != nil {
 				return nil, err
 			}
 			out = image.NewNRGBA64(bounds)
@@ -2210,6 +2230,11 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			return nil, err
 		}
 		if sampled && palette == nil && deviceN == nil && separation == nil && profile == nil && calibrated == nil && lab == nil {
+			if mask != nil {
+				if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), (components+1)*2, maxBytes); err != nil {
+					return nil, err
+				}
+			}
 			if components == 4 {
 				if _, ok := imageCMYKAt(samples, bounds.Min.X, bounds.Min.Y); !ok {
 					return nil, fmt.Errorf("invalid CMYK image samples")
@@ -2217,6 +2242,35 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			}
 			target.view = &imageComponentView{source: samples, mask: mask, channels: components, ranges: ranges, keys: keys, matte: matte, inverted: inverted, embedded: embeddedMask != 0, maximum: imageSampleMaximum(bits), maxima: channelMaxima}
 			return nil, nil
+		}
+		alphaRequired := false
+		if len(target.Colorants) > 0 {
+			alphaRequired = palette != nil && palette.colors[0].A == 0 || deviceN != nil && deviceN.none || separation != nil && separation.none
+			if target.processOnly {
+				alphaRequired = mask != nil || embeddedMask != 0 || len(keys) != 0
+			}
+		}
+		totalComponents := 0
+		if !target.processOnly {
+			totalComponents += target.Space.Components() + 1
+		}
+		if len(target.Colorants) > 0 {
+			if len(target.Colorants) > int(^uint(0)>>1)/2-totalComponents-1 {
+				return nil, fmt.Errorf("image sample size exceeds platform buffer range")
+			}
+			totalComponents += len(target.Colorants)
+			if alphaRequired {
+				totalComponents++
+			}
+		}
+		if totalComponents > 0 {
+			if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), totalComponents*2, maxBytes); err != nil {
+				return nil, err
+			}
+		} else if mask != nil {
+			if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), 2, maxBytes); err != nil {
+				return nil, err
+			}
 		}
 		size := 0
 		if !target.processOnly {
@@ -2231,12 +2285,12 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				return nil, err
 			}
 			target.Tints = make([]uint16, tintSize/2)
-			alphaRequired := palette != nil && palette.colors[0].A == 0 || deviceN != nil && deviceN.none || separation != nil && separation.none
-			if target.processOnly {
-				alphaRequired = mask != nil || embeddedMask != 0 || len(keys) != 0
-			}
 			if alphaRequired {
-				target.ColorantAlpha = make([]uint16, bounds.Dx()*bounds.Dy())
+				_, alphaSize, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 2)
+				if err != nil {
+					return nil, err
+				}
+				target.ColorantAlpha = make([]uint16, alphaSize/2)
 			}
 		}
 		if !target.processOnly {

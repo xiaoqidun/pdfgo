@@ -165,7 +165,10 @@ func (r *Reader) attachmentReplacements(ctx context.Context, options RewriteOpti
 	if !ok || result[root] != nil {
 		return nil, fmt.Errorf("invalid or conflicting PDF catalog replacement")
 	}
-	number := r.maxRewriteObjectID(result)
+	number, err := r.maxRewriteObjectID(ctx, result)
+	if err != nil {
+		return nil, err
+	}
 	changed := false
 	for _, key := range slices.Sorted(maps.Keys(options.Attachments)) {
 		if err := ctx.Err(); err != nil {

@@ -62,10 +62,34 @@ type iccLUTSpace struct {
 	fromPCS    [3]*iccLUT
 }
 
-// parseICCLUTSpace 读取ICC源空间的正向查找表，逆向信息由目标转换按需读取
-// 入参: data 配置文件数据, tags 已校验的标签
-// 返回: *iccLUTSpace 颜色变换, error 格式或能力错误
-func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error) {
+// maxICCLUTBytes 限制单个ICC配置展开多维查找表与管线浮点网格的累计内存上限
+const maxICCLUTBytes int64 = 64 << 20
+
+// iccReserveBytes 从ICC查找表预算中扣减指定字节数
+// 入参: budget 剩余字节预算指针, size 新增字节数
+// 返回: error 超出预算时返回包装ErrStreamLimitExceeded的错误
+func iccReserveBytes(budget *int64, size int64) error {
+	if size < 0 || size > *budget {
+		return fmt.Errorf("%w: ICC lookup table memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	*budget -= size
+	return nil
+}
+
+// iccReserveLUTBytes 从ICC查找表预算中扣减指定数量float64元素的内存字节
+// 入参: budget 剩余字节预算指针, elements 新增float64元素数
+// 返回: error 超出预算时返回包装ErrStreamLimitExceeded的错误
+func iccReserveLUTBytes(budget *int64, elements int64) error {
+	if elements < 0 || elements > math.MaxInt64/8 {
+		return fmt.Errorf("%w: ICC lookup table memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	return iccReserveBytes(budget, elements*8)
+}
+
+// parseICCLUTSpace 读取ICC源空间的正向查找表，共享标签去重并受累计内存预算约束
+// 入参: data 配置文件数据, tags 已校验的标签, budget 剩余查找表字节预算指针
+// 返回: *iccLUTSpace 颜色变换, error 格式、能力或预算错误
+func parseICCLUTSpace(data []byte, tags map[string][]byte, budget *int64) (*iccLUTSpace, error) {
 	s := &iccLUTSpace{pcs: string(data[20:24])}
 	switch string(data[16:20]) {
 	case "GRAY":
@@ -80,7 +104,16 @@ func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error)
 	for i := range s.toPCS {
 		name := fmt.Sprintf("A2B%d", i)
 		if tag := tags[name]; tag != nil {
-			lut, err := iccLookupTransform(tag, s.components, 3, s.pcs, false)
+			for j := 0; j < i; j++ {
+				if sameICCTag(tag, tags[fmt.Sprintf("A2B%d", j)]) {
+					s.toPCS[i] = s.toPCS[j]
+					break
+				}
+			}
+			if s.toPCS[i] != nil {
+				continue
+			}
+			lut, err := iccLookupTransform(tag, s.components, 3, s.pcs, false, budget)
 			if err != nil {
 				return nil, fmt.Errorf("ICC %s: %w", name, err)
 			}
@@ -93,14 +126,14 @@ func parseICCLUTSpace(data []byte, tags map[string][]byte) (*iccLUTSpace, error)
 	return s, nil
 }
 
-// iccLookupTransform 按变换方向校验查找表通道、PCS编码及矩阵
-// 入参: data 标签数据, input 输入通道, output 输出通道, pcs 连接空间, inverse 是否逆向
-// 返回: *iccLUT 查找表, error 无效变换
-func iccLookupTransform(data []byte, input, output int, pcs string, inverse bool) (*iccLUT, error) {
+// iccLookupTransform 在给定字节预算内按变换方向校验查找表通道、PCS编码及矩阵
+// 入参: data 标签数据, input 输入通道, output 输出通道, pcs 连接空间, inverse 是否逆向, budget 剩余字节预算指针
+// 返回: *iccLUT 查找表, error 无效变换或预算错误
+func iccLookupTransform(data []byte, input, output int, pcs string, inverse bool, budget *int64) (*iccLUT, error) {
 	if len(data) >= 4 && (string(data[:4]) == "mAB " && inverse || string(data[:4]) == "mBA " && !inverse) {
 		return nil, fmt.Errorf("invalid ICC lookup direction")
 	}
-	lut, err := parseICCLUT(data)
+	lut, err := parseICCLUT(data, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -116,12 +149,12 @@ func iccLookupTransform(data []byte, input, output int, pcs string, inverse bool
 	return lut, nil
 }
 
-// parseICCLUT 解析ICC查找表及多阶段变换，按实际数据长度校验维数
-// 入参: data 标签数据
-// 返回: *iccLUT 查找表, error 格式错误
-func parseICCLUT(data []byte) (*iccLUT, error) {
+// parseICCLUT 解析ICC查找表及多阶段变换，按实际数据长度校验维数并约束展开内存
+// 入参: data 标签数据, budget 剩余字节预算指针
+// 返回: *iccLUT 查找表, error 格式或预算错误
+func parseICCLUT(data []byte, budget *int64) (*iccLUT, error) {
 	if len(data) >= 4 && (string(data[:4]) == "mAB " || string(data[:4]) == "mBA ") {
-		return parseICCPipeline(data)
+		return parseICCPipeline(data, budget)
 	}
 	if len(data) < 48 {
 		return nil, fmt.Errorf("invalid ICC lookup table header")
@@ -155,6 +188,9 @@ func parseICCLUT(data []byte) (*iccLUT, error) {
 	}
 	if input*in+count+output*out > (len(data)-offset)/width {
 		return nil, fmt.Errorf("truncated ICC lookup table")
+	}
+	if err := iccReserveLUTBytes(budget, int64(input)*int64(in)+int64(count)+int64(output)*int64(out)); err != nil {
+		return nil, err
 	}
 	for i := range s.matrix {
 		s.matrix[i] = float64(int32(binary.BigEndian.Uint32(data[12+4*i:]))) / 65536

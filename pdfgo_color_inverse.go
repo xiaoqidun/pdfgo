@@ -18,16 +18,21 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
+	"sync/atomic"
 )
 
 // iccInverseSpace 按需读取共享逆向标签，不影响源颜色或配置身份
 type iccInverseSpace struct {
-	once    sync.Once
-	tags    map[string][]byte
-	lut     *iccLUTSpace
-	process [4]*iccProcessElements
-	err     error
+	once      sync.Once
+	tags      map[string][]byte
+	tagBytes  int64
+	initBytes int64
+	ready     atomic.Bool
+	lut       *iccLUTSpace
+	process   [4]*iccProcessElements
+	err       error
 }
 
 // newICCInverse 保存逆向标签快照，不解码普通绘制用不到的查找表
@@ -50,6 +55,7 @@ func newICCInverse(tags map[string][]byte, components int, pcs string) *iccInver
 		}
 		if inverse.tags[name] == nil {
 			inverse.tags[name] = bytes.Clone(data)
+			inverse.tagBytes += int64(len(data))
 		}
 	}
 	return inverse
@@ -131,7 +137,27 @@ func (s *iccInverseSpace) initialize() {
 			s.lut.fromPCS = [3]*iccLUT{}
 			s.process = [4]*iccProcessElements{}
 		}
+		var size int64
+		seenLUT := make(map[*iccLUT]bool, len(s.lut.fromPCS))
+		for _, lut := range s.lut.fromPCS {
+			if lut == nil || seenLUT[lut] {
+				continue
+			}
+			seenLUT[lut] = true
+			size += iccLUTMemoryBytes(lut)
+		}
+		seenProc := make(map[*iccProcessElements]bool, len(s.process))
+		for _, proc := range s.process {
+			if proc == nil || seenProc[proc] {
+				continue
+			}
+			seenProc[proc] = true
+			size += iccProcessMemoryBytes(proc)
+		}
+		s.initBytes = size
+		s.ready.Store(true)
 	}()
+	budget := maxICCLUTBytes
 	for i := range s.lut.fromPCS {
 		name := fmt.Sprintf("B2A%d", i)
 		if data := s.tags[name]; data != nil {
@@ -144,7 +170,7 @@ func (s *iccInverseSpace) initialize() {
 			if s.lut.fromPCS[i] != nil {
 				continue
 			}
-			s.lut.fromPCS[i], s.err = iccLookupTransform(data, 3, s.lut.components, s.lut.pcs, true)
+			s.lut.fromPCS[i], s.err = iccLookupTransform(data, 3, s.lut.components, s.lut.pcs, true, &budget)
 			if s.err != nil {
 				s.err = fmt.Errorf("ICC %s: %w", name, s.err)
 				return
@@ -163,6 +189,11 @@ func (s *iccInverseSpace) initialize() {
 			if s.process[i] != nil {
 				continue
 			}
+			elements, sized := iccProcessElementsFloatCount(data)
+			if sized && (elements > math.MaxInt64/8 || elements*8 > budget) {
+				s.err = fmt.Errorf("ICC %s: %w: ICC lookup table memory limit exceeded", name, ErrStreamLimitExceeded)
+				return
+			}
 			transform, err := parseICCProcessElements(data)
 			var unsupported *UnsupportedError
 			if errors.As(err, &unsupported) {
@@ -175,6 +206,12 @@ func (s *iccInverseSpace) initialize() {
 			if transform.input != 3 || transform.output != s.lut.components {
 				s.err = fmt.Errorf("invalid ICC %s channels", name)
 				return
+			}
+			if sized {
+				if err := iccReserveLUTBytes(&budget, elements); err != nil {
+					s.err = fmt.Errorf("ICC %s: %w", name, err)
+					return
+				}
 			}
 			s.process[i] = transform
 		}

@@ -343,6 +343,9 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			if len(font.glyphMap)%2 != 0 {
 				return nil, fmt.Errorf("invalid CIDToGIDMap length")
 			}
+			if font.glyphMap == nil {
+				font.glyphMap = []byte{}
+			}
 		}
 	} else if subtype == Name("TrueType") || (subtype == Name("Type1") || subtype == Name("MMType1")) || subtype == Name("Type3") {
 		var encoding Object

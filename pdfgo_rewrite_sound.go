@@ -100,7 +100,11 @@ func (r *Reader) soundReplacements(ctx context.Context, options RewriteOptions, 
 			if sounds == nil {
 				sounds = make(map[*SoundAction]Reference)
 				streams = make(map[Sound]Reference)
-				number = r.maxRewriteObjectID(result)
+				var err error
+				number, err = r.maxRewriteObjectID(ctx, result)
+				if err != nil {
+					return nil, err
+				}
 			}
 			volume := action.Sound.Volume
 			if math.IsNaN(volume) || math.IsInf(volume, 0) || volume < -1 || volume > 1 {

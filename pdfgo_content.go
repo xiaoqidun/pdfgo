@@ -90,6 +90,8 @@ func walkOperationsReader(ctx context.Context, data []byte, visit func(Operation
 			var err error
 			if b == '[' && warning != nil {
 				object, err = p.contentArray(ctx)
+			} else if b == '[' || b == '<' || b == '(' || b == '/' {
+				object, err = p.objectContext(ctx)
 			} else {
 				object, err = p.object()
 			}
@@ -428,6 +430,8 @@ func (p *objectParser) contentArray(ctx context.Context) (Array, error) {
 		var err error
 		if b == '[' {
 			object, err = p.contentArray(ctx)
+		} else if b == '<' || b == '(' || b == '/' {
+			object, err = p.objectContext(ctx)
 		} else {
 			object, err = p.object()
 		}

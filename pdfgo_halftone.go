@@ -38,21 +38,57 @@ type halftoneCacheEntry struct {
 	used     bool
 }
 
-// halftoneReadState 保存单次半色调解析的累计阈值内存预算与子网屏去重表
+// halftoneReadState 保存单次半色调解析的累计阈值与完整内存预算及子网屏去重表
 type halftoneReadState struct {
-	limit  int64
-	bytes  int64
-	cached map[Reference]halftoneCacheEntry
+	limit          int64
+	bytes          int64
+	thresholdLimit int64
+	thresholdBytes int64
+	cached         map[Reference]halftoneCacheEntry
 }
 
 // newHalftoneReadState 创建受生效流限制约束的单次半色调解析状态
 // 返回: *halftoneReadState 解析状态
 func (r *Reader) newHalftoneReadState() *halftoneReadState {
+	thresholdLimit := maxHalftoneThresholdBytes
 	limit := maxHalftoneThresholdBytes
-	if maxBytes, _ := effectiveStreamLimits(r, nil); maxBytes > 0 && maxBytes < limit {
-		limit = maxBytes
+	if maxBytes, _ := effectiveStreamLimits(r, nil); maxBytes > 0 {
+		if maxBytes < thresholdLimit {
+			thresholdLimit = maxBytes
+		}
+		if maxBytes < limit {
+			limit = max(maxBytes, 4096)
+		}
 	}
-	return &halftoneReadState{limit: limit}
+	return &halftoneReadState{limit: limit, thresholdLimit: thresholdLimit}
+}
+
+// halftoneMemoryBytes 估算单个网屏定义的完整内存占用，包含阈值表、名称、字典键值及固定开销
+// 入参: h 网屏定义
+// 返回: int64 估算字节数
+func halftoneMemoryBytes(h *Halftone) int64 {
+	cost := int64(256) + int64(len(h.Name)) + int64(len(h.Thresholds))*2
+	for key, value := range h.Dictionary {
+		cost += 64 + int64(len(key))
+		switch v := value.(type) {
+		case Name:
+			cost += int64(len(v))
+		case String:
+			cost += int64(len(v))
+		}
+	}
+	return cost
+}
+
+// reserveMemory 从半色调解析内存预算中扣减指定字节数
+// 入参: cost 待扣减字节数
+// 返回: error 超出预算时返回包装ErrStreamLimitExceeded的错误
+func (s *halftoneReadState) reserveMemory(cost int64) error {
+	if cost < 0 || cost > s.limit-s.bytes {
+		return fmt.Errorf("%w: halftone memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	s.bytes += cost
+	return nil
 }
 
 // Halftone 保存设备空间半色调定义，连续色调显示不需要网屏化
@@ -92,7 +128,7 @@ func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, er
 	ref, indirect := object.(Reference)
 	if indirect {
 		if cached, ok := r.halftones[ref]; ok {
-			return cloneHalftone(cached), nil
+			return cloneHalftoneContext(ctx, cached)
 		}
 	}
 	h, err := r.readHalftone(ctx, object, false, nil, nil, r.newHalftoneReadState())
@@ -101,7 +137,7 @@ func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, er
 			r.halftones = make(map[Reference]*Halftone)
 		}
 		r.halftones[ref] = h
-		return cloneHalftone(h), nil
+		return cloneHalftoneContext(ctx, h)
 	}
 	return h, err
 }
@@ -128,7 +164,7 @@ func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named
 	ref, indirect := object.(Reference)
 	if indirect {
 		if cached, ok := r.halftones[ref]; ok && !cached.namedOverride(named) {
-			return cloneHalftone(cached), nil
+			return cloneHalftoneContext(ctx, cached)
 		}
 	}
 	used := false
@@ -138,29 +174,51 @@ func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named
 			r.halftones = make(map[Reference]*Halftone)
 		}
 		r.halftones[ref] = h
-		return cloneHalftone(h), nil
+		return cloneHalftoneContext(ctx, h)
 	}
 	return h, err
 }
 
-// cloneHalftone 深拷贝网屏的可变字段，隔离内部缓存与外部修改
-// 入参: h 源网屏定义
-// 返回: *Halftone 独立副本
-func cloneHalftone(h *Halftone) *Halftone {
+// cloneHalftoneContext 在取消上下文内深拷贝网屏的可变字段，隔离内部缓存与外部修改
+// 入参: ctx 取消上下文, h 源网屏定义
+// 返回: *Halftone 独立副本, error 取消错误
+func cloneHalftoneContext(ctx context.Context, h *Halftone) (*Halftone, error) {
 	if h == nil {
-		return nil
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	cloned := *h
 	cloned.Name = bytes.Clone(h.Name)
-	cloned.Dictionary = maps.Clone(h.Dictionary)
+	if h.Dictionary != nil {
+		cloned.Dictionary = make(Dictionary, len(h.Dictionary))
+		steps := 0
+		for key, value := range h.Dictionary {
+			if steps&255 == 255 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			cloned.Dictionary[key] = value
+			steps++
+		}
+	}
 	cloned.Thresholds = slices.Clone(h.Thresholds)
 	if h.Components != nil {
 		cloned.Components = make(map[Name]*Halftone, len(h.Components))
 		for key, part := range h.Components {
-			cloned.Components[key] = cloneHalftone(part)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			copied, err := cloneHalftoneContext(ctx, part)
+			if err != nil {
+				return nil, err
+			}
+			cloned.Components[key] = copied
 		}
 	}
-	return &cloned
+	return &cloned, nil
 }
 
 // namedOverride 检查缓存定义及其单层分量是否被设备名称覆盖
@@ -291,11 +349,17 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 		return nil, fmt.Errorf("invalid halftone object type")
 	}
 	if !ok {
+		if err := state.reserveMemory(halftoneMemoryBytes(h)); err != nil {
+			return nil, err
+		}
 		return h, nil
 	}
 	if kind == 5 {
 		if component || isStream {
 			return nil, fmt.Errorf("invalid component halftone type")
+		}
+		if err := state.reserveMemory(halftoneMemoryBytes(h)); err != nil {
+			return nil, err
 		}
 		h.Components = make(map[Name]*Halftone)
 		for _, key := range slices.Sorted(maps.Keys(dict)) {
@@ -314,12 +378,20 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 						h.Components[key] = cached.halftone
 						continue
 					}
-					cost := int64(len(cached.halftone.Thresholds)) * 2
-					if cost > state.limit-state.bytes {
+					thresholdCost := int64(len(cached.halftone.Thresholds)) * 2
+					if thresholdCost > state.thresholdLimit-state.thresholdBytes {
 						return nil, fmt.Errorf("%w: halftone threshold memory limit exceeded", ErrStreamLimitExceeded)
 					}
-					state.bytes += cost
-					h.Components[key] = cloneHalftone(cached.halftone)
+					memCost := halftoneMemoryBytes(cached.halftone)
+					if err := state.reserveMemory(memCost); err != nil {
+						return nil, err
+					}
+					state.thresholdBytes += thresholdCost
+					copied, err := cloneHalftoneContext(ctx, cached.halftone)
+					if err != nil {
+						return nil, err
+					}
+					h.Components[key] = copied
 					continue
 				}
 			}
@@ -384,6 +456,9 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 			}
 			h.AccurateScreens = bool(flag)
 		}
+		if err := state.reserveMemory(halftoneMemoryBytes(h)); err != nil {
+			return nil, err
+		}
 		return h, nil
 	}
 	if kind != 6 && kind != 10 && kind != 16 {
@@ -436,8 +511,12 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 	if kind == 10 {
 		pairs = [][2]int{{h.Xsquare, h.Xsquare}, {h.Ysquare, h.Ysquare}}
 	}
+	if err := state.reserveMemory(halftoneMemoryBytes(h)); err != nil {
+		return nil, err
+	}
 	var count uint64
-	remainingPixels := uint64((state.limit - state.bytes) / 2)
+	remainingBytes := min(state.thresholdLimit-state.thresholdBytes, state.limit-state.bytes)
+	remainingPixels := uint64(remainingBytes / 2)
 	for _, pair := range pairs {
 		if pair[0] == 0 {
 			continue
@@ -466,7 +545,9 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 	if count != limit || uint64(len(data))%width != 0 {
 		return nil, fmt.Errorf("invalid halftone threshold length")
 	}
-	state.bytes += int64(count) * 2
+	thresholdCost := int64(count) * 2
+	state.thresholdBytes += thresholdCost
+	state.bytes += thresholdCost
 	h.Thresholds = make([]uint16, int(count))
 	for i := range h.Thresholds {
 		if kind == 16 {
@@ -496,7 +577,7 @@ func (h *Halftone) identityTransfer(reader *Reader, depth int) (bool, error) {
 		return false, fmt.Errorf("halftone recursion limit exceeded")
 	}
 	if !reader.ownsObject(h.reader, h.cache) {
-		reader = h.reader
+		reader = h.reader.Fork(ForkOptions{})
 	}
 	if reader == nil {
 		return false, fmt.Errorf("missing halftone reader")

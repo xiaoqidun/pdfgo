@@ -45,6 +45,14 @@ type TilingPattern struct {
 	empty          bool
 }
 
+// tilingPatternCache 按名称和流有界复用平铺图案，大流通过单槽共享避免重复解压与常驻滞留
+type tilingPatternCache struct {
+	byName   map[Name]*TilingPattern
+	byStream map[*Stream]*TilingPattern
+	last     *TilingPattern
+	bytes    int64
+}
+
 // patternBaseColor 按底层颜色空间解释无色图案的颜色分量
 // 入参: paint 当前画刷, space 底层色空间, operands 颜色分量, intent 渲染意图
 // 返回: error 分量或颜色转换错误
@@ -141,8 +149,10 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if p.reader.closed {
 		return nil, os.ErrClosed
 	}
-	if pattern := p.tilingPatterns[name]; pattern != nil {
-		return pattern, nil
+	if p.tilings != nil {
+		if pattern := p.tilings.byName[name]; pattern != nil {
+			return pattern, nil
+		}
 	}
 	object, err := p.resource("Pattern", name)
 	if err != nil {
@@ -189,6 +199,20 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 				return nil, err
 			}
 			return &TilingPattern{Matrix: Identity(), XStep: 1, YStep: 1, PaintType: int(paintType), reader: p.reader, page: p.page, stream: stream, depth: p.depth + 1, glyphStreams: p.glyphStreams, formStreams: p.formStreams, patternStreams: p.patternStreams, empty: true}, nil
+		}
+	}
+	if p.tilings != nil {
+		if cached := p.tilings.byStream[stream]; cached != nil {
+			if len(p.tilings.byName) < 1024 {
+				if p.tilings.byName == nil {
+					p.tilings.byName = make(map[Name]*TilingPattern)
+				}
+				p.tilings.byName[name] = cached
+			}
+			return cached, nil
+		}
+		if p.tilings.last != nil && p.tilings.last.stream == stream {
+			return p.tilings.last, nil
 		}
 	}
 	value, err = p.reader.Resolve(dict["TilingType"])
@@ -251,15 +275,37 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 			return nil, fmt.Errorf("invalid tiling pattern resources")
 		}
 	}
-	data, _, err := p.formData(stream)
-	if err != nil {
-		return nil, err
+	var data []byte
+	if !empty {
+		data, _, err = p.formData(stream)
+		if err != nil {
+			return nil, err
+		}
 	}
 	pattern := &TilingPattern{BBox: box, Matrix: matrix, XStep: xstep, YStep: ystep, PaintType: int(paintType), reader: p.reader, resources: resourceDict, pageResources: p.pageResources, data: data, depth: p.depth + 1, glyphStreams: p.glyphStreams, formStreams: p.formStreams, patternStreams: p.patternStreams, initial: p.patternInitialState(), blendingSpace: p.blendingSpace, maskGroup: p.maskGroup, halftones: p.visitor.Halftones, empty: empty}
 	pattern.page, pattern.stream = p.page, stream
-	if p.tilingPatterns == nil {
-		p.tilingPatterns = make(map[Name]*TilingPattern)
+	if p.tilings == nil {
+		p.tilings = &tilingPatternCache{}
 	}
-	p.tilingPatterns[name] = pattern
+	budget := int64(formCacheLimit)
+	if maxBytes, _ := effectiveStreamLimits(p.reader, nil); maxBytes > 0 && maxBytes < budget {
+		budget = maxBytes
+	}
+	cost := int64(len(data)) + 256
+	if len(p.tilings.byStream) < 1024 && cost <= budget-p.tilings.bytes {
+		if p.tilings.byStream == nil {
+			p.tilings.byStream = make(map[*Stream]*TilingPattern)
+		}
+		p.tilings.byStream[stream] = pattern
+		p.tilings.bytes += cost
+		if len(p.tilings.byName) < 1024 {
+			if p.tilings.byName == nil {
+				p.tilings.byName = make(map[Name]*TilingPattern)
+			}
+			p.tilings.byName[name] = pattern
+		}
+	} else {
+		p.tilings.last = pattern
+	}
 	return pattern, nil
 }

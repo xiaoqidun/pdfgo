@@ -107,25 +107,38 @@ func pdfImagePhotographic(ctx context.Context, img image.Image, gray bool) (bool
 		return photographicImage(ctx, img)
 	}
 	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if b.Empty() || w <= 0 || h <= 0 {
+		return false, ctx.Err()
+	}
 	var seen [256]bool
 	unique, count, edges := 0, 0, 0
-	for y := b.Min.Y; y < b.Max.Y; y += max(1, b.Dy()/128) {
+	stepY, stepX := max(1, h/128), max(1, w/128)
+	for dy := 0; ; dy += stepY {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		for x := b.Min.X; x < b.Max.X; x += max(1, b.Dx()/128) {
+		y := b.Min.Y + dy
+		for dx := 0; ; dx += stepX {
+			x := b.Min.X + dx
 			c := imageNRGBAAt(img, x, y).R
 			if !seen[c] {
 				seen[c] = true
 				unique++
 			}
-			if x+1 < b.Max.X {
+			if dx+1 < w {
 				d := imageNRGBAAt(img, x+1, y).R
 				if math.Abs(float64(c)-float64(d)) > 40 {
 					edges++
 				}
 				count++
 			}
+			if dx >= w-stepX {
+				break
+			}
+		}
+		if dy >= h-stepY {
+			break
 		}
 	}
 	return unique > 32 && edges*20 < count, ctx.Err()
@@ -771,7 +784,8 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 	defer cleanup()
 	formCache := make(map[Reference]*cachedFormImages)
 	formActive := make(map[Reference]bool)
-	patternActive := make(map[Reference]bool)
+	patternCache := make(map[Reference]*cachedFormImages)
+	patternActive := make(map[Reference]uint8)
 	resolveObjectRef := func(value Object) (Object, Reference, error) {
 		return r.resolveOptimizationObjectRef(value, cached, "cyclic image reference")
 	}
@@ -1035,11 +1049,17 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 	errUnsafe := errors.New("global unsafe")
 	var walk func([]byte, Dictionary, Matrix, int, *int, map[imagePlacementKey]struct{}, map[Reference]bool) error
 	walkPatterns := func(resources Dictionary, initialMatrix Matrix, depth int, budget *int, collector map[imagePlacementKey]struct{}, localUnsafe map[Reference]bool) error {
-		if resources == nil || resources["Pattern"] == nil || depth > 32 {
+		if resources == nil || resources["Pattern"] == nil {
 			return nil
+		}
+		if depth > 32 {
+			return errUnsafe
 		}
 		val, err := r.Resolve(resources["Pattern"])
 		if err != nil {
+			if isFatalOptimizationReadError(ctx, err) {
+				return err
+			}
 			return nil
 		}
 		patterns, ok := val.(Dictionary)
@@ -1050,61 +1070,150 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if *budget <= 0 {
+				return errUnsafe
+			}
+			*budget--
+			if patRef, ok := entry.(Reference); ok && patRef.Number > 0 {
+				if active := patternActive[patRef]; active != 0 {
+					if active == 2 {
+						return errUnsafe
+					}
+					continue
+				}
+				if cachedEntry, ok := patternCache[patRef]; ok {
+					if !applyCachedForm(cachedEntry, initialMatrix, collector, localUnsafe) {
+						return errUnsafe
+					}
+					continue
+				}
+			}
 			obj, ref, err := resolveObjectRef(entry)
 			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
+				}
 				continue
+			}
+			if ref.Number > 0 {
+				if active := patternActive[ref]; active != 0 {
+					if active == 2 {
+						return errUnsafe
+					}
+					continue
+				}
+				if cachedEntry, ok := patternCache[ref]; ok {
+					if !applyCachedForm(cachedEntry, initialMatrix, collector, localUnsafe) {
+						return errUnsafe
+					}
+					continue
+				}
 			}
 			patStream, ok := obj.(*Stream)
 			if !ok {
 				continue
 			}
 			kind, err := r.Resolve(patStream.Dictionary["PatternType"])
-			if err != nil || kind != Integer(1) {
+			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return err
+				}
 				continue
 			}
-			if ref.Number > 0 && patternActive[ref] {
+			if kind != Integer(1) {
 				continue
 			}
 			patRes := resources
+			hasOwnRes := false
 			if patStream.Dictionary["Resources"] != nil {
 				resVal, err := r.Resolve(patStream.Dictionary["Resources"])
 				if err != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
+					if isFatalOptimizationReadError(ctx, err) {
+						return err
 					}
 					return errUnsafe
 				}
 				if resDict, ok := resVal.(Dictionary); ok {
 					patRes = resDict
+					hasOwnRes = true
 				} else if resVal != nil {
 					return errUnsafe
 				}
 			}
 			patMatrix := Identity()
+			matrixErr := false
 			if patStream.Dictionary["Matrix"] != nil {
 				mVal, err := r.Resolve(patStream.Dictionary["Matrix"])
 				if err != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
+					if isFatalOptimizationReadError(ctx, err) {
+						return err
 					}
-					if !markResourcesUnsafe(patRes, localUnsafe, map[Reference]bool{ref: true}, 0) {
+					matrixErr = true
+				} else if mVal != nil {
+					values, err := r.numberArray(mVal, 6)
+					if err != nil {
+						matrixErr = true
+					} else {
+						patMatrix = Matrix(values)
+					}
+				}
+			}
+			if hasOwnRes && ref.Number > 0 {
+				if matrixErr {
+					subUnsafe := make(map[Reference]bool)
+					cachedEntry := &cachedFormImages{}
+					if !markResourcesUnsafe(patRes, subUnsafe, map[Reference]bool{ref: true}, 0) {
+						cachedEntry.opaqueError = true
+					} else {
+						cachedEntry.unsafe = slices.Collect(maps.Keys(subUnsafe))
+					}
+					patternCache[ref] = cachedEntry
+					if !applyCachedForm(cachedEntry, initialMatrix, collector, localUnsafe) {
 						return errUnsafe
 					}
 					continue
 				}
-				if mVal != nil {
-					values, err := r.numberArray(mVal, 6)
-					if err != nil {
-						if !markResourcesUnsafe(patRes, localUnsafe, map[Reference]bool{ref: true}, 0) {
-							return errUnsafe
-						}
-						continue
-					}
-					patMatrix = Matrix(values)
+				patternActive[ref] = 2
+				patternBudget := 100000
+				subCollector := make(map[imagePlacementKey]struct{})
+				subUnsafe := make(map[Reference]bool)
+				content, decodeErr := r.optimizationContentData(ctx, patStream, optimizationBufferLimit)
+				walkErr := decodeErr
+				if walkErr == nil {
+					walkErr = walk(content, patRes, patMatrix, depth+1, &patternBudget, subCollector, subUnsafe)
 				}
+				delete(patternActive, ref)
+				if isFatalOptimizationReadError(ctx, walkErr) || errors.Is(walkErr, errUnsafe) {
+					return walkErr
+				}
+				var cachedEntry *cachedFormImages
+				if walkErr != nil || len(subCollector) > 10000 {
+					cachedEntry = &cachedFormImages{}
+					if !markResourcesUnsafe(patRes, subUnsafe, map[Reference]bool{ref: true}, 0) {
+						cachedEntry.opaqueError = true
+					} else {
+						cachedEntry.unsafe = slices.Collect(maps.Keys(subUnsafe))
+					}
+				} else {
+					cachedEntry = &cachedFormImages{
+						placements: slices.Collect(maps.Keys(subCollector)),
+						unsafe:     slices.Collect(maps.Keys(subUnsafe)),
+					}
+				}
+				patternCache[ref] = cachedEntry
+				if !applyCachedForm(cachedEntry, initialMatrix, collector, localUnsafe) {
+					return errUnsafe
+				}
+				continue
+			}
+			if matrixErr {
+				if !markResourcesUnsafe(patRes, localUnsafe, map[Reference]bool{ref: true}, 0) {
+					return errUnsafe
+				}
+				continue
 			}
 			if ref.Number > 0 {
-				patternActive[ref] = true
+				patternActive[ref] = 1
 			}
 			content, decodeErr := r.optimizationContentData(ctx, patStream, optimizationBufferLimit)
 			walkErr := decodeErr
@@ -1127,7 +1236,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 	}
 	walk = func(data []byte, resources Dictionary, matrix Matrix, depth int, budget *int, collector map[imagePlacementKey]struct{}, localUnsafe map[Reference]bool) error {
 		if depth > 32 {
-			return fmt.Errorf("image placement recursion limit exceeded")
+			return errUnsafe
 		}
 		initialMatrix := matrix
 		var stack []Matrix
@@ -1239,7 +1348,7 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 							walkErr = walk(content, childResources, formMatrix, depth+1, &formBudget, subCollector, subUnsafe)
 						}
 						delete(formActive, ref)
-						if isFatalOptimizationReadError(ctx, walkErr) {
+						if isFatalOptimizationReadError(ctx, walkErr) || errors.Is(walkErr, errUnsafe) {
 							return walkErr
 						}
 						var entry *cachedFormImages
@@ -2756,7 +2865,17 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 	if downscale {
 		smaskTarget = image.Pt(max(1, int(math.Ceil(float64(sw)*scale))), max(1, int(math.Ceil(float64(sh)*scale))))
 	}
-	matteVal, _ := r.optimizationValue(smaskStream.Dictionary["Matte"])
+	matteVal, matteErr := r.optimizationValue(smaskStream.Dictionary["Matte"])
+	if matteErr != nil {
+		if isFatalOptimizationReadError(ctx, matteErr) {
+			return nil, nil, false, matteErr
+		}
+		baseMain, err := r.optimizeStreamSizeWithContext(ctx, mainStream, losslessOpts, image.Point{}, colorResources, false)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return finish(baseMain, baseSMask, false)
+	}
 	if matteVal != nil {
 		baseMain, err := r.optimizeStreamSizeWithContext(ctx, mainStream, losslessOpts, image.Point{}, colorResources, false)
 		if err != nil {

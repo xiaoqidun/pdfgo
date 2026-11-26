@@ -234,7 +234,7 @@ func writeAnnotationOperand(content *strings.Builder, value Object) error {
 
 // ReadAnnotationText 读取注解文本字段并响应取消，RC和RV允许文本流，其他字段要求文本字符串
 // 入参: ctx 取消上下文, annotation 注解, field 文本字段名
-// 返回: string Unicode文本, error 引用、类型、编码或取消错误
+// 返回: string Unicode文本, error 引用、类型、编码、超限或取消错误
 func (r *Reader) ReadAnnotationText(ctx context.Context, annotation Annotation, field Name) (string, error) {
 	var warning func(Diagnostic)
 	if r != nil {
@@ -245,7 +245,7 @@ func (r *Reader) ReadAnnotationText(ctx context.Context, annotation Annotation, 
 
 // readAnnotationText 按指定警告回调读取注解文本并响应取消，取消错误不作为异常字段忽略
 // 入参: ctx 取消上下文, annotation 注解, field 文本字段名, warning 异常字段警告，空值使用严格检查
-// 返回: string Unicode文本, error 引用、类型、编码或取消错误
+// 返回: string Unicode文本, error 引用、类型、编码、超限或取消错误
 func (r *Reader) readAnnotationText(ctx context.Context, annotation Annotation, field Name, warning func(Diagnostic)) (string, error) {
 	if ctx == nil {
 		return "", fmt.Errorf("missing annotation text context")
@@ -260,9 +260,14 @@ func (r *Reader) readAnnotationText(ctx context.Context, annotation Annotation, 
 	if err != nil || value == nil {
 		return "", err
 	}
+	limit := annotationRichContentLimit(r)
 	var data String
 	switch value := value.(type) {
 	case String:
+		if len(value) > 3 && (len(value)-3)/2 > limit {
+			err = fmt.Errorf("%w: annotation text limit exceeded", ErrStreamLimitExceeded)
+			break
+		}
 		data = value
 	case *Stream:
 		if field != "RC" && field != "RV" {
@@ -274,7 +279,7 @@ func (r *Reader) readAnnotationText(ctx context.Context, annotation Annotation, 
 			break
 		}
 		var decoded []byte
-		decoded, err = r.DecodeStreamContext(ctx, value)
+		decoded, err = r.decodeAnnotationTextStream(ctx, value, int64(limit))
 		data = String(decoded)
 	default:
 		err = fmt.Errorf("invalid annotation %s: expected text string", field)
@@ -282,6 +287,9 @@ func (r *Reader) readAnnotationText(ctx context.Context, annotation Annotation, 
 	var text string
 	if err == nil {
 		text, err = DecodeTextString(data)
+		if err == nil && len(text) > limit {
+			err = fmt.Errorf("%w: annotation text limit exceeded", ErrStreamLimitExceeded)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -317,9 +325,22 @@ func (r *Reader) formDefaults() (Dictionary, error) {
 	return form, nil
 }
 
+// decodeAnnotationTextStream 按指定字节上限解码注解文本流，不放大默认流上限
+// 入参: ctx 取消上下文, stream 数据流, limit 最大解压字节数
+// 返回: []byte 独立解码数据, error 解码、超限或取消错误
+func (r *Reader) decodeAnnotationTextStream(ctx context.Context, stream *Stream, limit int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !r.ownsObject(stream.reader, stream.cache) {
+		return nil, fmt.Errorf("stream belongs to another reader")
+	}
+	return stream.decodeWithLimit(ctx, r, r.warning, 0, limit)
+}
+
 // annotationTextString 读取文本字符串或文本流，并统一换行符
 // 入参: ctx 取消上下文, object 文本对象
-// 返回: string Unicode文本, error 引用、类型、编码或取消错误
+// 返回: string Unicode文本, error 引用、类型、编码、超限或取消错误
 func (r *Reader) annotationTextString(ctx context.Context, object Object) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -331,15 +352,19 @@ func (r *Reader) annotationTextString(ctx context.Context, object Object) (strin
 	if err != nil || value == nil {
 		return "", err
 	}
+	limit := annotationRichContentLimit(r)
 	var data []byte
 	switch value := value.(type) {
 	case String:
+		if len(value) > 3 && (len(value)-3)/2 > limit {
+			return "", fmt.Errorf("%w: annotation text limit exceeded", ErrStreamLimitExceeded)
+		}
 		data = value
 	case *Stream:
 		if value == nil {
 			return "", fmt.Errorf("missing annotation text stream")
 		}
-		data, err = r.DecodeStreamContext(ctx, value)
+		data, err = r.decodeAnnotationTextStream(ctx, value, int64(limit))
 		if err != nil {
 			return "", err
 		}
@@ -349,6 +374,9 @@ func (r *Reader) annotationTextString(ctx context.Context, object Object) (strin
 	text, err := DecodeTextString(data)
 	if err != nil {
 		return "", err
+	}
+	if len(text) > limit {
+		return "", fmt.Errorf("%w: annotation text limit exceeded", ErrStreamLimitExceeded)
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -610,7 +638,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		return nil
 	}
 	if !free && dict["FT"] == Name("Ch") {
-		value, err := r.readChoiceField(dict)
+		value, err := r.readChoiceFieldContext(ctx, dict)
 		if err != nil {
 			return err
 		}
@@ -634,12 +662,26 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			text = choice.Values[0]
 		}
 	} else {
-		labels := make([]string, 0, len(choice.Options)-choice.TopIndex)
+		contentLimit := annotationRichContentLimit(r)
+		var builder strings.Builder
 		normalize := strings.NewReplacer("\r", " ", "\n", " ")
-		for _, option := range choice.Options[choice.TopIndex:] {
-			labels = append(labels, normalize.Replace(option.Label))
+		for i, option := range choice.Options[choice.TopIndex:] {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			extra := len(option.Label)
+			if i > 0 {
+				extra++
+			}
+			if extra > contentLimit-builder.Len() {
+				return fmt.Errorf("%w: choice field text limit exceeded", ErrStreamLimitExceeded)
+			}
+			if i > 0 {
+				builder.WriteByte('\n')
+			}
+			builder.WriteString(normalize.Replace(option.Label))
 		}
-		text = strings.Join(labels, "\n")
+		text = builder.String()
 	}
 	if err != nil {
 		return err
@@ -736,7 +778,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			candidate := (low + high) / 2
+			candidate := low + (high-low)/2
 			lines := annotationLines(letters, p.state, candidate, width, multiline)
 			leading := p.state.leading
 			if leading <= 0 {
@@ -761,7 +803,7 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 		}
 		size = low
 	}
-	if size <= 0 {
+	if size <= 0 || math.IsNaN(size) || math.IsInf(size, 0) {
 		return fmt.Errorf("invalid automatic font size")
 	}
 	content.WriteString("q\n")
@@ -769,6 +811,9 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	leading := p.state.leading
 	if leading <= 0 {
 		leading = size * 1.2
+	}
+	if leading <= 0 || math.IsNaN(leading) || math.IsInf(leading, 0) {
+		return fmt.Errorf("invalid text line spacing")
 	}
 	if list {
 		content.WriteString("q\n")
@@ -779,8 +824,12 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			}
 			row := selected - choice.TopIndex
 			if row >= 0 && float64(row)*leading < height {
+				top := y + height - float64(row+1)*leading
+				if !finiteFloats([]float64{x, top, width, leading}) {
+					return fmt.Errorf("list selection background exceeds coordinate range")
+				}
 				content.WriteString("q 0.153 0.392 0.714 rg\n")
-				writeAnnotationOperation(content, "re f Q", x, y+height-float64(row+1)*leading, width, leading)
+				writeAnnotationOperation(content, "re f Q", x, top, width, leading)
 				if content.Len() > contentLimit {
 					return fmt.Errorf("%w: text appearance content limit exceeded", ErrStreamLimitExceeded)
 				}
@@ -916,6 +965,7 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 	var fontName Name
 	var stateContent strings.Builder
 	contentLimit := annotationRichContentLimit(r)
+	var gsCache annotationGraphicsStateCache
 	matrices := 0
 	hasFont := false
 	err = walkOperationsBorrowed(ctx, appearance, func(op Operation) error {
@@ -949,7 +999,7 @@ func (r *Reader) annotationTextState(ctx context.Context, object Object, resourc
 			p.state.fontSize = 0
 		}
 		if op.Operator == "gs" {
-			name, rewritten, err := r.annotationTextGraphicsState(p, op)
+			name, rewritten, err := r.annotationTextGraphicsState(p, op, &gsCache)
 			if err != nil {
 				return err
 			}

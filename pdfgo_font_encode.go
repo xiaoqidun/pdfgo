@@ -271,11 +271,17 @@ func (f *Font) characterLookup(ctx context.Context, wanted map[rune]bool) (map[r
 		}
 		ch, _ := utf8.DecodeRuneInString(glyph.Text)
 		entry := fontEncodedGlyph{code: code, glyph: glyph}
-		if wanted['\u00a0'] && !f.composite && f.encoding == "WinAnsiEncoding" && code == "\xa0" && glyph.Name == "space" && glyph.Text == " " && f.Unicode[code] == "" {
-			lookup['\u00a0'] = entry
+		nbspSpace := glyph.Name == "space" || glyph.Name == "" && f.Subtype == "TrueType" && (f.differences[0xa0] == "" || f.differences[0xa0] == "space")
+		if wanted['\u00a0'] && !f.composite && f.encoding == "WinAnsiEncoding" && code == "\xa0" && nbspSpace && glyph.Text == " " && f.Unicode[code] == "" {
+			if _, ok := lookup['\u00a0']; !ok {
+				lookup['\u00a0'] = entry
+			}
 		}
 		if _, ok := lookup[ch]; !ok && wanted[ch] {
 			lookup[ch] = entry
+		}
+		if len(lookup) == len(wanted) {
+			break
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -348,7 +354,11 @@ func (f *Font) encodingGlyph(ctx context.Context, code string) (Glyph, bool, err
 	}
 	if f.cidMap != nil {
 		data := []byte(code)
-		if n, valid := f.cidMap.next(data); !valid || n != len(data) {
+		n, valid, err := f.cidMap.nextContext(ctx, data)
+		if err != nil {
+			return Glyph{}, false, err
+		}
+		if !valid || n != len(data) {
 			return Glyph{}, false, nil
 		}
 		mapped := false

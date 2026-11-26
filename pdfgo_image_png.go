@@ -99,10 +99,10 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 		return fmt.Errorf("missing PNG image")
 	}
 	bounds := source.Bounds()
-	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
+	if bounds.Empty() || bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
 		return fmt.Errorf("invalid PNG dimensions")
 	}
-	if err := validatePalettedImage(ctx, source); err != nil {
+	if err := validateSourceImage(ctx, source); err != nil {
 		return err
 	}
 	if palette, ok := source.ColorModel().(color.Palette); ok {
@@ -219,7 +219,7 @@ func newPNGImageEncoderWithCompression(ctx context.Context, writer io.Writer, bo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
+	if bounds.Empty() || bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
 		return nil, fmt.Errorf("invalid PNG dimensions")
 	}
 	stride, _, err := imageSampleSize(bounds.Dx(), 1, channels, depth)

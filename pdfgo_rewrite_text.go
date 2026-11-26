@@ -120,7 +120,10 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 	if len(changes) == 0 {
 		return nil, false, nil
 	}
-	number := r.maxRewriteObjectID(result)
+	number, err := r.maxRewriteObjectID(ctx, result)
+	if err != nil {
+		return nil, false, err
+	}
 	var pending map[Reference][]byte
 	if deferCompress {
 		pending = make(map[Reference][]byte, len(changes))
@@ -128,7 +131,7 @@ func (r *Reader) textReplacements(ctx context.Context, changes map[Reference][]T
 	seen := make(map[Reference]bool)
 	matched := make(map[Reference]bool, len(changes))
 	changed := false
-	err := r.WalkPages(ctx, func(_ int, source *Page) error {
+	err = r.WalkPages(ctx, func(_ int, source *Page) error {
 		if source.Reference != (Reference{}) {
 			if seen[source.Reference] {
 				return nil
@@ -303,9 +306,12 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 
 // transformPageContent 逐页替换内容流，独立封装共享内容并保留已有页面修改
 // 入参: ctx 取消上下文, transform 内容变换, pending 文字替换后的未压缩页面内容, result 本次替换对象, compressLevel 流压缩级别
-// 返回: error 读取、变换或写出错误
+// 返回: error 读取、变换、写出或取消错误
 func (r *Reader) transformPageContent(ctx context.Context, transform func(context.Context, *Page, []byte) ([]byte, error), pending map[Reference][]byte, result map[Reference]Object, compressLevel int) error {
-	number := r.maxRewriteObjectID(result)
+	number, err := r.maxRewriteObjectID(ctx, result)
+	if err != nil {
+		return err
+	}
 	seen := make(map[Reference]bool)
 	return r.rewriteReader(result).WalkPages(ctx, func(_ int, page *Page) error {
 		if page.Reference != (Reference{}) {

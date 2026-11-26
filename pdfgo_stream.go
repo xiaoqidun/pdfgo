@@ -1076,10 +1076,17 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 	return s.decodeWith(ctx, nil, warning, 0)
 }
 
-// decodeWith 按调用方阅读器、诊断策略及可选字节上限解码通用流
-// 入参: ctx 取消上下文, reader 解析间接过滤器用的阅读器, warning 恢复诊断, limit 数据上限，零值沿用通用解码
+// decodeWith 按调用方阅读器、诊断策略及可选恢复上限解码通用流
+// 入参: ctx 取消上下文, reader 解析间接过滤器用的阅读器, warning 恢复诊断, limit 恢复数据上限，零值沿用通用解码
 // 返回: []byte 独立解码数据, error 解码、超限或取消错误
 func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Diagnostic), limit int64) ([]byte, error) {
+	return s.decodeWithLimit(ctx, reader, warning, limit, 0)
+}
+
+// decodeWithLimit 按调用方阅读器、诊断策略及可选上限覆盖解码通用流，不修改阅读器状态
+// 入参: ctx 取消上下文, reader 解析间接过滤器用的阅读器, warning 恢复诊断, limit 恢复数据上限，零值沿用通用解码, maxBytesLimit 当前流解压字节上限覆盖
+// 返回: []byte 独立解码数据, error 解码、超限或取消错误
+func (s *Stream) decodeWithLimit(ctx context.Context, reader *Reader, warning func(Diagnostic), limit, maxBytesLimit int64) ([]byte, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("invalid stream context")
 	}
@@ -1091,6 +1098,9 @@ func (s *Stream) decodeWith(ctx context.Context, reader *Reader, warning func(Di
 		return nil, err
 	}
 	maxBytes, _ := effectiveStreamLimits(reader, s)
+	if maxBytesLimit > 0 && (maxBytes == 0 || maxBytesLimit < maxBytes) {
+		maxBytes = maxBytesLimit
+	}
 	if limit > 0 && (maxBytes == 0 || limit < maxBytes) {
 		maxBytes = limit
 	}

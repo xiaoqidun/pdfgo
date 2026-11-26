@@ -107,7 +107,7 @@ func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options Halft
 	_, primary := transferChannel(options.Colorant)
 	requireTransfer := compound && !primary && options.Colorant != ""
 	if requireTransfer {
-		if err := r.defaultColorantTransfer(h, options.Named); err != nil {
+		if err := r.defaultColorantTransfer(ctx, h, options.Named); err != nil {
 			return nil, err
 		}
 	}
@@ -126,7 +126,7 @@ func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options Halft
 	}
 	transferReader := r
 	if !r.ownsObject(h.reader, h.cache) {
-		r = h.reader
+		r = h.reader.Fork(ForkOptions{})
 	}
 	if r.closed {
 		return nil, os.ErrClosed
@@ -473,6 +473,9 @@ func (s *HalftoneScreen) Apply(ctx context.Context, source *image.Gray16) (*imag
 		return nil, fmt.Errorf("truncated halftone source pixels")
 	}
 	result := image.NewGray16(source.Bounds())
+	if width == 0 || height == 0 {
+		return result, nil
+	}
 	for y := source.Rect.Min.Y; y < source.Rect.Max.Y; y++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err

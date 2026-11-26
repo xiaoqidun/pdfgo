@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"math"
 	"strconv"
@@ -249,6 +250,18 @@ func (p *objectParser) streamDataStart() bool {
 // object 读取单个PDF对象
 // 返回: Object 对象，null对应nil, error 语法错误
 func (p *objectParser) object() (Object, error) {
+	return p.objectContext(nil)
+}
+
+// objectContext 在可选取消上下文内读取单个PDF对象并在复合对象长循环中响应取消
+// 入参: ctx 可选取消上下文，nil表示不检查取消
+// 返回: Object 对象，null对应nil, error 语法或取消错误
+func (p *objectParser) objectContext(ctx context.Context) (Object, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	p.skipSpace()
 	if p.pos == len(p.data) {
 		return nil, p.fail("unexpected end of object")
@@ -260,18 +273,23 @@ func (p *objectParser) object() (Object, error) {
 	defer func() { p.depth-- }()
 	switch p.data[p.pos] {
 	case '/':
-		return p.name()
+		return p.name(ctx)
 	case '(':
-		return p.literalString()
+		return p.literalString(ctx)
 	case '<':
 		if p.pos+1 < len(p.data) && p.data[p.pos+1] == '<' {
-			return p.dictionary()
+			return p.dictionary(ctx)
 		}
-		return p.hexString()
+		return p.hexString(ctx)
 	case '[':
 		p.pos++
 		values := Array{}
-		for {
+		for steps := 0; ; steps++ {
+			if ctx != nil && steps&255 == 255 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			p.skipSpace()
 			if p.pos == len(p.data) && p.final && p.warning != nil {
 				p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "array closed at source EOF; parsed elements retained"})
@@ -281,7 +299,7 @@ func (p *objectParser) object() (Object, error) {
 				p.pos++
 				return values, nil
 			}
-			value, err := p.object()
+			value, err := p.objectContext(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -354,8 +372,9 @@ func (p *objectParser) integerOrReference(value int64) Object {
 }
 
 // name 读取名称并解除十六进制转义
-// 返回: Object 名称对象, error 语法错误
-func (p *objectParser) name() (Object, error) {
+// 入参: ctx 可选取消上下文
+// 返回: Object 名称对象, error 语法或取消错误
+func (p *objectParser) name(ctx context.Context) (Object, error) {
 	p.pos++
 	start := p.pos
 	for p.pos < len(p.data) && !isDelimiter(p.data[p.pos]) && p.data[p.pos] != '#' {
@@ -365,7 +384,12 @@ func (p *objectParser) name() (Object, error) {
 		return Name(p.data[start:p.pos]), nil
 	}
 	value := append([]byte(nil), p.data[start:p.pos]...)
-	for p.pos < len(p.data) && !isDelimiter(p.data[p.pos]) {
+	for steps := 0; p.pos < len(p.data) && !isDelimiter(p.data[p.pos]); steps++ {
+		if ctx != nil && steps&255 == 255 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		b := p.data[p.pos]
 		p.pos++
 		if b == '#' {
@@ -388,12 +412,18 @@ func (p *objectParser) name() (Object, error) {
 }
 
 // literalString 读取括号字符串并处理嵌套与转义
-// 返回: Object 字符串对象, error 语法错误
-func (p *objectParser) literalString() (Object, error) {
+// 入参: ctx 可选取消上下文
+// 返回: Object 字符串对象, error 语法或取消错误
+func (p *objectParser) literalString(ctx context.Context) (Object, error) {
 	p.pos++
 	level := 1
 	value := String{}
-	for p.pos < len(p.data) {
+	for steps := 0; p.pos < len(p.data); steps++ {
+		if ctx != nil && steps&255 == 255 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		b := p.data[p.pos]
 		p.pos++
 		switch b {
@@ -454,12 +484,18 @@ func (p *objectParser) literalString() (Object, error) {
 }
 
 // hexString 读取十六进制字符串
-// 返回: Object 字符串对象, error 语法错误
-func (p *objectParser) hexString() (Object, error) {
+// 入参: ctx 可选取消上下文
+// 返回: Object 字符串对象, error 语法或取消错误
+func (p *objectParser) hexString(ctx context.Context) (Object, error) {
 	p.pos++
 	var digits []byte
 	invalid := false
-	for p.pos < len(p.data) {
+	for steps := 0; p.pos < len(p.data); steps++ {
+		if ctx != nil && steps&255 == 255 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		b := p.data[p.pos]
 		p.pos++
 		if b == '>' {
@@ -498,11 +534,17 @@ func (p *objectParser) hexString() (Object, error) {
 }
 
 // dictionary 读取字典并拒绝有歧义的重复键
-// 返回: Object 字典对象, error 语法错误
-func (p *objectParser) dictionary() (Object, error) {
+// 入参: ctx 可选取消上下文
+// 返回: Object 字典对象, error 语法或取消错误
+func (p *objectParser) dictionary(ctx context.Context) (Object, error) {
 	p.pos += 2
 	value := Dictionary{}
-	for {
+	for steps := 0; ; steps++ {
+		if ctx != nil && steps&255 == 255 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		p.skipSpace()
 		if p.pos == len(p.data) && p.final && p.warning != nil {
 			p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "dictionary closed at source EOF; parsed entries retained"})
@@ -515,7 +557,7 @@ func (p *objectParser) dictionary() (Object, error) {
 		if p.pos == len(p.data) || p.data[p.pos] != '/' {
 			return nil, p.fail("expected dictionary key")
 		}
-		key, err := p.name()
+		key, err := p.name(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -526,7 +568,7 @@ func (p *objectParser) dictionary() (Object, error) {
 			}
 			p.warning(Diagnostic{Offset: p.base + int64(p.pos), Message: "duplicate dictionary key " + string(name) + "; last value retained"})
 		}
-		entry, err := p.object()
+		entry, err := p.objectContext(ctx)
 		if err != nil {
 			return nil, err
 		}

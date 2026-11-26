@@ -87,13 +87,16 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			candidate := (low + high) / 2
+			candidate := low + (high-low)/2
 			columns, total, err := v.columns(ctx, candidate)
 			if err != nil {
 				return err
 			}
 			fits := total <= width
 			for _, column := range columns {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if v.comb == 0 {
 					fits = fits && column.bounds.YMax-column.bounds.YMin <= height
 				} else {
@@ -256,7 +259,7 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 
 // columns 按段落及可用高度划分混合字体列，列间距覆盖实际字形范围
 // 入参: ctx 取消上下文, size 默认字号
-// 返回: []annotationRichColumn 文字列, float64 总宽度, error 度量或取消错误
+// 返回: []annotationRichColumn 文字列, float64 总宽度, error 度量、超限或取消错误
 func (v annotationRichVertical) columns(ctx context.Context, size float64) ([]annotationRichColumn, float64, error) {
 	var columns []annotationRichColumn
 	for p, glyphs := range v.glyphs {
@@ -266,7 +269,10 @@ func (v annotationRichVertical) columns(ctx context.Context, size float64) ([]an
 		start, pen, largest := 0, 0.0, 0.0
 		var bounds Rectangle
 		have := false
-		appendColumn := func(end int) {
+		appendColumn := func(end int) error {
+			if len(columns) >= maxAnnotationRichLines {
+				return fmt.Errorf("%w: rich text column limit exceeded", ErrStreamLimitExceeded)
+			}
 			if !have {
 				largest = size
 				if value := v.paragraphs[p].style.size; value != nil {
@@ -280,6 +286,7 @@ func (v annotationRichVertical) columns(ctx context.Context, size float64) ([]an
 			}
 			columns = append(columns, annotationRichColumn{glyphs[start:end], &v.paragraphs[p].style, bounds, advance})
 			start, pen, largest, have = end, 0, 0, false
+			return nil
 		}
 		for i, glyph := range glyphs {
 			if err := ctx.Err(); err != nil {
@@ -298,7 +305,9 @@ func (v annotationRichVertical) columns(ctx context.Context, size float64) ([]an
 				combined = Rectangle{min(bounds.XMin, box.XMin), min(bounds.YMin, box.YMin), max(bounds.XMax, box.XMax), max(bounds.YMax, box.YMax)}
 			}
 			if v.multiline && v.comb == 0 && have && combined.YMax-combined.YMin > v.frame.YMax-v.frame.YMin {
-				appendColumn(i)
+				if err := appendColumn(i); err != nil {
+					return nil, 0, err
+				}
 				box, advance, _, err = annotationRichVerticalBounds(glyph, v.state, size, 0)
 				if err != nil {
 					return nil, 0, err
@@ -307,7 +316,9 @@ func (v annotationRichVertical) columns(ctx context.Context, size float64) ([]an
 			}
 			bounds, pen, largest, have = combined, pen+advance, max(largest, n), true
 		}
-		appendColumn(len(glyphs))
+		if err := appendColumn(len(glyphs)); err != nil {
+			return nil, 0, err
+		}
 	}
 	total := 0.0
 	for _, column := range columns {

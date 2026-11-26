@@ -119,7 +119,10 @@ func (r *Reader) renditionActions(ctx context.Context, options RewriteOptions, a
 			}
 		}
 	}
-	number := r.maxRewriteObjectID(result)
+	number, err := r.maxRewriteObjectID(ctx, result)
+	if err != nil {
+		return nil, err
+	}
 	output := renditionOutput{
 		reader:     r,
 		copy:       rewriteObjectCopy{ctx: ctx, source: r, objects: result, number: &number, copied: make(map[rewriteObjectIdentity]Reference)},

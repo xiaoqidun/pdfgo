@@ -467,15 +467,12 @@ func encodePDFImage(ctx context.Context, img image.Image, options ImageWriteOpti
 	if img == nil {
 		return nil, nil, fmt.Errorf("missing replacement image")
 	}
+	if err := validateSourceImage(ctx, img); err != nil {
+		return nil, nil, err
+	}
 	img = unwrapImage(img)
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
-	if width <= 0 || height <= 0 {
-		return nil, nil, fmt.Errorf("invalid replacement image dimensions")
-	}
-	if err := validatePalettedImage(ctx, img); err != nil {
-		return nil, nil, err
-	}
 	switch source := img.(type) {
 	case *packedGrayImage:
 		if source.depth == 1 || source.depth == 2 || source.depth == 4 || source.depth == 8 {
@@ -999,13 +996,16 @@ func (r *Reader) ReplaceImagesTo(ctx context.Context, writer io.Writer, images m
 
 // prepareImageReplacements 校验替换图像并准备延迟编码元信息，不提前压缩像素
 // 入参: ctx 取消上下文, images 替换图像, settings 编码参数
-// 返回: map[Reference]*lazyReplacementImage 延迟替换图像, error 参数错误
+// 返回: map[Reference]*lazyReplacementImage 延迟替换图像, error 参数或取消错误
 func (r *Reader) prepareImageReplacements(ctx context.Context, images map[Reference]image.Image, settings ImageWriteOptions) (map[Reference]*lazyReplacementImage, error) {
 	lazy := make(map[Reference]*lazyReplacementImage, len(images))
 	if len(images) == 0 {
 		return lazy, nil
 	}
-	maximum := r.maxRewriteObjectID(nil)
+	maximum, err := r.maxRewriteObjectID(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
 	if maximum > math.MaxInt32-int64(len(images))-1024 {
 		return nil, fmt.Errorf("PDF object number exceeds output limit")
 	}
@@ -1029,11 +1029,7 @@ func (r *Reader) prepareImageReplacements(ctx context.Context, images map[Refere
 		if source == nil {
 			return nil, fmt.Errorf("missing replacement image")
 		}
-		bounds := source.Bounds()
-		if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
-			return nil, fmt.Errorf("invalid replacement image dimensions")
-		}
-		if err := validatePalettedImage(ctx, source); err != nil {
+		if err := validateSourceImage(ctx, source); err != nil {
 			return nil, err
 		}
 		dict := maps.Clone(original.Stream.Dictionary)

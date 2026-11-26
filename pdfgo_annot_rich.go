@@ -22,6 +22,9 @@ import (
 	"strings"
 )
 
+// maxAnnotationRichNodes 限制单次富文本XML解析允许的累计元素、属性、段落和文本片段数量
+const maxAnnotationRichNodes = 65536
+
 // annotationRichStyle 保存富文本继承样式，未指定字号、字体和颜色时沿用默认外观
 type annotationRichStyle struct {
 	families    []annotationRichFamilyName
@@ -56,7 +59,7 @@ type annotationRichParagraph struct {
 
 // readAnnotationRich 读取PDF文本编码的富文本XML，保留段落和行内样式
 // 入参: ctx 取消上下文, object 富文本对象, defaults 默认样式字符串, align 默认对齐
-// 返回: []annotationRichParagraph 段落, error XML、样式或引用错误
+// 返回: []annotationRichParagraph 段落, error XML、样式、超限、引用或取消错误
 func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults Object, align int) ([]annotationRichParagraph, error) {
 	text, err := r.annotationTextString(ctx, object)
 	if err != nil {
@@ -68,7 +71,10 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 		if err != nil {
 			return nil, err
 		}
-		style, err = annotationRichCSS(style, value)
+		if len(value) > annotationRichContentLimit(r) {
+			return nil, fmt.Errorf("%w: rich text default style limit exceeded", ErrStreamLimitExceeded)
+		}
+		style, err = annotationRichCSSStyle(ctx, style, style, value)
 		if err != nil {
 			return nil, err
 		}
@@ -85,11 +91,15 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 	var stack []annotationRichStyle
 	var paragraphs []annotationRichParagraph
 	paragraph := -1
+	nodes, steps := 0, 0
 	root, closed := false, false
 	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
+		steps++
 		token, err := decoder.Token()
 		if err == io.EOF {
 			break
@@ -108,6 +118,10 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 			if len(stack) >= maxAnnotationRichDepth {
 				return nil, fmt.Errorf("%w: rich text nesting depth limit exceeded", ErrStreamLimitExceeded)
 			}
+			if nodes+1+len(token.Attr) > maxAnnotationRichNodes {
+				return nil, fmt.Errorf("%w: rich text node limit exceeded", ErrStreamLimitExceeded)
+			}
+			nodes += 1 + len(token.Attr)
 			if token.Name.Space != "http://www.w3.org/1999/xhtml" {
 				return nil, fmt.Errorf("invalid rich text element namespace")
 			}
@@ -142,9 +156,12 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 				return nil, fmt.Errorf("missing rich text body")
 			}
 			for _, attr := range token.Attr {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				switch {
 				case attr.Name.Space == "" && attr.Name.Local == "style":
-					current, err = annotationRichCSSStyle(parent, current, attr.Value)
+					current, err = annotationRichCSSStyle(ctx, parent, current, attr.Value)
 					if err != nil {
 						return nil, err
 					}
@@ -188,6 +205,10 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 				if strings.Trim(string(token), " \t\r\n") == "" {
 					continue
 				}
+				if nodes >= maxAnnotationRichNodes {
+					return nil, fmt.Errorf("%w: rich text node limit exceeded", ErrStreamLimitExceeded)
+				}
+				nodes++
 				paragraphs = append(paragraphs, annotationRichParagraph{style: stack[0]})
 				paragraph = len(paragraphs) - 1
 			}
@@ -203,7 +224,7 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 					if err := ctx.Err(); err != nil {
 						return nil, err
 					}
-					check = index + 4096
+					check = index + 256
 				}
 				if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
 					if !space {
@@ -216,6 +237,10 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 				}
 			}
 			if normalized.Len() != 0 {
+				if nodes >= maxAnnotationRichNodes {
+					return nil, fmt.Errorf("%w: rich text node limit exceeded", ErrStreamLimitExceeded)
+				}
+				nodes++
 				p.runs = append(p.runs, annotationRichRun{normalized.String(), stack[len(stack)-1]})
 			}
 		case xml.Directive:
@@ -226,6 +251,11 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 		return nil, fmt.Errorf("incomplete rich text body")
 	}
 	for i := range paragraphs {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		runs := paragraphs[i].runs
 		for len(runs) != 0 {
 			runs[len(runs)-1].text = strings.TrimRight(runs[len(runs)-1].text, " ")
@@ -236,5 +266,5 @@ func (r *Reader) readAnnotationRich(ctx context.Context, object Object, defaults
 		}
 		paragraphs[i].runs = runs
 	}
-	return paragraphs, nil
+	return paragraphs, ctx.Err()
 }

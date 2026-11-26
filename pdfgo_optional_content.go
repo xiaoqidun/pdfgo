@@ -34,32 +34,33 @@ type optionalContentKey struct {
 
 // optionalContentEvaluator 维护单次可选内容求值的缓存、环路与步数状态
 type optionalContentEvaluator struct {
-	reader        *Reader
-	ctx           context.Context
-	config        Dictionary
-	steps         int
-	memo          map[optionalContentKey]bool
-	active        map[optionalContentKey]bool
-	intentsReady  bool
-	configIntents Array
-	stateReady    bool
-	baseState     bool
-	groupStates   map[Reference]bool
-	dictReady     bool
-	dictStates    map[uintptr]bool
+	reader          *Reader
+	ctx             context.Context
+	config          Dictionary
+	steps           int
+	memo            map[optionalContentKey]bool
+	active          map[optionalContentKey]bool
+	intentsReady    bool
+	configIntentSet map[Name]bool
+	configIntentAll bool
+	stateReady      bool
+	baseState       bool
+	groupStates     map[Reference]bool
+	dictReady       bool
+	dictStates      map[uintptr]bool
 }
 
 // OptionalContentVisible 按文档默认配置判断可选内容的可见性，供固定版式输出使用
 // 不应用交互阅读器的Usage自动状态；交互状态可通过Visitor.OptionalContent提供
 // 入参: object OCG引用或OCMD字典
-// 返回: bool 是否可见, error 配置或表达式错误
+// 返回: bool 是否可见, error 配置、表达式或超限错误
 func (r *Reader) OptionalContentVisible(object Object) (bool, error) {
 	return r.optionalContentVisibleContext(context.Background(), object)
 }
 
 // optionalContentVisibleContext 按文档默认配置及取消上下文判断可选内容可见性
 // 入参: ctx 取消上下文, object OCG引用或OCMD字典
-// 返回: bool 是否可见, error 配置、表达式或取消错误
+// 返回: bool 是否可见, error 配置、表达式、超限或取消错误
 func (r *Reader) optionalContentVisibleContext(ctx context.Context, object Object) (bool, error) {
 	if r == nil {
 		return false, fmt.Errorf("invalid reader")
@@ -304,8 +305,8 @@ func (e *optionalContentEvaluator) evalValue(ref Reference, value Object, depth 
 
 // intents 解析可选内容意图名称列表，缺省视为View
 // 入参: object 意图名称或数组
-// 返回: Array 意图名称数组, error 解析或取消错误
-func (e *optionalContentEvaluator) intents(object Object) (Array, error) {
+// 返回: []Name 意图名称列表, error 解析、超限或取消错误
+func (e *optionalContentEvaluator) intents(object Object) ([]Name, error) {
 	if err := e.ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -314,30 +315,35 @@ func (e *optionalContentEvaluator) intents(object Object) (Array, error) {
 		return nil, err
 	}
 	if value == nil {
-		return Array{Name("View")}, nil
+		return []Name{"View"}, nil
 	}
 	if name, ok := value.(Name); ok {
-		return Array{name}, nil
+		return []Name{name}, nil
 	}
 	array, ok := value.(Array)
 	if !ok {
 		return nil, fmt.Errorf("invalid optional content intent")
 	}
-	resolved := make(Array, len(array))
+	if len(array) > maxOptionalContentSteps-e.steps {
+		return nil, fmt.Errorf("%w: optional content evaluation step limit exceeded", ErrStreamLimitExceeded)
+	}
+	resolved := make([]Name, len(array))
 	for i, item := range array {
 		if i&255 == 0 {
 			if err := e.ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
+		e.steps++
 		item, err := e.reader.Resolve(item)
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := item.(Name); !ok {
+		name, ok := item.(Name)
+		if !ok {
 			return nil, fmt.Errorf("invalid optional content intent")
 		}
-		resolved[i] = item
+		resolved[i] = name
 	}
 	return resolved, nil
 }
@@ -425,7 +431,7 @@ func (e *optionalContentEvaluator) loadDictStates() error {
 
 // groupState 按配置意图、基础状态和显式开关确定组状态
 // 入参: currentRef 规范化后的组引用，直接字典时为零值, group 组字典
-// 返回: bool 是否可见, error 配置或取消错误
+// 返回: bool 是否可见, error 配置、超限或取消错误
 func (e *optionalContentEvaluator) groupState(currentRef Reference, group Dictionary) (bool, error) {
 	a, err := e.intents(group["Intent"])
 	if err != nil {
@@ -436,12 +442,37 @@ func (e *optionalContentEvaluator) groupState(currentRef Reference, group Dictio
 		if err != nil {
 			return false, err
 		}
-		e.configIntents, e.intentsReady = b, true
+		set := make(map[Name]bool, len(b))
+		for i, y := range b {
+			if i&255 == 0 {
+				if err := e.ctx.Err(); err != nil {
+					return false, err
+				}
+			}
+			if y == Name("All") {
+				e.configIntentAll = true
+				break
+			}
+			set[y] = true
+		}
+		e.configIntentSet, e.intentsReady = set, true
 	}
-	match := false
-	for _, x := range a {
-		for _, y := range e.configIntents {
-			match = match || x == y || y == Name("All")
+	match := e.configIntentAll && len(a) > 0
+	if !match {
+		for i, x := range a {
+			if i&255 == 0 {
+				if err := e.ctx.Err(); err != nil {
+					return false, err
+				}
+			}
+			e.steps++
+			if e.steps > maxOptionalContentSteps {
+				return false, fmt.Errorf("%w: optional content evaluation step limit exceeded", ErrStreamLimitExceeded)
+			}
+			if e.configIntentSet[x] {
+				match = true
+				break
+			}
 		}
 	}
 	if !match {

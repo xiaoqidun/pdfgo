@@ -28,13 +28,21 @@ type colorRemapKey struct {
 	remap bool
 }
 
+// iccAlternateKey 标识单次重映射中可复用的ICC备用颜色空间流及其替换模式
+type iccAlternateKey struct {
+	stream *Stream
+	count  int
+	remap  bool
+}
+
 // colorRemapState 保存单次颜色空间重映射的节点预算与中间缓存
 type colorRemapState struct {
-	nodes    int
-	cache    map[colorRemapKey]Object
-	defaults map[Name]Object
-	iccValid map[iccStreamKey]bool
-	iccV5    map[iccStreamKey]bool
+	nodes         int
+	cache         map[colorRemapKey]Object
+	defaults      map[Name]Object
+	iccValid      map[iccStreamKey]bool
+	iccV5         map[iccStreamKey]bool
+	iccAlternates map[iccAlternateKey]Object
 }
 
 // cloneColorantDictionary 复制需重映射的属性字典，不改变共享资源

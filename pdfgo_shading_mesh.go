@@ -323,11 +323,9 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 	maxBytes, _ := effectiveStreamLimits(p.reader, stream)
 	var maxTriangles, maxPatches int64
 	if maxBytes > 0 {
-		maxMeshBudget := int64(256 << 20)
-		if maxBytes > math.MaxInt64/4 {
-			maxMeshBudget = math.MaxInt64
-		} else if budget := maxBytes * 4; budget > maxMeshBudget {
-			maxMeshBudget = budget
+		maxMeshBudget := int64(math.MaxInt64)
+		if maxBytes <= math.MaxInt64/4 {
+			maxMeshBudget = maxBytes * 4
 		}
 		maxTriangles = maxMeshBudget / (144 + int64(components)*24)
 		maxPatches = maxMeshBudget / (400 + int64(components)*32)
@@ -513,6 +511,10 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 		if maxTriangles > 0 && (rows-1 > maxTriangles/2/(cols-1) || (rows-1)*(cols-1)*2 > maxTriangles) {
 			return nil, fmt.Errorf("%w: mesh shading element limit exceeded", ErrStreamLimitExceeded)
 		}
+		if rows-1 > int64(math.MaxInt)/2/(cols-1) {
+			return nil, fmt.Errorf("%w: mesh shading element limit exceeded", ErrStreamLimitExceeded)
+		}
+		result = make([]MeshTriangle, 0, int((rows-1)*(cols-1)*2))
 		row := make([]vertex, int(columns))
 		var aboveLeft, left vertex
 		for index := 0; index < count; index++ {

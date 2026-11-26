@@ -27,6 +27,9 @@ import (
 // maxCMapStreamDepth 限制CMap流级UseCMap的最大继承深度
 const maxCMapStreamDepth = 64
 
+// maxCMapCodespaceRanges 限制单条CID CMap继承链去重后的最大编码范围条数
+const maxCMapCodespaceRanges = 4096
+
 // CIDMap 保存字符码到CID的映射
 type CIDMap map[string]uint16
 
@@ -47,9 +50,10 @@ type cidNotdefRange struct {
 
 // cidCMapBudget 跟踪单条CID CMap继承链的累计条目预算
 type cidCMapBudget struct {
-	spaces uint64
-	notdef uint64
-	ranges uint64
+	spaces       uint64
+	uniqueSpaces map[cidCodeRange]struct{}
+	notdef       uint64
+	ranges       uint64
 }
 
 // cidMappedRange 保留连续CID区间及定义顺序，避免展开大量逐字符映射
@@ -63,19 +67,19 @@ type cidMappedRange struct {
 
 // cidCMap 保存编码范围、字形选择和只读继承关系
 type cidCMap struct {
-	ranges     []cidMappedRange
-	spaces     []cidCodeRange
-	spaceMask  [4]uint64
-	minSpace   uint8
-	notdef     []cidNotdefRange
-	notdefFlat bool
-	registry   string
-	ordering   string
-	vertical   bool
-	modeSet    bool
-	use        Name
-	base       *cidCMap
-	recovered  bool
+	ranges       []cidMappedRange
+	spaces       []cidCodeRange
+	spaceByFirst [256][]uint16
+	minSpace     uint8
+	notdef       []cidNotdefRange
+	notdefFlat   bool
+	registry     string
+	ordering     string
+	vertical     bool
+	modeSet      bool
+	use          Name
+	base         *cidCMap
+	recovered    bool
 }
 
 // makeCIDCodeRange 将原始编码范围压缩为固定字节值类型以便去重和比较
@@ -89,18 +93,55 @@ func makeCIDCodeRange(first, last String) cidCodeRange {
 	return entry
 }
 
-// buildSpaceIndex 重建首字节位图与最小编码长度索引，加速无效首字节快速判定
-func (c *cidCMap) buildSpaceIndex() {
-	c.spaceMask = [4]uint64{}
+// buildSpaceIndex 重建分桶索引与最小编码长度，加速首字节判定与范围扫描
+// 入参: ctx 取消上下文
+// 返回: error 取消错误
+func (c *cidCMap) buildSpaceIndex(ctx context.Context) error {
+	c.spaceByFirst = [256][]uint16{}
 	c.minSpace = 0
-	for _, space := range c.spaces {
+	if len(c.spaces) == 0 {
+		return ctx.Err()
+	}
+	var counts [256]int
+	total := 0
+	for i, space := range c.spaces {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		if c.minSpace == 0 || space.size < c.minSpace {
 			c.minSpace = space.size
 		}
-		for b := int(space.first[0]); b <= int(space.last[0]); b++ {
-			c.spaceMask[b>>6] |= 1 << (uint(b) & 63)
+		lo, hi := int(space.first[0]), int(space.last[0])
+		total += hi - lo + 1
+		for b := lo; b <= hi; b++ {
+			counts[b]++
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	backing := make([]uint16, total)
+	offset := 0
+	for b, n := range counts {
+		if n > 0 {
+			c.spaceByFirst[b] = backing[offset : offset : offset+n]
+			offset += n
+		}
+	}
+	for i, space := range c.spaces {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		idx := uint16(i)
+		for b := int(space.first[0]); b <= int(space.last[0]); b++ {
+			c.spaceByFirst[b] = append(c.spaceByFirst[b], idx)
+		}
+	}
+	return ctx.Err()
 }
 
 // ParseCIDMap 读取CMap中的字符码到CID的直接映射及连续范围
@@ -176,6 +217,9 @@ func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Di
 	if budget == nil {
 		budget = &cidCMapBudget{}
 	}
+	if budget.uniqueSpaces == nil {
+		budget.uniqueSpaces = make(map[cidCodeRange]struct{})
+	}
 	p := objectParser{data: data}
 	result := &cidCMap{}
 	seenSpaces := make(map[cidCodeRange]struct{})
@@ -197,7 +241,9 @@ func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Di
 				return nil, err
 			}
 			result.notdef = notdef
-			result.buildSpaceIndex()
+			if err := result.buildSpaceIndex(ctx); err != nil {
+				return nil, err
+			}
 			return result, nil
 		}
 		if b := p.data[p.pos]; b == '/' || b == '(' || b == '<' || b == '[' {
@@ -319,6 +365,12 @@ func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Di
 				}
 				budget.spaces++
 				entry := makeCIDCodeRange(first, last)
+				if _, exists := budget.uniqueSpaces[entry]; !exists {
+					if len(budget.uniqueSpaces) >= maxCMapCodespaceRanges {
+						return nil, fmt.Errorf("%w: CID CMap codespace limit exceeded", ErrStreamLimitExceeded)
+					}
+					budget.uniqueSpaces[entry] = struct{}{}
+				}
 				if _, exists := seenSpaces[entry]; !exists {
 					seenSpaces[entry] = struct{}{}
 					result.spaces = append(result.spaces, entry)
@@ -601,6 +653,8 @@ func (c *cidCMap) inherit() {
 	if len(c.base.spaces) != 0 {
 		if len(c.spaces) == 0 {
 			c.spaces = c.base.spaces
+			c.spaceByFirst = c.base.spaceByFirst
+			c.minSpace = c.base.minSpace
 		} else {
 			seen := make(map[cidCodeRange]struct{}, len(c.spaces)+len(c.base.spaces))
 			merged := make([]cidCodeRange, 0, len(c.spaces)+len(c.base.spaces))
@@ -617,8 +671,8 @@ func (c *cidCMap) inherit() {
 				}
 			}
 			c.spaces = merged
+			_ = c.buildSpaceIndex(context.Background())
 		}
-		c.buildSpaceIndex()
 	}
 	if c.registry == "" {
 		c.registry = c.base.registry
@@ -631,33 +685,6 @@ func (c *cidCMap) inherit() {
 	}
 }
 
-// next 按编码范围取出字符，无效编码依标准选择最长部分匹配的消耗长度
-// 入参: data 剩余字符串
-// 返回: int 字节数, bool 是否有效字符码
-func (c *cidCMap) next(data []byte) (int, bool) {
-	if len(data) == 0 {
-		return 0, false
-	}
-	if c.minSpace != 0 && c.spaceMask[data[0]>>6]&(1<<(uint(data[0])&63)) == 0 {
-		return min(int(c.minSpace), len(data)), false
-	}
-	length, longest := 5, -1
-	for _, space := range c.spaces {
-		size := int(space.size)
-		matched := 0
-		for matched < size && matched < len(data) && data[matched] >= space.first[matched] && data[matched] <= space.last[matched] {
-			matched++
-		}
-		if matched == size {
-			return matched, true
-		}
-		if matched > longest || matched == longest && size < length {
-			length, longest = size, matched
-		}
-	}
-	return min(length, len(data)), false
-}
-
 // nextContext 按编码范围取出字符并周期性检查取消，防止大编码表长时间阻塞
 // 入参: ctx 取消上下文, data 剩余字符串
 // 返回: int 字节数, bool 是否有效字符码, error 取消错误
@@ -665,18 +692,23 @@ func (c *cidCMap) nextContext(ctx context.Context, data []byte) (int, bool, erro
 	if len(data) == 0 {
 		return 0, false, ctx.Err()
 	}
-	if c.minSpace != 0 && c.spaceMask[data[0]>>6]&(1<<(uint(data[0])&63)) == 0 {
-		return min(int(c.minSpace), len(data)), false, nil
+	bucket := c.spaceByFirst[data[0]]
+	if len(bucket) == 0 {
+		if c.minSpace != 0 {
+			return min(int(c.minSpace), len(data)), false, nil
+		}
+		return min(5, len(data)), false, nil
 	}
 	length, longest := 5, -1
-	for i, space := range c.spaces {
+	for i, idx := range bucket {
 		if i&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return 0, false, err
 			}
 		}
+		space := c.spaces[idx]
 		size := int(space.size)
-		matched := 0
+		matched := 1
 		for matched < size && matched < len(data) && data[matched] >= space.first[matched] && data[matched] <= space.last[matched] {
 			matched++
 		}
@@ -826,6 +858,17 @@ func addCIDCMapBudget(mapping *cidCMap, budget *cidCMapBudget) error {
 		return fmt.Errorf("%w: CID CMap codespace limit exceeded", ErrStreamLimitExceeded)
 	}
 	budget.spaces += uint64(len(mapping.spaces))
+	if budget.uniqueSpaces == nil {
+		budget.uniqueSpaces = make(map[cidCodeRange]struct{}, len(mapping.spaces))
+	}
+	for _, space := range mapping.spaces {
+		if _, exists := budget.uniqueSpaces[space]; !exists {
+			if len(budget.uniqueSpaces) >= maxCMapCodespaceRanges {
+				return fmt.Errorf("%w: CID CMap codespace limit exceeded", ErrStreamLimitExceeded)
+			}
+			budget.uniqueSpaces[space] = struct{}{}
+		}
+	}
 	for current := mapping; current != nil; current = current.base {
 		if uint64(len(current.notdef)) > maxCMapEntries-budget.notdef {
 			return fmt.Errorf("%w: CID CMap notdef limit exceeded", ErrStreamLimitExceeded)
@@ -861,7 +904,7 @@ func finalizeCIDCMapChain(ctx context.Context, mapping *cidCMap, owned []*cidCMa
 				}
 			}
 			if _, exists := seenSpaces[space]; !exists {
-				if uint64(len(mergedSpaces)) >= maxCMapEntries {
+				if len(mergedSpaces) >= maxCMapCodespaceRanges {
 					return fmt.Errorf("%w: CID CMap codespace limit exceeded", ErrStreamLimitExceeded)
 				}
 				seenSpaces[space] = struct{}{}
@@ -905,10 +948,13 @@ func finalizeCIDCMapChain(ctx context.Context, mapping *cidCMap, owned []*cidCMa
 	}
 	mapping.spaces = mergedSpaces
 	mapping.notdefFlat = true
-	mapping.buildSpaceIndex()
+	if err := mapping.buildSpaceIndex(ctx); err != nil {
+		return err
+	}
 	for _, node := range owned {
 		if node != mapping {
 			node.spaces = nil
+			node.spaceByFirst = [256][]uint16{}
 			node.notdef = nil
 		}
 	}

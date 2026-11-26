@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"fmt"
 	"io"
+	"math/bits"
 	"sort"
 	"strings"
 )
@@ -56,6 +57,7 @@ type faxReader struct {
 	allowDamage, damage            int
 	previousDamaged                bool
 	resynced                       bool
+	trailingZeros                  int
 	done                           bool
 	row, previous                  []byte
 	changes                        []int
@@ -112,6 +114,13 @@ func (r *faxReader) take(count uint) (uint64, error) {
 	if err == nil {
 		r.available -= count
 		r.bits &= 1<<r.available - 1
+		if count > 0 {
+			if v == 0 {
+				r.trailingZeros = min(11, r.trailingZeros+int(count))
+			} else {
+				r.trailingZeros = bits.TrailingZeros64(v)
+			}
+		}
 	}
 	return v, err
 }
@@ -414,8 +423,9 @@ func (r *faxReader) decodeRow(oneD bool) ([]int, error) {
 }
 
 // rowMode 识别行编码模式及RTC、EOFB终止标记，不越过有效编码边界
+// 入参: resynced 当前行起始EOL是否已由坏行重同步消费
 // 返回: bool 是否为一维编码, error 编码结束或错误
-func (r *faxReader) rowMode() (bool, error) {
+func (r *faxReader) rowMode(resynced bool) (bool, error) {
 	if r.group4 {
 		for count := uint(1); count < 12; count++ {
 			value, err := r.peek(count)
@@ -436,9 +446,13 @@ func (r *faxReader) rowMode() (bool, error) {
 		r.done = true
 		return false, io.EOF
 	}
-	marked, err := r.marker(r.eol)
-	if err != nil {
-		return false, err
+	marked := resynced
+	if !marked {
+		var err error
+		marked, err = r.marker(r.eol)
+		if err != nil {
+			return false, err
+		}
 	}
 	if !marked && !r.eol {
 		for count := uint(1); count < 12; count++ {
@@ -462,7 +476,7 @@ func (r *faxReader) rowMode() (bool, error) {
 		}
 		oneD = bit != 0
 	}
-	if marked {
+	if marked && (!r.mixed || oneD) {
 		for markers := 1; markers < 6; markers++ {
 			more, err := r.marker(false)
 			if err != nil {
@@ -476,7 +490,7 @@ func (r *faxReader) rowMode() (bool, error) {
 			}
 			if r.mixed {
 				bit, err := r.take(1)
-				if err != nil || bit != 1 || !oneD {
+				if err != nil || bit != 1 {
 					return false, fmt.Errorf("invalid CCITT return-to-control tag")
 				}
 			}
@@ -501,36 +515,43 @@ func (r *faxReader) nextRow() (result error) {
 		r.done = true
 		return io.EOF
 	}
-	if r.resynced {
+	resynced := r.resynced
+	if resynced {
 		r.resynced = false
 	} else if r.align {
 		if _, err := r.take(r.available % 8); err != nil {
 			return err
 		}
 	}
-	oneD, err := r.rowMode()
+	oneD, err := r.rowMode(resynced)
 	if err != nil {
 		return err
 	}
 	for n := range r.row {
 		r.row[n] = 255
 	}
+	r.trailingZeros = 0
 	changes, err := r.decodeRow(oneD)
 	if err != nil {
 		if !r.eol || r.damage >= r.allowDamage {
 			return err
 		}
+		zeros := r.trailingZeros
 		for {
-			v, boundaryErr := r.peek(12)
+			bit, boundaryErr := r.take(1)
 			if boundaryErr != nil {
 				return boundaryErr
 			}
-			if v == 1 {
+			if bit == 0 {
+				if zeros < 11 {
+					zeros++
+				}
+				continue
+			}
+			if zeros >= 11 {
 				break
 			}
-			if _, boundaryErr := r.take(1); boundaryErr != nil {
-				return boundaryErr
-			}
+			zeros = 0
 		}
 		r.resynced = true
 		r.damage++

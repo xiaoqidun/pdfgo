@@ -383,7 +383,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		case "Text", "FileAttachment", "Sound", "Caret":
 			stream, synthErr = r.iconAppearance(annotation)
 		case "Ink":
-			stream, synthErr = r.inkAppearance(annotation)
+			stream, synthErr = r.inkAppearance(ctx, annotation)
 		case "Line":
 			stream, synthErr = r.lineAppearance(ctx, page, annotation, visitor.Warning)
 		case "Redact":
@@ -391,7 +391,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		case "Highlight", "Underline", "StrikeOut", "Squiggly":
 			stream, synthErr = r.textMarkupAppearance(ctx, annotation)
 		case "Square", "Circle", "Polygon", "PolyLine":
-			stream, synthErr = r.shapeAppearance(annotation)
+			stream, synthErr = r.shapeAppearanceContext(ctx, annotation)
 		case "Screen":
 			return ctx.Err()
 		case "Movie":
@@ -586,6 +586,9 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 		value, err := r.Resolve(parent)
 		if err != nil {
 			return nil, err
+		}
+		if value == nil {
+			break
 		}
 		current, ok = value.(Dictionary)
 		if !ok {

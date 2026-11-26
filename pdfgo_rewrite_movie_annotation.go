@@ -38,11 +38,14 @@ func (r *Reader) movieAnnotationReplacements(ctx context.Context, additions map[
 	if len(additions) == 0 {
 		return nil, nil
 	}
-	number := r.maxRewriteObjectID(result)
+	number, err := r.maxRewriteObjectID(ctx, result)
+	if err != nil {
+		return nil, err
+	}
 	refs := make(map[*MovieAnnotation]Reference)
 	media := make(map[*Movie]Reference)
 	visited := make(map[Reference]bool)
-	err := r.WalkPages(ctx, func(_ int, source *Page) error {
+	err = r.WalkPages(ctx, func(_ int, source *Page) error {
 		annotations, exists := additions[source.Reference]
 		if !exists {
 			return nil

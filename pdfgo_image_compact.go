@@ -57,6 +57,13 @@ type pngCompactPaletteImage struct {
 	indices map[color.NRGBA]uint8
 }
 
+// jpegOriginImage 将非零起点图像平移至原点，规避标准库JPEG分块步进溢出
+type jpegOriginImage struct {
+	source image.Image
+	origin image.Point
+	bounds image.Rectangle
+}
+
 // OptimizeImageResource 优化资源图片，有损模式允许无元数据不透明照片改用JPEG（调用方须更新格式声明，固定格式请用OptimizeImage），不修改输入且返回值只读
 // 入参: ctx 取消上下文, data 图片数据, options 压缩配置, size 像素需求
 // 返回: []byte 更小的图片数据, error 编码错误
@@ -122,7 +129,7 @@ func encodeImage(ctx context.Context, source image.Image, options CompressionOpt
 		return nil, fmt.Errorf("missing PNG image")
 	}
 	bounds := source.Bounds()
-	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
+	if bounds.Empty() || bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx()) > 1<<31-1 || int64(bounds.Dy()) > 1<<31-1 {
 		return nil, fmt.Errorf("invalid PNG dimensions")
 	}
 	if options.Mode == CompressionUnchanged {
@@ -136,7 +143,7 @@ func encodeImage(ctx context.Context, source image.Image, options CompressionOpt
 		}
 		return output.Bytes(), nil
 	}
-	if err := validatePalettedImage(ctx, source); err != nil {
+	if err := validateSourceImage(ctx, source); err != nil {
 		return nil, err
 	}
 	var jpegBest []byte
@@ -167,6 +174,24 @@ func encodeOptimalPNGFromPixels(ctx context.Context, source image.Image, best []
 	var buffers pngOptimizationBuffers
 	bounds := source.Bounds()
 	img := source
+	if _, _, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 4); err != nil || !pixelsWithinBudget(int64(bounds.Dx()), int64(bounds.Dy()), optimizationBufferLimit/4) {
+		var out bytes.Buffer
+		maxLen := optimizationBufferLimit
+		if len(best) > 0 {
+			maxLen = min(len(best), optimizationBufferLimit)
+		}
+		limit := &optimizationBuffer{buffer: &out, limit: maxLen}
+		if err := EncodePNG(ctx, limit, img); err != nil {
+			if limit.exceeded && len(best) > 0 {
+				return best, ctx.Err()
+			}
+			return nil, err
+		}
+		if len(best) == 0 || out.Len() < len(best) {
+			best = out.Bytes()
+		}
+		return best, ctx.Err()
+	}
 	depth16 := sourceNeeds16BitPNG(ctx, img)
 	if depth16 && options.Mode != CompressionLossy {
 		var byteExact bool
@@ -186,25 +211,6 @@ func encodeOptimalPNGFromPixels(ctx context.Context, source image.Image, best []
 		}
 	}
 	quantize := options.Mode == CompressionLossy && options.ImageQuality() < 100
-	pixelCount := int64(bounds.Dx()) * int64(bounds.Dy())
-	if pixelCount > optimizationBufferLimit/4 {
-		var out bytes.Buffer
-		maxLen := optimizationBufferLimit
-		if len(best) > 0 {
-			maxLen = min(len(best), optimizationBufferLimit)
-		}
-		limit := &optimizationBuffer{buffer: &out, limit: maxLen}
-		if err := EncodePNG(ctx, limit, img); err != nil {
-			if limit.exceeded && len(best) > 0 {
-				return best, ctx.Err()
-			}
-			return nil, err
-		}
-		if len(best) == 0 || out.Len() < len(best) {
-			best = out.Bytes()
-		}
-		return best, ctx.Err()
-	}
 	var pixels image.Image
 	var writable *image.NRGBA
 	reused := false
@@ -533,7 +539,11 @@ func encodeBestPNG16(ctx context.Context, img image.Image, best []byte) ([]byte,
 // 返回: []byte JPEG编码，超限或超尺寸时为空, error 编码或取消错误
 func encodePhotoJPEG(ctx context.Context, img image.Image, quality, maxBytes int) ([]byte, error) {
 	bounds := img.Bounds()
-	if bounds.Dx() > 65535 || bounds.Dy() > 65535 {
+	w, h := bounds.Dx(), bounds.Dy()
+	if bounds.Empty() || w <= 0 || h <= 0 || w > 65535 || h > 65535 {
+		return nil, nil
+	}
+	if _, total, err := imageBufferSize(w, h, 1); err != nil || total > optimizationBufferLimit {
 		return nil, nil
 	}
 	gray, err := imageAllGray(ctx, img)
@@ -548,6 +558,7 @@ func encodePhotoJPEG(ctx context.Context, img image.Image, quality, maxBytes int
 	if err != nil {
 		return nil, err
 	}
+	img = jpegZeroOrigin(img)
 	var out bytes.Buffer
 	limit := &optimizationBuffer{buffer: &out, limit: maxBytes}
 	if err := jpeg.Encode(&pdfOutput{ctx: ctx, writer: limit}, img, &jpeg.Options{Quality: quality}); err != nil {
@@ -559,14 +570,38 @@ func encodePhotoJPEG(ctx context.Context, img image.Image, quality, maxBytes int
 	return OptimizeJPEG(ctx, out.Bytes())
 }
 
+// jpegZeroOrigin 将非零起点图像无拷贝平移至原点，防止JPEG编码器按块步进时坐标溢出
+// 入参: img 待编码图像
+// 返回: image.Image 原点归一化后的只读图像
+func jpegZeroOrigin(img image.Image) image.Image {
+	b := img.Bounds()
+	if b.Min == (image.Point{}) {
+		return img
+	}
+	rect := image.Rect(0, 0, b.Dx(), b.Dy())
+	switch s := img.(type) {
+	case *image.Gray:
+		return &image.Gray{Pix: s.Pix, Stride: s.Stride, Rect: rect}
+	case *image.RGBA:
+		return &image.RGBA{Pix: s.Pix, Stride: s.Stride, Rect: rect}
+	case *image.NRGBA:
+		return &image.NRGBA{Pix: s.Pix, Stride: s.Stride, Rect: rect}
+	default:
+		return &jpegOriginImage{source: img, origin: b.Min, bounds: rect}
+	}
+}
+
 // imageToGray8 将图像转换为8位单通道灰度图像，已有8位灰度直接复用
 // 入参: ctx 取消上下文, src 源图像
-// 返回: *image.Gray 8位灰度图像, error 取消错误
+// 返回: *image.Gray 8位灰度图像, error 缓冲或取消错误
 func imageToGray8(ctx context.Context, src image.Image) (*image.Gray, error) {
 	if gray, ok := src.(*image.Gray); ok {
 		return gray, ctx.Err()
 	}
 	b := src.Bounds()
+	if _, _, err := imageBufferSize(b.Dx(), b.Dy(), 1); err != nil {
+		return nil, err
+	}
 	dst := image.NewGray(image.Rect(0, 0, b.Dx(), b.Dy()))
 	for y := 0; y < b.Dy(); y++ {
 		if err := ctx.Err(); err != nil {
@@ -596,14 +631,21 @@ func photographicImage(ctx context.Context, img image.Image) (bool, error) {
 		return false, err
 	}
 	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if b.Empty() || w <= 0 || h <= 0 {
+		return false, ctx.Err()
+	}
+	stepX, stepY := max(1, w/128), max(1, h/128)
 	colors := make(map[color.NRGBA]bool)
 	gray := true
 	count, edges := 0, 0
-	for y := b.Min.Y; y < b.Max.Y; y += max(1, b.Dy()/128) {
+	for dy := 0; ; {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		for x := b.Min.X; x < b.Max.X; x += max(1, b.Dx()/128) {
+		y := b.Min.Y + dy
+		for dx := 0; ; {
+			x := b.Min.X + dx
 			c := imageNRGBAAt(img, x, y)
 			if gray && (c.R != c.G || c.G != c.B) {
 				gray = false
@@ -611,14 +653,22 @@ func photographicImage(ctx context.Context, img image.Image) (bool, error) {
 			if len(colors) <= 256 {
 				colors[c] = true
 			}
-			if x+1 < b.Max.X {
+			if dx < w-1 {
 				d := imageNRGBAAt(img, x+1, y)
 				if math.Abs(float64(c.R)-float64(d.R))+math.Abs(float64(c.G)-float64(d.G))+math.Abs(float64(c.B)-float64(d.B)) > 120 {
 					edges++
 				}
 				count++
 			}
+			if dx >= w-stepX {
+				break
+			}
+			dx += stepX
 		}
+		if dy >= h-stepY {
+			break
+		}
+		dy += stepY
 	}
 	if edges*20 >= count {
 		return false, ctx.Err()
@@ -889,6 +939,9 @@ func compactPNGPrecision(ctx context.Context, img image.Image) (image.Image, boo
 	if _, ok := img.(*image.Gray16); ok {
 		return img, false, ctx.Err()
 	}
+	if _, total, err := imageBufferSize(bounds.Dx(), bounds.Dy(), 2); err != nil || total > optimizationBufferLimit {
+		return img, false, ctx.Err()
+	}
 	result := image.NewGray16(bounds)
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
@@ -1021,4 +1074,30 @@ func (b *optimizationBuffer) Write(data []byte) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 	return b.buffer.Write(data)
+}
+
+// ColorModel 返回底层图像的颜色模型
+// 返回: color.Model 颜色模型
+func (j *jpegOriginImage) ColorModel() color.Model {
+	return j.source.ColorModel()
+}
+
+// Bounds 返回平移至原点后的图像边界
+// 返回: image.Rectangle 归一化边界
+func (j *jpegOriginImage) Bounds() image.Rectangle {
+	return j.bounds
+}
+
+// At 按原始坐标偏移读取像素颜色
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 像素颜色
+func (j *jpegOriginImage) At(x, y int) color.Color {
+	return j.source.At(j.origin.X+x, j.origin.Y+y)
+}
+
+// RGBA64At 按原始坐标偏移读取十六位预乘颜色
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.RGBA64 十六位预乘颜色
+func (j *jpegOriginImage) RGBA64At(x, y int) color.RGBA64 {
+	return imageRGBA64At(j.source, j.origin.X+x, j.origin.Y+y)
 }

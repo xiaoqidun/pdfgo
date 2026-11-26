@@ -15,28 +15,33 @@
 package pdfgo
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
 	"strings"
 )
 
-// annotationRichCSS 解析标准富文本内联样式，未覆盖的属性不静默丢弃
-// 入参: parent 继承样式, text CSS声明
-// 返回: annotationRichStyle 当前样式, error 属性或数值错误
-func annotationRichCSS(parent annotationRichStyle, text string) (annotationRichStyle, error) {
-	return annotationRichCSSStyle(parent, parent, text)
-}
+// maxAnnotationRichCSSParts 限制单次富文本CSS属性或列表切分的最大项数
+const maxAnnotationRichCSSParts = 4096
 
 // annotationRichCSSStyle 将CSS声明应用到元素样式，inherit取父元素而非前一条声明
-// 入参: parent 父元素样式, style 当前元素样式, text CSS声明
-// 返回: annotationRichStyle 当前样式, error 属性或数值错误
-func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (annotationRichStyle, error) {
-	declarations, err := splitAnnotationRichCSS(text, ';')
+// 入参: ctx 取消上下文, parent 父元素样式, style 当前元素样式, text CSS声明
+// 返回: annotationRichStyle 当前样式, error 属性、数值、超限或取消错误
+func annotationRichCSSStyle(ctx context.Context, parent, style annotationRichStyle, text string) (annotationRichStyle, error) {
+	if err := ctx.Err(); err != nil {
+		return style, err
+	}
+	declarations, err := splitAnnotationRichCSS(ctx, text, ';')
 	if err != nil {
 		return parent, err
 	}
-	for _, declaration := range declarations {
+	for index, declaration := range declarations {
+		if index&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return style, err
+			}
+		}
 		if strings.TrimSpace(declaration) == "" {
 			continue
 		}
@@ -121,13 +126,13 @@ func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (ann
 			}
 			style.stretch = stretch
 		case "font-family":
-			families, err := annotationRichFamilies(value)
+			families, err := annotationRichFamilies(ctx, value)
 			if err != nil {
 				return style, err
 			}
 			style.families = families
 		case "font":
-			fields, err := splitAnnotationRichCSS(value, ' ')
+			fields, err := splitAnnotationRichCSS(ctx, value, ' ')
 			if err != nil {
 				return style, err
 			}
@@ -136,6 +141,11 @@ func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (ann
 			style.stretch = 5
 			found := false
 			for i, field := range fields {
+				if i&63 == 0 {
+					if err := ctx.Err(); err != nil {
+						return style, err
+					}
+				}
 				if field == "" {
 					continue
 				}
@@ -145,7 +155,7 @@ func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (ann
 					if family == "" {
 						return style, fmt.Errorf("invalid rich text font shorthand")
 					}
-					style, err = annotationRichCSSStyle(parent, style, "font-size:"+field+";font-family:"+family)
+					style, err = annotationRichCSSStyle(ctx, parent, style, "font-size:"+field+";font-family:"+family)
 					found = true
 					break
 				}
@@ -173,7 +183,33 @@ func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (ann
 			style.color = &color
 		case "text-decoration":
 			style.decoration = 0
-			fields := strings.Fields(strings.ToLower(value))
+			var fields []string
+			for i := 0; i < len(value); {
+				for i < len(value) && (value[i] == ' ' || value[i] == '\t' || value[i] == '\r' || value[i] == '\n') {
+					if i&255 == 0 {
+						if err := ctx.Err(); err != nil {
+							return style, err
+						}
+					}
+					i++
+				}
+				if i == len(value) {
+					break
+				}
+				start := i
+				for i < len(value) && value[i] != ' ' && value[i] != '\t' && value[i] != '\r' && value[i] != '\n' {
+					if i&255 == 0 {
+						if err := ctx.Err(); err != nil {
+							return style, err
+						}
+					}
+					i++
+				}
+				if len(fields) >= maxAnnotationRichCSSParts {
+					return style, fmt.Errorf("%w: rich text decoration part limit exceeded", ErrStreamLimitExceeded)
+				}
+				fields = append(fields, strings.ToLower(value[start:i]))
+			}
 			if len(fields) == 0 {
 				return style, fmt.Errorf("invalid rich text decoration")
 			}
@@ -200,7 +236,7 @@ func annotationRichCSSStyle(parent, style annotationRichStyle, text string) (ann
 			return style, &UnsupportedError{Feature: "rich text style " + name}
 		}
 	}
-	return style, nil
+	return style, ctx.Err()
 }
 
 // annotationRichStretch 读取PDF富文本允许的九种CSS字体宽度
@@ -230,17 +266,24 @@ func annotationRichStretch(value string) int {
 	return 0
 }
 
-// splitAnnotationRichCSS 按引号和括号边界拆分CSS属性或列表
-// 入参: text CSS内容, separator 分隔符
-// 返回: []string 内容片段, error 未闭合的字符串或括号
-func splitAnnotationRichCSS(text string, separator byte) ([]string, error) {
-	var fields []string
-	start, depth, quote := 0, 0, byte(0)
+// walkAnnotationRichCSS 按引号和括号边界遍历CSS属性或列表片段并限制切分项数量
+// 入参: ctx 取消上下文, text CSS内容, separator 分隔符, fn 片段回调
+// 返回: error 未闭合的字符串或括号、超限、取消或回调错误
+func walkAnnotationRichCSS(ctx context.Context, text string, separator byte, fn func(string) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	start, depth, quote, parts := 0, 0, byte(0), 0
 	for i := 0; i < len(text); i++ {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		ch := text[i]
 		if ch == '\\' {
 			if i+1 == len(text) {
-				return nil, fmt.Errorf("incomplete rich text CSS escape")
+				return fmt.Errorf("incomplete rich text CSS escape")
 			}
 			i++
 			continue
@@ -259,18 +302,42 @@ func splitAnnotationRichCSS(text string, separator byte) ([]string, error) {
 		case ')':
 			depth--
 			if depth < 0 {
-				return nil, fmt.Errorf("invalid rich text CSS parentheses")
+				return fmt.Errorf("invalid rich text CSS parentheses")
 			}
 		}
 		if depth == 0 && (ch == separator || separator == ' ' && (ch == '\t' || ch == '\r' || ch == '\n')) {
-			fields = append(fields, text[start:i])
+			parts++
+			if parts >= maxAnnotationRichCSSParts {
+				return fmt.Errorf("%w: rich text CSS part limit exceeded", ErrStreamLimitExceeded)
+			}
+			if err := fn(text[start:i]); err != nil {
+				return err
+			}
 			start = i + 1
 		}
 	}
 	if quote != 0 || depth != 0 {
-		return nil, fmt.Errorf("incomplete rich text CSS value")
+		return fmt.Errorf("incomplete rich text CSS value")
 	}
-	return append(fields, text[start:]), nil
+	if err := fn(text[start:]); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// splitAnnotationRichCSS 按引号和括号边界拆分CSS属性或列表并限制切分项数量
+// 入参: ctx 取消上下文, text CSS内容, separator 分隔符
+// 返回: []string 内容片段, error 未闭合的字符串或括号、超限或取消错误
+func splitAnnotationRichCSS(ctx context.Context, text string, separator byte) ([]string, error) {
+	var fields []string
+	err := walkAnnotationRichCSS(ctx, text, separator, func(part string) error {
+		fields = append(fields, part)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return fields, nil
 }
 
 // annotationRichPoint 解析富文本的点单位数值，零允许省略单位
@@ -314,17 +381,12 @@ func annotationRichWeight(value string) (int, error) {
 const maxAnnotationRichFamilies = 64
 
 // annotationRichFamilies 解析有序字体名称列表，保留名称中的空格并去重限制数量
-// 入参: value 字体列表
-// 返回: []annotationRichFamilyName 字体名称, error 空名称、超限或引号错误
-func annotationRichFamilies(value string) ([]annotationRichFamilyName, error) {
-	fields, err := splitAnnotationRichCSS(value, ',')
-	if err != nil {
-		return nil, err
-	}
-	capacity := min(len(fields), maxAnnotationRichFamilies)
-	families := make([]annotationRichFamilyName, 0, capacity)
-	seen := make(map[string]bool, capacity)
-	for _, field := range fields {
+// 入参: ctx 取消上下文, value 字体列表
+// 返回: []annotationRichFamilyName 字体名称, error 空名称、超限、引号或取消错误
+func annotationRichFamilies(ctx context.Context, value string) ([]annotationRichFamilyName, error) {
+	families := make([]annotationRichFamilyName, 0, 8)
+	seen := make(map[string]bool, 8)
+	err := walkAnnotationRichCSS(ctx, value, ',', func(field string) error {
 		field = strings.TrimSpace(field)
 		quoted := false
 		if len(field) >= 2 && (field[0] == '\'' || field[0] == '"') && field[len(field)-1] == field[0] {
@@ -332,7 +394,7 @@ func annotationRichFamilies(value string) ([]annotationRichFamilyName, error) {
 			field = field[1 : len(field)-1]
 		}
 		if field == "" || strings.ContainsAny(field, "\\") {
-			return nil, &UnsupportedError{Feature: "rich text font family " + field}
+			return &UnsupportedError{Feature: "rich text font family " + field}
 		}
 		generic := false
 		if !quoted {
@@ -345,13 +407,17 @@ func annotationRichFamilies(value string) ([]annotationRichFamilyName, error) {
 		item := annotationRichFamilyName{field, generic}
 		key := strings.ToLower(annotationRichFamily(item))
 		if seen[key] {
-			continue
+			return nil
 		}
 		if len(families) >= maxAnnotationRichFamilies {
-			return nil, fmt.Errorf("%w: rich text font family limit exceeded", ErrStreamLimitExceeded)
+			return fmt.Errorf("%w: rich text font family limit exceeded", ErrStreamLimitExceeded)
 		}
 		seen[key] = true
 		families = append(families, item)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return families, nil
 }
@@ -375,7 +441,7 @@ func annotationRichColor(value string) ([3]float64, error) {
 	if !strings.HasPrefix(value, "rgb(") || !strings.HasSuffix(value, ")") {
 		return color, &UnsupportedError{Feature: "rich text color " + value}
 	}
-	values := strings.Split(value[4:len(value)-1], ",")
+	values := strings.SplitN(value[4:len(value)-1], ",", 4)
 	if len(values) != 3 {
 		return color, fmt.Errorf("invalid rich text RGB color")
 	}

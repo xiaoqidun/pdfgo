@@ -266,14 +266,25 @@ func (r *Reader) isLiveXrefRef(ref Reference) bool {
 }
 
 // baseRewriteObjectID 统计交叉引用表与原始可达对象图悬空引用中的最大对象编号
-// 返回: int64 原始文档最大对象编号
-func (r *Reader) baseRewriteObjectID() int64 {
+// 入参: ctx 取消上下文
+// 返回: int64 原始文档最大对象编号, error 取消错误
+func (r *Reader) baseRewriteObjectID(ctx context.Context) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	maximum := int64(0)
+	xrefSteps := 0
 	for id := range r.xref {
+		if xrefSteps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
+		xrefSteps++
 		maximum = max(maximum, id)
 	}
 	if r.Trailer == nil {
-		return maximum
+		return maximum, ctx.Err()
 	}
 	originalCache := r.cache.snapshot()
 	defer r.cache.prune(originalCache)
@@ -282,19 +293,26 @@ func (r *Reader) baseRewriteObjectID() int64 {
 	seen := make(map[Reference]bool)
 	var queue []Reference
 	var dangling []int64
-	var scan func(Object, int)
-	scan = func(value Object, depth int) {
+	scanSteps := 0
+	var scan func(Object, int) error
+	scan = func(value Object, depth int) error {
 		if depth > 256 {
-			return
+			return nil
 		}
+		if scanSteps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		scanSteps++
 		switch v := value.(type) {
 		case Reference:
 			if v.Number <= 0 || v.Generation < 0 || v.Generation > 65535 {
-				return
+				return nil
 			}
 			if !r.isLiveXrefRef(v) {
 				dangling = append(dangling, v.Number)
-				return
+				return nil
 			}
 			if !seen[v] {
 				seen[v] = true
@@ -302,18 +320,28 @@ func (r *Reader) baseRewriteObjectID() int64 {
 			}
 		case Array:
 			for _, item := range v {
-				scan(item, depth+1)
+				if err := scan(item, depth+1); err != nil {
+					return err
+				}
 			}
 		case Dictionary:
 			for _, item := range v {
-				scan(item, depth+1)
+				if err := scan(item, depth+1); err != nil {
+					return err
+				}
 			}
 		case *Stream:
-			scan(v.Dictionary, depth+1)
+			return scan(v.Dictionary, depth+1)
 		}
+		return nil
 	}
-	scan(r.Trailer, 0)
+	if err := scan(r.Trailer, 0); err != nil {
+		return 0, err
+	}
 	for i := 0; i < len(queue); i++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		ref := queue[i]
 		value, err := r.Object(ref)
 		if !originalCache[ref] {
@@ -322,36 +350,61 @@ func (r *Reader) baseRewriteObjectID() int64 {
 		if err != nil {
 			continue
 		}
-		scan(value, 0)
+		if err := scan(value, 0); err != nil {
+			return 0, err
+		}
 	}
 	slices.Sort(dangling)
-	for _, id := range dangling {
+	for i, id := range dangling {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
 		if id > maximum && id <= maximum+1<<20 && id < math.MaxInt32-1024 {
 			maximum = id
 		}
 	}
-	return maximum
+	return maximum, ctx.Err()
 }
 
 // maxRewriteObjectID 统计交叉引用表、替换对象表与原始可达对象图悬空引用中的最大对象编号，并复用单次写出周期的基准扫描结果
-// 入参: replacements 已有替换对象
-// 返回: int64 最大对象编号
-func (r *Reader) maxRewriteObjectID(replacements map[Reference]Object) int64 {
+// 入参: ctx 取消上下文, replacements 已有替换对象
+// 返回: int64 最大对象编号, error 取消错误
+func (r *Reader) maxRewriteObjectID(ctx context.Context, replacements map[Reference]Object) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	var maximum int64
 	if cache := r.rewriteMaxID; cache != nil {
 		if !cache.ready || cache.xrefLen != len(r.xref) {
-			cache.maxID = r.baseRewriteObjectID()
+			baseID, err := r.baseRewriteObjectID(ctx)
+			if err != nil {
+				return 0, err
+			}
+			cache.maxID = baseID
 			cache.xrefLen = len(r.xref)
 			cache.ready = true
 		}
 		maximum = cache.maxID
 	} else {
-		maximum = r.baseRewriteObjectID()
+		var err error
+		maximum, err = r.baseRewriteObjectID(ctx)
+		if err != nil {
+			return 0, err
+		}
 	}
+	steps := 0
 	for ref := range replacements {
+		if steps&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
+		steps++
 		maximum = max(maximum, ref.Number)
 	}
-	return maximum
+	return maximum, ctx.Err()
 }
 
 // actionSequences 按确定顺序遍历待写动作序列，不改变各序列内部顺序
@@ -421,7 +474,7 @@ func (r *Reader) rewriteReader(replacements map[Reference]Object) *Reader {
 
 // linkReplacements 按页面复制链接及注解数组，不影响其他页面共享的注解
 // 入参: ctx 取消上下文, regions 注解位置与目标区域, destinations 链接导航修改, result 已有替换对象
-// 返回: error 引用或区域错误
+// 返回: error 引用、区域或取消错误
 func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLocation]LinkRegion, destinations map[AnnotationLocation]linkNavigation, result map[Reference]Object) error {
 	if len(regions) == 0 && len(destinations) == 0 {
 		return nil
@@ -437,7 +490,10 @@ func (r *Reader) linkReplacements(ctx context.Context, regions map[AnnotationLoc
 	if err != nil {
 		return err
 	}
-	maximum := r.maxRewriteObjectID(result)
+	maximum, err := r.maxRewriteObjectID(ctx, result)
+	if err != nil {
+		return err
+	}
 	if maximum > math.MaxInt32-int64(len(selected))-1024 {
 		return fmt.Errorf("PDF object number exceeds output limit")
 	}

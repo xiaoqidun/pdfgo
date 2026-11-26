@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -46,7 +47,7 @@ type HideAction struct {
 
 // ReadResetFormAction 按PDF标准表238和表239解析重置范围及排除标志
 // 入参: ctx 取消上下文, object 动作字典或引用
-// 返回: ResetFormAction 重置范围, error 字段、标志、引用或取消错误
+// 返回: ResetFormAction 重置范围, error 字段、标志、引用、超限或取消错误
 func (r *Reader) ReadResetFormAction(ctx context.Context, object Object) (ResetFormAction, error) {
 	var result ResetFormAction
 	dict, err := r.actionDictionary(ctx, object, "ResetForm")
@@ -98,7 +99,7 @@ func (r *Reader) ReadImportDataAction(ctx context.Context, object Object) (Impor
 
 // ReadHideAction 按PDF标准表210解析注解及字段的隐藏或显示目标
 // 入参: ctx 取消上下文, object 动作字典或引用
-// 返回: HideAction 目标和可见性操作, error 目标、标志或取消错误
+// 返回: HideAction 目标和可见性操作, error 目标、标志、超限或取消错误
 func (r *Reader) ReadHideAction(ctx context.Context, object Object) (HideAction, error) {
 	result := HideAction{Hide: true}
 	dict, err := r.actionDictionary(ctx, object, "Hide")
@@ -130,8 +131,9 @@ func (r *Reader) ReadHideAction(ctx context.Context, object Object) (HideAction,
 
 // actionTargets 读取动作目标，区分字段引用与注解引用，不修改源字典
 // 入参: ctx 取消上下文, objects 混合目标数组, annotations 是否限定注解引用
-// 返回: []ActionTarget 引用和字段名称, error 结构、文字或取消错误
+// 返回: []ActionTarget 引用和字段名称, error 结构、文字、超限或取消错误
 func (r *Reader) actionTargets(ctx context.Context, objects Array, annotations bool) ([]ActionTarget, error) {
+	budget := newTextStringBudget(r)
 	result := make([]ActionTarget, 0, len(objects))
 	for _, object := range objects {
 		if err := ctx.Err(); err != nil {
@@ -142,8 +144,11 @@ func (r *Reader) actionTargets(ctx context.Context, objects Array, annotations b
 			return nil, err
 		}
 		if text, ok := value.(String); ok {
-			name, err := DecodeTextString(text)
+			name, err := budget.decodeString(ref, text, "action target")
 			if err != nil {
+				if errors.Is(err, ErrStreamLimitExceeded) {
+					return nil, err
+				}
 				return nil, wrapActionError(err)
 			}
 			result = append(result, ActionTarget{Name: name})

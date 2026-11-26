@@ -312,9 +312,12 @@ func (r *Reader) linkAppearance(annotation Annotation) (*Stream, error) {
 }
 
 // inkAppearance 按原始手写坐标生成线段外观，保留公共笔画和不透明度
-// 入参: annotation 手写注解
-// 返回: *Stream 外观流, error 笔画或坐标错误
-func (r *Reader) inkAppearance(annotation Annotation) (*Stream, error) {
+// 入参: ctx 取消上下文, annotation 手写注解
+// 返回: *Stream 外观流, error 笔画、坐标、超限或取消错误
+func (r *Reader) inkAppearance(ctx context.Context, annotation Annotation) (*Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	border, err := r.readAnnotationBorder(annotation)
 	if err != nil {
 		return nil, err
@@ -346,32 +349,98 @@ func (r *Reader) inkAppearance(annotation Annotation) (*Stream, error) {
 	if err != nil {
 		return nil, err
 	}
+	contentLimit := annotationRichContentLimit(r)
 	content.WriteString("/Opacity gs 1 J 1 j\n")
+	if content.Len() > contentLimit {
+		return nil, fmt.Errorf("%w: ink appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
+	var validated map[Reference]bool
 	for _, path := range paths {
-		value, err := r.Resolve(path)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		ref, resolved, err := r.resolveIndirect(path)
 		if err != nil {
 			return nil, err
 		}
-		points, ok := value.(Array)
+		points, ok := resolved.(Array)
 		if !ok || len(points) < 2 || len(points)%2 != 0 {
 			return nil, fmt.Errorf("invalid ink coordinates")
 		}
-		coordinates, err := r.numberArray(points, len(points))
-		if err != nil {
-			return nil, err
-		}
 		if !stroke {
+			if ref != (Reference{}) && validated[ref] {
+				continue
+			}
+			for i := 0; i < len(points); i += 2 {
+				if i&511 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				x, err := r.number(points[i])
+				if err != nil {
+					return nil, err
+				}
+				y, err := r.number(points[i+1])
+				if err != nil {
+					return nil, err
+				}
+				if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+					return nil, fmt.Errorf("invalid ink coordinates")
+				}
+			}
+			if ref != (Reference{}) {
+				if validated == nil {
+					validated = make(map[Reference]bool)
+				}
+				validated[ref] = true
+			}
 			continue
 		}
-		writeAnnotationOperation(&content, "m", coordinates[0], coordinates[1])
-		if len(coordinates) == 2 {
-			writeAnnotationOperation(&content, "l", coordinates[0], coordinates[1])
+		pairs := len(points) / 2
+		if pairs == 1 {
+			pairs = 2
 		}
-		for i := 2; i < len(coordinates); i += 2 {
-			writeAnnotationOperation(&content, "l", coordinates[i], coordinates[i+1])
+		if remaining := contentLimit - content.Len(); remaining < 6 || pairs > remaining/6 {
+			return nil, fmt.Errorf("%w: ink appearance content limit exceeded", ErrStreamLimitExceeded)
+		}
+		for i := 0; i < len(points); i += 2 {
+			if i&511 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			x, err := r.number(points[i])
+			if err != nil {
+				return nil, err
+			}
+			y, err := r.number(points[i+1])
+			if err != nil {
+				return nil, err
+			}
+			if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
+				return nil, fmt.Errorf("invalid ink coordinates")
+			}
+			if i == 0 {
+				writeAnnotationOperation(&content, "m", x, y)
+				if len(points) == 2 {
+					writeAnnotationOperation(&content, "l", x, y)
+				}
+			} else {
+				writeAnnotationOperation(&content, "l", x, y)
+			}
+			if content.Len() > contentLimit {
+				return nil, fmt.Errorf("%w: ink appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 		}
 	}
 	content.WriteString("S\n")
+	if content.Len() > contentLimit {
+		return nil, fmt.Errorf("%w: ink appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	box := annotation.Rect
 	resources := Dictionary{"ExtGState": Dictionary{"Opacity": Dictionary{"CA": Real(alpha), "ca": Real(alpha)}}}
 	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}, "Resources": resources}, Data: []byte(content.String()), reader: r, cache: r.cache, hasWarning: r.warning != nil}, nil
@@ -482,10 +551,13 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 	return r.annotationAppearance(annotation, content.String(), nil)
 }
 
-// shapeAppearance 按图形边界或顶点、笔画和内部颜色生成外观
-// 入参: annotation 图形注解
-// 返回: *Stream 外观流, error 属性错误或不支持的边框效果
-func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
+// shapeAppearanceContext 在取消上下文和内容流上限内按图形边界或顶点、笔画和内部颜色生成外观
+// 入参: ctx 取消上下文, annotation 图形注解
+// 返回: *Stream 外观流, error 属性、超限、取消或不支持的边框效果错误
+func (r *Reader) shapeAppearanceContext(ctx context.Context, annotation Annotation) (*Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	border, err := r.readAnnotationBorder(annotation)
 	if err != nil {
 		return nil, err
@@ -531,6 +603,10 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 			return nil, err
 		}
 	}
+	contentLimit := annotationRichContentLimit(r)
+	if content.Len() > contentLimit {
+		return nil, fmt.Errorf("%w: shape appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
 	if stroke {
 		dx, dy := math.Min(border.width/2, (inner.XMax-inner.XMin)/2), math.Min(border.width/2, (inner.YMax-inner.YMin)/2)
 		inner.XMin += dx
@@ -553,9 +629,25 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 		if !ok || len(points) < minimum || len(points)%2 != 0 {
 			return nil, fmt.Errorf("invalid annotation vertices")
 		}
-		vertices, err = r.numberArray(points, len(points))
-		if err != nil {
-			return nil, err
+		remaining := contentLimit - content.Len()
+		if cloud == 0 && (remaining < 6 || len(points)/2 > remaining/6) || cloud > 0 && len(points)/2 > contentLimit {
+			return nil, fmt.Errorf("%w: shape appearance content limit exceeded", ErrStreamLimitExceeded)
+		}
+		vertices = make([]float64, len(points))
+		for i, item := range points {
+			if i&255 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			n, err := r.number(item)
+			if err != nil {
+				return nil, err
+			}
+			if math.IsNaN(n) || math.IsInf(n, 0) {
+				return nil, fmt.Errorf("invalid annotation vertices")
+			}
+			vertices[i] = n
 		}
 		pathValue, err := r.Resolve(annotation.Dictionary["Path"])
 		if err != nil {
@@ -565,13 +657,24 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 			return nil, &UnsupportedError{Feature: "annotation curved path"}
 		}
 		if cloud > 0 {
-			if err := writeAnnotationCloud(&content, vertices, 3*cloud); err != nil {
+			if err := writeAnnotationCloud(ctx, &content, vertices, 3*cloud, contentLimit); err != nil {
 				return nil, err
 			}
 		} else {
 			writeAnnotationOperation(&content, "m", vertices[0], vertices[1])
+			if content.Len() > contentLimit {
+				return nil, fmt.Errorf("%w: shape appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 			for j := 2; j < len(vertices); j += 2 {
+				if j&511 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				writeAnnotationOperation(&content, "l", vertices[j], vertices[j+1])
+				if content.Len() > contentLimit {
+					return nil, fmt.Errorf("%w: shape appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 			if annotation.Subtype == "Polygon" {
 				content.WriteString("h\n")
@@ -580,7 +683,7 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 			}
 		}
 	} else if cloud > 0 {
-		if err := writeAnnotationCloudFrame(&content, inner, cloud, annotation.Subtype == "Circle"); err != nil {
+		if err := writeAnnotationCloudFrameContext(ctx, &content, inner, cloud, annotation.Subtype == "Circle", contentLimit); err != nil {
 			return nil, err
 		}
 	} else if annotation.Subtype == "Square" {
@@ -619,6 +722,12 @@ func (r *Reader) shapeAppearance(annotation Annotation) (*Stream, error) {
 		if err := r.writeAnnotationEndings(&content, annotation, border, vertices, stroke); err != nil {
 			return nil, err
 		}
+	}
+	if content.Len() > contentLimit {
+		return nil, fmt.Errorf("%w: shape appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return r.annotationAppearance(annotation, content.String(), nil)
 }

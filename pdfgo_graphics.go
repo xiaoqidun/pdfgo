@@ -303,7 +303,8 @@ type pageInterpreter struct {
 	opaqueGroup            bool
 	patternMatrix          Matrix
 	patternState           *graphicsState
-	tilingPatterns         map[Name]*TilingPattern
+	tilings                *tilingPatternCache
+	shadingPatterns        *shadingPatternCache
 	bounds                 Rectangle
 	uncoloredPattern       bool
 	type3                  bool
@@ -401,7 +402,8 @@ func (p *pageInterpreter) resetTransient() {
 	p.uncoloredPattern = false
 	p.type3, p.uncoloredType3, p.type3Metrics = false, false, false
 	p.patternState = nil
-	p.tilingPatterns = nil
+	p.tilings = nil
+	p.shadingPatterns = nil
 	p.forms, p.content = nil, nil
 }
 
@@ -941,7 +943,12 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 // 入参: data 解码后的内容流
 // 返回: error 错误信息
 func (p *pageInterpreter) run(data []byte) error {
-	p.tilingPatterns = nil
+	p.tilings = nil
+	p.shadingPatterns = nil
+	defer func() {
+		p.tilings = nil
+		p.shadingPatterns = nil
+	}()
 	if p.patternState == nil && p.resources["Pattern"] != nil {
 		p.sealClips()
 		initial := p.state

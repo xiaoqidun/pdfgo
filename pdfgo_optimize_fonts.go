@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -816,6 +817,9 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 	visitedForms := make(map[Reference]bool)
 	visitedOwnForms := make(map[formVisitKey]bool)
 	visitedCharProcs := make(map[charProcVisitKey]bool)
+	visitedOwnType3 := make(map[Reference]bool)
+	visitedOwnType3Ptr := make(map[uintptr]bool)
+	visitedType3Res := make(map[uintptr]bool)
 	visitedContextType3 := make(map[Reference]bool)
 	visitedContextProcs := make(map[Reference]bool)
 	activeProcs := make(map[Reference]bool)
@@ -824,8 +828,15 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 	var scanResourcesType3 func(Dictionary, int) error
 	var scanType3Dict func(Dictionary, Reference, Dictionary, int) error
 	scanType3Dict = func(dict Dictionary, fontRef Reference, fallbackRes Dictionary, depth int) error {
+		budget--
+		if budget < 0 {
+			return fmt.Errorf("type3 operation limit exceeded")
+		}
 		if depth > 32 {
 			return fmt.Errorf("type3 recursion limit exceeded")
+		}
+		if fontRef.Number != 0 && visitedOwnType3[fontRef] {
+			return nil
 		}
 		procsVal, err := resolveMeta(dict["CharProcs"])
 		if err != nil {
@@ -855,7 +866,16 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 				hasOwnRes = true
 			}
 		}
-		if !hasOwnRes {
+		if hasOwnRes {
+			if fontRef.Number != 0 {
+				visitedOwnType3[fontRef] = true
+			} else if ptr := reflect.ValueOf(dict).Pointer(); ptr != 0 {
+				if visitedOwnType3Ptr[ptr] {
+					return nil
+				}
+				visitedOwnType3Ptr[ptr] = true
+			}
+		} else {
 			if fallbackRes == nil && fontRef.Number != 0 && visitedContextType3[fontRef] {
 				return nil
 			}
@@ -867,6 +887,10 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		for _, procObj := range procs {
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			budget--
+			if budget < 0 {
+				return fmt.Errorf("type3 operation limit exceeded")
 			}
 			objVal, procRef, err := r.resolveOptimizationObject(procObj, nil, cached)
 			if err != nil {
@@ -926,8 +950,18 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		if res == nil || res["Font"] == nil {
 			return nil
 		}
+		budget--
+		if budget < 0 {
+			return fmt.Errorf("type3 operation limit exceeded")
+		}
 		if depth > 32 {
 			return fmt.Errorf("type3 recursion limit exceeded")
+		}
+		if ptr := reflect.ValueOf(res).Pointer(); ptr != 0 {
+			if visitedType3Res[ptr] {
+				return nil
+			}
+			visitedType3Res[ptr] = true
 		}
 		fontsVal, err := resolveMeta(res["Font"])
 		if err != nil {
@@ -940,6 +974,10 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		for _, fontObj := range fontsDict {
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			budget--
+			if budget < 0 {
+				return fmt.Errorf("type3 operation limit exceeded")
 			}
 			objVal, fontRef, err := r.resolveOptimizationObject(fontObj, metadata, cached)
 			if err != nil {

@@ -40,12 +40,15 @@ func (r *Reader) screenAnnotationReplacements(ctx context.Context, additions map
 	if len(additions) == 0 {
 		return nil, nil
 	}
-	number := r.maxRewriteObjectID(result)
+	number, err := r.maxRewriteObjectID(ctx, result)
+	if err != nil {
+		return nil, err
+	}
 	refs := make(map[*ScreenAnnotation]Reference)
 	visited := make(map[Reference]bool)
 	copier := rewriteObjectCopy{ctx: ctx, source: r, objects: result, number: &number, copied: make(map[rewriteObjectIdentity]Reference)}
 	empty := &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Integer(1), Integer(1)}}}
-	err := r.WalkPages(ctx, func(_ int, source *Page) error {
+	err = r.WalkPages(ctx, func(_ int, source *Page) error {
 		annotations, exists := additions[source.Reference]
 		if !exists {
 			return nil

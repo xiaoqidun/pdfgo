@@ -20,6 +20,9 @@ import (
 	"os"
 )
 
+// maxRichMediaInstances 限制单次读取富媒体注解允许展开的最大实例总数
+const maxRichMediaInstances = 4096
+
 // ThreeD 保存3D数据、视图和激活参数，不解码模型或执行脚本
 // AnnotationBackground仅在面色要求宿主背景时读取，空值表示透明
 // AnnotationBox使用页面用户坐标，ViewBox以注解中心为原点
@@ -446,7 +449,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 
 // ReadRichMedia 解析资源名称树和实例配置，允许实例资源不出现在名称树中
 // 入参: ctx 取消上下文, annotation 富媒体注解
-// 返回: RichMedia 媒体信息, error 资源、配置、引用、关闭或取消错误
+// 返回: RichMedia 媒体信息, error 资源、配置、引用、超限、关闭或取消错误
 func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (RichMedia, error) {
 	result := RichMedia{}
 	if ctx == nil || r == nil {
@@ -466,16 +469,49 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 		return result, err
 	}
 	result.Dictionary = dict
-	err = r.WalkNameTree(ctx, dict["Assets"], func(name string, object Object) error {
+	budget := newTextStringBudget(r)
+	assets := map[Reference]FileSpecification{}
+	readAsset := func(object Object) (FileSpecification, error) {
+		if err := ctx.Err(); err != nil {
+			return FileSpecification{}, err
+		}
+		ref, _, err := r.resolveIndirect(object)
+		if err != nil {
+			return FileSpecification{}, err
+		}
+		if ref != (Reference{}) {
+			if cached, ok := assets[ref]; ok {
+				if err := budget.consume(int64(len(cached.Name))+int64(len(cached.Description)), "rich media"); err != nil {
+					return FileSpecification{}, err
+				}
+				return cached, nil
+			}
+		}
 		file, err := r.ReadFileSpecification(object)
 		if err != nil {
+			return FileSpecification{}, err
+		}
+		if err := budget.consume(int64(len(file.Name))+int64(len(file.Description)), "rich media"); err != nil {
+			return FileSpecification{}, err
+		}
+		if ref != (Reference{}) {
+			assets[ref] = file
+		}
+		return file, nil
+	}
+	err = r.WalkNameTree(ctx, dict["Assets"], func(name string, object Object) error {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		name, err = DecodeTextString(String(name))
+		file, err := readAsset(object)
 		if err != nil {
 			return err
 		}
-		result.Assets = append(result.Assets, MediaAsset{Name: name, File: file})
+		decoded, err := budget.decodeString(Reference{}, String(name), "rich media")
+		if err != nil {
+			return err
+		}
+		result.Assets = append(result.Assets, MediaAsset{Name: decoded, File: file})
 		return nil
 	})
 	if err != nil {
@@ -488,6 +524,7 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 	if len(configs) == 0 {
 		return result, fmt.Errorf("missing rich media configurations")
 	}
+	totalInstances := 0
 	for index, config := range configs {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -501,31 +538,46 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 			return result, fmt.Errorf("invalid rich media configuration subtype")
 		}
 		converted := MediaConfiguration{Reference: configRefs[index], Subtype: kind, Dictionary: config}
-		instances, err := r.mediaDictionariesContext(ctx, config["Instances"])
+		rawInstances, err := r.Resolve(config["Instances"])
 		if err != nil {
 			return result, err
 		}
-		for _, instance := range instances {
-			if err := ctx.Err(); err != nil {
-				return result, err
+		if rawInstances != nil {
+			instanceArray, ok := rawInstances.(Array)
+			if !ok {
+				return result, fmt.Errorf("invalid media dictionary array")
 			}
-			value, err := r.Resolve(instance["Subtype"])
-			if err != nil {
-				return result, err
+			if len(instanceArray) > maxRichMediaInstances-totalInstances {
+				return result, fmt.Errorf("%w: rich media instance limit exceeded", ErrStreamLimitExceeded)
 			}
-			subtype, ok := value.(Name)
-			if !ok || subtype == "" {
-				return result, fmt.Errorf("invalid rich media instance subtype")
+			converted.Instances = make([]MediaInstance, 0, len(instanceArray))
+			for _, item := range instanceArray {
+				if err := ctx.Err(); err != nil {
+					return result, err
+				}
+				instance, err := r.mediaDictionary(item, false)
+				if err != nil {
+					return result, err
+				}
+				totalInstances++
+				value, err := r.Resolve(instance["Subtype"])
+				if err != nil {
+					return result, err
+				}
+				subtype, ok := value.(Name)
+				if !ok || subtype == "" {
+					return result, fmt.Errorf("invalid rich media instance subtype")
+				}
+				file, err := readAsset(instance["Asset"])
+				if err != nil {
+					return result, err
+				}
+				params, err := r.mediaDictionary(instance["Params"], true)
+				if err != nil {
+					return result, err
+				}
+				converted.Instances = append(converted.Instances, MediaInstance{Subtype: subtype, Asset: file, Parameters: params, Dictionary: instance})
 			}
-			file, err := r.ReadFileSpecification(instance["Asset"])
-			if err != nil {
-				return result, err
-			}
-			params, err := r.mediaDictionary(instance["Params"], true)
-			if err != nil {
-				return result, err
-			}
-			converted.Instances = append(converted.Instances, MediaInstance{Subtype: subtype, Asset: file, Parameters: params, Dictionary: instance})
 		}
 		if converted.Subtype == "" && len(converted.Instances) != 0 {
 			converted.Subtype = converted.Instances[0].Subtype

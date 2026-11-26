@@ -137,6 +137,64 @@ func (p *ShadingPattern) source() (Paint, *Path, *Paint, error) {
 	return paint, clip, bg, nil
 }
 
+// shadingPatternKey 标识当前内容流作用域内可复用的着色图案结果
+type shadingPatternKey struct {
+	ref      Reference
+	name     Name
+	matrix   Matrix
+	blending *ColorSpace
+}
+
+// shadingStreamKey 标识当前内容流作用域内可复用的网格着色流结果
+type shadingStreamKey struct {
+	stream   *Stream
+	matrix   Matrix
+	intent   Name
+	blending *ColorSpace
+}
+
+// shadingPatternCache 有界缓存着色图案与底层网格着色结果，超大结果通过单槽复用避免重复分配
+type shadingPatternCache struct {
+	byPattern  map[shadingPatternKey]Paint
+	byStream   map[shadingStreamKey]Paint
+	lastKey    shadingPatternKey
+	lastPaint  Paint
+	hasLast    bool
+	lastStream shadingStreamKey
+	lastMesh   Paint
+	hasMesh    bool
+	bytes      int64
+}
+
+// shadingPaintBytes 估算着色画刷的内存占用
+// 入参: paint 着色画刷
+// 返回: int64 估算字节数
+func shadingPaintBytes(paint Paint) int64 {
+	if paint.Shading != nil {
+		return 256 + shadingPaintBytes(paint.Shading.Paint)
+	}
+	if m := paint.Mesh; m != nil {
+		size := int64(256)
+		if len(m.Triangles) > 0 {
+			size += int64(len(m.Triangles)) * (144 + int64(len(m.Triangles[0].Colors[0]))*24)
+		}
+		if len(m.Patches) > 0 {
+			size += int64(len(m.Patches)) * (400 + int64(len(m.Patches[0].Colors[0]))*32)
+		}
+		return size
+	}
+	if paint.Axial != nil {
+		return 256 + int64(len(paint.Axial.Stops))*64
+	}
+	if paint.Radial != nil {
+		return 256 + int64(len(paint.Radial.Stops))*64
+	}
+	if paint.Function != nil {
+		return 256 + coordinateFunctionBytes(paint.Function.function)
+	}
+	return 256
+}
+
 // shadingPattern 读取定义时的状态，仅解释影响sh的内部参数
 // 入参: name 图案资源名
 // 返回: Paint 图案画刷, error 状态或着色错误
@@ -144,6 +202,18 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	object, err := p.resource("Pattern", name)
 	if err != nil {
 		return Paint{}, err
+	}
+	key := shadingPatternKey{name: name, matrix: p.patternMatrix, blending: p.blendingSpace}
+	if ref, ok := object.(Reference); ok {
+		key.ref, key.name = ref, ""
+	}
+	if cache := p.shadingPatterns; cache != nil {
+		if cached, ok := cache.byPattern[key]; ok {
+			return cached, nil
+		}
+		if cache.hasLast && cache.lastKey == key {
+			return cache.lastPaint, nil
+		}
 	}
 	value, err := p.reader.Resolve(object)
 	if err != nil {
@@ -203,40 +273,102 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if err != nil {
 		return Paint{}, err
 	}
-	paint, err := child.shadingPatternPaint(shading, matrix)
-	if err != nil || paint.None || object == nil {
-		return paint, err
+	budget := int64(formCacheLimit)
+	if maxBytes, _ := effectiveStreamLimits(p.reader, nil); maxBytes > 0 && maxBytes < budget {
+		budget = maxBytes
 	}
-	definition, ok := shading.(Dictionary)
+	var paint Paint
+	streamHit, streamBudgeted := false, false
 	if stream, isStream := shading.(*Stream); isStream {
-		definition, ok = stream.Dictionary, true
-	}
-	if !ok {
-		return Paint{}, fmt.Errorf("invalid shading pattern definition")
-	}
-	var background *Paint
-	value, err = p.reader.Resolve(definition["Background"])
-	if err != nil {
-		return Paint{}, err
-	}
-	if value != nil {
-		space, err := child.shadingColorSpace(definition["ColorSpace"])
+		sKey := shadingStreamKey{stream: stream, matrix: matrix, intent: child.state.style.RenderingIntent, blending: child.blendingSpace}
+		if cache := p.shadingPatterns; cache != nil {
+			if cached, hit := cache.byStream[sKey]; hit {
+				paint, streamHit, streamBudgeted = cached, true, true
+			} else if cache.hasMesh && cache.lastStream == sKey {
+				paint, streamHit = cache.lastMesh, true
+			}
+		}
+		if !streamHit {
+			paint, err = child.shadingPatternPaint(shading, matrix)
+			if err != nil {
+				return Paint{}, err
+			}
+			if !paint.None {
+				if p.shadingPatterns == nil {
+					p.shadingPatterns = &shadingPatternCache{}
+				}
+				cost := shadingPaintBytes(paint)
+				if len(p.shadingPatterns.byStream) < 1024 && cost <= budget-p.shadingPatterns.bytes {
+					if p.shadingPatterns.byStream == nil {
+						p.shadingPatterns.byStream = make(map[shadingStreamKey]Paint)
+					}
+					p.shadingPatterns.byStream[sKey] = paint
+					p.shadingPatterns.bytes += cost
+					streamBudgeted = true
+				} else {
+					p.shadingPatterns.lastStream, p.shadingPatterns.lastMesh, p.shadingPatterns.hasMesh = sKey, paint, true
+				}
+			}
+		}
+	} else {
+		paint, err = child.shadingPatternPaint(shading, matrix)
 		if err != nil {
 			return Paint{}, err
 		}
-		base, err := child.reader.readPatternColorSpaceContext(child.ctx, space, true)
-		if err != nil {
-			return Paint{}, err
-		}
-		values, err := child.reader.numberArray(value, base.components)
-		if err != nil {
-			return Paint{}, err
-		}
-		color, err := base.convert(values, child.state.style.RenderingIntent)
-		if err != nil {
-			return Paint{}, err
-		}
-		background = &color
 	}
-	return Paint{Alpha: 1, Shading: &ShadingPattern{Paint: paint, Style: child.state.style, Background: background}}, nil
+	if paint.None {
+		return paint, nil
+	}
+	result := paint
+	if object != nil {
+		definition, ok := shading.(Dictionary)
+		if stream, isStream := shading.(*Stream); isStream {
+			definition, ok = stream.Dictionary, true
+		}
+		if !ok {
+			return Paint{}, fmt.Errorf("invalid shading pattern definition")
+		}
+		var background *Paint
+		value, err = p.reader.Resolve(definition["Background"])
+		if err != nil {
+			return Paint{}, err
+		}
+		if value != nil {
+			space, err := child.shadingColorSpace(definition["ColorSpace"])
+			if err != nil {
+				return Paint{}, err
+			}
+			base, err := child.reader.readPatternColorSpaceContext(child.ctx, space, true)
+			if err != nil {
+				return Paint{}, err
+			}
+			values, err := child.reader.numberArray(value, base.components)
+			if err != nil {
+				return Paint{}, err
+			}
+			color, err := base.convert(values, child.state.style.RenderingIntent)
+			if err != nil {
+				return Paint{}, err
+			}
+			background = &color
+		}
+		result = Paint{Alpha: 1, Shading: &ShadingPattern{Paint: paint, Style: child.state.style, Background: background}}
+	}
+	if p.shadingPatterns == nil {
+		p.shadingPatterns = &shadingPatternCache{}
+	}
+	cost := int64(256)
+	if !streamBudgeted {
+		cost = shadingPaintBytes(result)
+	}
+	if len(p.shadingPatterns.byPattern) < 1024 && cost <= budget-p.shadingPatterns.bytes {
+		if p.shadingPatterns.byPattern == nil {
+			p.shadingPatterns.byPattern = make(map[shadingPatternKey]Paint)
+		}
+		p.shadingPatterns.byPattern[key] = result
+		p.shadingPatterns.bytes += cost
+	} else {
+		p.shadingPatterns.lastKey, p.shadingPatterns.lastPaint, p.shadingPatterns.hasLast = key, result, true
+	}
+	return result, nil
 }

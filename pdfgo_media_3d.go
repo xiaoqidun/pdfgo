@@ -88,16 +88,35 @@ type ThreeDPresentation struct {
 	ResetNodes    bool
 }
 
+// cloneThreeDNode 复制节点的可变数值指针字段并共享不可变名称和源字典
+// 入参: node 源三维节点
+// 返回: ThreeDNode 克隆后的节点
+func cloneThreeDNode(node ThreeDNode) ThreeDNode {
+	if node.Opacity != nil {
+		v := *node.Opacity
+		node.Opacity = &v
+	}
+	if node.Visible != nil {
+		v := *node.Visible
+		node.Visible = &v
+	}
+	if node.Matrix != nil {
+		v := *node.Matrix
+		node.Matrix = &v
+	}
+	return node
+}
+
 // ReadThreeDPresentation 按PDF标准表304及表308读取生效的视图内容，不执行脚本
 // 入参: object 视图字典或引用
-// 返回: ThreeDPresentation 呈现参数, error 类型或引用错误
+// 返回: ThreeDPresentation 呈现参数, error 类型、引用或超限错误
 func (r *Reader) ReadThreeDPresentation(object Object) (ThreeDPresentation, error) {
 	return r.readThreeDPresentation(context.Background(), object)
 }
 
 // readThreeDPresentation 按取消上下文与PDF标准表304及表308读取生效的视图内容，不执行脚本
 // 入参: ctx 取消上下文, object 视图字典或引用
-// 返回: ThreeDPresentation 呈现参数, error 类型、引用或取消错误
+// 返回: ThreeDPresentation 呈现参数, error 类型、引用、超限或取消错误
 func (r *Reader) readThreeDPresentation(ctx context.Context, object Object) (ThreeDPresentation, error) {
 	result := ThreeDPresentation{}
 	if err := ctx.Err(); err != nil {
@@ -138,19 +157,37 @@ func (r *Reader) readThreeDPresentation(ctx context.Context, object Object) (Thr
 		}
 		result.ResetNodes = bool(flag)
 	}
-	nodes, err := r.mediaDictionariesContext(ctx, dict["NA"])
+	nodes, nodeRefs, err := r.mediaDictionariesWithRefs(ctx, dict["NA"])
 	if err != nil {
 		return result, err
 	}
 	if len(nodes) != 0 {
+		budget := newTextStringBudget(r)
+		var nodeCache map[Reference]ThreeDNode
 		result.Nodes = make([]ThreeDNode, len(nodes))
 		for i, node := range nodes {
 			if err := ctx.Err(); err != nil {
 				return result, err
 			}
-			result.Nodes[i], err = r.ReadThreeDNode(node)
+			if nodeRefs[i] != (Reference{}) {
+				if cached, ok := nodeCache[nodeRefs[i]]; ok {
+					if err := budget.consume(int64(len(cached.Name)), "3D node"); err != nil {
+						return result, err
+					}
+					result.Nodes[i] = cloneThreeDNode(cached)
+					continue
+				}
+			}
+			parsed, err := r.readThreeDNode(ctx, node, &budget)
 			if err != nil {
 				return result, err
+			}
+			result.Nodes[i] = parsed
+			if nodeRefs[i] != (Reference{}) {
+				if nodeCache == nil {
+					nodeCache = make(map[Reference]ThreeDNode)
+				}
+				nodeCache[nodeRefs[i]] = parsed
 			}
 		}
 	}
@@ -247,14 +284,14 @@ func (r *Reader) ReadThreeDLighting(object Object) (ThreeDLighting, error) {
 
 // ReadThreeDCamera 按PDF标准表304解析相机来源，仅读取该来源生效的参数
 // 入参: object 视图字典或引用
-// 返回: ThreeDCamera 相机参数, error 类型、数值、路径或引用错误
+// 返回: ThreeDCamera 相机参数, error 类型、数值、路径、超限或引用错误
 func (r *Reader) ReadThreeDCamera(object Object) (ThreeDCamera, error) {
 	return r.readThreeDCamera(context.Background(), object)
 }
 
 // readThreeDCamera 按取消上下文与PDF标准表304解析相机来源，仅读取该来源生效的参数
 // 入参: ctx 取消上下文, object 视图字典或引用
-// 返回: ThreeDCamera 相机参数, error 类型、数值、路径、引用或取消错误
+// 返回: ThreeDCamera 相机参数, error 类型、数值、路径、超限、引用或取消错误
 func (r *Reader) readThreeDCamera(ctx context.Context, object Object) (ThreeDCamera, error) {
 	result := ThreeDCamera{}
 	if err := ctx.Err(); err != nil {
@@ -282,24 +319,26 @@ func (r *Reader) readThreeDCamera(ctx context.Context, object Object) (ThreeDCam
 			result.Matrix[i] = value
 		}
 	} else {
-		value, err := r.Resolve(dict["U3DPath"])
+		rawPath := dict["U3DPath"]
+		value, err := r.Resolve(rawPath)
 		if err != nil {
 			return result, err
 		}
 		path, ok := value.(Array)
 		result.PathFromRoot = ok
 		if _, single := value.(String); single {
-			path, ok = Array{value}, true
+			path, ok = Array{rawPath}, true
 		}
 		if !ok || len(path) == 0 {
 			return result, fmt.Errorf("invalid 3D camera path")
 		}
+		budget := newTextStringBudget(r)
 		result.Path = make([]string, len(path))
 		for i, item := range path {
 			if err := ctx.Err(); err != nil {
 				return result, err
 			}
-			value, err := r.Resolve(item)
+			ref, value, err := r.resolveIndirect(item)
 			if err != nil {
 				return result, err
 			}
@@ -307,7 +346,7 @@ func (r *Reader) readThreeDCamera(ctx context.Context, object Object) (ThreeDCam
 			if !ok {
 				return result, fmt.Errorf("invalid 3D camera path component")
 			}
-			result.Path[i], err = DecodeTextString(text)
+			result.Path[i], err = budget.decodeString(ref, text, "3D camera path")
 			if err != nil {
 				return result, err
 			}

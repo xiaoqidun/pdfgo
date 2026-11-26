@@ -27,6 +27,9 @@ import (
 // maxColorSpaceParseNodes 限制单次颜色空间解析允许访问的最大节点数，防止共享DAG指数展开
 const maxColorSpaceParseNodes = 4096
 
+// maxColorProfileCacheEntries 限制单个Reader常驻缓存的ICC配置最大条数
+const maxColorProfileCacheEntries = 256
+
 // colorParseStateKey 作为上下文键传递单次颜色空间解析状态
 type colorParseStateKey struct{}
 
@@ -42,10 +45,12 @@ type separationCacheKey struct {
 	effective bool
 }
 
-// colorParseState 保存单次颜色空间解析的节点预算及高版本配置流与分色缓存
+// colorParseState 保存单次颜色空间解析的节点预算及配置流与分色缓存
 type colorParseState struct {
 	nodes       int
 	iccV5       map[iccStreamKey]bool
+	iccSpaces   map[iccStreamKey]*iccColorSpace
+	iccRecover  map[iccStreamKey]bool
 	separations map[separationCacheKey]*separationSpace
 }
 
@@ -150,7 +155,7 @@ func NewICCColorSpace(data []byte) (*ColorSpace, error) {
 
 // parseICCColorSpace 解析已确定分量数的配置，所有来源共用矩阵、曲线和查找表实现
 // 入参: data 配置快照, count 源分量数, key 内容摘要
-// 返回: *iccColorSpace 不可变颜色变换, error 配置错误
+// 返回: *iccColorSpace 不可变颜色变换, error 配置或预算错误
 func parseICCColorSpace(data []byte, count int, key [32]byte) (*iccColorSpace, error) {
 	model := map[int]string{1: "GRAY", 3: "RGB ", 4: "CMYK"}[count]
 	if count == 3 && len(data) >= 20 && string(data[16:20]) == "Lab " {
@@ -172,8 +177,9 @@ func parseICCColorSpace(data []byte, count int, key [32]byte) (*iccColorSpace, e
 	default:
 		space.intent = "RelativeColorimetric"
 	}
+	budget := maxICCLUTBytes
 	if tags["A2B0"] != nil {
-		space.lut, err = parseICCLUTSpace(data, tags)
+		space.lut, err = parseICCLUTSpace(data, tags, &budget)
 	} else if count == 1 {
 		space.gray, err = parseICCGray(data)
 	} else if count == 3 && !space.lab {
@@ -188,6 +194,21 @@ func parseICCColorSpace(data []byte, count int, key [32]byte) (*iccColorSpace, e
 	for n := range space.toFloat {
 		name := fmt.Sprintf("D2B%d", n)
 		if tag := tags[name]; tag != nil {
+			reused := false
+			for prev := 0; prev < n; prev++ {
+				if sameICCTag(tag, tags[fmt.Sprintf("D2B%d", prev)]) {
+					space.toFloat[n] = space.toFloat[prev]
+					reused = true
+					break
+				}
+			}
+			if reused {
+				continue
+			}
+			elements, sized := iccProcessElementsFloatCount(tag)
+			if sized && (elements > math.MaxInt64/8 || elements*8 > budget) {
+				return nil, fmt.Errorf("ICC %s: %w: ICC lookup table memory limit exceeded", name, ErrStreamLimitExceeded)
+			}
 			transform, err := parseICCProcessElements(tag)
 			var unsupported *UnsupportedError
 			if errors.As(err, &unsupported) {
@@ -199,12 +220,147 @@ func parseICCColorSpace(data []byte, count int, key [32]byte) (*iccColorSpace, e
 			if transform.input != int(count) || transform.output != 3 {
 				return nil, fmt.Errorf("invalid ICC %s channels", name)
 			}
+			if sized {
+				if err := iccReserveLUTBytes(&budget, elements); err != nil {
+					return nil, fmt.Errorf("ICC %s: %w", name, err)
+				}
+			}
 			space.toFloat[n] = transform
 		}
 	}
 	space.inverse = newICCInverse(tags, int(count), space.processPCS)
 	space.data = data
 	return space, nil
+}
+
+// iccProcessElementsFloatCount 解析前估算mpet标签中去重元素的float64数组总元素数
+// 入参: data mpet标签数据
+// 返回: int64 估算元素总数, bool 是否为可估算的合法mpet头结构
+func iccProcessElementsFloatCount(data []byte) (int64, bool) {
+	if len(data) < 16 || string(data[:4]) != "mpet" {
+		return 0, false
+	}
+	count := uint64(binary.BigEndian.Uint32(data[12:]))
+	if count > maxICCProcessElements {
+		return 0, false
+	}
+	blocks, err := iccProcessBlocks(data, 16, count)
+	if err != nil {
+		return 0, false
+	}
+	seen := make(map[*byte]bool, len(blocks))
+	var total int64
+	for _, block := range blocks {
+		if seen[&block[0]] {
+			continue
+		}
+		seen[&block[0]] = true
+		kind := string(block[:4])
+		in := uint64(binary.BigEndian.Uint16(block[8:]))
+		out := uint64(binary.BigEndian.Uint16(block[10:]))
+		if in == 0 || out == 0 {
+			return 0, false
+		}
+		var elems uint64
+		switch kind {
+		case "cvst":
+			if in != out {
+				return 0, false
+			}
+			curveBlocks, err := iccProcessBlocks(block, 12, in)
+			if err != nil {
+				return 0, false
+			}
+			curveSeen := make(map[*byte]bool, len(curveBlocks))
+			for _, curve := range curveBlocks {
+				if curveSeen[&curve[0]] {
+					continue
+				}
+				curveSeen[&curve[0]] = true
+				n, ok := iccSegmentedCurveFloatCount(curve)
+				if !ok {
+					return 0, false
+				}
+				if n > math.MaxUint64-elems {
+					return math.MaxInt64, true
+				}
+				elems += n
+			}
+		case "matf":
+			if len(block) < 12 || out > uint64(len(block)-12)/4/(in+1) {
+				return 0, false
+			}
+			elems = out * (in + 1)
+		case "clut":
+			if in > 16 || len(block) < 28 {
+				return 0, false
+			}
+			elems = out
+			for n := uint64(0); n < in; n++ {
+				g := uint64(block[12+n])
+				if g < 2 || elems > uint64(len(block)-28)/4/g {
+					return 0, false
+				}
+				elems *= g
+			}
+		default:
+			continue
+		}
+		if elems > uint64(math.MaxInt64-total) {
+			return math.MaxInt64, true
+		}
+		total += int64(elems)
+	}
+	return total, true
+}
+
+// iccSegmentedCurveFloatCount 估算单条curf分段曲线的float64元素总数
+// 入参: data curf分段曲线数据
+// 返回: uint64 估算元素总数, bool 是否为可估算的合法curf结构
+func iccSegmentedCurveFloatCount(data []byte) (uint64, bool) {
+	if len(data) < 12 || string(data[:4]) != "curf" {
+		return 0, false
+	}
+	count := int(binary.BigEndian.Uint16(data[8:]))
+	if count == 0 || count-1 > (len(data)-12)/4 {
+		return 0, false
+	}
+	total := uint64(count - 1)
+	seg := data[12+4*(count-1):]
+	for n := 0; n < count; n++ {
+		if len(seg) < 12 {
+			return 0, false
+		}
+		var add uint64
+		switch string(seg[:4]) {
+		case "parf":
+			fn := int(binary.BigEndian.Uint16(seg[8:]))
+			counts := [...]uint64{4, 5, 5}
+			if fn >= len(counts) {
+				return 0, false
+			}
+			add = counts[fn]
+		case "samf":
+			if n == 0 || n == count-1 {
+				return 0, false
+			}
+			add = uint64(binary.BigEndian.Uint32(seg[8:]))
+			if add == 0 {
+				return 0, false
+			}
+		default:
+			return 0, false
+		}
+		if add > uint64(len(seg)-12)/4 {
+			return 0, false
+		}
+		if add > math.MaxUint64-total {
+			return math.MaxUint64, true
+		}
+		total += add
+		seg = seg[12+4*add:]
+	}
+	return total, true
 }
 
 // parseICCRGB 校验ICC标签边界并读取D50矩阵和色调曲线
@@ -526,7 +682,10 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 		return nil, err
 	}
 	streamKey := iccStreamKey{stream: stream, count: int(count)}
-	if state.iccV5[streamKey] {
+	if cached := state.iccSpaces[streamKey]; cached != nil {
+		return cached.withRanges(ranges), nil
+	}
+	if state.iccV5[streamKey] || state.iccRecover[streamKey] {
 		return r.readICCAlternate(ctx, stream, int(count), ranges, effective)
 	}
 	data, err := r.DecodeStreamContext(ctx, stream)
@@ -534,11 +693,25 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		return r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
+		space, recErr := r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
+		if recErr == nil {
+			if state.iccRecover == nil {
+				state.iccRecover = make(map[iccStreamKey]bool)
+			}
+			state.iccRecover[streamKey] = true
+		}
+		return space, recErr
 	}
 	space, err := r.readICCProfileData(data, int(count))
 	if err != nil {
-		return r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
+		space, recErr := r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
+		if recErr == nil {
+			if state.iccRecover == nil {
+				state.iccRecover = make(map[iccStreamKey]bool)
+			}
+			state.iccRecover[streamKey] = true
+		}
+		return space, recErr
 	}
 	if space == nil {
 		if state.iccV5 == nil {
@@ -547,12 +720,16 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 		state.iccV5[streamKey] = true
 		return r.readICCAlternate(ctx, stream, int(count), ranges, effective)
 	}
+	if state.iccSpaces == nil {
+		state.iccSpaces = make(map[iccStreamKey]*iccColorSpace)
+	}
+	state.iccSpaces[streamKey] = space
 	return space.withRanges(ranges), nil
 }
 
 // readICCProfileData 校验并缓存源配置，后续版本返回空值以选择标准备用空间
 // 入参: data 配置数据, count PDF声明的分量数
-// 返回: *iccColorSpace 配置变换，后续版本为空, error 配置错误
+// 返回: *iccColorSpace 配置变换，后续版本为空, error 配置或预算错误
 func (r *Reader) readICCProfileData(data []byte, count int) (*iccColorSpace, error) {
 	if err := validateICCSourceHeader(data, count); err != nil {
 		return nil, err
@@ -572,11 +749,118 @@ func (r *Reader) readICCProfileData(data []byte, count int) (*iccColorSpace, err
 	if err != nil {
 		return nil, err
 	}
+	spaceBytes := iccProfileCacheBytes(space)
 	if r.colorProfiles == nil {
 		r.colorProfiles = make(map[[32]byte]*iccColorSpace)
+	} else {
+		var cachedBytes int64
+		for _, cached := range r.colorProfiles {
+			cachedBytes += iccProfileCacheBytes(cached)
+		}
+		if len(r.colorProfiles) >= maxColorProfileCacheEntries || cachedBytes+spaceBytes > maxICCLUTBytes*2 {
+			clear(r.colorProfiles)
+		}
 	}
-	r.colorProfiles[key] = space
+	if spaceBytes <= maxICCLUTBytes*2 {
+		r.colorProfiles[key] = space
+	}
 	return space, nil
+}
+
+// iccProfileCacheBytes 估算单个已解析ICC配置在缓存中占用的近似字节数
+// 入参: space 已解析的ICC配置
+// 返回: int64 估算字节数
+func iccProfileCacheBytes(space *iccColorSpace) int64 {
+	size := int64(256) + int64(len(space.data))
+	if space.lut != nil {
+		seenLUT := make(map[*iccLUT]bool, len(space.lut.toPCS))
+		for _, lut := range space.lut.toPCS {
+			if lut == nil || seenLUT[lut] {
+				continue
+			}
+			seenLUT[lut] = true
+			size += iccLUTMemoryBytes(lut)
+		}
+	}
+	seenProc := make(map[*iccProcessElements]bool, len(space.toFloat))
+	for _, proc := range space.toFloat {
+		if proc == nil || seenProc[proc] {
+			continue
+		}
+		seenProc[proc] = true
+		size += iccProcessMemoryBytes(proc)
+	}
+	if space.inverse != nil {
+		if space.inverse.ready.Load() {
+			size += space.inverse.initBytes
+		} else {
+			size += space.inverse.tagBytes
+		}
+	}
+	return size
+}
+
+// iccLUTMemoryBytes 估算单个ICC查找表或其多阶段管线的近似内存字节数
+// 入参: lut 查找表定义
+// 返回: int64 估算字节数
+func iccLUTMemoryBytes(lut *iccLUT) int64 {
+	var size int64
+	if lut.pipeline != nil {
+		p := lut.pipeline
+		size += int64(len(p.values)+len(p.matrix)+len(p.grid)) * 8
+		seenSamples := make(map[*uint16]bool)
+		seenParams := make(map[*float64]bool)
+		for _, set := range [][]iccToneCurve{p.a, p.b, p.m} {
+			for _, curve := range set {
+				if len(curve.samples) > 0 && !seenSamples[&curve.samples[0]] {
+					seenSamples[&curve.samples[0]] = true
+					size += int64(len(curve.samples)) * 2
+				}
+				if len(curve.parameters) > 0 && !seenParams[&curve.parameters[0]] {
+					seenParams[&curve.parameters[0]] = true
+					size += int64(len(curve.parameters)) * 8
+				}
+			}
+		}
+		return size
+	}
+	size += int64(len(lut.values)) * 8
+	for _, curve := range lut.input {
+		size += int64(len(curve)) * 8
+	}
+	for _, curve := range lut.output {
+		size += int64(len(curve)) * 8
+	}
+	return size
+}
+
+// iccProcessMemoryBytes 估算单个ICC浮点多阶段变换去重后的近似内存字节数
+// 入参: proc 浮点多阶段变换
+// 返回: int64 估算字节数
+func iccProcessMemoryBytes(proc *iccProcessElements) int64 {
+	var size int64
+	seenValues := make(map[*float64]bool)
+	seenBreaks := make(map[*float64]bool)
+	seenSeg := make(map[*iccCurveSegment]bool)
+	for _, elem := range proc.elements {
+		if len(elem.values) > 0 && !seenValues[&elem.values[0]] {
+			seenValues[&elem.values[0]] = true
+			size += int64(len(elem.values)) * 8
+		}
+		for _, curve := range elem.curves {
+			if len(curve.breaks) > 0 && !seenBreaks[&curve.breaks[0]] {
+				seenBreaks[&curve.breaks[0]] = true
+				size += int64(len(curve.breaks)) * 8
+			}
+			if len(curve.segments) > 0 && !seenSeg[&curve.segments[0]] {
+				seenSeg[&curve.segments[0]] = true
+				for _, seg := range curve.segments {
+					size += int64(len(seg.parameters)+len(seg.samples)) * 8
+				}
+			}
+		}
+	}
+	return size
 }
 
 // iccRanges 读取PDF声明的源分量范围，缺省或单位范围不分配配置副本

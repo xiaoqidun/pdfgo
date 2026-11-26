@@ -48,9 +48,74 @@ type ThreeDMeasurement struct {
 	Dictionary      Dictionary
 }
 
+// threeDMeasurementTextBytes 计算三维测量对象中全部已解码文本字段的总字节数
+// 入参: m 三维测量参数
+// 返回: int64 文本总字节数
+func threeDMeasurementTextBytes(m ThreeDMeasurement) int64 {
+	total := int64(len(m.Name)) + int64(len(m.UserText))
+	for _, part := range m.Parts {
+		if part != nil {
+			total += int64(len(*part))
+		}
+	}
+	if m.Units != nil {
+		total += int64(len(*m.Units))
+	}
+	return total
+}
+
+// cloneThreeDMeasurement 复制三维测量对象中的指针字段并共享不可变字符串和源字典
+// 入参: m 源三维测量参数
+// 返回: ThreeDMeasurement 克隆后的三维测量参数
+func cloneThreeDMeasurement(m ThreeDMeasurement) ThreeDMeasurement {
+	if m.Plane != nil {
+		v := *m.Plane
+		m.Plane = &v
+	}
+	for i, anchor := range m.Anchors {
+		if anchor != nil {
+			v := *anchor
+			m.Anchors[i] = &v
+		}
+	}
+	for i, part := range m.Parts {
+		if part != nil {
+			v := *part
+			m.Parts[i] = &v
+		}
+	}
+	for i, dir := range m.Directions {
+		if dir != nil {
+			v := *dir
+			m.Directions[i] = &v
+		}
+	}
+	if m.TextX != nil {
+		v := *m.TextX
+		m.TextX = &v
+	}
+	if m.TextY != nil {
+		v := *m.TextY
+		m.TextY = &v
+	}
+	if m.TextBox != nil {
+		v := *m.TextBox
+		m.TextBox = &v
+	}
+	if m.Value != nil {
+		v := *m.Value
+		m.Value = &v
+	}
+	if m.Units != nil {
+		v := *m.Units
+		m.Units = &v
+	}
+	return m
+}
+
 // ReadThreeDMeasurements 读取视图的MA数组，取消或解析失败时不返回部分结果
 // 入参: ctx 取消上下文, object 测量数组或引用，可为空
-// 返回: []ThreeDMeasurement 测量数据, error 类型、参数、关闭或取消错误
+// 返回: []ThreeDMeasurement 测量数据, error 类型、参数、超限、关闭或取消错误
 func (r *Reader) ReadThreeDMeasurements(ctx context.Context, object Object) ([]ThreeDMeasurement, error) {
 	if ctx == nil || r == nil {
 		return nil, fmt.Errorf("invalid 3D measurement reader or context")
@@ -69,14 +134,35 @@ func (r *Reader) ReadThreeDMeasurements(ctx context.Context, object Object) ([]T
 	if !ok {
 		return nil, fmt.Errorf("invalid 3D measurement array")
 	}
+	budget := newTextStringBudget(r)
+	var cache map[Reference]ThreeDMeasurement
 	var result []ThreeDMeasurement
-	for _, object := range array {
+	for _, item := range array {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		measurement, err := r.ReadThreeDMeasurement(object)
+		ref, _, err := r.resolveIndirect(item)
 		if err != nil {
 			return nil, err
+		}
+		if ref != (Reference{}) {
+			if cached, ok := cache[ref]; ok {
+				if err := budget.consume(threeDMeasurementTextBytes(cached), "3D measurement"); err != nil {
+					return nil, err
+				}
+				result = append(result, cloneThreeDMeasurement(cached))
+				continue
+			}
+		}
+		measurement, err := r.readThreeDMeasurement(ctx, item, &budget)
+		if err != nil {
+			return nil, err
+		}
+		if ref != (Reference{}) {
+			if cache == nil {
+				cache = make(map[Reference]ThreeDMeasurement)
+			}
+			cache[ref] = measurement
 		}
 		result = append(result, measurement)
 	}
@@ -88,7 +174,7 @@ func (r *Reader) ReadThreeDMeasurements(ctx context.Context, object Object) ([]T
 
 // ReadThreeDMeasurement 按PDF标准表326至331解析五类三维测量和批注
 // 入参: object 测量字典或引用
-// 返回: ThreeDMeasurement 测量参数, error 类型、参数或引用错误
+// 返回: ThreeDMeasurement 测量参数, error 类型、参数、超限或引用错误
 func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error) {
 	result := ThreeDMeasurement{TextSize: 12, Color: [3]float64{1, 1, 1}, Precision: 3, Degrees: true, ExtensionLength: 60, Radius: true}
 	if r == nil {
@@ -96,6 +182,18 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 	}
 	if r.closed {
 		return result, os.ErrClosed
+	}
+	budget := newTextStringBudget(r)
+	return r.readThreeDMeasurement(context.Background(), object, &budget)
+}
+
+// readThreeDMeasurement 在取消上下文和文本预算内按PDF标准表326至331解析五类三维测量和批注
+// 入参: ctx 取消上下文, object 测量字典或引用, budget 文本解码预算
+// 返回: ThreeDMeasurement 测量参数, error 类型、参数、超限、引用或取消错误
+func (r *Reader) readThreeDMeasurement(ctx context.Context, object Object, budget *textStringBudget) (ThreeDMeasurement, error) {
+	result := ThreeDMeasurement{TextSize: 12, Color: [3]float64{1, 1, 1}, Precision: 3, Degrees: true, ExtensionLength: 60, Radius: true}
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
 	dict, err := r.mediaDictionary(object, false)
 	if err != nil {
@@ -123,7 +221,10 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 		key Name
 		dst *string
 	}{{"TRL", &result.Name}, {"UT", &result.UserText}} {
-		text, err := r.threeDMeasureText(dict[field.key], false)
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		text, err := r.threeDMeasureText(ctx, dict[field.key], false, budget)
 		if err != nil {
 			return result, fmt.Errorf("3D measurement %s: %w", field.key, err)
 		}
@@ -148,6 +249,9 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 		{"A4", &result.Anchors[3], result.Subtype == "RD3", false},
 	} {
 		if field.active {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
 			*field.dst, err = r.threeDMeasureVector(dict[field.key], field.required)
 			if err != nil {
 				return result, fmt.Errorf("3D measurement %s: %w", field.key, err)
@@ -163,13 +267,13 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 	}
 	result.TextPosition = *position
 	if result.Subtype != "RD3" {
-		result.Parts[0], err = r.threeDMeasureText(dict["N1"], false)
+		result.Parts[0], err = r.threeDMeasureText(ctx, dict["N1"], false, budget)
 		if err != nil {
 			return result, err
 		}
 	}
 	if result.Subtype != "3DC" {
-		result.Parts[1], err = r.threeDMeasureText(dict["N2"], false)
+		result.Parts[1], err = r.threeDMeasureText(ctx, dict["N2"], false, budget)
 		if err != nil {
 			return result, err
 		}
@@ -194,7 +298,7 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 			result.Precision = int64(n)
 		}
 		if result.Subtype != "AD3" {
-			result.Units, err = r.threeDMeasureText(dict["U"], true)
+			result.Units, err = r.threeDMeasureText(ctx, dict["U"], true, budget)
 			if err != nil {
 				return result, err
 			}
@@ -291,7 +395,7 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 		}
 		result.Comment = ref
 	}
-	return result, nil
+	return result, ctx.Err()
 }
 
 // threeDMeasureVector 读取有限的三维坐标或向量，不归一化原始数据
@@ -321,11 +425,14 @@ func (r *Reader) threeDMeasureVector(object Object, required bool) (*[3]float64,
 	return result, nil
 }
 
-// threeDMeasureText 读取测量文本字符串，保留缺省与显式空字符串的区别
-// 入参: object 文本或引用, required 是否必须提供
-// 返回: *string 文本, error 类型、编码或引用错误
-func (r *Reader) threeDMeasureText(object Object, required bool) (*string, error) {
-	value, err := r.Resolve(object)
+// threeDMeasureText 在文本预算内读取测量文本字符串并复用共享引用，保留缺省与显式空字符串的区别
+// 入参: ctx 取消上下文, object 文本或引用, required 是否必须提供, budget 文本解码预算
+// 返回: *string 文本, error 类型、编码、超限、引用或取消错误
+func (r *Reader) threeDMeasureText(ctx context.Context, object Object, required bool, budget *textStringBudget) (*string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ref, value, err := r.resolveIndirect(object)
 	if err != nil || value == nil && !required {
 		return nil, err
 	}
@@ -333,7 +440,7 @@ func (r *Reader) threeDMeasureText(object Object, required bool) (*string, error
 	if !ok {
 		return nil, fmt.Errorf("invalid 3D measurement text")
 	}
-	text, err := DecodeTextString(data)
+	text, err := budget.decodeString(ref, data, "3D measurement")
 	if err != nil {
 		return nil, err
 	}

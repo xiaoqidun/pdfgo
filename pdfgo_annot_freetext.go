@@ -103,7 +103,7 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 			inset := math.Min(border.width/2, math.Min(fw, fh)/2)
 			outline = Rectangle{frame.XMin + inset, frame.YMin + inset, frame.XMax - inset, frame.YMax - inset}
 		}
-		if err := writeAnnotationCloudFrame(&content, outline, cloud, false); err != nil {
+		if err := writeAnnotationCloudFrameContext(ctx, &content, outline, cloud, false, annotationRichContentLimit(r)); err != nil {
 			return nil, err
 		}
 		switch {

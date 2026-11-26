@@ -639,11 +639,24 @@ func downsampleYCbCr(ctx context.Context, src *image.YCbCr, target image.Point, 
 		cy1 := (b.Min.Y + y1 - 1) >> shiftY
 		outRow := out.Pix[dy*out.Stride:]
 		for dx := 0; dx < dstW; dx++ {
+			if dx&255 == 255 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			x0, x1 := xStarts[dx], xStarts[dx+1]
 			var sumY uint64
 			for sy := y0; sy < y1; sy++ {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				rowOff := src.YOffset(b.Min.X+x0, b.Min.Y+sy)
-				for _, v := range src.Y[rowOff : rowOff+(x1-x0)] {
+				for i, v := range src.Y[rowOff : rowOff+(x1-x0)] {
+					if i&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					sumY += uint64(v)
 				}
 			}
@@ -653,12 +666,25 @@ func downsampleYCbCr(ctx context.Context, src *image.YCbCr, target image.Point, 
 			cx1 := (b.Min.X + x1 - 1) >> shiftX
 			var sumCb, sumCr uint64
 			for cy := cy0; cy <= cy1; cy++ {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				cRow := (cy-(b.Min.Y>>shiftY))*src.CStride + (cx0 - (b.Min.X >> shiftX))
 				n := cx1 - cx0 + 1
-				for _, v := range src.Cb[cRow : cRow+n] {
+				for i, v := range src.Cb[cRow : cRow+n] {
+					if i&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					sumCb += uint64(v)
 				}
-				for _, v := range src.Cr[cRow : cRow+n] {
+				for i, v := range src.Cr[cRow : cRow+n] {
+					if i&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					sumCr += uint64(v)
 				}
 			}
@@ -809,11 +835,24 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sum uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					off := s.PixOffset(b.Min.X+x0, b.Min.Y+sy)
-					for _, v := range s.Pix[off : off+(x1-x0)] {
+					for i, v := range s.Pix[off : off+(x1-x0)] {
+						if i&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						sum += uint64(v)
 					}
 				}
@@ -834,11 +873,24 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sum uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					off := s.PixOffset(b.Min.X+x0, b.Min.Y+sy)
 					for sx := 0; sx < x1-x0; sx++ {
+						if sx&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						sum += uint64(binary.BigEndian.Uint16(s.Pix[off+sx*2:]))
 					}
 				}
@@ -860,14 +912,39 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sum uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					line := s.data[sy*s.stride:]
 					if s.depth == 1 {
-						sum += countBitsRange(line, x0, x1)
+						for start := x0; start < x1; {
+							if start != x0 {
+								if err := ctx.Err(); err != nil {
+									return nil, err
+								}
+							}
+							end := x1
+							if x1-start > 2048 {
+								end = start + 2048
+							}
+							sum += countBitsRange(line, start, end)
+							start = end
+						}
 					} else {
 						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, err
+								}
+							}
 							sum += uint64(packedSample(line, int64(sx), s.depth))
 						}
 					}
@@ -890,11 +967,24 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 				y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 				outRow := out.Pix[dy*out.Stride:]
 				for dx := 0; dx < dstW; dx++ {
+					if dx&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					x0, x1 := xStarts[dx], xStarts[dx+1]
 					var sum uint64
 					for sy := y0; sy < y1; sy++ {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
 						line := s.source.data[sy*s.source.stride:]
 						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, err
+								}
+							}
 							sum += uint64(s.lookup[packedSample(line, int64(sx), s.source.depth)] >> 8)
 						}
 					}
@@ -915,11 +1005,24 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sum uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					line := s.source.data[sy*s.source.stride:]
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						sum += uint64(s.lookup[packedSample(line, int64(sx), s.source.depth)])
 					}
 				}
@@ -940,11 +1043,25 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sumR, sumG, sumB, sumA uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					off := s.PixOffset(b.Min.X+x0, b.Min.Y+sy)
-					for pos := off; pos < off+(x1-x0)*4; pos += 4 {
+					for sx := 0; sx < x1-x0; sx++ {
+						if sx&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
+						pos := off + sx*4
 						a := uint64(s.Pix[pos+3])
 						sumR += uint64(s.Pix[pos]) * a
 						sumG += uint64(s.Pix[pos+1]) * a
@@ -975,11 +1092,25 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sumR, sumG, sumB, sumA uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					off := s.PixOffset(b.Min.X+x0, b.Min.Y+sy)
-					for pos := off; pos < off+(x1-x0)*4; pos += 4 {
+					for sx := 0; sx < x1-x0; sx++ {
+						if sx&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
+						pos := off + sx*4
 						sumR += uint64(s.Pix[pos])
 						sumG += uint64(s.Pix[pos+1])
 						sumB += uint64(s.Pix[pos+2])
@@ -1014,12 +1145,26 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.data[dy*out.stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sum [4]uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					if s.depth == 8 {
 						row := s.data[sy*s.stride:]
-						for pos := x0 * 4; pos < x1*4; pos += 4 {
+						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, err
+								}
+							}
+							pos := sx * 4
 							sum[0] += uint64(row[pos])
 							sum[1] += uint64(row[pos+1])
 							sum[2] += uint64(row[pos+2])
@@ -1027,6 +1172,11 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 						}
 					} else {
 						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, err
+								}
+							}
 							sample := s.sample(b.Min.X+sx, b.Min.Y+sy)
 							for c := 0; c < 4; c++ {
 								sum[c] += uint64(sample[c])
@@ -1061,10 +1211,23 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.data[dy*out.stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				clear(sum)
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						sample := packedDeviceNSample{source: s, x: b.Min.X + sx, y: b.Min.Y + sy}
 						for c := 0; c < s.channels; c++ {
 							sum[c] += uint64(sample.component(c))
@@ -1091,10 +1254,23 @@ func downsampleDecodedImageMode(ctx context.Context, src image.Image, target ima
 			}
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sumR, sumG, sumB, sumA uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						p := imageNRGBA64At(src, b.Min.X+sx, b.Min.Y+sy)
 						a := uint64(p.A)
 						sumR += uint64(p.R) * a
@@ -1146,11 +1322,24 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 				y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 				outRow := out.data[dy*out.stride:]
 				for dx := 0; dx < dstW; dx++ {
+					if dx&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					x0, x1 := xStarts[dx], xStarts[dx+1]
 					clear(sum)
 					var sumA uint64
 					for sy := y0; sy < y1; sy++ {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
 						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, err
+								}
+							}
 							a := uint64(s.sample(s.alpha, b.Min.X+sx, b.Min.Y+sy))
 							if premultiplied {
 								for c, idx := range s.channels {
@@ -1197,10 +1386,23 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.data[dy*out.stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				clear(sum)
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						for c, idx := range s.channels {
 							sum[c] += uint64(s.sample(idx, b.Min.X+sx, b.Min.Y+sy))
 						}
@@ -1228,11 +1430,24 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 				y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 				outRow := out.data[dy*out.stride:]
 				for dx := 0; dx < dstW; dx++ {
+					if dx&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					x0, x1 := xStarts[dx], xStarts[dx+1]
 					var sum [4]uint64
 					var sumA uint64
 					for sy := y0; sy < y1; sy++ {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
 						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, err
+								}
+							}
 							p := s.pixel(b.Min.X+sx, b.Min.Y+sy)
 							if premultiplied {
 								for c := 0; c < 4; c++ {
@@ -1279,10 +1494,23 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.data[dy*out.stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sum [4]uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						p := s.pixel(b.Min.X+sx, b.Min.Y+sy)
 						for c := 0; c < 4; c++ {
 							sum[c] += uint64(p.values[c])
@@ -1310,10 +1538,23 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 				y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 				outRow := out.Pix[dy*out.Stride:]
 				for dx := 0; dx < dstW; dx++ {
+					if dx&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					x0, x1 := xStarts[dx], xStarts[dx+1]
 					var sum uint64
 					for sy := y0; sy < y1; sy++ {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
 						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, err
+								}
+							}
 							sum += uint64(s.sample(s.channels[0], b.Min.X+sx, b.Min.Y+sy) >> 8)
 						}
 					}
@@ -1334,10 +1575,23 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sum uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						sum += uint64(s.sample(s.channels[0], b.Min.X+sx, b.Min.Y+sy))
 					}
 				}
@@ -1359,10 +1613,23 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sumR, sumG, sumB uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						p := s.pixel(b.Min.X+sx, b.Min.Y+sy)
 						sumR += uint64(p.values[0] >> 8)
 						sumG += uint64(p.values[1] >> 8)
@@ -1389,10 +1656,23 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			}
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sumR, sumG, sumB uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						p := s.pixel(b.Min.X+sx, b.Min.Y+sy)
 						sumR += uint64(p.values[0])
 						sumG += uint64(p.values[1])
@@ -1417,10 +1697,23 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 			}
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sumR, sumG, sumB, sumA uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, err
+							}
+						}
 						p := s.pixel(b.Min.X+sx, b.Min.Y+sy)
 						sumR += uint64(p.values[0])
 						sumG += uint64(p.values[1])
@@ -1445,10 +1738,23 @@ func downsampleJPXImage(ctx context.Context, s *jpxSampleImage, target image.Poi
 		}
 		y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 		for dx := 0; dx < dstW; dx++ {
+			if dx&255 == 255 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			x0, x1 := xStarts[dx], xStarts[dx+1]
 			var sumR, sumG, sumB, sumA uint64
 			for sy := y0; sy < y1; sy++ {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				for sx := x0; sx < x1; sx++ {
+					if (sx-x0)&255 == 255 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					p := s.pixel(b.Min.X+sx, b.Min.Y+sy)
 					a := uint64(p.alpha)
 					sumR += uint64(p.values[0]) * a
@@ -1523,13 +1829,26 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 			y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 			outRow := out.Pix[dy*out.Stride:]
 			for dx := 0; dx < dstW; dx++ {
+				if dx&255 == 255 {
+					if err := ctx.Err(); err != nil {
+						return nil, false, err
+					}
+				}
 				x0, x1 := xStarts[dx], xStarts[dx+1]
 				var sumR, sumG, sumB uint64
 				for sy := y0; sy < y1; sy++ {
+					if err := ctx.Err(); err != nil {
+						return nil, false, err
+					}
 					switch {
 					case isGray:
 						off := graySrc.PixOffset(b.Min.X+x0, b.Min.Y+sy)
-						for _, idx := range graySrc.Pix[off : off+(x1-x0)] {
+						for i, idx := range graySrc.Pix[off : off+(x1-x0)] {
+							if i&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, false, err
+								}
+							}
 							c := lut[idx]
 							sumR += uint64(c.R >> 8)
 							sumG += uint64(c.G >> 8)
@@ -1538,6 +1857,11 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 					case isPacked && packedSrc.depth <= 8:
 						line := packedSrc.data[sy*packedSrc.stride:]
 						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, false, err
+								}
+							}
 							c := lut[packedSample(line, int64(sx), packedSrc.depth)]
 							sumR += uint64(c.R >> 8)
 							sumG += uint64(c.G >> 8)
@@ -1545,6 +1869,11 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 						}
 					default:
 						for sx := x0; sx < x1; sx++ {
+							if (sx-x0)&255 == 255 {
+								if err := ctx.Err(); err != nil {
+									return nil, false, err
+								}
+							}
 							c := lookupColor(float64(imageNRGBA64At(src, b.Min.X+sx, b.Min.Y+sy).R) / 65535)
 							sumR += uint64(c.R >> 8)
 							sumG += uint64(c.G >> 8)
@@ -1571,13 +1900,26 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 		}
 		y0, y1 := int(int64(dy)*int64(srcH)/int64(dstH)), int(int64(dy+1)*int64(srcH)/int64(dstH))
 		for dx := 0; dx < dstW; dx++ {
+			if dx&255 == 255 {
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
+			}
 			x0, x1 := xStarts[dx], xStarts[dx+1]
 			var sumR, sumG, sumB, sumA uint64
 			for sy := y0; sy < y1; sy++ {
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
 				switch {
 				case isGray:
 					off := graySrc.PixOffset(b.Min.X+x0, b.Min.Y+sy)
-					for _, idx := range graySrc.Pix[off : off+(x1-x0)] {
+					for i, idx := range graySrc.Pix[off : off+(x1-x0)] {
+						if i&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, false, err
+							}
+						}
 						c := lut[idx]
 						a := uint64(c.A)
 						sumR += uint64(c.R) * a
@@ -1588,6 +1930,11 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 				case isPacked && packedSrc.depth <= 8:
 					line := packedSrc.data[sy*packedSrc.stride:]
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, false, err
+							}
+						}
 						c := lut[packedSample(line, int64(sx), packedSrc.depth)]
 						a := uint64(c.A)
 						sumR += uint64(c.R) * a
@@ -1597,6 +1944,11 @@ func downsampleIndexedImage(ctx context.Context, src image.Image, palette *image
 					}
 				default:
 					for sx := x0; sx < x1; sx++ {
+						if (sx-x0)&255 == 255 {
+							if err := ctx.Err(); err != nil {
+								return nil, false, err
+							}
+						}
 						c := lookupColor(float64(imageNRGBA64At(src, b.Min.X+sx, b.Min.Y+sy).R) / 65535)
 						a := uint64(c.A)
 						sumR += uint64(c.R) * a

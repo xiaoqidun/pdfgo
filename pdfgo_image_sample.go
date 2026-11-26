@@ -86,11 +86,15 @@ func imageNativeAlpha(ctx context.Context, source image.Image) (bool, bool, erro
 	default:
 		return false, false, nil
 	}
-	width, height := source.Bounds().Dx(), source.Bounds().Dy()
+	bounds := source.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if bounds.Empty() || width <= 0 || height <= 0 {
+		return true, true, ctx.Err()
+	}
+	if err := validateNativePixelBuffer(pixels, stride, width, height, step); err != nil {
+		return false, true, err
+	}
 	for y := 0; y < height; y++ {
-		if width == 0 {
-			break
-		}
 		row := pixels[y*stride:][:width*step]
 		for x := 0; x < width; x++ {
 			if x&4095 == 0 {
@@ -107,16 +111,23 @@ func imageNativeAlpha(ctx context.Context, source image.Image) (bool, bool, erro
 	return true, true, ctx.Err()
 }
 
-// validatePalettedImage 沿解包链逐层校验调色板图像的有效颜色条目、像素缓冲及索引边界
-// 入参: ctx 取消上下文, source 待校验图像
-// 返回: error 调色板非法、越界或取消错误
-func validatePalettedImage(ctx context.Context, source image.Image) error {
+// validateSourceImage 沿解包链逐层校验源图像边界、原生像素缓冲及调色板，拒绝空图或越界缓冲
+// 入参: ctx 取消上下文, source 待校验源图像
+// 返回: error 图像非法、缓冲越界、调色板非法或取消错误
+func validateSourceImage(ctx context.Context, source image.Image) error {
+	return validateImageChain(ctx, source, false)
+}
+
+// validateImageChain 沿解包链最多16层校验边界、原生像素缓冲和调色板
+// 入参: ctx 取消上下文, source 待校验图像, allowEmpty 是否允许合法空矩形
+// 返回: error 参数非法、越界或取消错误
+func validateImageChain(ctx context.Context, source image.Image, allowEmpty bool) error {
 	img := source
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := validatePalettedLayer(ctx, img); err != nil {
+		if err := validateSourceLayer(ctx, img, allowEmpty); err != nil {
 			return err
 		}
 		if step >= 16 {
@@ -135,10 +146,54 @@ func validatePalettedImage(ctx context.Context, source image.Image) error {
 	return ctx.Err()
 }
 
-// validatePalettedLayer 校验单层图像的调色板颜色条目以及原生索引图像的像素缓冲与索引边界
-// 入参: ctx 取消上下文, img 单层图像
-// 返回: error 调色板非法、越界或取消错误
-func validatePalettedLayer(ctx context.Context, img image.Image) error {
+// validateNativePixelBuffer 校验原生像素图像的行跨度与缓冲长度，杜绝切片越界与整数溢出
+// 入参: pix 像素切片, stride 行字节跨度, width 图像宽度, height 图像高度, pixelBytes 单像素字节数
+// 返回: error 像素缓冲不合法错误
+func validateNativePixelBuffer(pix []byte, stride, width, height, pixelBytes int) error {
+	rowBytes, _, err := imageBufferSize(width, 1, pixelBytes)
+	if err != nil || stride < rowBytes || len(pix) < rowBytes {
+		return fmt.Errorf("invalid image pixel buffer")
+	}
+	if height > 1 && height-1 > (len(pix)-rowBytes)/stride {
+		return fmt.Errorf("invalid image pixel buffer")
+	}
+	return nil
+}
+
+// validateYCbCrBuffer 校验YCbCr图像亮度与色度平面的行跨度和缓冲长度
+// 入参: img 待校验YCbCr图像
+// 返回: error 像素缓冲不合法错误
+func validateYCbCrBuffer(img *image.YCbCr) error {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if err := validateNativePixelBuffer(img.Y, img.YStride, w, h, 1); err != nil {
+		return err
+	}
+	cw, ch := w, h
+	switch img.SubsampleRatio {
+	case image.YCbCrSubsampleRatio422:
+		cw = (b.Max.X-1)/2 - b.Min.X/2 + 1
+	case image.YCbCrSubsampleRatio420:
+		cw = (b.Max.X-1)/2 - b.Min.X/2 + 1
+		ch = (b.Max.Y-1)/2 - b.Min.Y/2 + 1
+	case image.YCbCrSubsampleRatio440:
+		ch = (b.Max.Y-1)/2 - b.Min.Y/2 + 1
+	case image.YCbCrSubsampleRatio411:
+		cw = (b.Max.X-1)/4 - b.Min.X/4 + 1
+	case image.YCbCrSubsampleRatio410:
+		cw = (b.Max.X-1)/4 - b.Min.X/4 + 1
+		ch = (b.Max.Y-1)/2 - b.Min.Y/2 + 1
+	}
+	if err := validateNativePixelBuffer(img.Cb, img.CStride, cw, ch, 1); err != nil {
+		return err
+	}
+	return validateNativePixelBuffer(img.Cr, img.CStride, cw, ch, 1)
+}
+
+// validateSourceLayer 校验单层图像的边界、色板条目及标准库原生像素缓冲
+// 入参: ctx 取消上下文, img 单层图像, allowEmpty 是否允许空矩形
+// 返回: error 图像非法、越界或取消错误
+func validateSourceLayer(ctx context.Context, img image.Image, allowEmpty bool) error {
 	p, isPaletted := img.(*image.Paletted)
 	var palette color.Palette
 	hasPalette := isPaletted
@@ -160,37 +215,67 @@ func validatePalettedLayer(ctx context.Context, img image.Image) error {
 			}
 		}
 	}
-	if !isPaletted {
-		return ctx.Err()
-	}
-	bounds := p.Bounds()
+	bounds := img.Bounds()
 	if bounds.Empty() {
-		return ctx.Err()
-	}
-	width := bounds.Dx()
-	checkIndex := len(p.Palette) < 256
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		if err := ctx.Err(); err != nil {
-			return err
+		if allowEmpty {
+			return ctx.Err()
 		}
-		offset := p.PixOffset(bounds.Min.X, y)
-		if offset < 0 || width > len(p.Pix)-offset {
+		return fmt.Errorf("invalid image dimensions")
+	}
+	width, height := bounds.Dx(), bounds.Dy()
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("invalid image dimensions")
+	}
+	switch s := img.(type) {
+	case *image.Paletted:
+		if err := validateNativePixelBuffer(s.Pix, s.Stride, width, height, 1); err != nil {
 			return fmt.Errorf("invalid palette pixel buffer")
 		}
-		if !checkIndex {
-			continue
+		if len(s.Palette) >= 256 {
+			return ctx.Err()
 		}
-		row := p.Pix[offset : offset+width]
-		for x, index := range row {
-			if x&4095 == 4095 {
-				if err := ctx.Err(); err != nil {
-					return err
+		for dy := 0; dy < height; dy++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			offset := dy * s.Stride
+			row := s.Pix[offset : offset+width]
+			for x, index := range row {
+				if x&4095 == 4095 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				if int(index) >= len(s.Palette) {
+					return fmt.Errorf("palette index out of range")
 				}
 			}
-			if int(index) >= len(p.Palette) {
-				return fmt.Errorf("palette index out of range")
-			}
 		}
+	case *image.NRGBA:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 4)
+	case *image.RGBA:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 4)
+	case *image.NRGBA64:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 8)
+	case *image.RGBA64:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 8)
+	case *image.Gray:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 1)
+	case *image.Gray16:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 2)
+	case *image.Alpha:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 1)
+	case *image.Alpha16:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 2)
+	case *image.CMYK:
+		return validateNativePixelBuffer(s.Pix, s.Stride, width, height, 4)
+	case *image.YCbCr:
+		return validateYCbCrBuffer(s)
+	case *image.NYCbCrA:
+		if err := validateYCbCrBuffer(&s.YCbCr); err != nil {
+			return err
+		}
+		return validateNativePixelBuffer(s.A, s.AStride, width, height, 1)
 	}
 	return ctx.Err()
 }
@@ -201,11 +286,14 @@ func validatePalettedLayer(ctx context.Context, img image.Image) error {
 func imagePalettedAlpha(ctx context.Context, source *image.Paletted) (bool, error) {
 	var opaque [256]bool
 	width, height := source.Rect.Dx(), source.Rect.Dy()
-	for y := 0; y < height && width > 0; y++ {
+	if source.Rect.Empty() || width <= 0 || height <= 0 {
+		return true, ctx.Err()
+	}
+	if err := validateNativePixelBuffer(source.Pix, source.Stride, width, height, 1); err != nil {
+		return false, fmt.Errorf("invalid palette pixel buffer")
+	}
+	for y := 0; y < height; y++ {
 		offset := y * source.Stride
-		if offset < 0 || width > len(source.Pix)-offset {
-			return false, fmt.Errorf("invalid palette pixel buffer")
-		}
 		row := source.Pix[offset : offset+width]
 		for x, index := range row {
 			if x&4095 == 0 {

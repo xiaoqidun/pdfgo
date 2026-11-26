@@ -26,6 +26,9 @@ import (
 // annotationRichGlyphCapacity 限制单段字形缓冲的初始容量，超出后按需增长
 const annotationRichGlyphCapacity = 1 << 16
 
+// maxAnnotationRichLines 限制单次富文本排版允许生成的最大行数或列数
+const maxAnnotationRichLines = 65536
+
 // annotationRichGlyph 保存富文本字符及实际选用的字体和样式
 type annotationRichGlyph struct {
 	letter annotationLetter
@@ -170,10 +173,15 @@ func writeAnnotationRichRun(ctx context.Context, content *strings.Builder, glyph
 		return err
 	}
 	glyph := glyphs[0]
-	content.WriteString("0 g\n" + defaults)
+	fontSize := annotationRichSize(glyph, size)
+	rise := state.rise + glyph.style.rise
+	if !finiteFloats([]float64{fontSize, rise}) {
+		return fmt.Errorf("rich text state exceeds coordinate range")
+	}
+	content.WriteString("0 g 0 G 1 w [] 0 d\n" + defaults)
 	fmt.Fprintf(content, "/%s ", escapeAnnotationName(glyph.font.name))
-	writeAnnotationOperation(content, "Tf", annotationRichSize(glyph, size))
-	writeAnnotationOperation(content, "Ts", state.rise+glyph.style.rise)
+	writeAnnotationOperation(content, "Tf", fontSize)
+	writeAnnotationOperation(content, "Ts", rise)
 	if glyph.style.color != nil {
 		color := glyph.style.color
 		writeAnnotationOperation(content, "rg", color[0], color[1], color[2])
@@ -239,7 +247,7 @@ func annotationRichAdvance(glyph annotationRichGlyph, state graphicsState, size 
 
 // annotationRichLayout 按段落、词边界及混合字号计算排版行
 // 入参: ctx 取消上下文, paragraphs 段落字符, styles 段落样式, state 文字状态, size 默认字号, width 行宽, multiline 是否折行
-// 返回: []annotationRichLine 排版行, float64 总高度, error 度量或取消错误
+// 返回: []annotationRichLine 排版行, float64 总高度, error 度量、超限或取消错误
 func annotationRichLayout(ctx context.Context, paragraphs [][]annotationRichGlyph, styles []annotationRichParagraph, state graphicsState, size, width float64, multiline bool) ([]annotationRichLine, float64, error) {
 	var lines []annotationRichLine
 	for p, glyphs := range paragraphs {
@@ -267,6 +275,9 @@ func annotationRichLayout(ctx context.Context, paragraphs [][]annotationRichGlyp
 					}
 					lineEnd--
 				}
+				if len(lines) >= maxAnnotationRichLines {
+					return nil, 0, fmt.Errorf("%w: rich text line limit exceeded", ErrStreamLimitExceeded)
+				}
 				lines = append(lines, annotationRichLine{glyphs: glyphs[start:lineEnd], style: &styles[p].style})
 				for end < len(glyphs) && glyphs[end].letter.text == ' ' {
 					if err := ctx.Err(); err != nil {
@@ -281,6 +292,9 @@ func annotationRichLayout(ctx context.Context, paragraphs [][]annotationRichGlyp
 			if glyphs[i].letter.text == ' ' {
 				lastBreak = i
 			}
+		}
+		if len(lines) >= maxAnnotationRichLines {
+			return nil, 0, fmt.Errorf("%w: rich text line limit exceeded", ErrStreamLimitExceeded)
 		}
 		lines = append(lines, annotationRichLine{glyphs: glyphs[start:], style: &styles[p].style})
 	}
@@ -438,13 +452,16 @@ func (r *Reader) writeAnnotationRichText(ctx context.Context, annotation Annotat
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			candidate := (low + high) / 2
+			candidate := low + (high-low)/2
 			lines, total, err := annotationRichLayout(ctx, glyphs, paragraphs, state, candidate, width, multiline)
 			if err != nil {
 				return err
 			}
 			fits := total <= height
 			for _, line := range lines {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if comb > 0 {
 					for _, glyph := range line.glyphs {
 						fits = fits && annotationRichAdvance(glyph, state, candidate, false) <= width/float64(comb)

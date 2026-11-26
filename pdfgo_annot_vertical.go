@@ -86,9 +86,16 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 		size = min(12, width/state.hscale)
 	}
 	if size == 0 {
-		low, high := 0.0, max(width/state.hscale, height)
+		scaledWidth := width / state.hscale
+		if math.IsNaN(scaledWidth) || math.IsInf(scaledWidth, 0) {
+			return fmt.Errorf("invalid vertical font size")
+		}
+		low, high := 0.0, max(scaledWidth, height)
 		for range 32 {
-			candidate := (low + high) / 2
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			candidate := low + (high-low)/2
 			columns, total, err := v.columns(ctx, state, candidate)
 			if err != nil {
 				return err
@@ -142,9 +149,13 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 				break
 			}
 			if _, selected := slices.BinarySearch(v.choice.Selected, v.choice.TopIndex+i); selected {
+				left := edge - column.advance
+				if !finiteFloats([]float64{left, v.frame.YMin, column.advance, height}) {
+					return fmt.Errorf("vertical list selection background exceeds coordinate range")
+				}
 				content.WriteString("q 0.153 0.392 0.714 rg\n")
 				writeAnnotationOperation(content, "cm", v.matrix[:]...)
-				writeAnnotationOperation(content, "re f Q", edge-column.advance, v.frame.YMin, column.advance, height)
+				writeAnnotationOperation(content, "re f Q", left, v.frame.YMin, column.advance, height)
 				if content.Len() > limit {
 					return fmt.Errorf("%w: vertical text appearance content limit exceeded", ErrStreamLimitExceeded)
 				}
@@ -157,7 +168,7 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 	}
 	content.WriteString("BT\n")
 	if !list {
-		content.WriteString("0 g\n" + v.defaults)
+		content.WriteString("0 g 0 G 1 w [] 0 d\n" + v.defaults)
 		fmt.Fprintf(content, "/%s ", escapeAnnotationName(v.font))
 		writeAnnotationOperation(content, "Tf", size)
 		if content.Len() > limit {
@@ -173,7 +184,7 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 		}
 		if list {
 			_, selected := slices.BinarySearch(v.choice.Selected, v.choice.TopIndex+i)
-			content.WriteString("0 g\n" + v.defaults)
+			content.WriteString("0 g 0 G 1 w [] 0 d\n" + v.defaults)
 			fmt.Fprintf(content, "/%s ", escapeAnnotationName(v.font))
 			writeAnnotationOperation(content, "Tf", size)
 			if selected {
@@ -304,11 +315,15 @@ func (v annotationVerticalText) columns(ctx context.Context, state graphicsState
 		if leading <= 0 {
 			leading = size * state.hscale * 1.2
 		}
-		column.advance = max(column.bounds.XMax-column.bounds.XMin, leading)
+		colWidth := column.bounds.XMax - column.bounds.XMin
+		if math.IsNaN(leading) || math.IsInf(leading, 0) || math.IsNaN(colWidth) || math.IsInf(colWidth, 0) {
+			return nil, 0, fmt.Errorf("vertical text dimensions overflow")
+		}
+		column.advance = max(colWidth, leading)
 		if i+1 < len(columns) {
 			total += column.advance
 		} else {
-			total += column.bounds.XMax - column.bounds.XMin
+			total += colWidth
 		}
 	}
 	if math.IsNaN(total) || math.IsInf(total, 0) {
