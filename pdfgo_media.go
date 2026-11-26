@@ -230,19 +230,26 @@ func (r *Reader) ReadFileSpecification(object Object) (FileSpecification, error)
 	if err != nil {
 		return FileSpecification{}, err
 	}
-	result := FileSpecification{}
 	if name, ok := value.(String); ok {
-		result.Name, err = DecodeTextString(name)
-		return result, err
+		decoded, err := DecodeTextString(name)
+		return FileSpecification{Name: decoded}, err
 	}
 	dict, ok := value.(Dictionary)
 	if !ok {
-		return result, fmt.Errorf("invalid file specification")
+		return FileSpecification{}, fmt.Errorf("invalid file specification")
 	}
-	result.Dictionary = dict
+	return r.readFileSpecificationDict(dict, nil, "")
+}
+
+// readFileSpecificationDict 解析文件说明字典字段并在配置预算时复用间接文本字符串
+// 入参: dict 文件说明字典, budget 可选文本预算，空值直接解码, label 超限错误标签
+// 返回: FileSpecification 文件说明, error 字段、编码或超限错误
+func (r *Reader) readFileSpecificationDict(dict Dictionary, budget *textStringBudget, label string) (FileSpecification, error) {
+	result := FileSpecification{Dictionary: dict}
 	if value, err := r.Resolve(dict["FS"]); err != nil {
 		return result, err
 	} else if value != nil {
+		var ok bool
 		result.FileSystem, ok = value.(Name)
 		if !ok {
 			return result, fmt.Errorf("invalid file system")
@@ -250,36 +257,43 @@ func (r *Reader) ReadFileSpecification(object Object) (FileSpecification, error)
 	}
 	fileKeys := [...]Name{"UF", "F", "DOS", "Mac", "Unix"}
 	var key Name
-	var name Object
+	var nameRef Reference
+	var nameObj Object
 	for _, candidate := range fileKeys {
-		value, err := r.Resolve(dict[candidate])
+		fieldRef, value, err := r.resolveIndirect(dict[candidate])
 		if err != nil {
 			return result, err
 		}
 		if value != nil {
-			key, name = candidate, value
+			key, nameRef, nameObj = candidate, fieldRef, value
 			break
 		}
 	}
-	for _, field := range []struct {
-		value  Object
-		target *string
-	}{{name, &result.Name}, {dict["Desc"], &result.Description}} {
-		value, err := r.Resolve(field.value)
-		if err != nil {
-			return result, err
-		}
+	decodeField := func(ref Reference, value Object, target *string) error {
 		if value == nil {
-			continue
+			return nil
 		}
 		encoded, ok := value.(String)
 		if !ok {
-			return result, fmt.Errorf("invalid file specification text")
+			return fmt.Errorf("invalid file specification text")
 		}
-		*field.target, err = DecodeTextString(encoded)
-		if err != nil {
-			return result, err
+		var err error
+		if budget != nil {
+			*target, err = budget.decodeString(ref, encoded, label)
+		} else {
+			*target, err = DecodeTextString(encoded)
 		}
+		return err
+	}
+	if err := decodeField(nameRef, nameObj, &result.Name); err != nil {
+		return result, err
+	}
+	descRef, descObj, err := r.resolveIndirect(dict["Desc"])
+	if err != nil {
+		return result, err
+	}
+	if err := decodeField(descRef, descObj, &result.Description); err != nil {
+		return result, err
 	}
 	embedded, err := r.Resolve(dict["EF"])
 	if err != nil {

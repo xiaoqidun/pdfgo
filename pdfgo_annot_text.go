@@ -108,7 +108,7 @@ func annotationLetters(ctx context.Context, font *Font, text string) ([]annotati
 
 // annotationLetterLookup 收集所需Unicode字符对应的原字体编码和度量
 // 入参: ctx 取消上下文, font 字体, wanted 所需字符
-// 返回: map[rune]annotationLetter 字符编码, error 取消错误
+// 返回: map[rune]annotationLetter 字符编码, error 解码、超限或取消错误
 func annotationLetterLookup(ctx context.Context, font *Font, wanted map[rune]bool) (map[rune]annotationLetter, error) {
 	entries, err := font.characterLookup(ctx, wanted)
 	if err != nil {
@@ -149,18 +149,29 @@ func annotationLineWidth(letters []annotationLetter, state graphicsState, size f
 }
 
 // annotationLines 按显式换行和词边界折行，长词按字符拆分
-// 入参: letters 字符, state 文字状态, size 字号, width 可用宽度, multiline 是否多行
-// 返回: [][]annotationLetter 排版行
-func annotationLines(letters []annotationLetter, state graphicsState, size, width float64, multiline bool) [][]annotationLetter {
+// 入参: ctx 取消上下文, letters 字符, state 文字状态, size 字号, width 可用宽度, multiline 是否多行
+// 返回: [][]annotationLetter 排版行, error 行数超限或取消错误
+func annotationLines(ctx context.Context, letters []annotationLetter, state graphicsState, size, width float64, multiline bool) ([][]annotationLetter, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !multiline {
-		return [][]annotationLetter{letters}
+		return [][]annotationLetter{letters}, nil
 	}
 	var lines [][]annotationLetter
 	start, lastBreak := 0, -1
 	advance := 0.0
 	for i := 0; i < len(letters); i++ {
+		if i&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		letter := letters[i]
 		if letter.text == '\n' {
+			if len(lines) >= maxAnnotationRichLines {
+				return nil, fmt.Errorf("%w: text line limit exceeded", ErrStreamLimitExceeded)
+			}
 			lines = append(lines, letters[start:i])
 			start, lastBreak, advance = i+1, -1, 0
 			continue
@@ -178,6 +189,9 @@ func annotationLines(letters []annotationLetter, state graphicsState, size, widt
 			if lastBreak >= start {
 				end = lastBreak + 1
 			}
+			if len(lines) >= maxAnnotationRichLines {
+				return nil, fmt.Errorf("%w: text line limit exceeded", ErrStreamLimitExceeded)
+			}
 			lines = append(lines, letters[start:end])
 			start, lastBreak, advance = end, -1, 0
 			i = end - 1
@@ -188,7 +202,10 @@ func annotationLines(letters []annotationLetter, state graphicsState, size, widt
 			lastBreak = i
 		}
 	}
-	return append(lines, letters[start:])
+	if len(lines) >= maxAnnotationRichLines {
+		return nil, fmt.Errorf("%w: text line limit exceeded", ErrStreamLimitExceeded)
+	}
+	return append(lines, letters[start:]), ctx.Err()
 }
 
 // escapeAnnotationName 将资源名编码为PDF名称，不改变原始字节
@@ -386,7 +403,7 @@ func (r *Reader) annotationTextString(ctx context.Context, object Object) (strin
 
 // widgetAppearance 为缺少外观的控件生成当前值的静态外观
 // 入参: ctx 取消上下文, page 页面, annotation 控件
-// 返回: *Stream 外观流, error 属性或能力错误
+// 返回: *Stream 外观流, error 属性、能力、超限或取消错误
 func (r *Reader) widgetAppearance(ctx context.Context, page *Page, annotation Annotation) (*Stream, error) {
 	field, err := r.ReadField(annotation)
 	if err != nil {
@@ -398,7 +415,7 @@ func (r *Reader) widgetAppearance(ctx context.Context, page *Page, annotation An
 
 // variableTextAppearance 生成普通文本和按钮外观，保留字体编码和绘图状态
 // 入参: ctx 取消上下文, page 页面, annotation 注解或控件
-// 返回: *Stream 外观流, error 不支持的布局或资源错误
+// 返回: *Stream 外观流, error 边界、不支持的布局、资源、超限或取消错误
 func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotation Annotation) (*Stream, error) {
 	if annotation.Subtype == "FreeText" {
 		return r.freeTextAppearance(ctx, page, annotation)
@@ -442,7 +459,7 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 			matrix, w, h = Matrix{0, -1, 1, 0, 0, h}, h, w
 		}
 	}
-	if w <= 0 || h <= 0 {
+	if w <= 0 || h <= 0 || math.IsNaN(w) || math.IsInf(w, 0) || math.IsNaN(h) || math.IsInf(h, 0) {
 		return nil, fmt.Errorf("invalid variable text bounds")
 	}
 	frame := Rectangle{0, 0, w, h}
@@ -479,7 +496,7 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 			writeAnnotationOperation(&content, "re f", frame.XMin, frame.YMin, fw, fh)
 		}
 	}
-	stroke, err := r.writeAnnotationStroke(&content, border)
+	stroke, err := r.writeAnnotationStroke(ctx, &content, border, annotationRichContentLimit(r))
 	if err != nil {
 		return nil, err
 	}
@@ -536,7 +553,7 @@ func (r *Reader) variableTextAppearance(ctx context.Context, page *Page, annotat
 
 // annotationCaptionFont 选择能够编码或整形标题的横排字体，不修改源资源
 // 入参: ctx 取消上下文, resources 可用资源, text 标题文字
-// 返回: *annotationCaptionText 字体与文字, error 字体或编码错误
+// 返回: *annotationCaptionText 字体与文字, error 字体、编码、超限或取消错误
 func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary, text string) (*annotationCaptionText, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -549,6 +566,9 @@ func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary
 	encoded, encodingErr := r.encodeAnnotationCaption(ctx, font, standard, text)
 	if encodingErr == nil {
 		return encoded, nil
+	}
+	if isFatalReaderError(encodingErr) {
+		return nil, encodingErr
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -571,12 +591,21 @@ func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary
 			return nil, err
 		}
 		font, err := r.ReadFontContext(ctx, fonts[name])
-		if err != nil || font.Vertical {
+		if err != nil {
+			if isFatalReaderError(err) {
+				return nil, err
+			}
+			continue
+		}
+		if font.Vertical {
 			continue
 		}
 		encoded, err := r.encodeAnnotationCaption(ctx, font, fonts[name], text)
 		if err == nil {
 			return encoded, nil
+		}
+		if isFatalReaderError(err) {
+			return nil, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -587,11 +616,11 @@ func (r *Reader) annotationCaptionFont(ctx context.Context, resources Dictionary
 
 // encodeAnnotationCaption 使用源字体生成标题字形与编码，复杂文字通过整形后端定位
 // 入参: ctx 取消上下文, font 源字体, object 字体资源, text 标题原文
-// 返回: *annotationCaptionText 字体与文字, error 整形、编码或取消错误
+// 返回: *annotationCaptionText 字体与文字, error 整形、编码、超限或取消错误
 func (r *Reader) encodeAnnotationCaption(ctx context.Context, font *Font, object Object, text string) (*annotationCaptionText, error) {
 	result := &annotationCaptionText{font: font, object: object}
 	if r.textShaper != nil && annotationNeedsShaping(text) {
-		s := &annotationShaper{ctx: ctx, shape: r.textShaper, font: font, cache: make(map[annotationShapeKey]*annotationShapedLine), entries: make(map[uint16]fontEncodedGlyph)}
+		s := &annotationShaper{ctx: ctx, shape: r.textShaper, font: font, cache: make(map[annotationShapeKey]*annotationShapedLine), entries: make(map[uint16]fontEncodedGlyph), maxBytes: annotationRichContentLimit(r)}
 		if _, err := s.prepare(text); err != nil {
 			return nil, err
 		}
@@ -779,7 +808,10 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 				return err
 			}
 			candidate := low + (high-low)/2
-			lines := annotationLines(letters, p.state, candidate, width, multiline)
+			lines, err := annotationLines(ctx, letters, p.state, candidate, width, multiline)
+			if err != nil {
+				return err
+			}
 			leading := p.state.leading
 			if leading <= 0 {
 				leading = candidate * 1.2
@@ -788,11 +820,22 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			if comb > 0 {
 				fits = candidate <= height
 				for _, letter := range letters {
-					fits = fits && letter.width/1000*candidate*p.state.hscale <= width/float64(comb)
+					if !fits {
+						break
+					}
+					fits = letter.width/1000*candidate*p.state.hscale <= width/float64(comb)
 				}
 			} else {
-				for _, line := range lines {
-					fits = fits && annotationLineWidth(line, p.state, candidate) <= width
+				for i, line := range lines {
+					if !fits {
+						break
+					}
+					if i&255 == 0 {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+					}
+					fits = annotationLineWidth(line, p.state, candidate) <= width
 				}
 			}
 			if fits {
@@ -849,7 +892,10 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 	if list {
 		lineWidth = math.Inf(1)
 	}
-	lines := annotationLines(letters, p.state, size, lineWidth, multiline)
+	lines, err := annotationLines(ctx, letters, p.state, size, lineWidth, multiline)
+	if err != nil {
+		return err
+	}
 	baseline := y + (height-size)/2 + size*.2 - p.state.rise
 	if multiline {
 		baseline = y + height - size - p.state.rise

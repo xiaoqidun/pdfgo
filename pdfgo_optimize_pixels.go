@@ -121,7 +121,11 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(stream.Data) > optimizationBufferLimit {
+	limit := optimizationBufferLimit
+	if maxBytes, _ := effectiveStreamLimits(r, stream); maxBytes > 0 && maxBytes < int64(limit) {
+		limit = int(maxBytes)
+	}
+	if len(stream.Data) > limit {
 		return stream, ctx.Err()
 	}
 	d, err := r.optimizationImageDictionary(stream)
@@ -152,7 +156,7 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 	}
 	w, _ := d["Width"].(Integer)
 	h, _ := d["Height"].(Integer)
-	if w > 1<<20 || h > 1<<20 || !pixelsWithinBudget(int64(w), int64(h), optimizationBufferLimit/int64(channels)) {
+	if w > 1<<20 || h > 1<<20 || !pixelsWithinBudget(int64(w), int64(h), int64(limit)/int64(channels)) {
 		return stream, nil
 	}
 	filters, params, err := stream.filterChain(r)
@@ -165,10 +169,10 @@ func (r *Reader) optimizeImagePixels(ctx context.Context, stream *Stream) (*Stre
 		if err != nil {
 			return stream, nil
 		}
-		pixels, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, optimizationBufferLimit+1), estimateFlateCapacity(len(pixels), optimizationBufferLimit))
+		pixels, err = readAllEstimated(io.LimitReader(&contextInput{ctx: ctx, reader: input}, int64(limit)+1), estimateFlateCapacity(len(pixels), int64(limit)))
 		input.Close()
 		releaseZlibReader(input)
-		if err != nil || len(pixels) > optimizationBufferLimit {
+		if err != nil || len(pixels) > limit {
 			return stream, ctx.Err()
 		}
 		dict, _ := params[0].(Dictionary)

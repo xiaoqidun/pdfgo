@@ -335,15 +335,16 @@ func (f *tintFunction) colorInto(tint float64, out []float64) {
 // 入参: index 分量索引
 // 返回: float64 采样值
 func (f *tintFunction) sample(index int) float64 {
-	bit := index * f.bits
-	data := f.samples[bit/8:]
+	bit := uint64(index) * uint64(f.bits)
+	data := f.samples[int(bit/8):]
+	shift := int(bit % 8)
 	switch f.bits {
 	case 1, 2, 4:
-		return float64(data[0] >> (8 - f.bits - bit%8) & byte((1<<f.bits)-1))
+		return float64(data[0] >> (8 - f.bits - shift) & byte((1<<f.bits)-1))
 	case 8:
 		return float64(data[0])
 	case 12:
-		return float64(binary.BigEndian.Uint16(data) >> (4 - bit%8) & 4095)
+		return float64(binary.BigEndian.Uint16(data) >> (4 - shift) & 4095)
 	case 16:
 		return float64(binary.BigEndian.Uint16(data))
 	case 24:

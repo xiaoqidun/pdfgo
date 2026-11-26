@@ -31,13 +31,34 @@ type rewriteObjectIdentity struct {
 	length  int
 }
 
+// rewriteRefIdentity 区分源阅读器与间接对象引用，避免共享或循环大流重复展开
+type rewriteRefIdentity struct {
+	source *Reader
+	ref    Reference
+}
+
 // rewriteObjectCopy 将资源参数复制到独立输出对象，不保留源文件引用
 type rewriteObjectCopy struct {
-	ctx     context.Context
-	source  *Reader
-	objects map[Reference]Object
-	number  *int64
-	copied  map[rewriteObjectIdentity]Reference
+	ctx       context.Context
+	source    *Reader
+	objects   map[Reference]Object
+	number    *int64
+	copied    map[rewriteObjectIdentity]Reference
+	refCopied map[rewriteRefIdentity]Reference
+	pinned    map[rewriteObjectIdentity]Object
+}
+
+// ensureMaps 惰性初始化引用与内联容器去重映射，保证值拷贝共享底层表
+func (c *rewriteObjectCopy) ensureMaps() {
+	if c.copied == nil {
+		c.copied = make(map[rewriteObjectIdentity]Reference)
+	}
+	if c.refCopied == nil {
+		c.refCopied = make(map[rewriteRefIdentity]Reference)
+	}
+	if c.pinned == nil {
+		c.pinned = make(map[rewriteObjectIdentity]Object)
+	}
 }
 
 // copy 保留资源图中的共享、循环及流编码，移除源文件的加密过滤器
@@ -50,14 +71,46 @@ func (c *rewriteObjectCopy) copy(value Object, depth int) (Object, error) {
 	if depth > 256 {
 		return nil, fmt.Errorf("excessive PDF resource nesting")
 	}
+	c.ensureMaps()
+	sourceKey := c.source
+	if sourceKey != nil && sourceKey.owner != nil {
+		sourceKey = sourceKey.owner
+	}
+	var sourceRefs []Reference
 	if ref, ok := value.(Reference); ok {
 		if c.source == nil {
 			return nil, fmt.Errorf("PDF resource reference has no source reader")
 		}
-		var err error
-		value, err = c.source.Resolve(ref)
-		if err != nil {
-			return nil, err
+		cur := ref
+		var seen map[Reference]bool
+		for {
+			if err := c.ctx.Err(); err != nil {
+				return nil, err
+			}
+			if outRef, exists := c.refCopied[rewriteRefIdentity{source: sourceKey, ref: cur}]; exists {
+				for _, prev := range sourceRefs {
+					c.refCopied[rewriteRefIdentity{source: sourceKey, ref: prev}] = outRef
+				}
+				return outRef, nil
+			}
+			if seen[cur] {
+				return nil, fmt.Errorf("cyclic indirect reference %d %d", cur.Number, cur.Generation)
+			}
+			if seen == nil {
+				seen = make(map[Reference]bool)
+			}
+			seen[cur] = true
+			sourceRefs = append(sourceRefs, cur)
+			resolved, err := c.source.Object(cur)
+			if err != nil {
+				return nil, err
+			}
+			next, isNextRef := resolved.(Reference)
+			if !isNextRef {
+				value = resolved
+				break
+			}
+			cur = next
 		}
 	}
 	var id rewriteObjectIdentity
@@ -89,13 +142,23 @@ func (c *rewriteObjectCopy) copy(value Object, depth int) (Object, error) {
 		return nil, fmt.Errorf("invalid PDF resource object")
 	}
 	if ref, exists := c.copied[id]; exists {
+		for _, prev := range sourceRefs {
+			c.refCopied[rewriteRefIdentity{source: sourceKey, ref: prev}] = ref
+		}
 		return ref, nil
 	}
 	ref, err := appendRewriteObject(c.objects, c.number, nil)
 	if err != nil {
 		return nil, err
 	}
-	c.copied[id] = ref
+	if len(sourceRefs) > 0 {
+		for _, prev := range sourceRefs {
+			c.refCopied[rewriteRefIdentity{source: sourceKey, ref: prev}] = ref
+		}
+	} else {
+		c.copied[id] = ref
+		c.pinned[id] = value
+	}
 	switch v := value.(type) {
 	case Dictionary:
 		result := make(Dictionary, len(v))
@@ -134,6 +197,7 @@ func (c *rewriteObjectCopy) copyStream(stream *Stream, depth int) (*Stream, erro
 	if err := c.ctx.Err(); err != nil {
 		return nil, err
 	}
+	c.ensureMaps()
 	dict := make(Dictionary, len(stream.Dictionary))
 	nested := *c
 	if !c.source.ownsObject(stream.reader, stream.cache) {

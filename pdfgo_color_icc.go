@@ -39,19 +39,27 @@ type iccStreamKey struct {
 	count  int
 }
 
+// iccAltCacheKey 标识单次解析中按配置流、分量数与替换标志缓存的备用空间条目
+type iccAltCacheKey struct {
+	stream    *Stream
+	count     int
+	effective bool
+}
+
 // separationCacheKey 标识单次解析中可复用的间接分色对象引用及替换标志
 type separationCacheKey struct {
 	ref       Reference
 	effective bool
 }
 
-// colorParseState 保存单次颜色空间解析的节点预算及配置流与分色缓存
+// colorParseState 保存单次颜色空间解析的节点预算及配置流、备用空间与分色缓存
 type colorParseState struct {
-	nodes       int
-	iccV5       map[iccStreamKey]bool
-	iccSpaces   map[iccStreamKey]*iccColorSpace
-	iccRecover  map[iccStreamKey]bool
-	separations map[separationCacheKey]*separationSpace
+	nodes        int
+	iccV5        map[iccStreamKey]bool
+	iccSpaces    map[iccStreamKey]*iccColorSpace
+	iccAltSpaces map[iccAltCacheKey]*iccColorSpace
+	iccRecover   map[iccStreamKey]bool
+	separations  map[separationCacheKey]*separationSpace
 }
 
 // consumeColorParseNode 复用或建立单次颜色空间解析状态并扣减节点预算
@@ -181,9 +189,9 @@ func parseICCColorSpace(data []byte, count int, key [32]byte) (*iccColorSpace, e
 	if tags["A2B0"] != nil {
 		space.lut, err = parseICCLUTSpace(data, tags, &budget)
 	} else if count == 1 {
-		space.gray, err = parseICCGray(data)
+		space.gray, err = parseICCGray(data, &budget)
 	} else if count == 3 && !space.lab {
-		space.rgb, err = parseICCRGB(data)
+		space.rgb, err = parseICCRGB(data, &budget)
 	} else {
 		err = fmt.Errorf("missing ICC A2B0 transform")
 	}
@@ -363,16 +371,17 @@ func iccSegmentedCurveFloatCount(data []byte) (uint64, bool) {
 	return total, true
 }
 
-// parseICCRGB 校验ICC标签边界并读取D50矩阵和色调曲线
-// 入参: data 配置文件数据
-// 返回: *iccRGBSpace 颜色变换, error 错误信息
-func parseICCRGB(data []byte) (*iccRGBSpace, error) {
+// parseICCRGB 校验ICC标签边界并读取D50矩阵和色调曲线，共享曲线标签去重并扣减内存预算
+// 入参: data 配置文件数据, budget 剩余字节预算指针
+// 返回: *iccRGBSpace 颜色变换, error 配置或预算错误
+func parseICCRGB(data []byte, budget *int64) (*iccRGBSpace, error) {
 	tags, err := iccTags(data, "RGB ")
 	if err != nil {
 		return nil, err
 	}
 	s := &iccRGBSpace{matrix: calRGBSpace{gamma: [3]float64{1, 1, 1}}}
 	source, target := bradford([3]float64{0.9642, 1, 0.8249}), bradford([3]float64{0.95047, 1, 1.08883})
+	var trcs [3][]byte
 	for i, channel := range []string{"r", "g", "b"} {
 		s.matrix.adapt[i] = target[i] / source[i]
 		xyz := tags[channel+"XYZ"]
@@ -382,7 +391,20 @@ func parseICCRGB(data []byte) (*iccRGBSpace, error) {
 		for j := 0; j < 3; j++ {
 			s.matrix.matrix[i*3+j] = float64(int32(binary.BigEndian.Uint32(xyz[8+4*j:]))) / 65536
 		}
-		s.curves[i], err = iccCurve(tags[channel+"TRC"])
+		trc := tags[channel+"TRC"]
+		trcs[i] = trc
+		reused := false
+		for prev := 0; prev < i; prev++ {
+			if sameICCTag(trc, trcs[prev]) {
+				s.curves[i] = s.curves[prev]
+				reused = true
+				break
+			}
+		}
+		if reused {
+			continue
+		}
+		s.curves[i], err = iccCurve(trc, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -391,10 +413,10 @@ func parseICCRGB(data []byte) (*iccRGBSpace, error) {
 	return s, nil
 }
 
-// parseICCGray 读取灰度曲线，使用ICC定义的D50连接空间
-// 入参: data 配置文件数据
-// 返回: *iccGraySpace 灰度颜色变换, error 错误信息
-func parseICCGray(data []byte) (*iccGraySpace, error) {
+// parseICCGray 读取灰度曲线，使用ICC定义的D50连接空间并扣减内存预算
+// 入参: data 配置文件数据, budget 剩余字节预算指针
+// 返回: *iccGraySpace 灰度颜色变换, error 配置或预算错误
+func parseICCGray(data []byte, budget *int64) (*iccGraySpace, error) {
 	tags, err := iccTags(data, "GRAY")
 	if err != nil {
 		return nil, err
@@ -403,7 +425,7 @@ func parseICCGray(data []byte) (*iccGraySpace, error) {
 	if len(white) != 20 || string(white[:4]) != "XYZ " {
 		return nil, &UnsupportedError{Feature: "ICC gray white point"}
 	}
-	curve, err := iccCurve(tags["kTRC"])
+	curve, err := iccCurve(tags["kTRC"], budget)
 	if err != nil {
 		return nil, err
 	}
@@ -496,10 +518,10 @@ func iccProfileDirectory(data []byte, model string) (map[string][]byte, error) {
 	return tags, nil
 }
 
-// iccCurve 读取ICC采样曲线或参数曲线并校验定义域
-// 入参: data 色调曲线标签数据
-// 返回: iccToneCurve 色调曲线, error 错误信息
-func iccCurve(data []byte) (iccToneCurve, error) {
+// iccCurve 在可选字节预算内读取ICC采样曲线或参数曲线并校验定义域
+// 入参: data 色调曲线标签数据, budget 可选剩余字节预算指针
+// 返回: iccToneCurve 色调曲线, error 格式、预算或能力错误
+func iccCurve(data []byte, budget *int64) (iccToneCurve, error) {
 	if len(data) < 12 {
 		return iccToneCurve{}, fmt.Errorf("invalid ICC tone curve length")
 	}
@@ -545,15 +567,21 @@ func iccCurve(data []byte) (iccToneCurve, error) {
 	if n > uint64(len(data)-12)/2 {
 		return iccToneCurve{}, fmt.Errorf("invalid ICC tone curve length")
 	}
+	if n == 1 {
+		gamma := binary.BigEndian.Uint16(data[12:])
+		if gamma == 0 {
+			return iccToneCurve{}, fmt.Errorf("invalid ICC curve gamma")
+		}
+		return iccToneCurve{parameters: []float64{float64(gamma) / 256}}, nil
+	}
+	if n > 1 && budget != nil {
+		if err := iccReserveBytes(budget, int64(n)*2); err != nil {
+			return iccToneCurve{}, err
+		}
+	}
 	curve := make([]uint16, int(n))
 	for j := range curve {
 		curve[j] = binary.BigEndian.Uint16(data[12+2*j:])
-	}
-	if n == 1 && curve[0] == 0 {
-		return iccToneCurve{}, fmt.Errorf("invalid ICC curve gamma")
-	}
-	if n == 1 {
-		return iccToneCurve{parameters: []float64{float64(curve[0]) / 256}}, nil
 	}
 	return iccToneCurve{samples: curve, direction: iccCurveDirection(curve)}, nil
 }
@@ -685,40 +713,54 @@ func (r *Reader) readICCSourceSpaceContext(ctx context.Context, object Array, ef
 	if cached := state.iccSpaces[streamKey]; cached != nil {
 		return cached.withRanges(ranges), nil
 	}
-	if state.iccV5[streamKey] || state.iccRecover[streamKey] {
-		return r.readICCAlternate(ctx, stream, int(count), ranges, effective)
+	altKey := iccAltCacheKey{stream: stream, count: int(count), effective: effective}
+	if cached := state.iccAltSpaces[altKey]; cached != nil {
+		return cached.withRanges(ranges), nil
 	}
+	cacheAlt := func(base *iccColorSpace) *iccColorSpace {
+		if state.iccAltSpaces == nil {
+			state.iccAltSpaces = make(map[iccAltCacheKey]*iccColorSpace)
+		}
+		state.iccAltSpaces[altKey] = base
+		return base.withRanges(ranges)
+	}
+	loadAlt := func() (*iccColorSpace, error) {
+		ctx = withGradientParseBudget(ctx, r)
+		base, err := r.readICCAlternate(ctx, stream, int(count), effective)
+		if err != nil {
+			return nil, err
+		}
+		return cacheAlt(base), nil
+	}
+	if state.iccV5[streamKey] || state.iccRecover[streamKey] {
+		return loadAlt()
+	}
+	var space *iccColorSpace
 	data, err := r.DecodeStreamContext(ctx, stream)
+	if err == nil {
+		space, err = r.readICCProfileData(data, int(count))
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		space, recErr := r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
-		if recErr == nil {
-			if state.iccRecover == nil {
-				state.iccRecover = make(map[iccStreamKey]bool)
-			}
-			state.iccRecover[streamKey] = true
+		ctx = withGradientParseBudget(ctx, r)
+		base, recErr := r.recoverICCAlternate(ctx, stream, int(count), effective, err)
+		if recErr != nil {
+			return nil, recErr
 		}
-		return space, recErr
-	}
-	space, err := r.readICCProfileData(data, int(count))
-	if err != nil {
-		space, recErr := r.recoverICCAlternate(ctx, stream, int(count), ranges, effective, err)
-		if recErr == nil {
-			if state.iccRecover == nil {
-				state.iccRecover = make(map[iccStreamKey]bool)
-			}
-			state.iccRecover[streamKey] = true
+		if state.iccRecover == nil {
+			state.iccRecover = make(map[iccStreamKey]bool)
 		}
-		return space, recErr
+		state.iccRecover[streamKey] = true
+		return cacheAlt(base), nil
 	}
 	if space == nil {
 		if state.iccV5 == nil {
 			state.iccV5 = make(map[iccStreamKey]bool)
 		}
 		state.iccV5[streamKey] = true
-		return r.readICCAlternate(ctx, stream, int(count), ranges, effective)
+		return loadAlt()
 	}
 	if state.iccSpaces == nil {
 		state.iccSpaces = make(map[iccStreamKey]*iccColorSpace)
@@ -772,6 +814,18 @@ func (r *Reader) readICCProfileData(data []byte, count int) (*iccColorSpace, err
 // 返回: int64 估算字节数
 func iccProfileCacheBytes(space *iccColorSpace) int64 {
 	size := int64(256) + int64(len(space.data))
+	if space.rgb != nil {
+		seenSamples := make(map[*uint16]bool, len(space.rgb.curves))
+		for _, curve := range space.rgb.curves {
+			if len(curve.samples) > 0 && !seenSamples[&curve.samples[0]] {
+				seenSamples[&curve.samples[0]] = true
+				size += int64(len(curve.samples)) * 2
+			}
+		}
+	}
+	if space.gray != nil {
+		size += int64(len(space.gray.curve.samples)) * 2
+	}
 	if space.lut != nil {
 		seenLUT := make(map[*iccLUT]bool, len(space.lut.toPCS))
 		for _, lut := range space.lut.toPCS {

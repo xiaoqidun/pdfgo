@@ -172,13 +172,8 @@ func iccEmbeddedCurves(data []byte, offset, end, count int, budget *int64, seen 
 		}
 		curve, cached := seen[pos]
 		if !cached {
-			if samples > 1 {
-				if err := iccReserveBytes(budget, int64(2*samples)); err != nil {
-					return nil, err
-				}
-			}
 			var err error
-			curve, err = iccCurve(cur[:length])
+			curve, err = iccCurve(cur[:length], budget)
 			if err != nil {
 				return nil, err
 			}

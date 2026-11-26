@@ -122,7 +122,14 @@ func (r *Reader) pageActionVersion(ctx context.Context, dict Dictionary) (string
 		if additional[key] == nil {
 			continue
 		}
-		required, err := r.navigationVersion(ctx, additional[key])
+		action, err := r.Resolve(additional[key])
+		if err != nil {
+			return "", err
+		}
+		if action == nil {
+			continue
+		}
+		required, err := r.navigationVersion(ctx, action)
 		if err != nil {
 			return "", err
 		}

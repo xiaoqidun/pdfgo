@@ -30,18 +30,63 @@ const maxGradientTotalStops = maxGradientLinearStops * 4
 // maxGradientFunctionNodes 限制单次渐变函数解析允许访问的最大节点数，防止共享DAG指数展开
 const maxGradientFunctionNodes = 4096
 
+// gradientParseStateKey 作为上下文键传递单次颜色或着色解析共享的渐变函数预算与记忆表
+type gradientParseStateKey struct{}
+
 // gradientFunctionKey 标识单次解析中可复用的间接函数对象及通道数
 type gradientFunctionKey struct {
 	ref      Reference
 	channels int
 }
 
-// gradientParseState 保存单次渐变函数解析的节点与跨节点总断点预算及间接引用记忆表
+// gradientParseState 保存单次渐变函数解析的节点、停点与解码字节预算及间接引用记忆表
 type gradientParseState struct {
 	nodes     int
 	stops     int
+	bytes     int64
+	limit     int64
 	functions map[gradientFunctionKey]*gradientFunction
 	vectors   map[gradientFunctionKey]*gradientVector
+}
+
+// withGradientParseBudget 在上下文中附着单次颜色或着色解析共享的渐变函数预算与记忆表
+// 入参: ctx 取消上下文, r 文档阅读器
+// 返回: context.Context 携带共享解析状态的上下文
+func withGradientParseBudget(ctx context.Context, r *Reader) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	if state, _ := ctx.Value(gradientParseStateKey{}).(*gradientParseState); state != nil {
+		return ctx
+	}
+	limit, _ := effectiveStreamLimits(r, nil)
+	return context.WithValue(ctx, gradientParseStateKey{}, &gradientParseState{limit: limit})
+}
+
+// gradientStateFromContext 复用上下文中已附着的渐变解析状态，未附着时创建局部状态
+// 入参: ctx 取消上下文, r 文档阅读器
+// 返回: *gradientParseState 渐变函数解析状态
+func gradientStateFromContext(ctx context.Context, r *Reader) *gradientParseState {
+	if ctx != nil {
+		if state, _ := ctx.Value(gradientParseStateKey{}).(*gradientParseState); state != nil {
+			return state
+		}
+	}
+	limit, _ := effectiveStreamLimits(r, nil)
+	return &gradientParseState{limit: limit}
+}
+
+// gradientParsedBytes 返回上下文共享解析状态已累计消耗的解码字节数
+// 入参: ctx 取消上下文
+// 返回: int64 已累计解码字节数
+func gradientParsedBytes(ctx context.Context) int64 {
+	if ctx == nil {
+		return 0
+	}
+	if state, _ := ctx.Value(gradientParseStateKey{}).(*gradientParseState); state != nil {
+		return state.bytes
+	}
+	return 0
 }
 
 // remainingStops 返回单次解析剩余允许保留的累计线性停点数
@@ -64,6 +109,54 @@ func (s *gradientParseState) reserveStops(count int) bool {
 	return true
 }
 
+// reserveBytes 从单次解析总字节预算中扣减指定解码或编译堆占用
+// 入参: size 新增字节数
+// 返回: error 超出预算时返回包装ErrStreamLimitExceeded的错误
+func (s *gradientParseState) reserveBytes(size int64) error {
+	if size <= 0 {
+		return nil
+	}
+	if s.limit > 0 && size > s.limit-s.bytes {
+		return fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	s.bytes += size
+	return nil
+}
+
+// checkGradientSampledBudget 解码一维采样流前按样本数和位宽预检累计字节预算
+// 入参: dict 采样函数字典, outputs 输出分量数, state 解析状态
+// 返回: error 预算超限错误
+func (r *Reader) checkGradientSampledBudget(dict Dictionary, outputs int, state *gradientParseState) error {
+	if state.limit <= 0 {
+		return nil
+	}
+	sizes, err := r.numberArray(dict["Size"], 1)
+	if err != nil || !finiteFloats(sizes) {
+		return nil
+	}
+	bits, err := r.number(dict["BitsPerSample"])
+	if err != nil || bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 12 && bits != 16 && bits != 24 && bits != 32 {
+		return nil
+	}
+	if sizes[0] < 1 || sizes[0] > float64(math.MaxInt64) || math.Trunc(sizes[0]) != sizes[0] {
+		return nil
+	}
+	remaining := uint64(state.limit - state.bytes)
+	limitBits := remaining * 8
+	if remaining > math.MaxUint64/8 {
+		limitBits = math.MaxUint64
+	}
+	perSample := uint64(outputs) * uint64(bits)
+	if uint64(sizes[0]) > limitBits/perSample {
+		return fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	needed := (uint64(sizes[0])*perSample-1)/8 + 1
+	if needed > remaining {
+		return fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
+	}
+	return nil
+}
+
 // gradientFunction 保存已解析的一维颜色函数及可精确展开的线性分段
 type gradientFunction struct {
 	value     func(float64) [4]float64
@@ -71,6 +164,7 @@ type gradientFunction struct {
 	linear    func([2]float64) []GradientStop
 	colorants *ColorantSpace
 	colorant  func(float64, []float64) error
+	bytes     int64
 }
 
 // constantGradientFunction 保存单点函数的确定结果及常量分段
@@ -78,6 +172,7 @@ type gradientFunction struct {
 // 返回: *gradientFunction 常量函数
 func constantGradientFunction(values [4]float64) *gradientFunction {
 	return &gradientFunction{
+		bytes: 256,
 		value: func(float64) [4]float64 { return values },
 		linear: func([2]float64) []GradientStop {
 			return []GradientStop{{Position: 0, Values: values}, {Position: 1, Values: values}}
@@ -89,7 +184,7 @@ func constantGradientFunction(values [4]float64) *gradientFunction {
 // 入参: source 源函数, lab Lab颜色参数
 // 返回: *gradientFunction 显示颜色函数
 func labGradientFunction(source *gradientFunction, lab *labSpace) *gradientFunction {
-	return &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+	return &gradientFunction{bytes: 128 + source.bytes, calculate: func(x float64) ([4]float64, error) {
 		values, err := source.evaluate(x)
 		if err != nil {
 			return values, err
@@ -105,7 +200,7 @@ func iccGradientFunction(source *gradientFunction, profile *iccColorSpace) *grad
 	if profile == nil || profile.ranges == nil {
 		return source
 	}
-	mapped := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+	mapped := &gradientFunction{bytes: 128 + source.bytes, calculate: func(x float64) ([4]float64, error) {
 		values, err := source.evaluate(x)
 		if err != nil {
 			return values, err
@@ -147,7 +242,11 @@ func iccGradientStops(stops []GradientStop, profile *iccColorSpace) []GradientSt
 // 入参: source 浓度函数, tint 着色函数
 // 返回: *gradientFunction 复合颜色函数
 func composeGradientFunction(source, tint *gradientFunction) *gradientFunction {
-	f := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+	size := int64(128) + source.bytes
+	if tint != source {
+		size += tint.bytes
+	}
+	f := &gradientFunction{bytes: size, calculate: func(x float64) ([4]float64, error) {
 		values, err := source.evaluate(x)
 		if err != nil {
 			return [4]float64{}, err
@@ -212,7 +311,7 @@ func deviceNGradientFunction(source *gradientFunction, input, output []float64, 
 		}
 		return
 	}
-	f := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+	f := &gradientFunction{bytes: 128 + source.bytes + int64(len(expressions))*48, calculate: func(x float64) ([4]float64, error) {
 		values, err := source.evaluate(x)
 		if err != nil {
 			return [4]float64{}, err
@@ -377,14 +476,14 @@ func (f *gradientFunction) evaluate(x float64) ([4]float64, error) {
 
 // readGradientFunctionContext 在取消上下文内解析采样、指数、拼接及计算器函数
 // 入参: ctx 取消上下文, object 函数对象, channels 输出分量数, depth 嵌套深度
-// 返回: *gradientFunction 颜色函数, error 解析或取消错误
+// 返回: *gradientFunction 颜色函数, error 解析、预算或取消错误
 func (r *Reader) readGradientFunctionContext(ctx context.Context, object Object, channels, depth int) (*gradientFunction, error) {
-	return r.readGradientFunctionState(ctx, object, channels, depth, &gradientParseState{})
+	return r.readGradientFunctionState(ctx, object, channels, depth, gradientStateFromContext(ctx, r))
 }
 
-// readGradientFunctionState 携带节点预算与间接引用记忆表解析渐变函数
+// readGradientFunctionState 携带节点、停点与字节预算及间接引用记忆表解析渐变函数
 // 入参: ctx 取消上下文, object 函数对象, channels 输出分量数, depth 嵌套深度, state 解析状态
-// 返回: *gradientFunction 颜色函数, error 解析或取消错误
+// 返回: *gradientFunction 颜色函数, error 解析、预算或取消错误
 func (r *Reader) readGradientFunctionState(ctx context.Context, object Object, channels, depth int, state *gradientParseState) (*gradientFunction, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -421,7 +520,7 @@ func (r *Reader) readGradientFunctionState(ctx context.Context, object Object, c
 
 // readGradientFunctionNode 解析单个渐变函数节点并在拼接展开超限时退回按需求值
 // 入参: ctx 取消上下文, object 函数对象, channels 输出分量数, depth 嵌套深度, state 解析状态
-// 返回: *gradientFunction 颜色函数, error 解析或取消错误
+// 返回: *gradientFunction 颜色函数, error 解析、预算或取消错误
 func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, channels, depth int, state *gradientParseState) (*gradientFunction, error) {
 	v, err := r.Resolve(object)
 	if err != nil {
@@ -432,15 +531,21 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			return nil, fmt.Errorf("invalid gradient function count")
 		}
 		parts := make([]*gradientFunction, channels)
+		seen := make(map[*gradientFunction]bool, channels)
+		size := int64(256) + int64(channels)*8
 		linear := true
 		for i, object := range array {
 			parts[i], err = r.readGradientFunctionState(ctx, object, 1, depth+1, state)
 			if err != nil {
 				return nil, err
 			}
+			if !seen[parts[i]] {
+				seen[parts[i]] = true
+				size += parts[i].bytes
+			}
 			linear = linear && parts[i].linear != nil
 		}
-		f := &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
+		f := &gradientFunction{bytes: size, calculate: func(x float64) (values [4]float64, err error) {
 			for c, part := range parts {
 				result, evalErr := part.evaluate(x)
 				if evalErr != nil {
@@ -467,11 +572,21 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		return nil, err
 	}
 	if kind == Integer(0) || kind == Integer(2) {
+		if kind == Integer(0) {
+			if err := r.checkGradientSampledBudget(dict, channels, state); err != nil {
+				return nil, err
+			}
+		}
 		tint, err := r.readTintFunction(ctx, v, channels)
 		if err != nil {
 			return nil, err
 		}
-		f := &gradientFunction{value: func(x float64) (values [4]float64) {
+		if tint.sampled {
+			if err := state.reserveBytes(int64(len(tint.samples))); err != nil {
+				return nil, err
+			}
+		}
+		f := &gradientFunction{bytes: 256 + int64(len(tint.samples)), value: func(x float64) (values [4]float64) {
 			tint.colorInto(x, values[:channels])
 			return
 		}}
@@ -486,6 +601,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			if budget := min(maxGradientLinearStops, state.remainingStops()); budget > 0 {
 				stops := sampledGradientStops(ctx, tint, budget)
 				if state.reserveStops(len(stops)) {
+					f.bytes += int64(len(stops)) * 64
 					f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, tint.domain, interval) }
 				}
 			}
@@ -509,6 +625,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			}
 			stops = clipGradientValues(stops, tint.outputRange)
 			if state.reserveStops(len(stops)) {
+				f.bytes += int64(len(stops)) * 64
 				f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, tint.domain, interval) }
 			}
 		}
@@ -543,8 +660,15 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		if err != nil {
 			return nil, err
 		}
+		if state.limit > 0 && int64(len(data)) > state.limit-state.bytes {
+			return nil, fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
+		}
 		program, err := newCalculatorFunction(data, r.warning)
 		if err != nil {
+			return nil, err
+		}
+		progBytes := calculatorProgramBytes(program)
+		if err := state.reserveBytes(max(int64(len(data)), progBytes)); err != nil {
 			return nil, err
 		}
 		if domain[0] == domain[1] {
@@ -556,7 +680,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		}
 		expressions, err := affineCalculator(data, 1, channels)
 		if err != nil {
-			return &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
+			return &gradientFunction{bytes: 256 + progBytes, calculate: func(x float64) (values [4]float64, err error) {
 				x = math.Max(domain[0], math.Min(domain[1], x))
 				err = program.evaluate([]float64{x}, values[:channels])
 				if err != nil {
@@ -580,7 +704,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		}
 		stops = clipGradientValues(stops, limits)
 		if !state.reserveStops(len(stops)) {
-			return &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
+			return &gradientFunction{bytes: 256 + progBytes, calculate: func(x float64) (values [4]float64, err error) {
 				x = math.Max(domain[0], math.Min(domain[1], x))
 				err = program.evaluate([]float64{x}, values[:channels])
 				if err != nil {
@@ -590,6 +714,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 			}}, nil
 		}
 		return &gradientFunction{
+			bytes:  256 + int64(len(stops))*64,
 			value:  func(x float64) [4]float64 { return gradientValue(stops, functionPosition(x, domain[0], domain[1])) },
 			linear: func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) },
 		}, nil
@@ -618,6 +743,8 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 	}
 	points := append(append([]float64{domain[0]}, bounds...), domain[1])
 	parts := make([]*gradientFunction, len(functions))
+	seen := make(map[*gradientFunction]bool, len(functions))
+	size := int64(256) + int64(len(functions))*24
 	linear := true
 	for i, object := range functions {
 		if points[i] > points[i+1] {
@@ -627,9 +754,13 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		if err != nil {
 			return nil, err
 		}
+		if !seen[parts[i]] {
+			seen[parts[i]] = true
+			size += parts[i].bytes
+		}
 		linear = linear && (points[i] == points[i+1] && i < len(functions)-1 || parts[i].linear != nil)
 	}
-	f := &gradientFunction{calculate: func(x float64) (values [4]float64, err error) {
+	f := &gradientFunction{bytes: size, calculate: func(x float64) (values [4]float64, err error) {
 		x = math.Max(domain[0], math.Min(domain[1], x))
 		for i, part := range parts {
 			if x < points[i+1] || i == len(parts)-1 {
@@ -687,6 +818,7 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 		if len(stops) > 0 {
 			stops = clipGradientValues(stops, limits)
 			if len(stops) <= budget && state.reserveStops(len(stops)) {
+				f.bytes += int64(len(stops)) * 64
 				f.linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
 			}
 		}

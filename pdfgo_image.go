@@ -618,6 +618,11 @@ func (s *emptySampleImage) Bounds() image.Rectangle { return s.rect }
 // 返回: color.Color 透明颜色
 func (s *emptySampleImage) At(x, y int) color.Color { return color.NRGBA64{} }
 
+// NRGBA64At 返回None色料的零覆盖率十六位颜色
+// 入参: x 横坐标, y 纵坐标
+// 返回: color.NRGBA64 透明颜色
+func (s *emptySampleImage) NRGBA64At(x, y int) color.NRGBA64 { return color.NRGBA64{} }
+
 // Opaque 返回图像没有不透明像素
 // 返回: bool 是否完全不透明
 func (s *emptySampleImage) Opaque() bool { return false }
@@ -1810,6 +1815,10 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 			return nil, err
 		}
 		if none {
+			maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+			if _, _, err := imageCompositeBufferSize(i.Width, i.Height, 8, maxBytes); err != nil {
+				return nil, err
+			}
 			return &emptySampleImage{rect: image.Rect(0, 0, i.Width, i.Height)}, nil
 		}
 	}
@@ -2141,14 +2150,12 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 				}
 			}
 		}
-		if mask != nil {
-			pixelBytes := 4
-			if !byteExact {
-				pixelBytes = 8
-			}
-			if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), pixelBytes, maxBytes); err != nil {
-				return nil, err
-			}
+		pixelBytes := 4
+		if !byteExact {
+			pixelBytes = 8
+		}
+		if _, _, err := imageCompositeBufferSize(bounds.Dx(), bounds.Dy(), pixelBytes, maxBytes); err != nil {
+			return nil, err
 		}
 		return &deviceSampleImage{source: samples, mask: mask, inverted: inverted, palette: palette, maximum: imageSampleMaximum(bits), byteExact: byteExact, embedded: embeddedMask != 0 || sampleHasAlpha}, nil
 	}
@@ -3099,8 +3106,9 @@ func (i *Image) rawSamplesSize(ctx context.Context, data []byte, target image.Po
 	if components == 4 {
 		return &packedCMYKImage{data: data, rect: image.Rect(0, 0, i.Width, i.Height), stride: stride, depth: i.BitsPerComponent}, nil
 	}
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
 	if components == 3 && i.BitsPerComponent == 8 {
-		if _, _, err := imageBufferSize(i.Width, i.Height, 4); err != nil {
+		if _, _, err := imageCompositeBufferSize(i.Width, i.Height, 4, maxBytes); err != nil {
 			return nil, err
 		}
 		out := image.NewNRGBA(image.Rect(0, 0, i.Width, i.Height))
@@ -3118,7 +3126,7 @@ func (i *Image) rawSamplesSize(ctx context.Context, data []byte, target image.Po
 	}
 	maximum := (uint32(1) << i.BitsPerComponent) - 1
 	if components == 2 || components == 3 {
-		if _, _, err := imageBufferSize(i.Width, i.Height, 8); err != nil {
+		if _, _, err := imageCompositeBufferSize(i.Width, i.Height, 8, maxBytes); err != nil {
 			return nil, err
 		}
 		out := image.NewNRGBA64(image.Rect(0, 0, i.Width, i.Height))

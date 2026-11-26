@@ -29,6 +29,12 @@ import (
 // maxHalftoneThresholdBytes 限制单次半色调解析展开为16位阈值表的累计总字节上限
 const maxHalftoneThresholdBytes int64 = 64 << 20
 
+// maxHalftoneCacheEntries 限制单个Reader常驻缓存的网屏最大条数
+const maxHalftoneCacheEntries = 256
+
+// maxHalftoneCacheBytes 限制单个Reader常驻缓存的网屏总字节上限
+const maxHalftoneCacheBytes int64 = maxHalftoneThresholdBytes * 2
+
 // errMissingHalftoneThreshold 标识缺失阈值流，不混淆引用、网屏类型或解码错误
 var errMissingHalftoneThreshold = errors.New("missing halftone threshold stream")
 
@@ -63,10 +69,20 @@ func (r *Reader) newHalftoneReadState() *halftoneReadState {
 	return &halftoneReadState{limit: limit, thresholdLimit: thresholdLimit}
 }
 
-// halftoneMemoryBytes 估算单个网屏定义的完整内存占用，包含阈值表、名称、字典键值及固定开销
+// halftoneMemoryBytes 估算单个网屏定义的完整内存占用，包含阈值表、名称、字典键值、分量网屏及固定开销
 // 入参: h 网屏定义
 // 返回: int64 估算字节数
 func halftoneMemoryBytes(h *Halftone) int64 {
+	return halftoneMemoryBytesSeen(h, nil)
+}
+
+// halftoneMemoryBytesSeen 递归估算网屏及其分量占用的近似字节数，跳过已统计的共享或循环引用
+// 入参: h 网屏定义, seen 已统计网屏指针集合
+// 返回: int64 估算字节数
+func halftoneMemoryBytesSeen(h *Halftone, seen map[*Halftone]bool) int64 {
+	if h == nil {
+		return 0
+	}
 	cost := int64(256) + int64(len(h.Name)) + int64(len(h.Thresholds))*2
 	for key, value := range h.Dictionary {
 		cost += 64 + int64(len(key))
@@ -77,7 +93,50 @@ func halftoneMemoryBytes(h *Halftone) int64 {
 			cost += int64(len(v))
 		}
 	}
+	if len(h.Components) == 0 {
+		return cost
+	}
+	if seen == nil {
+		seen = map[*Halftone]bool{h: true}
+	}
+	for key, part := range h.Components {
+		cost += 64 + int64(len(key))
+		if part != nil && !seen[part] {
+			seen[part] = true
+			cost += halftoneMemoryBytesSeen(part, seen)
+		}
+	}
 	return cost
+}
+
+// cacheHalftone 在条目数与总字节上限内缓存已解析网屏，超限时清空旧缓存
+// 入参: ref 网屏间接引用, h 已解析网屏
+// 返回: bool 是否已写入缓存
+func (r *Reader) cacheHalftone(ref Reference, h *Halftone) bool {
+	cost := halftoneMemoryBytes(h)
+	if cost > maxHalftoneCacheBytes {
+		return false
+	}
+	if r.halftones == nil {
+		r.halftones = make(map[Reference]*Halftone)
+	} else {
+		oldCost := int64(0)
+		entries := len(r.halftones)
+		if old, exists := r.halftones[ref]; exists {
+			oldCost = halftoneMemoryBytes(old)
+		} else {
+			entries++
+		}
+		if entries > maxHalftoneCacheEntries || cost > maxHalftoneCacheBytes-(r.halftoneCacheBytes-oldCost) {
+			clear(r.halftones)
+			r.halftoneCacheBytes = 0
+			oldCost = 0
+		}
+		r.halftoneCacheBytes -= oldCost
+	}
+	r.halftones[ref] = h
+	r.halftoneCacheBytes += cost
+	return true
 }
 
 // reserveMemory 从半色调解析内存预算中扣减指定字节数
@@ -132,11 +191,7 @@ func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, er
 		}
 	}
 	h, err := r.readHalftone(ctx, object, false, nil, nil, r.newHalftoneReadState())
-	if err == nil && indirect {
-		if r.halftones == nil {
-			r.halftones = make(map[Reference]*Halftone)
-		}
-		r.halftones[ref] = h
+	if err == nil && indirect && r.cacheHalftone(ref, h) {
 		return cloneHalftoneContext(ctx, h)
 	}
 	return h, err
@@ -169,11 +224,7 @@ func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named
 	}
 	used := false
 	h, err := r.readHalftone(ctx, object, false, named, &used, r.newHalftoneReadState())
-	if err == nil && indirect && !used {
-		if r.halftones == nil {
-			r.halftones = make(map[Reference]*Halftone)
-		}
-		r.halftones[ref] = h
+	if err == nil && indirect && !used && r.cacheHalftone(ref, h) {
 		return cloneHalftoneContext(ctx, h)
 	}
 	return h, err
@@ -331,7 +382,11 @@ func (r *Reader) readHalftone(ctx context.Context, object Object, component bool
 		}
 		name = append([]byte{}, raw...)
 	}
-	h := &Halftone{Dictionary: dict, Name: name, reader: r, cache: r.cache}
+	owner := r.owner
+	if owner == nil {
+		owner = r
+	}
+	h := &Halftone{Dictionary: dict, Name: name, reader: owner, cache: r.cache}
 	value, err = r.Resolve(dict["HalftoneType"])
 	if err != nil {
 		return nil, err
@@ -577,7 +632,9 @@ func (h *Halftone) identityTransfer(reader *Reader, depth int) (bool, error) {
 		return false, fmt.Errorf("halftone recursion limit exceeded")
 	}
 	if !reader.ownsObject(h.reader, h.cache) {
-		reader = h.reader.Fork(ForkOptions{})
+		forked := h.reader.Fork(ForkOptions{})
+		defer forked.Close()
+		reader = forked
 	}
 	if reader == nil {
 		return false, fmt.Errorf("missing halftone reader")

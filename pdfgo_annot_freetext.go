@@ -24,7 +24,7 @@ import (
 
 // freeTextAppearance 按文字内框、背景及引出线生成自由文本外观
 // 入参: ctx 取消上下文, page 所在页面, annotation 自由文本注解
-// 返回: *Stream 外观流, error 属性、字体或排版错误
+// 返回: *Stream 外观流, error 属性、字体、排版、超限或取消错误
 func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation Annotation) (*Stream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -69,7 +69,8 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 		return nil, err
 	}
 	var content strings.Builder
-	stroke, err := r.writeAnnotationStroke(&content, border)
+	contentLimit := annotationRichContentLimit(r)
+	stroke, err := r.writeAnnotationStroke(ctx, &content, border, contentLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +104,7 @@ func (r *Reader) freeTextAppearance(ctx context.Context, page *Page, annotation 
 			inset := math.Min(border.width/2, math.Min(fw, fh)/2)
 			outline = Rectangle{frame.XMin + inset, frame.YMin + inset, frame.XMax - inset, frame.YMax - inset}
 		}
-		if err := writeAnnotationCloudFrameContext(ctx, &content, outline, cloud, false, annotationRichContentLimit(r)); err != nil {
+		if err := writeAnnotationCloudFrameContext(ctx, &content, outline, cloud, false, contentLimit); err != nil {
 			return nil, err
 		}
 		switch {

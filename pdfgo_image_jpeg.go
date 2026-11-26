@@ -23,6 +23,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"io"
+	"math"
 	"os"
 )
 
@@ -529,13 +530,14 @@ func (i *Image) jpegSamplesSizeContext(ctx context.Context, data []byte, params 
 		}
 		i.Warning(Diagnostic{Message: fmt.Sprintf("JPEG dimensions differ from image dictionary; using image data dimensions %dx%d", config.Width, config.Height)})
 	}
-	if err := frame.sampleSize(); err != nil {
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if err := frame.sampleSize(maxBytes); err != nil {
 		return nil, err
 	}
 	dst := boundedSampleSize(config.Width, config.Height, size)
 	downscale := size.X > 0 && size.Y > 0 && (dst.X < config.Width || dst.Y < config.Height)
 	if !downscale && (components == 4 || components == 3 && (config.ColorModel != color.YCbCrModel || !transform)) {
-		if _, _, err := imageBufferSize(config.Width, config.Height, 4); err != nil {
+		if _, _, err := imageCompositeBufferSize(config.Width, config.Height, 4, maxBytes); err != nil {
 			return nil, err
 		}
 	}
@@ -653,7 +655,8 @@ func (i *Image) jpegReadTransformContext(ctx context.Context, data []byte, param
 		normalized = append(normalized, candidate[position:]...)
 		candidate = normalized
 	}
-	if err := frame.sampleSize(); err != nil {
+	maxBytes, _ := effectiveStreamLimits(i.reader, i.Stream)
+	if err := frame.sampleSize(maxBytes); err != nil {
 		return nil, jpegFrame{}, false, false, err
 	}
 	if frame.height <= 0 || frame.width <= 0 || frame.width > jpegRecoveryPixelLimit/frame.height {
@@ -780,11 +783,15 @@ func (i *Image) jpegDimensionFileContext(ctx context.Context, data []byte, frame
 	return data, ctx.Err()
 }
 
-// sampleSize 校验JPEG解码器的采样平面及渐进系数缓冲
-// 返回: error 不可分配的缓冲尺寸
-func (f jpegFrame) sampleSize() error {
+// sampleSize 校验JPEG解码器的采样平面、黑色通道、渐进系数及流内存预算
+// 入参: maxBytes 流解压字节上限，非正数表示仅校验平台缓冲上限
+// 返回: error 不可分配的缓冲尺寸或超限错误
+func (f jpegFrame) sampleSize(maxBytes int64) error {
 	if f.components != 1 && f.components != 3 && f.components != 4 {
 		return fmt.Errorf("invalid JPEG component count")
+	}
+	if f.width <= 0 || f.height <= 0 {
+		return fmt.Errorf("invalid JPEG dimensions")
 	}
 	if f.components == 1 {
 		f.sampling[0] = [2]int{1, 1}
@@ -797,33 +804,79 @@ func (f jpegFrame) sampleSize() error {
 		}
 		maxH, maxV = max(maxH, h), max(maxV, v)
 	}
-	columns := (f.width + 8*maxH - 1) / (8 * maxH)
-	rows := (f.height + 8*maxV - 1) / (8 * maxV)
-	width, height := columns*8*maxH, rows*8*maxV
-	_, size, err := imageBufferSize(width, height, 1)
-	if err != nil {
-		return err
+	budget := imageCompositeBudget(maxBytes)
+	limit := int64(imageBufferLimit())
+	overflow := func(msg string) error {
+		if budget > 0 {
+			return fmt.Errorf("%w: JPEG sample buffer exceeds limit", ErrStreamLimitExceeded)
+		}
+		return fmt.Errorf("%s", msg)
 	}
+	if int64(f.width) > math.MaxInt64-int64(8*maxH) || int64(f.height) > math.MaxInt64-int64(8*maxV) {
+		return overflow("JPEG sample size exceeds platform buffer range")
+	}
+	columns := (int64(f.width) + int64(8*maxH) - 1) / int64(8*maxH)
+	rows := (int64(f.height) + int64(8*maxV) - 1) / int64(8*maxV)
+	width, height := columns*int64(8*maxH), rows*int64(8*maxV)
+	if width > math.MaxInt64/height {
+		return overflow("JPEG sample size exceeds platform buffer range")
+	}
+	size := width * height
+	imgBytes := size
+	if budget > 0 && imgBytes > budget {
+		return fmt.Errorf("%w: JPEG sample buffer exceeds limit", ErrStreamLimitExceeded)
+	}
+	sampleOverLimit := size > limit
 	if f.components > 1 {
 		chromaWidth, chromaHeight := width, height
 		if f.sampling[1] == f.sampling[2] && f.sampling[0] == [2]int{maxH, maxV} {
-			chromaWidth = columns * 8 * f.sampling[1][0]
-			chromaHeight = rows * 8 * f.sampling[1][1]
+			chromaWidth = columns * int64(8*f.sampling[1][0])
+			chromaHeight = rows * int64(8*f.sampling[1][1])
 		}
-		_, chromaSize, err := imageBufferSize(chromaWidth, chromaHeight, 1)
-		if err != nil {
-			return err
+		chromaSize := chromaWidth * chromaHeight
+		if f.components == 4 {
+			if size > math.MaxInt64-imgBytes {
+				return overflow("JPEG sample size exceeds platform buffer range")
+			}
+			imgBytes += size
 		}
-		if chromaSize > (imageBufferLimit()-size)/2 {
-			return fmt.Errorf("JPEG sample size exceeds platform buffer range")
+		if chromaSize > (math.MaxInt64-imgBytes)/2 {
+			return overflow("JPEG sample size exceeds platform buffer range")
+		}
+		imgBytes += 2 * chromaSize
+		if budget > 0 && imgBytes > budget {
+			return fmt.Errorf("%w: JPEG sample buffer exceeds limit", ErrStreamLimitExceeded)
+		}
+		if imgBytes > limit {
+			sampleOverLimit = true
 		}
 	}
+	total := imgBytes
+	progOverLimit := false
 	if f.progressive {
 		for n := 0; n < f.components; n++ {
-			if _, _, err := imageBufferSize(columns*8*f.sampling[n][0], rows*8*f.sampling[n][1], 4); err != nil {
-				return fmt.Errorf("JPEG progressive coefficient size exceeds platform buffer range")
+			pw, ph := columns*int64(8*f.sampling[n][0]), rows*int64(8*f.sampling[n][1])
+			if pw > math.MaxInt64/4/ph {
+				return overflow("JPEG progressive coefficient size exceeds platform buffer range")
+			}
+			progSize := pw * ph * 4
+			if progSize > math.MaxInt64-total {
+				return overflow("JPEG progressive coefficient size exceeds platform buffer range")
+			}
+			total += progSize
+			if budget > 0 && total > budget {
+				return fmt.Errorf("%w: JPEG sample buffer exceeds limit", ErrStreamLimitExceeded)
+			}
+			if total > limit {
+				progOverLimit = true
 			}
 		}
+	}
+	if sampleOverLimit {
+		return fmt.Errorf("JPEG sample size exceeds platform buffer range")
+	}
+	if progOverLimit {
+		return fmt.Errorf("JPEG progressive coefficient size exceeds platform buffer range")
 	}
 	return nil
 }

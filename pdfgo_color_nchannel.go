@@ -227,6 +227,7 @@ func (r *Reader) readNChannelSpots(ctx context.Context, attrs Dictionary, names 
 	if err != nil {
 		return nil, err
 	}
+	ctx = withGradientParseBudget(ctx, r)
 	var colorants Dictionary
 	var spots []*separationSpace
 	loaded := false

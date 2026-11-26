@@ -166,33 +166,247 @@ type shadingPatternCache struct {
 	bytes      int64
 }
 
-// shadingPaintBytes 估算着色画刷的内存占用
+// shadingByteTracker 按节点指针去重统计着色画刷及其关联状态的子对象内存
+type shadingByteTracker struct {
+	functions   map[*gradientFunction]bool
+	vectors     map[*gradientVector]bool
+	tints       map[*deviceNSpace]bool
+	separations map[*separationSpace]bool
+	colorants   map[*ColorantSpace]bool
+	alternates  map[*tintAlternate]bool
+	profiles    map[*iccColorSpace]bool
+	halftones   map[*Halftone]bool
+}
+
+// shadingPaintBytes 估算着色画刷及其底层函数、专色、色彩配置和图案状态的完整内存占用
 // 入参: paint 着色画刷
 // 返回: int64 估算字节数
 func shadingPaintBytes(paint Paint) int64 {
+	return shadingPaintBytesWith(paint, &shadingByteTracker{})
+}
+
+// shadingPaintBytesWith 按去重表递归估算着色画刷内存占用
+// 入参: paint 着色画刷, seen 节点去重表
+// 返回: int64 估算字节数
+func shadingPaintBytesWith(paint Paint, seen *shadingByteTracker) int64 {
+	size := colorSpaceMemoryBytes(paint.Space, seen)
 	if paint.Shading != nil {
-		return 256 + shadingPaintBytes(paint.Shading.Paint)
+		size += 256 + shadingPaintBytesWith(paint.Shading.Paint, seen) + shadingStyleBytes(paint.Shading.Style, seen)
+		if paint.Shading.Background != nil {
+			size += colorSpaceMemoryBytes(paint.Shading.Background.Space, seen)
+		}
+		return size
 	}
 	if m := paint.Mesh; m != nil {
-		size := int64(256)
+		size += 256
 		if len(m.Triangles) > 0 {
 			size += int64(len(m.Triangles)) * (144 + int64(len(m.Triangles[0].Colors[0]))*24)
 		}
 		if len(m.Patches) > 0 {
 			size += int64(len(m.Patches)) * (400 + int64(len(m.Patches[0].Colors[0]))*32)
 		}
-		return size
+		return size + gradientVectorMemoryBytes(m.function, seen) + tintMemoryBytes(m.tint, seen) + colorSpaceMemoryBytes(m.Space, seen)
 	}
-	if paint.Axial != nil {
-		return 256 + int64(len(paint.Axial.Stops))*64
+	if a := paint.Axial; a != nil {
+		return size + 256 + int64(len(a.Stops))*64 + gradientFunctionMemoryBytes(a.function, seen) + colorSpaceMemoryBytes(a.Space, seen)
 	}
-	if paint.Radial != nil {
-		return 256 + int64(len(paint.Radial.Stops))*64
+	if r := paint.Radial; r != nil {
+		return size + 256 + int64(len(r.Stops))*64 + gradientFunctionMemoryBytes(r.function, seen) + colorSpaceMemoryBytes(r.Space, seen)
 	}
-	if paint.Function != nil {
-		return 256 + coordinateFunctionBytes(paint.Function.function)
+	if f := paint.Function; f != nil {
+		return size + 256 + coordinateFunctionBytes(f.function) + tintMemoryBytes(f.tint, seen) + colorSpaceMemoryBytes(f.Space, seen)
 	}
-	return 256
+	return size + 256
+}
+
+// shadingStyleBytes 估算着色图案状态持有的网屏、传递函数、软蒙版及颜色转换内存
+// 入参: style 图案图形状态, seen 节点去重表
+// 返回: int64 估算字节数
+func shadingStyleBytes(style Style, seen *shadingByteTracker) int64 {
+	var size int64
+	if style.Halftone != nil {
+		size += halftoneTreeBytes(style.Halftone, seen)
+	}
+	if style.Transfer != nil {
+		size += 64
+		for _, fn := range style.Transfer.functions {
+			if fn != nil {
+				size += gradientFunctionMemoryBytes(fn.function, seen)
+			}
+		}
+	}
+	if style.SoftMask != nil {
+		size += 256 + int64(len(style.SoftMask.Backdrop))*8 + colorSpaceMemoryBytes(style.SoftMask.ColorSpace, seen) + gradientFunctionMemoryBytes(style.SoftMask.transfer, seen)
+	}
+	if style.ColorConversion.BlackGeneration != nil {
+		size += gradientFunctionMemoryBytes(style.ColorConversion.BlackGeneration.function, seen)
+	}
+	if style.ColorConversion.UndercolorRemoval != nil {
+		size += gradientFunctionMemoryBytes(style.ColorConversion.UndercolorRemoval.function, seen)
+	}
+	return size
+}
+
+// halftoneTreeBytes 按指针去重递归估算网屏及复合子网屏的完整内存占用
+// 入参: h 网屏定义, seen 节点去重表
+// 返回: int64 估算字节数
+func halftoneTreeBytes(h *Halftone, seen *shadingByteTracker) int64 {
+	if h == nil {
+		return 0
+	}
+	if seen.halftones == nil {
+		seen.halftones = make(map[*Halftone]bool)
+	}
+	if seen.halftones[h] {
+		return 0
+	}
+	seen.halftones[h] = true
+	return halftoneMemoryBytesSeen(h, seen.halftones)
+}
+
+// colorSpaceMemoryBytes 按指针去重估算颜色空间所持ICC配置的内存占用
+// 入参: space 颜色空间, seen 节点去重表
+// 返回: int64 估算字节数
+func colorSpaceMemoryBytes(space *ColorSpace, seen *shadingByteTracker) int64 {
+	if space == nil || space.profile == nil {
+		return 0
+	}
+	if seen.profiles == nil {
+		seen.profiles = make(map[*iccColorSpace]bool)
+	}
+	if seen.profiles[space.profile] {
+		return 0
+	}
+	seen.profiles[space.profile] = true
+	return iccProfileCacheBytes(space.profile)
+}
+
+// gradientFunctionMemoryBytes 按指针去重估算一维渐变函数及其关联色料空间的内存占用
+// 入参: f 渐变函数, seen 节点去重表
+// 返回: int64 估算字节数
+func gradientFunctionMemoryBytes(f *gradientFunction, seen *shadingByteTracker) int64 {
+	if f == nil {
+		return 0
+	}
+	if seen.functions == nil {
+		seen.functions = make(map[*gradientFunction]bool)
+	}
+	if seen.functions[f] {
+		return 0
+	}
+	seen.functions[f] = true
+	return max(int64(128), f.bytes) + colorantSpaceBytes(f.colorants, seen)
+}
+
+// gradientVectorMemoryBytes 按指针去重估算多分量渐变函数的内存占用
+// 入参: v 多分量渐变函数, seen 节点去重表
+// 返回: int64 估算字节数
+func gradientVectorMemoryBytes(v *gradientVector, seen *shadingByteTracker) int64 {
+	if v == nil {
+		return 0
+	}
+	if seen.vectors == nil {
+		seen.vectors = make(map[*gradientVector]bool)
+	}
+	if seen.vectors[v] {
+		return 0
+	}
+	seen.vectors[v] = true
+	size := max(int64(128), v.bytes)
+	if v.scalar != nil {
+		if seen.functions == nil {
+			seen.functions = make(map[*gradientFunction]bool)
+		}
+		if !seen.functions[v.scalar] {
+			seen.functions[v.scalar] = true
+			if v.bytes == 0 {
+				size += v.scalar.bytes
+			}
+			size += colorantSpaceBytes(v.scalar.colorants, seen)
+		}
+	}
+	return size
+}
+
+// tintMemoryBytes 按指针去重估算专色空间及其采样表、计算器、嵌套备用与色料定义内存
+// 入参: tint 专色空间定义, seen 节点去重表
+// 返回: int64 估算字节数
+func tintMemoryBytes(tint *deviceNSpace, seen *shadingByteTracker) int64 {
+	if tint == nil {
+		return 0
+	}
+	if seen.tints == nil {
+		seen.tints = make(map[*deviceNSpace]bool)
+	}
+	if seen.tints[tint] {
+		return 0
+	}
+	seen.tints[tint] = true
+	size := int64(256) + int64(len(tint.input)+len(tint.output))*8 + int64(len(tint.expressions))*48 + int64(len(tint.processInputs))*8
+	size += colorSpaceMemoryBytes(tint.alternate, seen) + gradientFunctionMemoryBytes(tint.transform, seen) + calculatorProgramBytes(tint.program)
+	if tint.sampled != nil {
+		size += 256 + int64(len(tint.sampled.table.samples))
+	}
+	return size + tintAlternateBytes(tint.nested, seen) + colorantSpaceBytes(tint.colorants, seen)
+}
+
+// separationSpaceBytes 按指针去重估算分色空间及其备用变换和色料定义内存
+// 入参: s 分色空间定义, seen 节点去重表
+// 返回: int64 估算字节数
+func separationSpaceBytes(s *separationSpace, seen *shadingByteTracker) int64 {
+	if s == nil {
+		return 0
+	}
+	if seen.separations == nil {
+		seen.separations = make(map[*separationSpace]bool)
+	}
+	if seen.separations[s] {
+		return 0
+	}
+	seen.separations[s] = true
+	return 256 + colorSpaceMemoryBytes(s.space, seen) + gradientFunctionMemoryBytes(s.transform, seen) + tintAlternateBytes(s.nested, seen) + colorantSpaceBytes(s.colorants, seen)
+}
+
+// colorantSpaceBytes 按指针去重估算色料空间及其独立过程色与专色表内存
+// 入参: cs 色料空间定义, seen 节点去重表
+// 返回: int64 估算字节数
+func colorantSpaceBytes(cs *ColorantSpace, seen *shadingByteTracker) int64 {
+	if cs == nil {
+		return 0
+	}
+	if seen.colorants == nil {
+		seen.colorants = make(map[*ColorantSpace]bool)
+	}
+	if seen.colorants[cs] {
+		return 0
+	}
+	seen.colorants[cs] = true
+	size := int64(128) + int64(len(cs.Names))*16
+	if cs.Process != nil {
+		size += colorSpaceMemoryBytes(cs.Process.Space, seen)
+	}
+	size += separationSpaceBytes(cs.separation, seen) + tintMemoryBytes(cs.tint, seen)
+	for _, spot := range cs.spots {
+		size += separationSpaceBytes(spot, seen)
+	}
+	return size
+}
+
+// tintAlternateBytes 按指针去重估算嵌套备用颜色空间的内存占用
+// 入参: alt 嵌套备用空间, seen 节点去重表
+// 返回: int64 估算字节数
+func tintAlternateBytes(alt *tintAlternate, seen *shadingByteTracker) int64 {
+	if alt == nil {
+		return 0
+	}
+	if seen.alternates == nil {
+		seen.alternates = make(map[*tintAlternate]bool)
+	}
+	if seen.alternates[alt] {
+		return 0
+	}
+	seen.alternates[alt] = true
+	return 128 + colorSpaceMemoryBytes(alt.space, seen) + separationSpaceBytes(alt.separation, seen) + tintMemoryBytes(alt.deviceN, seen)
 }
 
 // shadingPattern 读取定义时的状态，仅解释影响sh的内部参数
@@ -231,6 +445,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		return Paint{}, &UnsupportedError{Feature: "shading pattern type"}
 	}
 	child := *p
+	child.ctx = withGradientParseBudget(child.ctx, child.reader)
 	child.resetTransient()
 	child.state = p.patternInitialState()
 	matrix := p.patternMatrix
@@ -253,6 +468,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	if err != nil {
 		return Paint{}, err
 	}
+	beforeExt := gradientParsedBytes(child.ctx)
 	if object != nil {
 		state, ok := object.(Dictionary)
 		if !ok {
@@ -269,6 +485,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 			return Paint{}, err
 		}
 	}
+	extBytes := gradientParsedBytes(child.ctx) - beforeExt
 	shading, err := p.reader.Resolve(dict["Shading"])
 	if err != nil {
 		return Paint{}, err
@@ -279,6 +496,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	}
 	var paint Paint
 	streamHit, streamBudgeted := false, false
+	var paintParsed int64
 	if stream, isStream := shading.(*Stream); isStream {
 		sKey := shadingStreamKey{stream: stream, matrix: matrix, intent: child.state.style.RenderingIntent, blending: child.blendingSpace}
 		if cache := p.shadingPatterns; cache != nil {
@@ -289,15 +507,17 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 			}
 		}
 		if !streamHit {
+			beforePaint := gradientParsedBytes(child.ctx)
 			paint, err = child.shadingPatternPaint(shading, matrix)
 			if err != nil {
 				return Paint{}, err
 			}
+			paintParsed = gradientParsedBytes(child.ctx) - beforePaint
 			if !paint.None {
 				if p.shadingPatterns == nil {
 					p.shadingPatterns = &shadingPatternCache{}
 				}
-				cost := shadingPaintBytes(paint)
+				cost := max(shadingPaintBytes(paint), paintParsed)
 				if len(p.shadingPatterns.byStream) < 1024 && cost <= budget-p.shadingPatterns.bytes {
 					if p.shadingPatterns.byStream == nil {
 						p.shadingPatterns.byStream = make(map[shadingStreamKey]Paint)
@@ -311,10 +531,12 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 			}
 		}
 	} else {
+		beforePaint := gradientParsedBytes(child.ctx)
 		paint, err = child.shadingPatternPaint(shading, matrix)
 		if err != nil {
 			return Paint{}, err
 		}
+		paintParsed = gradientParsedBytes(child.ctx) - beforePaint
 	}
 	if paint.None {
 		return paint, nil
@@ -359,7 +581,9 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 	}
 	cost := int64(256)
 	if !streamBudgeted {
-		cost = shadingPaintBytes(result)
+		cost = max(shadingPaintBytes(result), extBytes+paintParsed)
+	} else if result.Shading != nil {
+		cost += max(shadingStyleBytes(result.Shading.Style, &shadingByteTracker{}), extBytes)
 	}
 	if len(p.shadingPatterns.byPattern) < 1024 && cost <= budget-p.shadingPatterns.bytes {
 		if p.shadingPatterns.byPattern == nil {

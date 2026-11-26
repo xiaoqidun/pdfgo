@@ -126,7 +126,9 @@ func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options Halft
 	}
 	transferReader := r
 	if !r.ownsObject(h.reader, h.cache) {
-		r = h.reader.Fork(ForkOptions{})
+		forked := h.reader.Fork(ForkOptions{})
+		defer forked.Close()
+		r = forked
 	}
 	if r.closed {
 		return nil, os.ErrClosed

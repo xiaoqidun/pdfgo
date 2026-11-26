@@ -38,7 +38,7 @@ type DocumentInfo struct {
 	Custom       map[Name]string
 }
 
-// OutputIntent 保存目标输出条件和独立ICC快照，不替代对象颜色空间或启用屏幕打样
+// OutputIntent 保存目标输出条件和ICC配置快照，不替代对象颜色空间或启用屏幕打样
 type OutputIntent struct {
 	Subtype                   Name
 	OutputCondition           string
@@ -49,10 +49,39 @@ type OutputIntent struct {
 	Space                     *ColorSpace
 }
 
+// outputIntentProfile 保存已解码输出意图ICC配置及其校验结果
+type outputIntentProfile struct {
+	profile []byte
+	space   *ColorSpace
+	err     error
+}
+
+// outputIntentReadState 跟踪单次输出意图读取的文本预算、配置预算与共享ICC缓存
+type outputIntentReadState struct {
+	textBudget   textStringBudget
+	profileLimit int64
+	profileUsed  int64
+	profiles     map[Reference]outputIntentProfile
+}
+
+// consumeProfile 累计输出意图ICC配置逻辑字节数，超过上限时返回超限错误
+// 入参: size 新增配置字节数
+// 返回: error 超限错误
+func (s *outputIntentReadState) consumeProfile(size int64) error {
+	if s.profileLimit <= 0 {
+		return nil
+	}
+	if size > s.profileLimit-s.profileUsed {
+		return fmt.Errorf("%w: output intent profile size limit exceeded", ErrStreamLimitExceeded)
+	}
+	s.profileUsed += size
+	return nil
+}
+
 // OutputIntents 读取并验证文档输出意图，不将目标配置应用到普通屏显
 // 配置Warning时诊断无效辅助字段并返回可读取的部分，无效配置的Space为空，原始对象保持不变
 // 入参: ctx 取消上下文
-// 返回: []OutputIntent 按文档顺序排列的输出条件, error 字典、字段、ICC或取消错误
+// 返回: []OutputIntent 按文档顺序排列的输出条件, error 字典、字段、ICC、超限或取消错误
 func (r *Reader) OutputIntents(ctx context.Context) ([]OutputIntent, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("invalid output intents context")
@@ -79,27 +108,33 @@ func (r *Reader) OutputIntents(ctx context.Context) ([]OutputIntent, error) {
 		}
 		return nil, err
 	}
-	result := make([]OutputIntent, len(array))
+	profileLimit, _ := effectiveStreamLimits(r, nil)
+	state := outputIntentReadState{textBudget: newTextStringBudget(r), profileLimit: profileLimit}
+	result := make([]OutputIntent, 0, min(len(array), 64))
 	for n, object := range array {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		result[n], err = r.readOutputIntent(ctx, object)
+		if n >= 4096 {
+			return nil, fmt.Errorf("%w: output intents count limit exceeded", ErrStreamLimitExceeded)
+		}
+		intent, err := r.readOutputIntent(ctx, object, &state)
 		if err != nil {
 			err = fmt.Errorf("output intent %d: %w", n+1, err)
 			if !r.recoverAuxiliary(err) {
 				return nil, err
 			}
-			result[n].Space = nil
+			intent.Space = nil
 		}
+		result = append(result, intent)
 	}
 	return result, nil
 }
 
 // readOutputIntent 解析输出条件并验证嵌入配置，不使用ICCBased的备用空间掩盖无效目标配置
-// 入参: ctx 取消上下文, object 输出意图字典或引用
-// 返回: OutputIntent 输出条件, error 定义、配置或取消错误
-func (r *Reader) readOutputIntent(ctx context.Context, object Object) (OutputIntent, error) {
+// 入参: ctx 取消上下文, object 输出意图字典或引用, state 共享预算与配置缓存状态
+// 返回: OutputIntent 输出条件, error 定义、配置、超限或取消错误
+func (r *Reader) readOutputIntent(ctx context.Context, object Object, state *outputIntentReadState) (OutputIntent, error) {
 	var result OutputIntent
 	if err := ctx.Err(); err != nil {
 		return result, err
@@ -136,7 +171,7 @@ func (r *Reader) readOutputIntent(ctx context.Context, object Object) (OutputInt
 		{"RegistryName", &result.RegistryName},
 		{"Info", &result.Info},
 	} {
-		value, err := r.Resolve(dict[field.key])
+		ref, value, err := r.resolveIndirect(dict[field.key])
 		if err != nil {
 			return result, err
 		}
@@ -147,7 +182,7 @@ func (r *Reader) readOutputIntent(ctx context.Context, object Object) (OutputInt
 		if !ok {
 			return result, fmt.Errorf("invalid output intent %s", field.key)
 		}
-		*field.target, err = DecodeTextString(text)
+		*field.target, err = state.textBudget.decodeString(ref, text, "output intent")
 		if err != nil {
 			return result, err
 		}
@@ -159,7 +194,7 @@ func (r *Reader) readOutputIntent(ctx context.Context, object Object) (OutputInt
 	if value != nil {
 		return result, &UnsupportedError{Feature: "external output intent profile"}
 	}
-	value, err = r.Resolve(dict["DestOutputProfile"])
+	profileRef, value, err := r.resolveIndirect(dict["DestOutputProfile"])
 	if err != nil || value == nil {
 		return result, err
 	}
@@ -167,28 +202,48 @@ func (r *Reader) readOutputIntent(ctx context.Context, object Object) (OutputInt
 	if !ok {
 		return result, fmt.Errorf("invalid DestOutputProfile stream")
 	}
+	if profileRef != (Reference{}) {
+		if cached, exists := state.profiles[profileRef]; exists {
+			if err := state.consumeProfile(int64(len(cached.profile))); err != nil {
+				return result, err
+			}
+			result.Profile = cached.profile
+			result.Space = cached.space
+			return result, cached.err
+		}
+	}
 	data, err := r.DecodeStreamContext(ctx, stream)
 	if err != nil {
 		return result, fmt.Errorf("DestOutputProfile: %w", err)
 	}
+	if err := state.consumeProfile(int64(len(data))); err != nil {
+		return result, err
+	}
 	result.Profile = data
 	result.Space, err = NewICCColorSpace(data)
 	if err != nil {
-		return result, fmt.Errorf("DestOutputProfile: %w", err)
+		err = fmt.Errorf("DestOutputProfile: %w", err)
+	} else {
+		value, err = r.Resolve(stream.Dictionary["N"])
+		if err == nil && value != nil && value != Integer(result.Space.Components()) {
+			err = fmt.Errorf("DestOutputProfile component count mismatch")
+		}
 	}
-	value, err = r.Resolve(stream.Dictionary["N"])
+	if profileRef != (Reference{}) && !isFatalReaderError(err) {
+		if state.profiles == nil {
+			state.profiles = make(map[Reference]outputIntentProfile)
+		}
+		state.profiles[profileRef] = outputIntentProfile{profile: data, space: result.Space, err: err}
+	}
 	if err != nil {
 		return result, err
-	}
-	if value != nil && value != Integer(result.Space.Components()) {
-		return result, fmt.Errorf("DestOutputProfile component count mismatch")
 	}
 	return result, nil
 }
 
 // Info 读取文档信息字典，解码PDF文本字符串，日期保留原文以免丢失精度
 // 配置Warning时诊断无效辅助字段并读取其他文本，原始对象保持不变
-// 返回: DocumentInfo 文档信息, error 字典或字段类型错误
+// 返回: DocumentInfo 文档信息, error 字典、字段类型或超限错误
 func (r *Reader) Info() (DocumentInfo, error) {
 	result := DocumentInfo{Trapped: "Unknown"}
 	if r == nil {
@@ -212,8 +267,9 @@ func (r *Reader) Info() (DocumentInfo, error) {
 		}
 		return result, err
 	}
+	budget := newTextStringBudget(r)
 	for _, key := range slices.Sorted(maps.Keys(dict)) {
-		value, err := r.Resolve(dict[key])
+		ref, value, err := r.resolveIndirect(dict[key])
 		if err != nil {
 			if r.recoverAuxiliary(err) {
 				continue
@@ -243,7 +299,7 @@ func (r *Reader) Info() (DocumentInfo, error) {
 			}
 			return result, err
 		}
-		decoded, err := DecodeTextString(text)
+		decoded, err := budget.decodeString(ref, text, "document info")
 		if err != nil {
 			if r.recoverAuxiliary(err) {
 				continue

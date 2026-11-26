@@ -216,7 +216,7 @@ func (r *Reader) ReadRedactionRegions(ctx context.Context, annotation Annotation
 
 // redactionAppearance 生成待删改区域的笔画预览，不使用应用删改后的覆盖属性
 // 入参: ctx 取消上下文, annotation 删改注解
-// 返回: *Stream 待删改外观, error 取消、区域或笔画错误
+// 返回: *Stream 待删改外观, error 取消、超限、区域或笔画错误
 func (r *Reader) redactionAppearance(ctx context.Context, annotation Annotation) (*Stream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -230,7 +230,8 @@ func (r *Reader) redactionAppearance(ctx context.Context, annotation Annotation)
 		return nil, err
 	}
 	var content strings.Builder
-	stroke, err := r.writeAnnotationStroke(&content, border)
+	contentLimit := annotationRichContentLimit(r)
+	stroke, err := r.writeAnnotationStroke(ctx, &content, border, contentLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +245,13 @@ func (r *Reader) redactionAppearance(ctx context.Context, annotation Annotation)
 				writeAnnotationOperation(&content, "l", point.X, point.Y)
 			}
 			content.WriteString("h S\n")
+			if content.Len() > contentLimit {
+				return nil, fmt.Errorf("%w: redaction appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return r.annotationAppearance(annotation, content.String(), nil)
 }

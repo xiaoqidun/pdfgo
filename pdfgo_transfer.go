@@ -288,7 +288,9 @@ func (r *Reader) halftoneTransferContext(ctx context.Context, h *Halftone) (*Tra
 		return nil, false, err
 	}
 	if !r.ownsObject(h.reader, h.cache) {
-		r = h.reader.Fork(ForkOptions{})
+		forked := h.reader.Fork(ForkOptions{})
+		defer forked.Close()
+		r = forked
 	}
 	if r == nil {
 		return nil, false, fmt.Errorf("missing halftone reader")

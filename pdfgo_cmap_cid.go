@@ -30,6 +30,9 @@ const maxCMapStreamDepth = 64
 // maxCMapCodespaceRanges 限制单条CID CMap继承链去重后的最大编码范围条数
 const maxCMapCodespaceRanges = 4096
 
+// maxCIDReverseSteps 限制CID到字符码反查允许检验的最大候选步数，防止重复覆盖区间耗尽CPU
+const maxCIDReverseSteps = 1 << 20
+
 // CIDMap 保存字符码到CID的映射
 type CIDMap map[string]uint16
 
@@ -207,13 +210,13 @@ func ParseCIDMapContext(ctx context.Context, data []byte) (CIDMap, error) {
 // 入参: ctx 取消上下文, data CMap数据
 // 返回: *cidCMap 本层映射, error 格式、超限或取消错误
 func parseCIDCMapContext(ctx context.Context, data []byte) (*cidCMap, error) {
-	return parseCIDCMapBudgetContext(ctx, data, nil, nil)
+	return parseCIDCMapBudgetIndexContext(ctx, data, nil, nil, true)
 }
 
-// parseCIDCMapBudgetContext 在共享条目预算内解析单层CID映射，并对编码范围去重
-// 入参: ctx 取消上下文, data CMap数据, warning 恢复诊断，空值严格校验, budget 跨继承链条目预算
+// parseCIDCMapBudgetIndexContext 在共享条目预算内解析单层CID映射，按需延迟首字节索引构建
+// 入参: ctx 取消上下文, data CMap数据, warning 恢复诊断，空值严格校验, budget 跨继承链条目预算, buildIndex 是否立即构建首字节分桶索引
 // 返回: *cidCMap 本层映射, error 格式、超限或取消错误
-func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Diagnostic), budget *cidCMapBudget) (*cidCMap, error) {
+func parseCIDCMapBudgetIndexContext(ctx context.Context, data []byte, warning func(Diagnostic), budget *cidCMapBudget, buildIndex bool) (*cidCMap, error) {
 	if budget == nil {
 		budget = &cidCMapBudget{}
 	}
@@ -241,19 +244,21 @@ func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Di
 				return nil, err
 			}
 			result.notdef = notdef
-			if err := result.buildSpaceIndex(ctx); err != nil {
-				return nil, err
+			if buildIndex {
+				if err := result.buildSpaceIndex(ctx); err != nil {
+					return nil, err
+				}
 			}
 			return result, nil
 		}
 		if b := p.data[p.pos]; b == '/' || b == '(' || b == '<' || b == '[' {
-			object, err := p.object()
+			object, err := p.objectContext(ctx)
 			if err != nil {
 				return nil, err
 			}
 			name, _ = object.(Name)
 			if name == "WMode" || name == "Registry" || name == "Ordering" || name == "CMapType" {
-				value, err := p.object()
+				value, err := p.objectContext(ctx)
 				if err != nil {
 					return nil, err
 				}
@@ -331,7 +336,7 @@ func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Di
 					return nil, err
 				}
 			}
-			from, err := p.object()
+			from, err := p.objectContext(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -341,7 +346,7 @@ func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Di
 			}
 			last := first
 			if strings.HasSuffix(token, "range") {
-				to, err := p.object()
+				to, err := p.objectContext(ctx)
 				if err != nil {
 					return nil, err
 				}
@@ -377,7 +382,7 @@ func parseCIDCMapBudgetContext(ctx context.Context, data []byte, warning func(Di
 				}
 				continue
 			}
-			value, err := p.object()
+			value, err := p.objectContext(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -779,16 +784,65 @@ func (c *cidCMap) validateCode(raw []byte, valid bool) error {
 	return nil
 }
 
-// characterCodes 反查指定CID的有效字符码，不展开无关映射区间
-// 入参: ctx 取消上下文, cids 升序排列的字符标识
-// 返回: []string 去重后的字符码, error 取消错误
-func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, error) {
+// characterCodes 反查指定CID的最优有效字符码并跳过已显式覆写的字符码
+// 入参: ctx 取消上下文, cids 升序排列的字符标识, skip 需跳过的显式Unicode映射，可为空
+// 返回: []string 确定顺序的最优字符码, error 超限或取消错误
+func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16, skip UnicodeMap) ([]string, error) {
 	if len(cids) == 0 {
 		return nil, ctx.Err()
 	}
-	var codes []string
-	seen := make(map[string]bool)
+	dup := false
+	for i := 1; i < len(cids); i++ {
+		if cids[i] == cids[i-1] {
+			dup = true
+			break
+		}
+	}
+	if dup {
+		cids = slices.Compact(slices.Clone(cids))
+	}
+	var validFirst [5][256]bool
+	for _, space := range c.spaces {
+		if space.size >= 1 && space.size <= 4 {
+			for b := int(space.first[0]); b <= int(space.last[0]); b++ {
+				validFirst[space.size][b] = true
+			}
+		}
+	}
+	best := make(map[uint16]uint64, min(len(cids), 256))
+	var worstBest uint64
+	steps := 0
+	var layerCIDs []uint16
+	var layerDone []bool
 	for current := c; current != nil; current = current.base {
+		if len(current.ranges) == 0 {
+			continue
+		}
+		minFirst := current.ranges[0].first
+		if len(best) == len(cids) && worstBest <= minFirst {
+			continue
+		}
+		layerCIDs = layerCIDs[:0]
+		if len(best) == 0 {
+			layerCIDs = append(layerCIDs, cids...)
+		} else {
+			for _, cid := range cids {
+				if prev, ok := best[cid]; !ok || minFirst < prev {
+					layerCIDs = append(layerCIDs, cid)
+				}
+			}
+		}
+		if len(layerCIDs) == 0 {
+			continue
+		}
+		if cap(layerDone) < len(layerCIDs) {
+			layerDone = make([]bool, len(layerCIDs))
+		} else {
+			layerDone = layerDone[:len(layerCIDs)]
+			clear(layerDone)
+		}
+		doneCount := 0
+		improved := false
 		for _, entry := range current.ranges {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -796,39 +850,124 @@ func (c *cidCMap) characterCodes(ctx context.Context, cids []uint16) ([]string, 
 			if entry.invalid {
 				continue
 			}
-			start, _ := slices.BinarySearch(cids, entry.cid)
+			if len(best) == len(cids) && entry.first >= worstBest {
+				break
+			}
+			size := int(entry.first >> 32)
+			if size < 1 || size > 4 {
+				continue
+			}
+			shift := uint((size - 1) * 8)
+			firstB0, lastB0 := int(byte(entry.first>>shift)), int(byte(entry.last>>shift))
+			hasValidFirst := false
+			for b := firstB0; b <= lastB0; b++ {
+				if validFirst[size][b] {
+					hasValidFirst = true
+					break
+				}
+			}
+			if !hasValidFirst {
+				continue
+			}
+			start, _ := slices.BinarySearch(layerCIDs, entry.cid)
 			last := uint64(entry.cid) + entry.last - entry.first
-			for _, cid := range cids[start:] {
+			for idx := start; idx < len(layerCIDs); idx++ {
+				cid := layerCIDs[idx]
 				if uint64(cid) > last {
 					break
 				}
-				if err := ctx.Err(); err != nil {
-					return nil, err
+				if layerDone[idx] {
+					continue
 				}
 				code := entry.first + uint64(cid-entry.cid)
+				if prev, ok := best[cid]; ok && code >= prev {
+					layerDone[idx] = true
+					doneCount++
+					continue
+				}
+				if steps&255 == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				steps++
+				if steps > maxCIDReverseSteps {
+					return nil, fmt.Errorf("%w: CID CMap reverse lookup limit exceeded", ErrStreamLimitExceeded)
+				}
+				if !validFirst[size][byte(code>>shift)] {
+					continue
+				}
 				var raw [4]byte
-				size := int(code >> 32)
 				for i := 0; i < size; i++ {
 					raw[size-i-1] = byte(code >> (i * 8))
 				}
 				data := raw[:size]
-				key := string(data)
-				if seen[key] {
-					continue
+				if len(skip) != 0 {
+					if _, overridden := skip[string(data)]; overridden {
+						continue
+					}
 				}
-				seen[key] = true
 				n, valid, err := c.nextContext(ctx, data)
 				if err != nil {
 					return nil, err
 				}
 				if valid && n == size && c.validateCode(data, true) == nil && c.lookup(data, true) == cid {
-					codes = append(codes, key)
+					_, existed := best[cid]
+					best[cid] = code
+					improved = true
+					layerDone[idx] = true
+					doneCount++
+					if !existed && len(best) == len(cids) {
+						worstBest = 0
+						for _, found := range best {
+							if found > worstBest {
+								worstBest = found
+							}
+						}
+					}
+				}
+			}
+			if doneCount > 0 && doneCount*2 >= len(layerCIDs) {
+				kept := 0
+				for i, cid := range layerCIDs {
+					if !layerDone[i] {
+						layerCIDs[kept] = cid
+						kept++
+					}
+				}
+				layerCIDs = layerCIDs[:kept]
+				if len(layerCIDs) == 0 {
+					break
+				}
+				layerDone = layerDone[:kept]
+				clear(layerDone)
+				doneCount = 0
+			}
+		}
+		if improved && len(best) == len(cids) {
+			worstBest = 0
+			for _, found := range best {
+				if found > worstBest {
+					worstBest = found
 				}
 			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	codes := make([]string, 0, len(best))
+	for _, cid := range cids {
+		code, ok := best[cid]
+		if !ok {
+			continue
+		}
+		var raw [4]byte
+		size := int(code >> 32)
+		for i := 0; i < size; i++ {
+			raw[size-i-1] = byte(code >> (i * 8))
+		}
+		codes = append(codes, string(raw[:size]))
 	}
 	return codes, nil
 }
@@ -1035,7 +1174,7 @@ func (r *Reader) readCIDCMapChainContext(ctx context.Context, object Object, act
 	if err != nil {
 		return nil, false, err
 	}
-	mapping, err := parseCIDCMapBudgetContext(ctx, data, r.warning, budget)
+	mapping, err := parseCIDCMapBudgetIndexContext(ctx, data, r.warning, budget, false)
 	if err != nil {
 		return nil, false, err
 	}

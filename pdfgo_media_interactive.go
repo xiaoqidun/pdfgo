@@ -218,14 +218,14 @@ func (r *Reader) mediaDictionariesWithRefs(ctx context.Context, object Object) (
 
 // ReadThreeD 解析3D注解及共享数据引用，保留模型原始编码和视图选择
 // 入参: annotation 3D注解
-// 返回: ThreeD 模型信息, error 类型、引用或视图错误
+// 返回: ThreeD 模型信息, error 类型、引用、视图或超限错误
 func (r *Reader) ReadThreeD(annotation Annotation) (ThreeD, error) {
 	return r.ReadThreeDContext(context.Background(), annotation)
 }
 
 // ReadThreeDContext 解析三维注解及默认视图，支持批量测量读取取消
 // 入参: ctx 取消上下文, annotation 三维注解
-// 返回: ThreeD 模型信息, error 类型、引用、视图、关闭或取消错误
+// 返回: ThreeD 模型信息, error 类型、引用、视图、超限、关闭或取消错误
 func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (ThreeD, error) {
 	result := ThreeD{Interactive: true, Dictionary: annotation.Dictionary}
 	if ctx == nil || r == nil {
@@ -318,7 +318,12 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 			return result, err
 		}
 	case String:
-		name, err := DecodeTextString(v)
+		budget := newTextStringBudget(r)
+		selectorRef, err := r.resolveIndirectReference(selectorRaw)
+		if err != nil {
+			return result, err
+		}
+		name, err := budget.decodeString(selectorRef, v, "3D view")
 		if err != nil {
 			return result, err
 		}
@@ -326,12 +331,12 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 			if err := ctx.Err(); err != nil {
 				return result, err
 			}
-			value, err := r.Resolve(view["IN"])
+			ref, value, err := r.resolveIndirect(view["IN"])
 			if err != nil {
 				return result, err
 			}
 			if value, ok := value.(String); ok {
-				internal, err := DecodeTextString(value)
+				internal, err := budget.decodeString(ref, value, "3D view")
 				if err != nil {
 					return result, err
 				}

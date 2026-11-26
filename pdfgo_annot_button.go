@@ -131,7 +131,7 @@ func (r *Reader) writeAnnotationPushButton(ctx context.Context, annotation Annot
 
 // writeAnnotationToggleButton 恢复缺失外观的复选框及单选框，显式AS优先，自定义标题作为选中标记
 // 入参: ctx 取消上下文, annotation 控件, mk 外观属性, flags 标志, frame 内框, border 边框, resources 外观资源, content 内容, bordered 是否已有边框
-// 返回: error 状态、标题或字体错误
+// 返回: error 状态、标题、字体、超限或取消错误
 func (r *Reader) writeAnnotationToggleButton(ctx context.Context, annotation Annotation, mk Dictionary, flags Integer, frame Rectangle, border *annotationBorder, resources Dictionary, content *strings.Builder, bordered bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -198,8 +198,11 @@ func (r *Reader) writeAnnotationToggleButton(ctx context.Context, annotation Ann
 
 // annotationButtonState 读取当前按钮状态，Opt存在时按Kids中的零基位置区分控件
 // 入参: ctx 取消上下文, annotation 已合并字段的控件, flags 字段标志
-// 返回: Name 当前状态, error 状态或控件归属错误
+// 返回: Name 当前状态, error 状态、控件归属、超限或取消错误
 func (r *Reader) annotationButtonState(ctx context.Context, annotation Annotation, flags Integer) (Name, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	field := annotation.Dictionary
 	value, err := r.Resolve(field["AS"])
 	if err != nil {
@@ -232,11 +235,12 @@ func (r *Reader) annotationButtonState(ctx context.Context, annotation Annotatio
 		if !ok {
 			return "", fmt.Errorf("invalid button options")
 		}
+		budget := newTextStringBudget(r)
 		for _, object := range options {
 			if err := ctx.Err(); err != nil {
 				return "", err
 			}
-			value, err := r.Resolve(object)
+			ref, value, err := r.resolveIndirect(object)
 			if err != nil {
 				return "", err
 			}
@@ -244,7 +248,7 @@ func (r *Reader) annotationButtonState(ctx context.Context, annotation Annotatio
 			if !ok {
 				return "", fmt.Errorf("invalid button option text")
 			}
-			if _, err := DecodeTextString(text); err != nil {
+			if _, err := budget.decodeString(ref, text, "button option"); err != nil {
 				return "", err
 			}
 		}

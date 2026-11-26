@@ -51,7 +51,7 @@ type MeshGradient struct {
 // meshBits 按高位优先读取曲面网格的紧凑数值
 type meshBits struct {
 	data []byte
-	pos  int
+	pos  int64
 }
 
 // meshBernstein 计算三次伯恩斯坦基函数
@@ -244,7 +244,7 @@ func (g *MeshGradient) colorValues(input []float64) ([4]float64, error) {
 // 入参: count 位数
 // 返回: uint32 数值, error 截断错误
 func (b *meshBits) read(count int) (uint32, error) {
-	if count > len(b.data)*8-b.pos {
+	if int64(count) > int64(len(b.data))*8-b.pos {
 		return 0, io.ErrUnexpectedEOF
 	}
 	var value uint32
@@ -356,7 +356,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 		return functionValue(float64(value)/float64(uint64(1)<<uint(depth)-1), ranges[index], ranges[index+1]), err
 	}
 	warnedFlag := false
-	for bits.pos < len(data)*8 {
+	for bits.pos < int64(len(data))*8 {
 		if err := p.ctx.Err(); err != nil {
 			return Paint{}, err
 		}
@@ -408,7 +408,7 @@ func (p *pageInterpreter) meshPaint(stream *Stream, matrix Matrix) (Paint, error
 				}
 			}
 		}
-		bits.pos = (bits.pos + 7) / 8 * 8
+		bits.pos = (bits.pos + 7) &^ 7
 		patch := MeshPatch{Colors: colors}
 		indices := [16][2]int{{0, 0}, {0, 1}, {0, 2}, {0, 3}, {1, 3}, {2, 3}, {3, 3}, {3, 2}, {3, 1}, {3, 0}, {2, 0}, {1, 0}, {1, 1}, {1, 2}, {2, 2}, {2, 1}}
 		for i, index := range indices {
@@ -490,7 +490,7 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 				v.color[index-2] = value
 			}
 		}
-		bits.pos = (bits.pos + 7) / 8 * 8
+		bits.pos = (bits.pos + 7) &^ 7
 		return v, flag, nil
 	}
 	var result []MeshTriangle
@@ -535,7 +535,7 @@ func (p *pageInterpreter) meshTriangleData(dict Dictionary, data []byte, depths 
 		}
 	} else {
 		var previous [3]vertex
-		for bits.pos < len(data)*8 {
+		for bits.pos < int64(len(data))*8 {
 			if err := p.ctx.Err(); err != nil {
 				return nil, err
 			}

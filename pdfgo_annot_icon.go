@@ -16,6 +16,7 @@ package pdfgo
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -47,7 +48,7 @@ var annotationIcons = map[Name]string{
 
 // iconAppearance 为便笺、附件、声音和插入标记生成缺省外观
 // 入参: annotation 注解
-// 返回: *Stream 矢量外观, error 图标或颜色错误
+// 返回: *Stream 矢量外观, error 边界、图标或颜色错误
 func (r *Reader) iconAppearance(annotation Annotation) (*Stream, error) {
 	key, name := Name("Name"), Name("Note")
 	switch annotation.Subtype {
@@ -96,6 +97,9 @@ func (r *Reader) iconAppearance(annotation Annotation) (*Stream, error) {
 	}
 	x, y := box.XMin, box.YMin
 	width, height := box.XMax-box.XMin, box.YMax-box.YMin
+	if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) || math.IsNaN(width) || math.IsInf(width, 0) || math.IsNaN(height) || math.IsInf(height, 0) {
+		return nil, fmt.Errorf("invalid annotation icon bounds")
+	}
 	if annotation.Subtype == "Text" {
 		width, height = min(width, 20), min(height, 20)
 		y = box.YMax - height

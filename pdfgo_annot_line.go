@@ -21,11 +21,11 @@ import (
 	"strings"
 )
 
-// 直线标题的缺省字号及行距
-const (
-	annotationCaptionSize    float64 = 12
-	annotationCaptionLeading         = annotationCaptionSize * 1.2
-)
+// annotationCaptionSize 定义直线标题的缺省字号
+const annotationCaptionSize float64 = 12
+
+// annotationCaptionLeading 定义直线标题的缺省行距
+const annotationCaptionLeading = annotationCaptionSize * 1.2
 
 // annotationLineCaption 保存标题编码、度量和相对主线的布局
 type annotationLineCaption struct {
@@ -43,7 +43,7 @@ type annotationLineCaption struct {
 
 // lineAppearance 按引线端点、偏移和标题生成直线注解外观
 // 入参: ctx 取消上下文, page 所在页面, annotation 直线注解, warning 容错诊断
-// 返回: *Stream 外观流, error 属性、字体或排版错误
+// 返回: *Stream 外观流, error 属性、字体、排版、超限或取消错误
 func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Annotation, warning func(Diagnostic)) (*Stream, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -107,7 +107,8 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 	var main [4]float64
 	copy(main[:], points)
 	var content strings.Builder
-	stroke, err := r.writeAnnotationStroke(&content, border)
+	contentLimit := annotationRichContentLimit(r)
+	stroke, err := r.writeAnnotationStroke(ctx, &content, border, contentLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +156,7 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 			}
 			if gap1 < length {
 				if len(border.dash) != 0 {
-					if err := r.writeAnnotationDash(&content, border.dash, gap1); err != nil {
+					if err := r.writeAnnotationDash(ctx, &content, border.dash, gap1, contentLimit); err != nil {
 						return nil, err
 					}
 				}
@@ -181,7 +182,7 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 		writeAnnotationOperation(&content, "cm", ux, uy, -uy, ux, cx, cy)
 		if caption.rich != nil {
 			resources = caption.resources
-			if err := writeRichLineCaption(ctx, &content, caption, annotationRichContentLimit(r)); err != nil {
+			if err := writeRichLineCaption(ctx, &content, caption, contentLimit); err != nil {
 				return nil, err
 			}
 		} else {
@@ -191,11 +192,17 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 				if err != nil {
 					return nil, err
 				}
+				if len(actual)*2+len("/Span << /ActualText <> >> BDC\n") > contentLimit-content.Len() {
+					return nil, fmt.Errorf("%w: line appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 				fmt.Fprintf(&content, "/Span << /ActualText <%x> >> BDC\n", []byte(actual))
 			}
 			content.WriteString("BT\n/CaptionFont ")
 			writeAnnotationOperation(&content, "Tf", annotationCaptionSize)
 			content.WriteString("0 g\n")
+			if content.Len() > contentLimit {
+				return nil, fmt.Errorf("%w: line appearance content limit exceeded", ErrStreamLimitExceeded)
+			}
 			baseline := caption.height/2 - (caption.height - float64(len(caption.widths)-1)*annotationCaptionLeading) - caption.descent
 			for i := range caption.widths {
 				if err := ctx.Err(); err != nil {
@@ -213,10 +220,21 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 				}
 				writeAnnotationOperation(&content, "Tm", 1, 0, 0, 1, tx, ty)
 				content.WriteByte('<')
-				for _, letter := range caption.lines[i] {
+				for j, letter := range caption.lines[i] {
+					if j&255 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
 					fmt.Fprintf(&content, "%x", letter.code)
+					if content.Len() > contentLimit {
+						return nil, fmt.Errorf("%w: line appearance content limit exceeded", ErrStreamLimitExceeded)
+					}
 				}
 				content.WriteString("> Tj\n")
+				if content.Len() > contentLimit {
+					return nil, fmt.Errorf("%w: line appearance content limit exceeded", ErrStreamLimitExceeded)
+				}
 			}
 			content.WriteString("ET\n")
 			if caption.shaper != nil {
@@ -225,12 +243,18 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 		}
 		content.WriteString("Q\n")
 	}
+	if content.Len() > contentLimit {
+		return nil, fmt.Errorf("%w: line appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return r.annotationAppearance(annotation, content.String(), resources)
 }
 
 // readLineCaption 读取标题及相对偏移，缺省外观采用12点字体
 // 入参: ctx 取消上下文, page 所在页面, annotation 直线注解, warning 容错诊断
-// 返回: *annotationLineCaption 标题或空值, error 属性或排版错误
+// 返回: *annotationLineCaption 标题或空值, error 属性、排版、超限或取消错误
 func (r *Reader) readLineCaption(ctx context.Context, page *Page, annotation Annotation, warning func(Diagnostic)) (*annotationLineCaption, error) {
 	value, err := r.Resolve(annotation.Dictionary["Cap"])
 	if err != nil {
@@ -294,7 +318,10 @@ func (r *Reader) readLineCaption(ctx context.Context, page *Page, annotation Ann
 			caption.widths[i] = paragraph.line.width(state, annotationCaptionSize)
 		}
 	} else {
-		caption.lines = annotationLines(encoded.letters, state, annotationCaptionSize, math.Inf(1), true)
+		caption.lines, err = annotationLines(ctx, encoded.letters, state, annotationCaptionSize, math.Inf(1), true)
+		if err != nil {
+			return nil, err
+		}
 		caption.widths = make([]float64, len(caption.lines))
 		for i, line := range caption.lines {
 			caption.widths[i] = annotationLineWidth(line, state, annotationCaptionSize)

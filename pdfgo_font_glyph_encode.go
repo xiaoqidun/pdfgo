@@ -89,7 +89,7 @@ func (f *Font) EncodeGlyphsContext(ctx context.Context, glyphs []uint16) ([]byte
 
 // glyphLookup 反查字形可用的源字符码及度量，优先选择较短且字节序较小的编码
 // 入参: ctx 取消上下文, wanted 字形计数
-// 返回: map[uint16]fontEncodedGlyph 编码与字形, error 取消错误
+// 返回: map[uint16]fontEncodedGlyph 编码与字形, error 超限或取消错误
 func (f *Font) glyphLookup(ctx context.Context, wanted map[uint16]int) (map[uint16]fontEncodedGlyph, error) {
 	var codes []string
 	if f.composite {
@@ -98,7 +98,7 @@ func (f *Font) glyphLookup(ctx context.Context, wanted map[uint16]int) (map[uint
 			return nil, err
 		}
 		if f.cidMap != nil {
-			codes, err = f.cidMap.characterCodes(ctx, cids)
+			codes, err = f.cidMap.characterCodes(ctx, cids, nil)
 			if err != nil {
 				return nil, err
 			}

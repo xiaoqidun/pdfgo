@@ -818,8 +818,8 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 	visitedOwnForms := make(map[formVisitKey]bool)
 	visitedCharProcs := make(map[charProcVisitKey]bool)
 	visitedOwnType3 := make(map[Reference]bool)
-	visitedOwnType3Ptr := make(map[uintptr]bool)
-	visitedType3Res := make(map[uintptr]bool)
+	visitedOwnType3Ptr := make(map[uintptr]Dictionary)
+	visitedType3Res := make(map[uintptr]Dictionary)
 	visitedContextType3 := make(map[Reference]bool)
 	visitedContextProcs := make(map[Reference]bool)
 	activeProcs := make(map[Reference]bool)
@@ -870,10 +870,12 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 			if fontRef.Number != 0 {
 				visitedOwnType3[fontRef] = true
 			} else if ptr := reflect.ValueOf(dict).Pointer(); ptr != 0 {
-				if visitedOwnType3Ptr[ptr] {
+				if _, seen := visitedOwnType3Ptr[ptr]; seen {
 					return nil
 				}
-				visitedOwnType3Ptr[ptr] = true
+				if len(visitedOwnType3Ptr) < 65536 {
+					visitedOwnType3Ptr[ptr] = dict
+				}
 			}
 		} else {
 			if fallbackRes == nil && fontRef.Number != 0 && visitedContextType3[fontRef] {
@@ -958,10 +960,12 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 			return fmt.Errorf("type3 recursion limit exceeded")
 		}
 		if ptr := reflect.ValueOf(res).Pointer(); ptr != 0 {
-			if visitedType3Res[ptr] {
+			if _, seen := visitedType3Res[ptr]; seen {
 				return nil
 			}
-			visitedType3Res[ptr] = true
+			if len(visitedType3Res) < 65536 {
+				visitedType3Res[ptr] = res
+			}
 		}
 		fontsVal, err := resolveMeta(res["Font"])
 		if err != nil {

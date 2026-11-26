@@ -85,6 +85,7 @@ func (r *Reader) rewriteExternalGoTo(ctx context.Context, action ExternalGoToAct
 		dict["NewWindow"] = Boolean(*action.NewWindow)
 	}
 	parent := dict
+	budget := newTextStringBudget(r)
 	for _, target := range action.Target {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -106,7 +107,7 @@ func (r *Reader) rewriteExternalGoTo(ctx context.Context, action ExternalGoToAct
 				return nil, fmt.Errorf("invalid embedded target selector")
 			}
 		}
-		parsed, err := r.readEmbeddedTarget(step)
+		parsed, err := r.readEmbeddedTargetContext(ctx, step, &budget, nil)
 		if err != nil {
 			return nil, err
 		}

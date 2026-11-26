@@ -108,7 +108,7 @@ func (m ThreeDMarkup) MatchesViewReference(ref Reference) bool {
 // ReadThreeDMarkups 批量解析同页批注关联，按输入顺序返回，未关联项为空
 // 没有三维批注时返回空列表；名称引用仅在传入的同页注解中查找
 // 入参: ctx 取消上下文, annotations 同页注解
-// 返回: []*ThreeDMarkup 批注关联, error 类型、引用或取消错误
+// 返回: []*ThreeDMarkup 批注关联, error 类型、引用、超限或取消错误
 func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation) ([]*ThreeDMarkup, error) {
 	if ctx == nil || r == nil {
 		return nil, fmt.Errorf("invalid 3D markup reader or context")
@@ -121,6 +121,7 @@ func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation
 	}
 	var result []*ThreeDMarkup
 	var names map[string][]Annotation
+	budget := newTextStringBudget(r)
 	for index, annotation := range annotations {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -164,19 +165,19 @@ func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation
 		if kind != nil && kind != Name("3DView") {
 			return nil, fmt.Errorf("invalid 3D markup view type")
 		}
-		value, err := r.Resolve(dict["3DA"])
+		hostRef, value, err := r.resolveIndirect(dict["3DA"])
 		if err != nil {
 			return nil, err
 		}
 		var host Annotation
 		switch value := value.(type) {
 		case String:
-			name, err := DecodeTextString(value)
+			name, err := budget.decodeString(hostRef, value, "3D markup")
 			if err != nil {
 				return nil, err
 			}
 			if names == nil {
-				names, err = r.threeDAnnotationNames(ctx, annotations)
+				names, err = r.threeDAnnotationNames(ctx, annotations, &budget)
 				if err != nil {
 					return nil, err
 				}
@@ -195,10 +196,6 @@ func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation
 				return nil, fmt.Errorf("invalid 3D markup annotation subtype")
 			}
 			box, err := r.rectangle(value["Rect"])
-			if err != nil {
-				return nil, err
-			}
-			hostRef, err := r.resolveIndirectReference(dict["3DA"])
 			if err != nil {
 				return nil, err
 			}
@@ -228,9 +225,9 @@ func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation
 }
 
 // threeDAnnotationNames 为同页三维注解建立名称索引，保留重名供调用方检查
-// 入参: ctx 取消上下文, annotations 同页注解
-// 返回: map[string][]Annotation 名称索引, error 文字、引用或取消错误
-func (r *Reader) threeDAnnotationNames(ctx context.Context, annotations []Annotation) (map[string][]Annotation, error) {
+// 入参: ctx 取消上下文, annotations 同页注解, budget 文本解码预算
+// 返回: map[string][]Annotation 名称索引, error 文字、引用、超限或取消错误
+func (r *Reader) threeDAnnotationNames(ctx context.Context, annotations []Annotation, budget *textStringBudget) (map[string][]Annotation, error) {
 	names := make(map[string][]Annotation)
 	for _, annotation := range annotations {
 		if err := ctx.Err(); err != nil {
@@ -239,7 +236,7 @@ func (r *Reader) threeDAnnotationNames(ctx context.Context, annotations []Annota
 		if annotation.Subtype != "3D" {
 			continue
 		}
-		value, err := r.Resolve(annotation.Dictionary["NM"])
+		ref, value, err := r.resolveIndirect(annotation.Dictionary["NM"])
 		if err != nil {
 			return nil, err
 		}
@@ -250,7 +247,7 @@ func (r *Reader) threeDAnnotationNames(ctx context.Context, annotations []Annota
 		if !ok {
 			return nil, fmt.Errorf("invalid 3D annotation name")
 		}
-		name, err := DecodeTextString(text)
+		name, err := budget.decodeString(ref, text, "3D markup")
 		if err != nil {
 			return nil, err
 		}

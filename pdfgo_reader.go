@@ -60,6 +60,7 @@ type Reader struct {
 	legacyDestinations Dictionary
 	fonts              map[Reference]*Font
 	halftones          map[Reference]*Halftone
+	halftoneCacheBytes int64
 	colorProfiles      map[[32]byte]*iccColorSpace
 	deviceProfile      *Stream
 	colorProfileDepth  int
@@ -397,6 +398,18 @@ func streamEndTypo(token string) bool {
 	return false
 }
 
+// isClosed 检查对象缓存或其原始缓存是否已随根阅读器关闭
+// 返回: bool 是否已关闭
+func (c *objectCache) isClosed() bool {
+	if c == nil {
+		return false
+	}
+	if c.closed.Load() {
+		return true
+	}
+	return c.origin != nil && c.origin != c && c.origin.closed.Load()
+}
+
 // get 按流解密模式查询缓存对象，隔离普通流与内嵌文件流缓存
 // 入参: ref 对象引用, embedded 是否按内嵌文件流模式查询
 // 返回: Object 缓存对象, bool 是否命中
@@ -406,6 +419,9 @@ func (c *objectCache) get(ref Reference, embedded bool) (Object, bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.isClosed() {
+		return nil, false
+	}
 	if c.pinned != nil {
 		if value, ok := c.pinned[ref]; ok {
 			return value, true
@@ -430,6 +446,9 @@ func (c *objectCache) set(ref Reference, value Object, embedded bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.isClosed() {
+		return
+	}
 	if c.pinned != nil {
 		if _, ok := c.pinned[ref]; ok {
 			c.pinned[ref] = value
@@ -476,6 +495,9 @@ func (c *objectCache) has(ref Reference) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.isClosed() {
+		return false
+	}
 	if c.pinned != nil {
 		if _, ok := c.pinned[ref]; ok {
 			return true
@@ -659,20 +681,95 @@ func (c *objectCache) evictLocked() {
 	}
 }
 
+// xrefEntry 并发安全读取单个交叉引用条目
+// 入参: number 对象编号
+// 返回: xrefEntry 交叉引用条目, bool 是否存在
+func (r *Reader) xrefEntry(number int64) (xrefEntry, bool) {
+	if r.cache != nil {
+		r.cache.mu.Lock()
+		entry, ok := r.xref[number]
+		r.cache.mu.Unlock()
+		return entry, ok
+	}
+	entry, ok := r.xref[number]
+	return entry, ok
+}
+
+// setXrefEntry 并发安全更新单个交叉引用条目，避免与并发Fork克隆冲突
+// 入参: number 对象编号, entry 交叉引用条目
+func (r *Reader) setXrefEntry(number int64, entry xrefEntry) {
+	if r.cache != nil {
+		r.cache.mu.Lock()
+		r.xref[number] = entry
+		r.cache.mu.Unlock()
+		return
+	}
+	r.xref[number] = entry
+}
+
 // Close 释放源数据、缓存与解密密钥并关闭Open持有的文件（不关闭NewReader外部源，可重复调用），关闭后读取方法及关联流均返回os.ErrClosed，共享底层os.File的Fork视图随之失效
 // 返回: error 关闭错误
 func (r *Reader) Close() error {
 	if r == nil {
 		return nil
 	}
+	cache := r.cache
+	if cache != nil {
+		cache.mu.Lock()
+	}
+	if r.closed {
+		if cache != nil {
+			cache.mu.Unlock()
+		}
+		return nil
+	}
 	closer := r.closer
-	if r.owner == nil && r.cache != nil {
-		r.cache.closed.Store(true)
+	if r.owner == nil && cache != nil {
+		cache.closed.Store(true)
+		clear(cache.objects)
+		clear(cache.pinned)
+		clear(cache.streams)
+		cache.head = nil
+		cache.tail = nil
+		cache.used = 0
 	}
 	if r.security != nil {
 		clear(r.security.key)
 	}
-	*r = Reader{closed: true}
+	r.Version = ""
+	r.Trailer = nil
+	r.source = nil
+	r.size = 0
+	r.originalSource = nil
+	r.originalSize = 0
+	r.closer = nil
+	r.xref = nil
+	r.loading = nil
+	r.destinations = nil
+	r.legacyDestinations = nil
+	r.fonts = nil
+	r.halftones = nil
+	r.halftoneCacheBytes = 0
+	r.colorProfiles = nil
+	r.deviceProfile = nil
+	r.colorProfileDepth = 0
+	r.objectStreams = [8]*objectStream{}
+	r.security = nil
+	r.warning = nil
+	r.textShaper = nil
+	r.decodeWorkers = 0
+	r.maxStreamBytes = 0
+	r.maxFilterChain = 0
+	r.jbig2Globals = nil
+	r.owner = nil
+	r.ownerHasWarning = false
+	r.closed = true
+	r.recoveryIndex = nil
+	r.recoveryTried = false
+	r.rewriteMaxID = nil
+	if cache != nil {
+		cache.mu.Unlock()
+	}
 	if closer != nil {
 		return closer.Close()
 	}
@@ -767,7 +864,7 @@ func (r *Reader) object(ref Reference, embedded bool) (Object, error) {
 	if value, ok := r.cache.get(ref, useEmbedded); ok {
 		return value, nil
 	}
-	entry, ok := r.xref[ref.Number]
+	entry, ok := r.xrefEntry(ref.Number)
 	if !ok && r.warning != nil && ref.Number > 0 {
 		index := r.recoveryIndex
 		if !r.recoveryTried {
@@ -779,7 +876,7 @@ func (r *Reader) object(ref Reference, embedded bool) (Object, error) {
 		}
 		if recovered, exists := index[ref.Number]; exists && recovered.generation == ref.Generation && recovered.kind == 1 {
 			entry, ok = recovered, true
-			r.xref[ref.Number] = entry
+			r.setXrefEntry(ref.Number, entry)
 			r.warning(Diagnostic{Offset: entry.position, Message: fmt.Sprintf("missing cross-reference entry recovered for object %d %d", ref.Number, ref.Generation)})
 		}
 	}
@@ -809,7 +906,7 @@ func (r *Reader) object(ref Reference, embedded bool) (Object, error) {
 			if found {
 				actual, value, err = r.indirect(position)
 				if err == nil && actual == ref {
-					r.xref[ref.Number] = xrefEntry{kind: 1, position: position, generation: ref.Generation}
+					r.setXrefEntry(ref.Number, xrefEntry{kind: 1, position: position, generation: ref.Generation})
 					r.warning(Diagnostic{Offset: position, Message: fmt.Sprintf("nearby cross-reference offset recovered for object %d %d", ref.Number, ref.Generation)})
 				} else if err == nil {
 					err = fmt.Errorf("recovered cross-reference object mismatch")
@@ -827,7 +924,7 @@ func (r *Reader) object(ref Reference, embedded bool) (Object, error) {
 					err = fmt.Errorf("recovered cross-reference object mismatch")
 				}
 				if err == nil {
-					r.xref[ref.Number] = recovered
+					r.setXrefEntry(ref.Number, recovered)
 					r.warning(Diagnostic{Offset: recovered.position, Message: fmt.Sprintf("recovered cross-reference offset for object %d %d", ref.Number, ref.Generation)})
 				}
 			}
@@ -917,10 +1014,16 @@ func (r *Reader) recoverObjectOffset(ref Reference, expected int64) (int64, bool
 // 返回: bool 是否落在已索引流内, error 源读取错误
 func (r *Reader) insideIndexedStream(offset int64, target Reference) (bool, error) {
 	previous := int64(-1)
+	if r.cache != nil {
+		r.cache.mu.Lock()
+	}
 	for number, entry := range r.xref {
 		if number != target.Number && entry.kind == 1 && entry.position >= 0 && entry.position < offset {
 			previous = max(previous, entry.position)
 		}
+	}
+	if r.cache != nil {
+		r.cache.mu.Unlock()
 	}
 	if previous < 0 {
 		return false, nil
@@ -1340,10 +1443,16 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 		}
 		trailer["Size"] = Integer(size + 1)
 	}
+	if r.cache != nil {
+		r.cache.mu.Lock()
+	}
 	for id, entry := range r.xref {
 		if entry.kind == 0 {
 			index[id] = entry
 		}
+	}
+	if r.cache != nil {
+		r.cache.mu.Unlock()
 	}
 	if damagedStreamIndex && hasObjectStreams {
 		if err := r.rebuildCompressedEntries(index, trailer, objectStreams); err != nil {
@@ -1652,16 +1761,22 @@ func (r *Reader) streamExtent(start, length int64, ref Reference) (int64, int64,
 	}
 	limit := min(r.size, start+(16<<20))
 	base := start
+	var expected Reference
+	nextPosition := int64(1<<63 - 1)
+	if r.cache != nil {
+		r.cache.mu.Lock()
+	}
 	if entry, ok := r.xref[ref.Number]; ok && entry.kind == 1 && entry.generation == ref.Generation {
 		base = entry.position
 	}
-	var expected Reference
-	nextPosition := int64(1<<63 - 1)
 	for number, entry := range r.xref {
 		if entry.kind == 1 && entry.position > base && entry.position < nextPosition {
 			nextPosition = entry.position
 			expected = Reference{number, entry.generation}
 		}
+	}
+	if r.cache != nil {
+		r.cache.mu.Unlock()
 	}
 	if nextPosition > start && nextPosition < limit {
 		limit = min(limit, nextPosition+4096)
@@ -2199,7 +2314,7 @@ func (r *Reader) readXrefStream(offset int64, limit int64) (Dictionary, map[int6
 // 入参: ref 对象引用, entry 对应的交叉引用条目
 // 返回: Object 解压后的对象, error 读取或解析错误
 func (r *Reader) compressedObject(ref Reference, entry xrefEntry) (Object, error) {
-	containerEntry, ok := r.xref[entry.position]
+	containerEntry, ok := r.xrefEntry(entry.position)
 	if !ok || containerEntry.kind != 1 {
 		return nil, fmt.Errorf("invalid object stream reference")
 	}

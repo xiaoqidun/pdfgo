@@ -78,7 +78,7 @@ func (r *Reader) ignoredTintSpace(space Array) error {
 	if err != nil {
 		return err
 	}
-	switch value := alternate.(type) {
+	switch value := normalizeDeviceColorSpace(alternate).(type) {
 	case Name:
 		if value != "DeviceGray" && value != "DeviceRGB" && value != "DeviceCMYK" {
 			return fmt.Errorf("invalid alternate color space")

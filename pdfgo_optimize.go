@@ -361,6 +361,45 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 		}
 		return r.isLiveXrefRef(ref)
 	}
+	originalCache := r.cache.snapshot()
+	originalObjectStreams := r.objectStreams
+	defer func() { r.objectStreams = originalObjectStreams }()
+	defer r.cache.prune(originalCache)
+	resolveOptValue := func(val Object) (Object, error) {
+		cur := val
+		var chain map[Reference]bool
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			ref, isRef := cur.(Reference)
+			if !isRef {
+				return cur, nil
+			}
+			if chain[ref] || !isLiveRef(ref) {
+				return nil, nil
+			}
+			if chain == nil {
+				chain = make(map[Reference]bool)
+			}
+			chain[ref] = true
+			if rep, ok := replacements[ref]; ok {
+				cur = rep
+				continue
+			}
+			if lazyImages[ref] != nil {
+				return nil, nil
+			}
+			resolved, readErr := r.Object(ref)
+			if !originalCache[ref] {
+				r.cache.delete(ref)
+			}
+			if readErr != nil {
+				return nil, readErr
+			}
+			cur = resolved
+		}
+	}
 	var collect func(Object, int) error
 	collect = func(value Object, depth int) error {
 		if err := ctx.Err(); err != nil {
@@ -428,8 +467,18 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 					noDownsampleRoots = append(noDownsampleRoots, v["CharProcs"])
 				}
 			}
-			if v["Type"] == Name("Sig") || v["Type"] == Name("DocTimeStamp") || v["ByteRange"] != nil && v["Contents"] != nil {
-				signed = true
+			if !signed && !protecting && !protectingScale && !preservingData {
+				if v["Type"] == Name("Sig") || v["Type"] == Name("DocTimeStamp") || v["ByteRange"] != nil && v["Contents"] != nil {
+					signed = true
+				} else if _, indirect := v["Type"].(Reference); indirect {
+					dictType, typeErr := resolveOptValue(v["Type"])
+					if typeErr != nil {
+						return typeErr
+					}
+					if dictType == Name("Sig") || dictType == Name("DocTimeStamp") {
+						signed = true
+					}
+				}
 			}
 			for _, key := range slices.Sorted(maps.Keys(v)) {
 				if err := collect(v[key], depth+1); err != nil {
@@ -444,10 +493,6 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	if err := collect(trailer, 0); err != nil {
 		return report, err
 	}
-	originalCache := r.cache.snapshot()
-	originalObjectStreams := r.objectStreams
-	defer func() { r.objectStreams = originalObjectStreams }()
-	defer r.cache.prune(originalCache)
 	scanned := make(map[Reference]bool)
 	scannedEmbedded := make(map[Reference]bool)
 	deferredSecurity := make(map[Reference]error)
@@ -459,41 +504,6 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 			return ErrSignedDocument
 		}
 		return copySource()
-	}
-	resolveOptValue := func(val Object) (Object, error) {
-		cur := val
-		var chain map[Reference]bool
-		for {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			ref, isRef := cur.(Reference)
-			if !isRef {
-				return cur, nil
-			}
-			if chain[ref] || !isLiveRef(ref) {
-				return nil, nil
-			}
-			if chain == nil {
-				chain = make(map[Reference]bool)
-			}
-			chain[ref] = true
-			if rep, ok := replacements[ref]; ok {
-				cur = rep
-				continue
-			}
-			if lazyImages[ref] != nil {
-				return nil, nil
-			}
-			resolved, readErr := r.Object(ref)
-			if !originalCache[ref] {
-				r.cache.delete(ref)
-			}
-			if readErr != nil {
-				return nil, readErr
-			}
-			cur = resolved
-		}
 	}
 	markEmbeddedFromEF := func(host Dictionary) error {
 		isSpec, specErr := isFileSpecDictionary(ctx, host, resolveOptValue)

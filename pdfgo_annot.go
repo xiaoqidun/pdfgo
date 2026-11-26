@@ -379,7 +379,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 				stream, synthErr = r.variableTextAppearance(ctx, page, annotation)
 			}
 		case "Link":
-			stream, synthErr = r.linkAppearance(annotation)
+			stream, synthErr = r.linkAppearanceContext(ctx, annotation)
 		case "Text", "FileAttachment", "Sound", "Caret":
 			stream, synthErr = r.iconAppearance(annotation)
 		case "Ink":

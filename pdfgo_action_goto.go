@@ -17,6 +17,7 @@ package pdfgo
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -52,7 +53,7 @@ type ExternalGoToAction struct {
 
 // ReadExternalGoToAction 解析单个跨文件或嵌入文件跳转，检测目标路径循环
 // 入参: ctx 取消上下文, object 动作字典或间接引用
-// 返回: ExternalGoToAction 目标信息, error 类型、必填项目或路径错误
+// 返回: ExternalGoToAction 目标信息, error 类型、必填项目、路径、超限或取消错误
 func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (ExternalGoToAction, error) {
 	if r == nil || ctx == nil {
 		return ExternalGoToAction{}, fmt.Errorf("invalid action context")
@@ -132,6 +133,8 @@ func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (Ext
 	}
 	seen := map[uintptr]bool{}
 	seenRefs := map[Reference]bool{}
+	budget := newTextStringBudget(r)
+	rawCache := map[Reference][]byte{}
 	for value != nil {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -154,8 +157,11 @@ func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (Ext
 			return result, fmt.Errorf("%w: cyclic embedded target path", ErrInvalidAction)
 		}
 		seen[id] = true
-		target, err := r.readEmbeddedTarget(dict)
+		target, err := r.readEmbeddedTargetContext(ctx, dict, &budget, rawCache)
 		if err != nil {
+			if errors.Is(err, ErrStreamLimitExceeded) {
+				return result, err
+			}
 			return result, wrapActionError(err)
 		}
 		result.Target = append(result.Target, target)
@@ -254,7 +260,7 @@ func (r *Reader) ResolveRemoteDestination(ctx context.Context, remote RemoteDest
 
 // ReadEmbeddedTargetFile 定位当前文档中的子文件，不解码内容，不推测父文档
 // 入参: ctx 取消上下文, target 子文件路径的一步
-// 返回: FileSpecification 内嵌文件说明, error 路径、目标缺失或结构错误
+// 返回: FileSpecification 内嵌文件说明, error 路径、目标缺失、结构、超限或取消错误
 func (r *Reader) ReadEmbeddedTargetFile(ctx context.Context, target EmbeddedTarget) (FileSpecification, error) {
 	if ctx == nil {
 		return FileSpecification{}, fmt.Errorf("invalid embedded target context")
@@ -266,7 +272,8 @@ func (r *Reader) ReadEmbeddedTargetFile(ctx context.Context, target EmbeddedTarg
 	if target.Name != nil {
 		dict["N"] = *target.Name
 	}
-	target, err := r.readEmbeddedTarget(dict)
+	budget := newTextStringBudget(r)
+	target, err := r.readEmbeddedTargetContext(ctx, dict, &budget, nil)
 	if err != nil {
 		return FileSpecification{}, err
 	}
@@ -320,14 +327,21 @@ func (r *Reader) ReadEmbeddedTargetFile(ctx context.Context, target EmbeddedTarg
 	return file, ctx.Err()
 }
 
-// readEmbeddedTarget 检查单步路径字段，区分名称树和注解两种子文件选择方式
-// 入参: dict 目标字典
-// 返回: EmbeddedTarget 路径一步, error 字段类型或组合错误
-func (r *Reader) readEmbeddedTarget(dict Dictionary) (EmbeddedTarget, error) {
-	values := make([]Object, 4)
+// readEmbeddedTargetContext 在取消上下文与文本预算内检查单步路径字段，复用共享间接字节串
+// 入参: ctx 取消上下文, dict 目标字典, budget 文本解码预算, rawCache 原始字节串缓存
+// 返回: EmbeddedTarget 路径一步, error 字段类型、组合、超限或取消错误
+func (r *Reader) readEmbeddedTargetContext(ctx context.Context, dict Dictionary, budget *textStringBudget, rawCache map[Reference][]byte) (EmbeddedTarget, error) {
+	if err := ctx.Err(); err != nil {
+		return EmbeddedTarget{}, err
+	}
+	var refs [4]Reference
+	var values [4]Object
 	for index, key := range []Name{"R", "N", "P", "A"} {
+		if err := ctx.Err(); err != nil {
+			return EmbeddedTarget{}, err
+		}
 		var err error
-		values[index], err = r.Resolve(dict[key])
+		refs[index], values[index], err = r.resolveIndirect(dict[key])
 		if err != nil {
 			return EmbeddedTarget{}, err
 		}
@@ -341,41 +355,91 @@ func (r *Reader) readEmbeddedTarget(dict Dictionary) (EmbeddedTarget, error) {
 		if values[1] != nil || values[2] != nil || values[3] != nil {
 			return result, fmt.Errorf("parent embedded target contains child selectors")
 		}
-		return result, nil
+		return result, ctx.Err()
+	}
+	copyRaw := func(ref Reference, data String) (String, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if ref != (Reference{}) && rawCache != nil {
+			if cached, exists := rawCache[ref]; exists {
+				if err := budget.consume(int64(len(cached)), "embedded target"); err != nil {
+					return nil, err
+				}
+				return String(cached), nil
+			}
+		}
+		if err := budget.consume(int64(len(data)), "embedded target"); err != nil {
+			return nil, err
+		}
+		cloned := bytes.Clone(data)
+		if ref != (Reference{}) && rawCache != nil {
+			rawCache[ref] = cloned
+		}
+		return String(cloned), nil
 	}
 	if values[1] != nil {
 		name, ok := values[1].(String)
 		if !ok || values[2] != nil || values[3] != nil {
 			return result, fmt.Errorf("invalid embedded file name selector")
 		}
-		name = bytes.Clone(name)
-		result.Name = &name
-		return result, nil
+		copied, err := copyRaw(refs[1], name)
+		if err != nil {
+			return result, err
+		}
+		result.Name = &copied
+		return result, ctx.Err()
 	}
 	for index, label := range []string{"page", "annotation"} {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		switch value := values[index+2].(type) {
 		case Integer:
 			if value < 0 {
 				return result, fmt.Errorf("negative embedded target %s", label)
 			}
 		case String:
+			ref := refs[index+2]
 			if index == 1 {
-				if _, err := DecodeTextString(value); err != nil {
+				decoded, err := budget.decodeString(ref, value, "embedded target")
+				if err != nil {
 					return result, err
 				}
+				if extra := int64(len(value)) - int64(len(decoded)); extra > 0 {
+					if err := budget.consume(extra, "embedded target"); err != nil {
+						return result, err
+					}
+				}
+				if ref != (Reference{}) && rawCache != nil {
+					if cached, exists := rawCache[ref]; exists {
+						values[index+2] = String(cached)
+					} else {
+						cloned := bytes.Clone(value)
+						rawCache[ref] = cloned
+						values[index+2] = String(cloned)
+					}
+				} else {
+					values[index+2] = String(bytes.Clone(value))
+				}
+			} else {
+				copied, err := copyRaw(ref, value)
+				if err != nil {
+					return result, err
+				}
+				values[index+2] = copied
 			}
-			values[index+2] = String(bytes.Clone(value))
 		default:
 			return result, fmt.Errorf("invalid embedded target %s selector", label)
 		}
 	}
 	result.Page, result.Annotation = values[2], values[3]
-	return result, nil
+	return result, ctx.Err()
 }
 
 // embeddedTargetAnnotation 按原始Annots索引或NM文本名称查找附件，页名称保留原始字节
 // 入参: ctx 取消上下文, target 注解选择路径
-// 返回: Object 附件文件说明, error 目标缺失或结构错误
+// 返回: Object 附件文件说明, error 目标缺失、结构、超限或取消错误
 func (r *Reader) embeddedTargetAnnotation(ctx context.Context, target EmbeddedTarget) (Object, error) {
 	var reference Reference
 	if name, ok := target.Page.(String); ok {
@@ -413,23 +477,34 @@ func (r *Reader) embeddedTargetAnnotation(ctx context.Context, target EmbeddedTa
 		}
 		chosen = annotations[index]
 	} else {
-		name, err := DecodeTextString(target.Annotation.(String))
+		budget := newTextStringBudget(r)
+		name, err := budget.decodeString(Reference{}, target.Annotation.(String), "embedded target")
 		if err != nil {
 			return nil, err
 		}
+		var seen map[Reference]bool
 		for _, object := range annotations {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			value, err := r.Resolve(object)
+			ref, value, err := r.resolveIndirect(object)
 			if err != nil {
 				return nil, err
+			}
+			if ref != (Reference{}) {
+				if seen[ref] {
+					continue
+				}
+				if seen == nil {
+					seen = make(map[Reference]bool)
+				}
+				seen[ref] = true
 			}
 			dict, ok := value.(Dictionary)
 			if !ok {
 				return nil, fmt.Errorf("invalid embedded target annotation")
 			}
-			value, err = r.Resolve(dict["NM"])
+			nameRef, value, err := r.resolveIndirect(dict["NM"])
 			if err != nil {
 				return nil, err
 			}
@@ -440,7 +515,7 @@ func (r *Reader) embeddedTargetAnnotation(ctx context.Context, target EmbeddedTa
 			if !ok {
 				return nil, fmt.Errorf("invalid annotation name")
 			}
-			decoded, err := DecodeTextString(text)
+			decoded, err := budget.decodeString(nameRef, text, "embedded target")
 			if err != nil {
 				return nil, err
 			}

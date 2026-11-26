@@ -157,7 +157,7 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 			return ctx.Err()
 		}
 		if b := p.data[p.pos]; b == '/' || b == '(' || b == '<' || b == '[' {
-			object, err := p.object()
+			object, err := p.objectContext(ctx)
 			if err != nil {
 				return err
 			}
@@ -206,7 +206,7 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 					return err
 				}
 			}
-			from, err := p.object()
+			from, err := p.objectContext(ctx)
 			if err != nil {
 				return err
 			}
@@ -215,7 +215,7 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 				return p.fail("invalid CMap source code")
 			}
 			if token == "beginbfchar" {
-				to, err := p.object()
+				to, err := p.objectContext(ctx)
 				if err != nil {
 					return err
 				}
@@ -259,7 +259,7 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 				}
 				wroteLocal = true
 			} else {
-				lastObject, err := p.object()
+				lastObject, err := p.objectContext(ctx)
 				if err != nil {
 					return err
 				}
@@ -276,7 +276,7 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 					return fmt.Errorf("%w: unicode cmap entry limit exceeded", ErrStreamLimitExceeded)
 				}
 				expanded += span
-				to, err := p.object()
+				to, err := p.objectContext(ctx)
 				if err != nil {
 					return err
 				}

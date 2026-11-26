@@ -124,6 +124,9 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	_, direct := source.(interface{ NRGBA64At(int, int) color.NRGBA64 })
 	nrgba, _ := source.(*image.NRGBA)
 	if _, packed := source.(*packedGrayImage); !direct && !packed && nrgba == nil {
+		if _, rowBytes, err := imageBufferSize(bounds.Dx(), 6, 8); err != nil || bounds.Dx() > imageBufferLimit()/64 || rowBytes > optimizationBufferLimit {
+			return fmt.Errorf("PNG row exceeds platform buffer range")
+		}
 		return png.Encode(output, source)
 	}
 	depth, channels, kind, err := pngSampleFormat(ctx, source)
@@ -223,7 +226,7 @@ func newPNGImageEncoderWithCompression(ctx context.Context, writer io.Writer, bo
 		return nil, fmt.Errorf("invalid PNG dimensions")
 	}
 	stride, _, err := imageSampleSize(bounds.Dx(), 1, channels, depth)
-	if err != nil || stride >= imageBufferLimit()/4 {
+	if err != nil || stride >= imageBufferLimit()/4 || stride > optimizationBufferLimit/4 {
 		return nil, fmt.Errorf("PNG row exceeds platform buffer range")
 	}
 	s := &pngImageEncoder{output: pngContextWriter{ctx: ctx, writer: writer}, pixelBytes: max(1, channels*depth/8), optimized: optimized}

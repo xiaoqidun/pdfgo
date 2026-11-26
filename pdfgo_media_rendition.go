@@ -54,27 +54,30 @@ type mediaReadEntry[T any] struct {
 	height int
 }
 
-// mediaReader 在一次解析中复用共享呈现及片段，同时检查循环与嵌套深度
+// mediaReader 在一次解析中复用共享呈现、片段、文件说明与文本字符串，同时控制循环、嵌套深度与文本预算
 type mediaReader struct {
 	*Reader
-	renditions map[uintptr]mediaReadEntry[Rendition]
-	clips      map[uintptr]mediaReadEntry[MediaClip]
+	renditions   map[uintptr]mediaReadEntry[Rendition]
+	clips        map[uintptr]mediaReadEntry[MediaClip]
+	files        map[Reference]FileSpecification
+	contentTypes map[Reference]string
+	budget       textStringBudget
 }
 
 // ReadRendition 读取媒体呈现及选择器候选树，保留必须遵守与尽力处理的约束
 // 入参: ctx 取消上下文, object 呈现字典或间接引用
-// 返回: *Rendition 媒体呈现, error 定义或循环引用错误
+// 返回: *Rendition 媒体呈现, error 定义、循环引用、超限或取消错误
 func (r *Reader) ReadRendition(ctx context.Context, object Object) (*Rendition, error) {
 	if r == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid rendition context")
 	}
-	state := mediaReader{Reader: r, renditions: make(map[uintptr]mediaReadEntry[Rendition]), clips: make(map[uintptr]mediaReadEntry[MediaClip])}
+	state := mediaReader{Reader: r, renditions: make(map[uintptr]mediaReadEntry[Rendition]), clips: make(map[uintptr]mediaReadEntry[MediaClip]), budget: newTextStringBudget(r)}
 	return state.readRendition(ctx, object, 0)
 }
 
 // readRendition 递归读取呈现树，不将未知子类型误判为可播放媒体
 // 入参: ctx 取消上下文, object 呈现对象, depth 嵌套深度
-// 返回: *Rendition 呈现对象, error 引用或定义错误
+// 返回: *Rendition 呈现对象, error 引用、定义、超限或取消错误
 func (r *mediaReader) readRendition(ctx context.Context, object Object, depth int) (*Rendition, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -179,18 +182,18 @@ func (r *mediaReader) readRendition(ctx context.Context, object Object, depth in
 
 // ReadMediaClip 读取媒体数据或连续片段，不访问外部文件或网络
 // 入参: ctx 取消上下文, object 媒体片段字典或间接引用
-// 返回: *MediaClip 媒体片段, error 定义或循环引用错误
+// 返回: *MediaClip 媒体片段, error 定义、循环引用、超限或取消错误
 func (r *Reader) ReadMediaClip(ctx context.Context, object Object) (*MediaClip, error) {
 	if r == nil || ctx == nil {
 		return nil, fmt.Errorf("invalid media clip context")
 	}
-	state := mediaReader{Reader: r, clips: make(map[uintptr]mediaReadEntry[MediaClip])}
+	state := mediaReader{Reader: r, clips: make(map[uintptr]mediaReadEntry[MediaClip]), budget: newTextStringBudget(r)}
 	return state.readMediaClip(ctx, object, 0)
 }
 
 // readMediaClip 读取片段链，保留时间、帧和标记偏移的原始字典
 // 入参: ctx 取消上下文, object 片段对象, depth 嵌套深度
-// 返回: *MediaClip 片段信息, error 引用或定义错误
+// 返回: *MediaClip 片段信息, error 引用、定义、超限或取消错误
 func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth int) (*MediaClip, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -235,7 +238,7 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 		r.clips[id] = mediaReadEntry[MediaClip]{value: result, height: 1}
 		return result, nil
 	}
-	value, err := r.Resolve(dict["D"])
+	fileRef, value, err := r.resolveIndirect(dict["D"])
 	if err != nil {
 		return nil, err
 	}
@@ -260,23 +263,16 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 		}
 		result.Form = stream
 	} else {
-		fileDict, err := r.mediaDictionary(value, false)
-		if err != nil {
-			return nil, err
+		fileDict, ok := value.(Dictionary)
+		if !ok {
+			return nil, fmt.Errorf("invalid media dictionary")
 		}
-		kind, err := r.Resolve(fileDict["Type"])
-		if err != nil {
-			return nil, err
-		}
-		if kind != nil && kind != Name("Filespec") {
-			return nil, fmt.Errorf("invalid media clip file type")
-		}
-		file, err := r.ReadFileSpecification(fileDict)
+		file, err := r.readMediaFile(fileRef, fileDict)
 		if err != nil {
 			return nil, err
 		}
 		result.File = &file
-		value, err := r.Resolve(dict["CT"])
+		ctRef, value, err := r.resolveIndirect(dict["CT"])
 		if err != nil {
 			return nil, err
 		}
@@ -285,12 +281,29 @@ func (r *mediaReader) readMediaClip(ctx context.Context, object Object, depth in
 			if !ok {
 				return nil, fmt.Errorf("invalid media content type")
 			}
-			for _, b := range text {
-				if b > 127 {
-					return nil, fmt.Errorf("non-ASCII media content type")
+			if cached, exists := r.contentTypes[ctRef]; ctRef != (Reference{}) && exists {
+				if err := r.budget.consume(int64(len(cached)), "media content type"); err != nil {
+					return nil, err
 				}
+				result.ContentType = cached
+			} else {
+				if err := r.budget.consume(int64(len(text)), "media content type"); err != nil {
+					return nil, err
+				}
+				for _, b := range text {
+					if b > 127 {
+						return nil, fmt.Errorf("non-ASCII media content type")
+					}
+				}
+				ct := string(text)
+				if ctRef != (Reference{}) {
+					if r.contentTypes == nil {
+						r.contentTypes = make(map[Reference]string)
+					}
+					r.contentTypes[ctRef] = ct
+				}
+				result.ContentType = ct
 			}
-			result.ContentType = string(text)
 		}
 	}
 	result.Permissions, err = r.mediaParameters(dict["P"], "MediaPermissions")
@@ -331,10 +344,42 @@ func (r *Reader) mediaParameters(object Object, kind Name) (Dictionary, error) {
 	return dict, nil
 }
 
-// mediaHeader 读取媒体对象类型、子类型及可选文本名称
+// readMediaFile 在文本预算内解析媒体片段文件说明，复用共享文件说明与间接文本字符串
+// 入参: ref 文件说明最终间接引用, dict 文件说明字典
+// 返回: FileSpecification 文件说明, error 类型、编码或超限错误
+func (r *mediaReader) readMediaFile(ref Reference, dict Dictionary) (FileSpecification, error) {
+	if ref != (Reference{}) {
+		if cached, exists := r.files[ref]; exists {
+			if err := r.budget.consume(int64(len(cached.Name))+int64(len(cached.Description)), "media clip"); err != nil {
+				return FileSpecification{}, err
+			}
+			return cached, nil
+		}
+	}
+	kind, err := r.Resolve(dict["Type"])
+	if err != nil {
+		return FileSpecification{}, err
+	}
+	if kind != nil && kind != Name("Filespec") {
+		return FileSpecification{}, fmt.Errorf("invalid media clip file type")
+	}
+	result, err := r.readFileSpecificationDict(dict, &r.budget, "media clip")
+	if err != nil {
+		return result, err
+	}
+	if ref != (Reference{}) {
+		if r.files == nil {
+			r.files = make(map[Reference]FileSpecification)
+		}
+		r.files[ref] = result
+	}
+	return result, nil
+}
+
+// mediaHeader 读取媒体对象类型、子类型及可选文本名称，复用共享间接字符串并控制文本预算
 // 入参: dict 媒体字典, kind 对象类型
-// 返回: Name 子类型, string 名称, error 字段错误
-func (r *Reader) mediaHeader(dict Dictionary, kind Name) (Name, string, error) {
+// 返回: Name 子类型, string 名称, error 字段、编码或超限错误
+func (r *mediaReader) mediaHeader(dict Dictionary, kind Name) (Name, string, error) {
 	value, err := r.Resolve(dict["Type"])
 	if err != nil {
 		return "", "", err
@@ -350,7 +395,7 @@ func (r *Reader) mediaHeader(dict Dictionary, kind Name) (Name, string, error) {
 	if !ok {
 		return "", "", fmt.Errorf("invalid %s subtype", kind)
 	}
-	value, err = r.Resolve(dict["N"])
+	ref, value, err := r.resolveIndirect(dict["N"])
 	if err != nil || value == nil {
 		return subtype, "", err
 	}
@@ -358,7 +403,7 @@ func (r *Reader) mediaHeader(dict Dictionary, kind Name) (Name, string, error) {
 	if !ok {
 		return "", "", fmt.Errorf("invalid media name")
 	}
-	text, err := DecodeTextString(name)
+	text, err := r.budget.decodeString(ref, name, "media")
 	return subtype, text, err
 }
 

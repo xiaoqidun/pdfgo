@@ -32,7 +32,7 @@ type MoviePlayback struct {
 // ReadMoviePlayback 在指定页面内解析视频动作目标，以显式动作参数覆盖注解播放参数
 // page应为执行动作时的页面；库不执行前序跳转，也不在其他页面猜测同名目标
 // 入参: ctx 取消上下文, page 当前页面, object 视频动作字典或引用
-// 返回: MoviePlayback 视频播放信息, error 目标、参数、引用或取消错误
+// 返回: MoviePlayback 视频播放信息, error 目标、参数、引用、超限或取消错误
 func (r *Reader) ReadMoviePlayback(ctx context.Context, page *Page, object Object) (MoviePlayback, error) {
 	var result MoviePlayback
 	if r == nil || ctx == nil {
@@ -82,7 +82,7 @@ func (r *Reader) ReadMoviePlayback(ctx context.Context, page *Page, object Objec
 
 // movieTarget 按引用或标题查找当前页视频注解，不解析无关注解的外观和内容
 // 入参: ctx 取消上下文, page 当前页面, action 已解析的视频动作
-// 返回: Annotation 唯一目标, error 页面注解、目标歧义或取消错误
+// 返回: Annotation 唯一目标, error 页面注解、目标歧义、超限或取消错误
 func (r *Reader) movieTarget(ctx context.Context, page *Page, action MovieAction) (Annotation, error) {
 	var result Annotation
 	value, err := r.Resolve(page.Dictionary["Annots"])
@@ -93,6 +93,8 @@ func (r *Reader) movieTarget(ctx context.Context, page *Page, action MovieAction
 	if value != nil && !ok {
 		return result, fmt.Errorf("invalid page annotations")
 	}
+	budget := newTextStringBudget(r)
+	var seen map[Reference]bool
 	found := false
 	for _, object := range array {
 		if err := ctx.Err(); err != nil {
@@ -104,6 +106,15 @@ func (r *Reader) movieTarget(ctx context.Context, page *Page, action MovieAction
 		}
 		if action.Annotation != (Reference{}) && ref != action.Annotation {
 			continue
+		}
+		if ref != (Reference{}) {
+			if seen[ref] {
+				continue
+			}
+			if seen == nil {
+				seen = make(map[Reference]bool)
+			}
+			seen[ref] = true
 		}
 		dict, ok := value.(Dictionary)
 		if !ok {
@@ -117,7 +128,7 @@ func (r *Reader) movieTarget(ctx context.Context, page *Page, action MovieAction
 			continue
 		}
 		if action.Annotation == (Reference{}) {
-			value, err := r.Resolve(dict["T"])
+			titleRef, value, err := r.resolveIndirect(dict["T"])
 			if err != nil {
 				return Annotation{}, err
 			}
@@ -125,7 +136,7 @@ func (r *Reader) movieTarget(ctx context.Context, page *Page, action MovieAction
 			if !ok {
 				continue
 			}
-			title, err := DecodeTextString(text)
+			title, err := budget.decodeString(titleRef, text, "movie target")
 			if err != nil {
 				return Annotation{}, err
 			}
@@ -134,9 +145,6 @@ func (r *Reader) movieTarget(ctx context.Context, page *Page, action MovieAction
 			}
 		}
 		if found {
-			if ref != (Reference{}) && ref == result.Reference {
-				continue
-			}
 			return Annotation{}, fmt.Errorf("%w: ambiguous movie target", ErrInvalidAction)
 		}
 		box, err := r.rectangle(dict["Rect"])

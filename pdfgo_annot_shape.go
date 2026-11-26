@@ -295,13 +295,16 @@ func (l *annotationShapedLine) width(state graphicsState, size float64) float64 
 
 // prepare 保留本次原文的段落整形，避免自动字号计算反复处理完整段落
 // 入参: text 原文
-// 返回: []annotationShapedParagraph 各段结果, error 整形或取消错误
+// 返回: []annotationShapedParagraph 各段结果, error 整形、超限或取消错误
 func (s *annotationShaper) prepare(text string) ([]annotationShapedParagraph, error) {
 	if err := s.ctx.Err(); err != nil {
 		return nil, err
 	}
 	if s.paragraphs != nil && s.input == text {
 		return s.paragraphs, nil
+	}
+	if strings.Count(text, "\n") >= maxAnnotationRichLines {
+		return nil, fmt.Errorf("%w: shaped text line limit exceeded", ErrStreamLimitExceeded)
 	}
 	parts := strings.Split(text, "\n")
 	paragraphs := make([]annotationShapedParagraph, len(parts))
@@ -322,7 +325,7 @@ func (s *annotationShaper) prepare(text string) ([]annotationShapedParagraph, er
 
 // lines 按逻辑簇和空白边界折行，断行后重新整形并保留段落方向
 // 入参: text 原文, state 文字状态, size 字号, width 行宽, multiline 是否多行
-// 返回: []*annotationShapedLine 各行结果, error 整形或取消错误
+// 返回: []*annotationShapedLine 各行结果, error 整形、超限或取消错误
 func (s *annotationShaper) lines(text string, state graphicsState, size, width float64, multiline bool) ([]*annotationShapedLine, error) {
 	paragraphs, err := s.prepare(text)
 	if err != nil {
@@ -335,6 +338,9 @@ func (s *annotationShaper) lines(text string, state graphicsState, size, width f
 		}
 		full, rtl := paragraph.line, paragraph.rtl
 		if !multiline || len(full.clusters) == 0 || full.width(state, size) <= width {
+			if len(lines) >= maxAnnotationRichLines {
+				return nil, fmt.Errorf("%w: shaped text line limit exceeded", ErrStreamLimitExceeded)
+			}
 			lines = append(lines, full)
 			continue
 		}
@@ -372,6 +378,9 @@ func (s *annotationShaper) lines(text string, state graphicsState, size, width f
 					break
 				}
 				end--
+			}
+			if len(lines) >= maxAnnotationRichLines {
+				return nil, fmt.Errorf("%w: shaped text line limit exceeded", ErrStreamLimitExceeded)
 			}
 			lines = append(lines, line)
 			start = end

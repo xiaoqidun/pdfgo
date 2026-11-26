@@ -29,6 +29,7 @@ type gradientVector struct {
 	scalar    *gradientFunction
 	calculate func(float64, []float64) error
 	parts     []*gradientFunction
+	bytes     int64
 }
 
 // projectedTintStops 单遍提取全部输出分量的精确断点，超限或非有限时返回nil退回按需求值
@@ -119,14 +120,14 @@ func projectedTintStops(ctx context.Context, f *tintFunction, limit int) ([][]Gr
 
 // readGradientVectorContext 在取消上下文内解析多分量采样、指数、拼接及计算器函数
 // 入参: ctx 取消上下文, object 函数对象, channels 输出数量, depth 嵌套深度
-// 返回: *gradientVector 分量函数, error 格式、求值或取消错误
+// 返回: *gradientVector 分量函数, error 格式、预算、求值或取消错误
 func (r *Reader) readGradientVectorContext(ctx context.Context, object Object, channels, depth int) (*gradientVector, error) {
-	return r.readGradientVectorState(ctx, object, channels, depth, &gradientParseState{})
+	return r.readGradientVectorState(ctx, object, channels, depth, gradientStateFromContext(ctx, r))
 }
 
 // readGradientVectorState 携带节点预算与间接引用记忆表解析多分量渐变函数
 // 入参: ctx 取消上下文, object 函数对象, channels 输出数量, depth 嵌套深度, state 解析状态
-// 返回: *gradientVector 分量函数, error 格式、求值或取消错误
+// 返回: *gradientVector 分量函数, error 格式、预算、求值或取消错误
 func (r *Reader) readGradientVectorState(ctx context.Context, object Object, channels, depth int, state *gradientParseState) (*gradientVector, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -139,7 +140,7 @@ func (r *Reader) readGradientVectorState(ctx context.Context, object Object, cha
 		if err != nil {
 			return nil, err
 		}
-		return &gradientVector{scalar: function, parts: make([]*gradientFunction, channels), calculate: func(x float64, out []float64) error {
+		return &gradientVector{scalar: function, parts: make([]*gradientFunction, channels), bytes: 128 + function.bytes, calculate: func(x float64, out []float64) error {
 			values, err := function.evaluate(x)
 			copy(out, values[:channels])
 			return err
@@ -171,7 +172,7 @@ func (r *Reader) readGradientVectorState(ctx context.Context, object Object, cha
 
 // readGradientVectorNode 解析单个高通道渐变函数节点并在拼接展开超限时退回按需求值
 // 入参: ctx 取消上下文, object 函数对象, channels 输出数量, depth 嵌套深度, state 解析状态
-// 返回: *gradientVector 分量函数, error 格式、求值或取消错误
+// 返回: *gradientVector 分量函数, error 格式、预算、求值或取消错误
 func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, channels, depth int, state *gradientParseState) (*gradientVector, error) {
 	value, err := r.Resolve(object)
 	if err != nil {
@@ -182,12 +183,19 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 		if len(array) != channels {
 			return nil, fmt.Errorf("invalid gradient function count")
 		}
+		seen := make(map[*gradientFunction]bool, channels)
+		size := int64(256) + int64(channels)*8
 		for c, item := range array {
 			f.parts[c], err = r.readGradientFunctionState(ctx, item, 1, depth+1, state)
 			if err != nil {
 				return nil, err
 			}
+			if !seen[f.parts[c]] {
+				seen[f.parts[c]] = true
+				size += f.parts[c].bytes
+			}
 		}
+		f.bytes = size
 		f.calculate = func(x float64, out []float64) error {
 			for c, part := range f.parts {
 				v, err := part.evaluate(x)
@@ -239,10 +247,21 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 	var evaluate func(float64, []float64) error
 	switch kind {
 	case Integer(0), Integer(2):
+		if kind == Integer(0) {
+			if err := r.checkGradientSampledBudget(dict, channels, state); err != nil {
+				return nil, err
+			}
+		}
 		tint, err := r.readTintFunction(ctx, value, channels)
 		if err != nil {
 			return nil, err
 		}
+		if tint.sampled {
+			if err := state.reserveBytes(int64(len(tint.samples))); err != nil {
+				return nil, err
+			}
+		}
+		f.bytes = 256 + int64(len(tint.samples)) + int64(channels)*64
 		evaluate = func(x float64, out []float64) error { tint.colorInto(x, out); return nil }
 		if domain[0] < domain[1] && budget > 0 && (tint.sampled && (tint.order != 3 || tint.size < 4) || !tint.sampled && (tint.exponent == 0 || tint.exponent == 1)) {
 			allStops, total, err := projectedTintStops(ctx, tint, budget)
@@ -250,6 +269,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 				return nil, err
 			}
 			if len(allStops) == channels && state.reserveStops(total) {
+				f.bytes += int64(total) * 64
 				for c, stops := range allStops {
 					f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
 				}
@@ -263,10 +283,18 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 		if err != nil {
 			return nil, err
 		}
+		if state.limit > 0 && int64(len(data)) > state.limit-state.bytes {
+			return nil, fmt.Errorf("%w: gradient function memory limit exceeded", ErrStreamLimitExceeded)
+		}
 		program, err := newCalculatorFunction(data, r.warning)
 		if err != nil {
 			return nil, err
 		}
+		progBytes := calculatorProgramBytes(program)
+		if err := state.reserveBytes(max(int64(len(data)), progBytes)); err != nil {
+			return nil, err
+		}
+		f.bytes = 256 + progBytes + int64(channels)*64
 		evaluate = func(x float64, out []float64) error { return program.evaluate([]float64{x}, out) }
 		if expressions, err := affineCalculator(data, 1, channels); err == nil {
 			output := make([]float64, channels)
@@ -304,6 +332,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 				total += len(stops)
 			}
 			if !exceeded && state.reserveStops(total) {
+				f.bytes += int64(total) * 64
 				for c, stops := range allStops {
 					f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
 				}
@@ -331,6 +360,8 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 		}
 		points := append(append([]float64{domain[0]}, bounds...), domain[1])
 		parts := make([]*gradientVector, len(functions))
+		seen := make(map[*gradientVector]bool, len(functions))
+		f.bytes = 256 + int64(len(functions))*24 + int64(channels)*64
 		for i, item := range functions {
 			if points[i] > points[i+1] {
 				return nil, fmt.Errorf("invalid gradient stitching bounds")
@@ -338,6 +369,10 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 			parts[i], err = r.readGradientVectorState(ctx, item, channels, depth+1, state)
 			if err != nil {
 				return nil, err
+			}
+			if !seen[parts[i]] {
+				seen[parts[i]] = true
+				f.bytes += parts[i].bytes
 			}
 		}
 		evaluate = func(x float64, out []float64) error {
@@ -424,6 +459,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 				}
 			}
 			if !exceeded && state.reserveStops(total) {
+				f.bytes += int64(total) * 64
 				for c, stops := range allStops {
 					if len(stops) > 0 {
 						f.parts[c].linear = func(interval [2]float64) []GradientStop { return gradientDomain(stops, domain, interval) }
@@ -453,6 +489,7 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 		if err := f.calculate(domain[0], values); err != nil {
 			return nil, err
 		}
+		f.bytes = 256 + int64(channels)*128
 		f.calculate = func(_ float64, out []float64) error { copy(out, values); return nil }
 		for c, value := range values {
 			f.parts[c] = constantGradientFunction([4]float64{value})
@@ -463,13 +500,13 @@ func (r *Reader) readGradientVectorNode(ctx context.Context, object Object, chan
 
 // deviceNWideGradientContext 在取消上下文内组合多分量渐变与备用空间映射，保留精确分段
 // 入参: ctx 取消上下文, function 渐变函数, tint 专色变换, domain 输入区间
-// 返回: []GradientStop 备用空间分段, *ColorSpace 输出空间, *gradientFunction 求值函数, error 解析或取消错误
+// 返回: []GradientStop 备用空间分段, *ColorSpace 输出空间, *gradientFunction 求值函数, error 解析、预算或取消错误
 func (r *Reader) deviceNWideGradientContext(ctx context.Context, function Object, tint *deviceNSpace, domain [2]float64) ([]GradientStop, *ColorSpace, *gradientFunction, error) {
 	source, err := r.readGradientVectorContext(ctx, function, tint.components, 0)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	mapped := &gradientFunction{calculate: func(x float64) ([4]float64, error) {
+	mapped := &gradientFunction{bytes: 128 + source.bytes, calculate: func(x float64) ([4]float64, error) {
 		var buffer [32]float64
 		values := buffer[:min(tint.components, len(buffer))]
 		if tint.components > len(buffer) {

@@ -24,6 +24,7 @@ import (
 	"maps"
 	"math"
 	"reflect"
+	"runtime"
 	"slices"
 )
 
@@ -203,13 +204,13 @@ func (r *Reader) remapICCAlternate(ctx context.Context, object Array, resources 
 }
 
 // recoverICCAlternate 仅在备用空间及分量范围有效时恢复损坏配置，保留原始配置
-// 入参: ctx 取消上下文, stream 配置流, count 源分量数, ranges 源范围, effective 是否已重映射, cause 配置错误
+// 入参: ctx 取消上下文, stream 配置流, count 源分量数, effective 是否已重映射, cause 配置错误
 // 返回: *iccColorSpace 备用变换, error 严格校验、备用空间或取消错误
-func (r *Reader) recoverICCAlternate(ctx context.Context, stream *Stream, count int, ranges *[8]float64, effective bool, cause error) (*iccColorSpace, error) {
+func (r *Reader) recoverICCAlternate(ctx context.Context, stream *Stream, count int, effective bool, cause error) (*iccColorSpace, error) {
 	if ctx.Err() != nil || r.warning == nil || errors.Is(cause, errICCSourceProfileClass) {
 		return nil, cause
 	}
-	space, err := r.readICCAlternate(ctx, stream, count, ranges, effective)
+	space, err := r.readICCAlternate(ctx, stream, count, effective)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, err
@@ -235,9 +236,9 @@ func (r *Reader) iccAlternateObject(stream *Stream, count int) (Object, error) {
 }
 
 // readICCAlternate 编译同分量备用空间，不预先转换原始分量或共享配置缓存
-// 入参: ctx 取消上下文, stream 配置流, count 源分量数, ranges 源范围, effective 是否已按资源校验并替换
+// 入参: ctx 取消上下文, stream 配置流, count 源分量数, effective 是否已按资源校验并替换
 // 返回: *iccColorSpace 备用源变换, error 定义、分量或取消错误
-func (r *Reader) readICCAlternate(ctx context.Context, stream *Stream, count int, ranges *[8]float64, effective bool) (*iccColorSpace, error) {
+func (r *Reader) readICCAlternate(ctx context.Context, stream *Stream, count int, effective bool) (*iccColorSpace, error) {
 	object, err := r.iccAlternateObject(stream, count)
 	if err != nil {
 		return nil, err
@@ -249,7 +250,7 @@ func (r *Reader) readICCAlternate(ctx context.Context, stream *Stream, count int
 	if alternate.components != count {
 		return nil, fmt.Errorf("invalid ICC alternate component count")
 	}
-	profile := &iccColorSpace{alternate: alternate, alternateCount: count, ranges: ranges, alternateBlending: alternate.blending}
+	profile := &iccColorSpace{alternate: alternate, alternateCount: count, alternateBlending: alternate.blending}
 	if alternate.blending == nil {
 		profile.alternateDigest, profile.hasAlternateDigest, err = r.canonicalObjectDigest(ctx, object)
 		if err != nil {
@@ -269,6 +270,7 @@ func (r *Reader) canonicalObjectDigest(ctx context.Context, object Object) ([32]
 	active := make(map[canonicalMemoKey]bool)
 	refMemo := make(map[Reference][32]byte)
 	refActive := make(map[Reference]bool)
+	var pinned []Object
 	writeBytes := func(h hash.Hash, data []byte) (bool, error) {
 		if int64(len(data)) > maxCanonicalDigestBytes-totalBytes {
 			return false, nil
@@ -288,189 +290,198 @@ func (r *Reader) canonicalObjectDigest(ctx context.Context, object Object) ([32]
 		binary.LittleEndian.PutUint64(buf[:], v)
 		return writeBytes(h, buf[:])
 	}
-	var digest func(Object, int) ([32]byte, bool, error)
-	digest = func(value Object, depth int) ([32]byte, bool, error) {
+	var digest func(Object, int) ([32]byte, bool, bool, error)
+	digest = func(value Object, depth int) ([32]byte, bool, bool, error) {
 		if err := ctx.Err(); err != nil {
-			return [32]byte{}, false, err
+			return [32]byte{}, false, false, err
 		}
 		if depth > 64 {
-			return [32]byte{}, false, nil
+			return [32]byte{}, false, false, nil
 		}
 		nodes++
 		if nodes > maxCanonicalDigestNodes {
-			return [32]byte{}, false, nil
+			return [32]byte{}, false, false, nil
 		}
 		switch v := value.(type) {
 		case Reference:
 			if r != nil && !refActive[v] {
 				if cached, ok := refMemo[v]; ok {
-					return cached, true, nil
+					return cached, true, false, nil
 				}
 				refActive[v] = true
 				resolved, err := r.Object(v)
 				if err != nil {
 					delete(refActive, v)
-					return [32]byte{}, false, nil
+					return [32]byte{}, false, false, nil
 				}
-				sum, ok, derr := digest(resolved, depth+1)
+				sum, ok, cyclic, derr := digest(resolved, depth+1)
 				delete(refActive, v)
-				if ok {
+				if ok && !cyclic {
 					refMemo[v] = sum
 				}
-				return sum, ok, derr
+				return sum, ok, cyclic, derr
 			}
 			h := sha256.New()
 			if ok, err := writeBytes(h, []byte{9}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, uint64(v.Number)); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, uint64(v.Generation)); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			var sum [32]byte
 			h.Sum(sum[:0])
-			return sum, true, nil
+			return sum, true, refActive[v], nil
 		case Array:
 			var key canonicalMemoKey
 			if len(v) > 0 {
 				key = canonicalMemoKey{kind: 6, ptr: reflect.ValueOf(v).Pointer(), length: len(v)}
 				if active[key] {
-					return [32]byte{}, false, nil
+					return [32]byte{}, false, false, nil
 				}
 				if cached, ok := memo[key]; ok {
-					return cached, true, nil
+					return cached, true, false, nil
 				}
 				active[key] = true
 				defer delete(active, key)
 			}
 			h := sha256.New()
 			if ok, err := writeBytes(h, []byte{6}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, uint64(len(v))); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
+			cyclic := false
 			for _, item := range v {
-				child, ok, err := digest(item, depth+1)
+				child, ok, childCyclic, err := digest(item, depth+1)
 				if !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
+				cyclic = cyclic || childCyclic
 				if ok, err := writeBytes(h, child[:]); !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
 			}
 			var sum [32]byte
 			h.Sum(sum[:0])
-			if len(v) > 0 {
+			if len(v) > 0 && !cyclic {
 				memo[key] = sum
+				pinned = append(pinned, v)
 			}
-			return sum, true, nil
+			return sum, true, cyclic, nil
 		case Dictionary:
 			var key canonicalMemoKey
 			if len(v) > 0 {
 				key = canonicalMemoKey{kind: 7, ptr: reflect.ValueOf(v).Pointer()}
 				if active[key] {
-					return [32]byte{}, false, nil
+					return [32]byte{}, false, false, nil
 				}
 				if cached, ok := memo[key]; ok {
-					return cached, true, nil
+					return cached, true, false, nil
 				}
 				active[key] = true
 				defer delete(active, key)
 			}
 			h := sha256.New()
 			if ok, err := writeBytes(h, []byte{7}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, uint64(len(v))); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
+			cyclic := false
 			for _, name := range slices.Sorted(maps.Keys(v)) {
 				if ok, err := writeU64(h, uint64(len(name))); !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
 				if ok, err := writeBytes(h, []byte(name)); !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
-				child, ok, err := digest(v[name], depth+1)
+				child, ok, childCyclic, err := digest(v[name], depth+1)
 				if !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
+				cyclic = cyclic || childCyclic
 				if ok, err := writeBytes(h, child[:]); !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
 			}
 			var sum [32]byte
 			h.Sum(sum[:0])
-			if len(v) > 0 {
+			if len(v) > 0 && !cyclic {
 				memo[key] = sum
+				pinned = append(pinned, v)
 			}
-			return sum, true, nil
+			return sum, true, cyclic, nil
 		case *Stream:
 			if v == nil {
 				h := sha256.New()
 				if ok, err := writeBytes(h, []byte{0}); !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
 				var sum [32]byte
 				h.Sum(sum[:0])
-				return sum, true, nil
+				return sum, true, false, nil
 			}
 			key := canonicalMemoKey{kind: 8, ptr: reflect.ValueOf(v).Pointer()}
 			if active[key] {
-				return [32]byte{}, false, nil
+				return [32]byte{}, false, false, nil
 			}
 			if cached, ok := memo[key]; ok {
-				return cached, true, nil
+				return cached, true, false, nil
 			}
 			active[key] = true
 			defer delete(active, key)
 			h := sha256.New()
 			if ok, err := writeBytes(h, []byte{8}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
-			dictSum, ok, err := digest(v.Dictionary, depth+1)
+			dictSum, ok, cyclic, err := digest(v.Dictionary, depth+1)
 			if !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeBytes(h, dictSum[:]); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, uint64(len(v.Data))); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeBytes(h, v.Data); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			var sum [32]byte
 			h.Sum(sum[:0])
-			memo[key] = sum
-			return sum, true, nil
+			if !cyclic {
+				memo[key] = sum
+				pinned = append(pinned, v)
+			}
+			return sum, true, cyclic, nil
 		}
 		h := sha256.New()
 		switch v := value.(type) {
 		case nil:
 			if ok, err := writeBytes(h, []byte{0}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 		case Boolean:
 			if v {
 				if ok, err := writeBytes(h, []byte{1, 1}); !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
 			} else {
 				if ok, err := writeBytes(h, []byte{1, 0}); !ok || err != nil {
-					return [32]byte{}, false, err
+					return [32]byte{}, false, false, err
 				}
 			}
 		case Integer:
 			if ok, err := writeBytes(h, []byte{2}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, uint64(v)); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 		case Real:
 			f := float64(v)
@@ -478,39 +489,41 @@ func (r *Reader) canonicalObjectDigest(ctx context.Context, object Object) ([32]
 				f = 0
 			}
 			if ok, err := writeBytes(h, []byte{3}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, math.Float64bits(f)); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 		case Name:
 			if ok, err := writeBytes(h, []byte{4}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, uint64(len(v))); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeBytes(h, []byte(v)); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 		case String:
 			if ok, err := writeBytes(h, []byte{5}); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeU64(h, uint64(len(v))); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 			if ok, err := writeBytes(h, v); !ok || err != nil {
-				return [32]byte{}, false, err
+				return [32]byte{}, false, false, err
 			}
 		default:
-			return [32]byte{}, false, nil
+			return [32]byte{}, false, false, nil
 		}
 		var sum [32]byte
 		h.Sum(sum[:0])
-		return sum, true, nil
+		return sum, true, false, nil
 	}
-	return digest(object, 0)
+	sum, ok, _, err := digest(object, 0)
+	runtime.KeepAlive(pinned)
+	return sum, ok, err
 }
 
 // alternateValues 裁切源范围后原样传入备用空间，不先归一化源分量

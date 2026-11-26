@@ -114,7 +114,32 @@ type coordinateFunctionState struct {
 	cached map[Reference]*coordinateFunction
 }
 
-// coordinateFunctionBytes 估算二维函数及其去重分量的采样内存占用
+// calculatorProgramBytes 估算已编译计算器函数指令树与条件分支的实际堆内存占用
+// 入参: f 已编译计算器函数
+// 返回: int64 估算字节数
+func calculatorProgramBytes(f *calculatorFunction) int64 {
+	if f == nil {
+		return 0
+	}
+	size := int64(64)
+	pending := [][]calculatorInstruction{f.program}
+	for len(pending) > 0 {
+		last := len(pending) - 1
+		instructions := pending[last]
+		pending = pending[:last]
+		size += int64(cap(instructions)) * 64
+		for i := range instructions {
+			size += int64(len(instructions[i].op))
+			if cap(instructions[i].branches) > 0 {
+				size += int64(cap(instructions[i].branches)) * 24
+				pending = append(pending, instructions[i].branches...)
+			}
+		}
+	}
+	return size
+}
+
+// coordinateFunctionBytes 估算二维函数及其去重分量的采样与计算器内存占用
 // 入参: f 二维函数定义
 // 返回: int64 估算字节数
 func coordinateFunctionBytes(f *coordinateFunction) int64 {
@@ -131,6 +156,9 @@ func coordinateFunctionBytes(f *coordinateFunction) int64 {
 		size := int64(256)
 		if node.sampled != nil {
 			size += int64(len(node.sampled.table.samples))
+		}
+		if node.program != nil {
+			size += calculatorProgramBytes(node.program)
 		}
 		for _, part := range node.parts {
 			size += walk(part)
@@ -231,12 +259,17 @@ func (r *Reader) readCoordinateFunctionState(ctx context.Context, object Object,
 		var data []byte
 		data, err = r.DecodeStreamContext(ctx, stream)
 		if err == nil {
-			cost := int64(len(data))
-			if state.limit > 0 && cost > state.limit-state.bytes {
+			if state.limit > 0 && int64(len(data)) > state.limit-state.bytes {
 				return nil, fmt.Errorf("%w: coordinate function memory limit exceeded", ErrStreamLimitExceeded)
 			}
-			state.bytes += cost
 			f.program, err = newCalculatorFunction(data, r.warning)
+			if err == nil {
+				cost := max(int64(len(data)), calculatorProgramBytes(f.program))
+				if state.limit > 0 && cost > state.limit-state.bytes {
+					return nil, fmt.Errorf("%w: coordinate function memory limit exceeded", ErrStreamLimitExceeded)
+				}
+				state.bytes += cost
+			}
 		}
 	default:
 		return nil, fmt.Errorf("invalid two-input function type")

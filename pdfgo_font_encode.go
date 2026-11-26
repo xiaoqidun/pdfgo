@@ -183,7 +183,7 @@ func (f *Font) EncodeContext(ctx context.Context, text string) ([]byte, error) {
 
 // characterCodes 收集所需文字的候选字符码，优先保留显式Unicode映射
 // 入参: ctx 取消上下文, wanted 所需字符
-// 返回: []string 候选字符码, error 取消错误
+// 返回: []string 候选字符码, error 超限或取消错误
 func (f *Font) characterCodes(ctx context.Context, wanted map[rune]bool) ([]string, error) {
 	return f.encodingCodes(ctx, func(value string) bool {
 		ch, n := utf8.DecodeRuneInString(value)
@@ -193,7 +193,7 @@ func (f *Font) characterCodes(ctx context.Context, wanted map[rune]bool) ([]stri
 
 // encodingCodes 收集符合条件的字符码，复合字体沿标准字符集反查CID
 // 入参: ctx 取消上下文, accept Unicode映射筛选, simple 是否包含简单字体字符码
-// 返回: []string 候选字符码, error 取消错误
+// 返回: []string 候选字符码, error 超限或取消错误
 func (f *Font) encodingCodes(ctx context.Context, accept func(string) bool, simple bool) ([]string, error) {
 	var codes []string
 	for code, value := range f.Unicode {
@@ -228,7 +228,7 @@ func (f *Font) encodingCodes(ctx context.Context, accept func(string) bool, simp
 		slices.Sort(cids)
 		if f.cidMap != nil {
 			var err error
-			extra, err = f.cidMap.characterCodes(ctx, cids)
+			extra, err = f.cidMap.characterCodes(ctx, cids, f.Unicode)
 			if err != nil {
 				return nil, err
 			}
@@ -248,7 +248,7 @@ func (f *Font) encodingCodes(ctx context.Context, accept func(string) bool, simp
 
 // characterLookup 查找单字符的原始编码，保留字体字宽和书写方向度量
 // 入参: ctx 取消上下文, wanted 所需字符
-// 返回: map[rune]fontEncodedGlyph 编码与字形, error 取消错误
+// 返回: map[rune]fontEncodedGlyph 编码与字形, error 解码、超限或取消错误
 func (f *Font) characterLookup(ctx context.Context, wanted map[rune]bool) (map[rune]fontEncodedGlyph, error) {
 	codes, err := f.characterCodes(ctx, wanted)
 	if err != nil {
@@ -292,7 +292,7 @@ func (f *Font) characterLookup(ctx context.Context, wanted map[rune]bool) (map[r
 
 // sequenceLookup 收集原文可能使用的多字符编码，不合成字形或修改映射
 // 入参: ctx 取消上下文, text Unicode原文
-// 返回: map[string]fontEncodedGlyph 多字符编码, error 取消错误
+// 返回: map[string]fontEncodedGlyph 多字符编码, error 解码、超限或取消错误
 func (f *Font) sequenceLookup(ctx context.Context, text string) (map[string]fontEncodedGlyph, error) {
 	wanted := make(map[rune]bool)
 	for _, ch := range text {

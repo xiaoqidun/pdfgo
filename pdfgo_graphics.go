@@ -585,7 +585,15 @@ type ForkOptions struct {
 // 入参: options 工作视图选项
 // 返回: *Reader 独立工作视图
 func (r *Reader) Fork(options ForkOptions) *Reader {
-	if r == nil || r.closed {
+	if r == nil {
+		return &Reader{closed: true}
+	}
+	cache := r.cache
+	if cache != nil {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+	}
+	if r.closed || cache != nil && cache.isClosed() {
 		return &Reader{closed: true}
 	}
 	source := options.Source
@@ -607,8 +615,8 @@ func (r *Reader) Fork(options ForkOptions) *Reader {
 	if owner == nil {
 		owner = r
 	}
-	if r.cache != nil {
-		r.cache.shared.Store(true)
+	if cache != nil {
+		cache.shared.Store(true)
 	}
 	return &Reader{
 		Version:         r.Version,
@@ -618,7 +626,7 @@ func (r *Reader) Fork(options ForkOptions) *Reader {
 		originalSource:  originalSource,
 		originalSize:    r.originalSize,
 		xref:            maps.Clone(r.xref),
-		cache:           r.cache,
+		cache:           cache,
 		loading:         make(map[Reference]bool),
 		deviceProfile:   r.deviceProfile,
 		security:        security,

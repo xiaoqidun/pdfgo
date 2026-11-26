@@ -193,9 +193,12 @@ func (r *Reader) readAnnotationBorder(annotation Annotation) (*annotationBorder,
 }
 
 // writeAnnotationStroke 写入共享笔画参数，不生成路径
-// 入参: content 外观内容, border 笔画样式
-// 返回: bool 是否绘制笔画, error 样式错误
-func (r *Reader) writeAnnotationStroke(content *strings.Builder, border *annotationBorder) (bool, error) {
+// 入参: ctx 取消上下文, content 外观内容, border 笔画样式, contentLimit 内容流字节上限
+// 返回: bool 是否绘制笔画, error 样式、超限或取消错误
+func (r *Reader) writeAnnotationStroke(ctx context.Context, content *strings.Builder, border *annotationBorder, contentLimit int) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if border.width == 0 || len(border.color) == 0 {
 		return false, nil
 	}
@@ -204,28 +207,45 @@ func (r *Reader) writeAnnotationStroke(content *strings.Builder, border *annotat
 	}
 	content.WriteString(strconv.FormatFloat(border.width, 'f', -1, 64))
 	content.WriteString(" w ")
-	if err := r.writeAnnotationDash(content, border.dash, 0); err != nil {
+	if contentLimit > 0 && content.Len() > contentLimit {
+		return false, fmt.Errorf("%w: annotation stroke content limit exceeded", ErrStreamLimitExceeded)
+	}
+	if err := r.writeAnnotationDash(ctx, content, border.dash, 0, contentLimit); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
 // writeAnnotationDash 写入虚线数组及沿路径推进的相位
-// 入参: content 外观内容, dash 虚线数组, phase 起始相位
-// 返回: error 虚线分量错误
-func (r *Reader) writeAnnotationDash(content *strings.Builder, dash Array, phase float64) error {
+// 入参: ctx 取消上下文, content 外观内容, dash 虚线数组, phase 起始相位, contentLimit 内容流字节上限
+// 返回: error 虚线分量、超限或取消错误
+func (r *Reader) writeAnnotationDash(ctx context.Context, content *strings.Builder, dash Array, phase float64, contentLimit int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	content.WriteByte('[')
-	for _, component := range dash {
+	for i, component := range dash {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		n, err := r.number(component)
 		if err != nil || n < 0 || math.IsNaN(n) || math.IsInf(n, 0) {
 			return fmt.Errorf("invalid annotation dash component")
 		}
 		content.WriteString(strconv.FormatFloat(n, 'f', -1, 64))
 		content.WriteByte(' ')
+		if contentLimit > 0 && content.Len() > contentLimit {
+			return fmt.Errorf("%w: annotation dash content limit exceeded", ErrStreamLimitExceeded)
+		}
 	}
 	content.WriteString("] ")
 	writeAnnotationOperation(content, "d", phase)
-	return nil
+	if contentLimit > 0 && content.Len() > contentLimit {
+		return fmt.Errorf("%w: annotation dash content limit exceeded", ErrStreamLimitExceeded)
+	}
+	return ctx.Err()
 }
 
 // writeAnnotationColor 写入设备颜色，空数组表示透明
@@ -261,10 +281,13 @@ func (r *Reader) writeAnnotationColor(content *strings.Builder, values Array, st
 	return true, nil
 }
 
-// linkAppearance 按链接的颜色和边框属性生成缺省外观，边框位于注解矩形内
-// 入参: annotation 链接注解
-// 返回: *Stream 外观流, error 属性或未支持的边框错误
-func (r *Reader) linkAppearance(annotation Annotation) (*Stream, error) {
+// linkAppearanceContext 在取消上下文与内容流上限内按链接的颜色和边框属性生成缺省外观
+// 入参: ctx 取消上下文, annotation 链接注解
+// 返回: *Stream 外观流, error 属性、未支持的边框、超限或取消错误
+func (r *Reader) linkAppearanceContext(ctx context.Context, annotation Annotation) (*Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	w, h := annotation.Rect.XMax-annotation.Rect.XMin, annotation.Rect.YMax-annotation.Rect.YMin
 	if w <= 0 || h <= 0 || math.IsNaN(w) || math.IsInf(w, 0) || math.IsNaN(h) || math.IsInf(h, 0) {
 		return nil, fmt.Errorf("invalid link bounds")
@@ -274,7 +297,8 @@ func (r *Reader) linkAppearance(annotation Annotation) (*Stream, error) {
 		return nil, err
 	}
 	var content strings.Builder
-	stroke, err := r.writeAnnotationStroke(&content, border)
+	contentLimit := annotationRichContentLimit(r)
+	stroke, err := r.writeAnnotationStroke(ctx, &content, border, contentLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -307,6 +331,12 @@ func (r *Reader) linkAppearance(annotation Annotation) (*Stream, error) {
 				writeAnnotationOperation(&content, "c h S", x0, y0+ry-k*ry, x0+rx-k*rx, y0, x0+rx, y0)
 			}
 		}
+	}
+	if content.Len() > contentLimit {
+		return nil, fmt.Errorf("%w: link appearance content limit exceeded", ErrStreamLimitExceeded)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Integer(0), Integer(0), Real(w), Real(h)}}, Data: []byte(content.String()), reader: r, cache: r.cache, hasWarning: r.warning != nil}, nil
 }
@@ -345,11 +375,11 @@ func (r *Reader) inkAppearance(ctx context.Context, annotation Annotation) (*Str
 		}
 	}
 	var content strings.Builder
-	stroke, err := r.writeAnnotationStroke(&content, border)
+	contentLimit := annotationRichContentLimit(r)
+	stroke, err := r.writeAnnotationStroke(ctx, &content, border, contentLimit)
 	if err != nil {
 		return nil, err
 	}
-	contentLimit := annotationRichContentLimit(r)
 	content.WriteString("/Opacity gs 1 J 1 j\n")
 	if content.Len() > contentLimit {
 		return nil, fmt.Errorf("%w: ink appearance content limit exceeded", ErrStreamLimitExceeded)
@@ -584,7 +614,8 @@ func (r *Reader) shapeAppearanceContext(ctx context.Context, annotation Annotati
 		return nil, fmt.Errorf("empty annotation shape")
 	}
 	var content strings.Builder
-	stroke, err := r.writeAnnotationStroke(&content, border)
+	contentLimit := annotationRichContentLimit(r)
+	stroke, err := r.writeAnnotationStroke(ctx, &content, border, contentLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -603,7 +634,6 @@ func (r *Reader) shapeAppearanceContext(ctx context.Context, annotation Annotati
 			return nil, err
 		}
 	}
-	contentLimit := annotationRichContentLimit(r)
 	if content.Len() > contentLimit {
 		return nil, fmt.Errorf("%w: shape appearance content limit exceeded", ErrStreamLimitExceeded)
 	}

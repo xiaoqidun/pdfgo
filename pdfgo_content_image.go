@@ -478,7 +478,7 @@ func (p *objectParser) inlineImage(ctx context.Context, resolve func(Object) (Ob
 			}
 			break
 		}
-		key, err := p.object()
+		key, err := p.objectContext(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -486,7 +486,7 @@ func (p *objectParser) inlineImage(ctx context.Context, resolve func(Object) (Ob
 		if full, ok := keys[name]; ok {
 			name = full
 		}
-		value, err := p.object()
+		value, err := p.objectContext(ctx)
 		if err != nil {
 			return nil, err
 		}
