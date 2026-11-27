@@ -132,49 +132,64 @@ func annotationRichCSSStyle(ctx context.Context, parent, style annotationRichSty
 			}
 			style.families = families
 		case "font":
-			fields, err := splitAnnotationRichCSS(ctx, value, ' ')
-			if err != nil {
+			var tokens []string
+			if err := walkAnnotationRichCSS(ctx, value, ' ', func(part string) error {
+				if part != "" {
+					tokens = append(tokens, part)
+				}
+				return nil
+			}); err != nil {
 				return style, err
 			}
 			italic := false
 			style.weight, style.italic = 400, &italic
 			style.stretch = 5
-			found := false
-			for i, field := range fields {
-				if i&63 == 0 {
-					if err := ctx.Err(); err != nil {
-						return style, err
-					}
-				}
-				if field == "" {
+			pos := 0
+			for pos < len(tokens) {
+				lower := strings.ToLower(tokens[pos])
+				if lower == "italic" {
+					italic = true
+					pos++
 					continue
 				}
-				field = strings.ToLower(field)
-				if strings.HasSuffix(field, "pt") || field == "0" {
-					family := strings.TrimSpace(strings.Join(fields[i+1:], " "))
-					if family == "" {
-						return style, fmt.Errorf("invalid rich text font shorthand")
-					}
-					style, err = annotationRichCSSStyle(ctx, parent, style, "font-size:"+field+";font-family:"+family)
-					found = true
-					break
+				if lower == "oblique" {
+					return style, &UnsupportedError{Feature: "rich text font style " + lower}
 				}
-				if field == "italic" {
-					italic := true
-					style.italic = &italic
-				} else if field != "normal" {
-					style.weight, err = annotationRichWeight(field)
-					if err != nil {
-						return style, err
-					}
+				if lower == "normal" {
+					pos++
+					continue
 				}
+				if weight, werr := annotationRichWeight(lower); werr == nil {
+					style.weight = weight
+					pos++
+					continue
+				}
+				break
 			}
+			rest := tokens[pos:]
+			if len(rest) < 2 {
+				return style, fmt.Errorf("invalid rich text font shorthand")
+			}
+			firstSize, firstErr := annotationRichPoint(rest[0])
+			lastSize, lastErr := annotationRichPoint(rest[len(rest)-1])
+			if (firstErr == nil) == (lastErr == nil) {
+				return style, fmt.Errorf("invalid rich text font shorthand")
+			}
+			size, family := firstSize, strings.Join(rest[1:], " ")
+			if firstErr != nil {
+				size, family = lastSize, strings.Join(rest[:len(rest)-1], " ")
+			}
+			if size < 0 {
+				return style, fmt.Errorf("invalid rich text font-size")
+			}
+			if strings.EqualFold(family, "inherit") {
+				return style, fmt.Errorf("invalid rich text font shorthand")
+			}
+			families, err := annotationRichFamilies(ctx, family)
 			if err != nil {
 				return style, err
 			}
-			if !found {
-				return style, fmt.Errorf("invalid rich text font shorthand")
-			}
+			style.size, style.families = &size, families
 		case "color":
 			color, err := annotationRichColor(value)
 			if err != nil {

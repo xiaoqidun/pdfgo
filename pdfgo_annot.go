@@ -289,6 +289,53 @@ func (r *Reader) annotationAppearanceStream(appearance Dictionary, selected Obje
 	return stream, nil
 }
 
+// annotationAppearanceTransform 校验外观流边界与矩阵并计算映射到注解区域的变换
+// 入参: stream 外观流, rect 注解区域
+// 返回: Matrix 页面映射变换, error 读取或无效外观错误
+func (r *Reader) annotationAppearanceTransform(stream *Stream, rect Rectangle) (Matrix, error) {
+	bounds, err := r.Resolve(stream.Dictionary["BBox"])
+	if err != nil {
+		return Matrix{}, err
+	}
+	box, err := r.rectangle(bounds)
+	if err != nil {
+		if isFatalReaderError(err) {
+			return Matrix{}, err
+		}
+		return Matrix{}, fmt.Errorf("%w: invalid appearance bounds", ErrInvalidAnnotationAppearance)
+	}
+	matrix := Identity()
+	value, err := r.Resolve(stream.Dictionary["Matrix"])
+	if err != nil {
+		return Matrix{}, err
+	}
+	if value != nil {
+		values, err := r.numberArray(value, 6)
+		if err != nil {
+			if isFatalReaderError(err) {
+				return Matrix{}, err
+			}
+			return Matrix{}, fmt.Errorf("%w: invalid appearance matrix", ErrInvalidAnnotationAppearance)
+		}
+		matrix = Matrix(values)
+	}
+	minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
+	for _, point := range []Point{{box.XMin, box.YMin}, {box.XMax, box.YMin}, {box.XMax, box.YMax}, {box.XMin, box.YMax}} {
+		point = matrix.Apply(point)
+		minX, minY = math.Min(minX, point.X), math.Min(minY, point.Y)
+		maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
+	}
+	if math.IsInf(minX, 0) || math.IsInf(minY, 0) || math.IsInf(maxX, 0) || math.IsInf(maxY, 0) || math.IsNaN(minX) || math.IsNaN(minY) || math.IsNaN(maxX) || math.IsNaN(maxY) || minX == maxX || minY == maxY {
+		return Matrix{}, fmt.Errorf("%w: invalid appearance bounds", ErrInvalidAnnotationAppearance)
+	}
+	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
+	tx, ty := rect.XMin-minX*scaleX, rect.YMin-minY*scaleY
+	if math.IsInf(scaleX, 0) || math.IsNaN(scaleX) || scaleX == 0 || math.IsInf(scaleY, 0) || math.IsNaN(scaleY) || scaleY == 0 || math.IsInf(tx, 0) || math.IsNaN(tx) || math.IsInf(ty, 0) || math.IsNaN(ty) {
+		return Matrix{}, fmt.Errorf("%w: invalid appearance transform", ErrInvalidAnnotationAppearance)
+	}
+	return Matrix{scaleX, 0, 0, scaleY, tx, ty}, nil
+}
+
 // WalkAnnotationAppearance 解释注解当前外观并映射到页面用户空间
 // Warning非空时按控件属性恢复结构无效的外观，保留原始字典并报告原因
 // 入参: ctx 取消上下文, page 所在页面, annotation 注解, visitor 图元访问器
@@ -433,23 +480,29 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		return &UnsupportedError{Feature: "annotation appearance"}
 	}
+	var transform Matrix
 	stream, err := r.annotationAppearanceStream(appearance, annotation.Dictionary["AS"])
 	if err == nil && stream != nil {
-		bounds, readErr := r.Resolve(stream.Dictionary["BBox"])
-		if readErr != nil {
-			return readErr
-		}
-		if array, ok := bounds.(Array); !ok || len(array) != 4 {
-			err = fmt.Errorf("%w: BBox", ErrInvalidAnnotationAppearance)
-		}
+		transform, err = r.annotationAppearanceTransform(stream, annotation.Rect)
 	}
 	if errors.Is(err, ErrInvalidAnnotationAppearance) && annotation.Subtype == "Widget" && visitor.Warning != nil {
-		stream, err = r.widgetAppearance(ctx, page, annotation)
-		if err == nil {
-			visitor.Warning(Diagnostic{Message: "invalid PDF widget appearance replaced from field properties"})
-		} else if ctx.Err() == nil && !isFatalReaderError(err) {
-			visitor.Warning(Diagnostic{Message: "PDF Widget annotation appearance synthesis failed: " + err.Error() + "; omitted"})
+		recovered, synthErr := r.widgetAppearance(ctx, page, annotation)
+		if synthErr != nil {
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				return cancelErr
+			}
+			if isFatalReaderError(synthErr) {
+				return synthErr
+			}
+			visitor.Warning(Diagnostic{Message: "PDF Widget annotation appearance synthesis failed: " + synthErr.Error() + "; omitted"})
 			return ctx.Err()
+		}
+		if recovered != nil {
+			transform, err = r.annotationAppearanceTransform(recovered, annotation.Rect)
+			if err == nil {
+				stream = recovered
+				visitor.Warning(Diagnostic{Message: "invalid PDF widget appearance replaced from field properties"})
+			}
 		}
 	}
 	if errors.Is(err, ErrInvalidAnnotationAppearance) && visitor.Warning != nil {
@@ -482,44 +535,9 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 			stream = &copy
 		}
 	}
-	box, err := r.rectangle(stream.Dictionary["BBox"])
-	if err != nil {
-		return err
-	}
-	matrix := Identity()
-	value, err = r.Resolve(stream.Dictionary["Matrix"])
-	if err != nil {
-		return err
-	}
-	if value != nil {
-		array, ok := value.(Array)
-		if !ok {
-			return fmt.Errorf("invalid appearance matrix")
-		}
-		values, err := r.numberArray(array, 6)
-		if err != nil {
-			return err
-		}
-		matrix = Matrix(values)
-	}
-	minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
-	for _, point := range []Point{{box.XMin, box.YMin}, {box.XMax, box.YMin}, {box.XMax, box.YMax}, {box.XMin, box.YMax}} {
-		point = matrix.Apply(point)
-		minX, minY = math.Min(minX, point.X), math.Min(minY, point.Y)
-		maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
-	}
-	if math.IsInf(minX, 0) || math.IsInf(minY, 0) || math.IsInf(maxX, 0) || math.IsInf(maxY, 0) || math.IsNaN(minX) || math.IsNaN(minY) || math.IsNaN(maxX) || math.IsNaN(maxY) || minX == maxX || minY == maxY {
-		return fmt.Errorf("invalid appearance bounds")
-	}
-	rect := annotation.Rect
-	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
-	tx, ty := rect.XMin-minX*scaleX, rect.YMin-minY*scaleY
-	if math.IsInf(scaleX, 0) || math.IsNaN(scaleX) || math.IsInf(scaleY, 0) || math.IsNaN(scaleY) || math.IsInf(tx, 0) || math.IsNaN(tx) || math.IsInf(ty, 0) || math.IsNaN(ty) {
-		return fmt.Errorf("invalid appearance transform")
-	}
-	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: rect}
+	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: annotation.Rect}
 	interpreter.patternMatrix = Identity()
-	interpreter.state = graphicsState{matrix: Matrix{scaleX, 0, 0, scaleY, tx, ty}, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
+	interpreter.state = graphicsState{matrix: transform, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
 	for _, operator := range []string{"g", "G"} {
 		if err := interpreter.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
 			return err
@@ -599,11 +617,14 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, key := range []Name{"DA", "Q"} {
-		if result[key] == nil {
-			result[key], err = r.Resolve(defaults[key])
-			if err != nil {
-				return nil, err
+	flags, _ := result["Ff"].(Integer)
+	if result["FT"] != Name("Btn") || flags&(1<<16) != 0 {
+		for _, key := range []Name{"DA", "Q"} {
+			if result[key] == nil {
+				result[key], err = r.Resolve(defaults[key])
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 	}

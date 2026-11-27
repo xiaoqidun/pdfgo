@@ -561,7 +561,7 @@ func (p *pageInterpreter) shadingPattern(name Name) (Paint, error) {
 		parameters := make(Dictionary)
 		for key, value := range state {
 			switch key {
-			case "Type", "RI", "ca", "BM", "SMask", "AIS", "OP", "op", "OPM", "TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT", "HTO", "SM", "AAPL:AA":
+			case "Type", "RI", "ca", "BM", "SMask", "AIS", "OP", "op", "OPM", "TR", "TR2", "BG", "BG2", "UCR", "UCR2", "HT", "HTO", "UseBlackPtComp", "SM", "AAPL:AA":
 				parameters[key] = value
 			}
 		}

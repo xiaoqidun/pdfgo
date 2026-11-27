@@ -73,6 +73,7 @@ type Font struct {
 	type3Matrix          Matrix
 	type3Bounds          *Rectangle
 	type3Procs           Dictionary
+	type3ProcState       map[Name]uint8
 	type3Resources       Dictionary
 	reader               *Reader
 	cache                *objectCache
@@ -707,7 +708,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 		}
 		font.differences = builtIn
 	}
-	if (subtype == "Type1" || subtype == "MMType1") && font.ProgramType == "FontFile" && len(font.widths) == 0 && !font.defaultWidthDeclared {
+	if (subtype == "Type1" || subtype == "MMType1") && font.ProgramType == "FontFile" {
 		font.programMetrics = &fontProgramMetrics{program: font.Program, type1: true}
 	}
 	var cffProgram []byte
@@ -915,6 +916,46 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			font.FallbackBoundingBox = &bounds
 		}
 	}
+	if font.Subtype == Name("Type3") && len(font.type3Procs) != 0 {
+		state := make(map[Name]uint8)
+		var checked map[Name]bool
+		for code := 0; code < 256; code++ {
+			name := Name(font.simpleGlyphName(uint32(code), nil))
+			if name == "" || name == ".notdef" || checked[name] {
+				continue
+			}
+			if checked == nil {
+				checked = make(map[Name]bool)
+			}
+			checked[name] = true
+			proc := font.type3Procs[name]
+			if proc == nil {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			resolved, err := r.Resolve(proc)
+			if err != nil {
+				if isFatalReaderError(err) {
+					return nil, err
+				}
+				state[name] = 2
+				continue
+			}
+			if resolved == nil {
+				continue
+			}
+			if stream, ok := resolved.(*Stream); ok && stream != nil {
+				state[name] = 1
+			} else {
+				state[name] = 2
+			}
+		}
+		if len(state) != 0 {
+			font.type3ProcState = state
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -933,7 +974,7 @@ func fontMemoryBytes(f *Font) int64 {
 	}
 	cost := int64(512) + int64(len(f.Name)) + int64(len(f.Subtype)) + int64(len(f.Program)) + int64(len(f.ProgramType)) + int64(len(f.coreName)) + int64(len(f.encoding)) + int64(len(f.cmapEncoding)) + int64(len(f.glyphMap)) + int64(len(f.simpleCmap))
 	cost += int64(len(f.Dictionary)+len(f.type3Procs)+len(f.type3Resources)) * 64
-	cost += int64(len(f.widths))*24 + int64(len(f.cidWidths.ranges))*24 + int64(len(f.verticals.ranges))*40 + int64(len(f.cffGlyphs))*16
+	cost += int64(len(f.widths))*24 + int64(len(f.type3ProcState))*24 + int64(len(f.cidWidths.ranges))*24 + int64(len(f.verticals.ranges))*40 + int64(len(f.cffGlyphs))*16
 	for k, v := range f.Unicode {
 		cost += 64 + int64(len(k)) + int64(len(v))
 	}
@@ -1032,7 +1073,7 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 	}
 	var type1Metrics *type1FontMetrics
 	var cffMetrics *cffFontMetrics
-	if f.programMetrics != nil {
+	if f.programMetrics != nil && len(f.widths) == 0 && !f.defaultWidthDeclared {
 		var err error
 		type1Metrics, cffMetrics, err = f.programMetrics.load(ctx)
 		if err != nil {

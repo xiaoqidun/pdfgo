@@ -92,6 +92,9 @@ func (f *Font) EncodeGlyphsContext(ctx context.Context, glyphs []uint16) ([]byte
 // 返回: map[uint16]fontEncodedGlyph 编码与字形, error 超限或取消错误
 func (f *Font) glyphLookup(ctx context.Context, wanted map[uint16]int) (map[uint16]fontEncodedGlyph, error) {
 	var codes []string
+	if f.programMetrics != nil && f.programMetrics.type1 {
+		return nil, ctx.Err()
+	}
 	if f.composite {
 		cids, err := f.glyphCIDs(ctx, wanted)
 		if err != nil {

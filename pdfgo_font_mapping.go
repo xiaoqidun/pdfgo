@@ -40,7 +40,7 @@ func (f *Font) GlyphMapContext(ctx context.Context) (map[rune]uint16, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(f.Program) == 0 {
+	if len(f.Program) == 0 || f.programMetrics != nil && f.programMetrics.type1 {
 		return make(map[rune]uint16), nil
 	}
 	codes, err := f.encodingCodes(ctx, func(value string) bool {

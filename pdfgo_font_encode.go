@@ -409,5 +409,26 @@ func (f *Font) encodingGlyph(ctx context.Context, code string) (Glyph, bool, err
 			}
 		}
 	}
+	if f.programMetrics != nil && f.programMetrics.type1 {
+		type1Metrics, _, err := f.programMetrics.load(ctx)
+		if err != nil {
+			return Glyph{}, false, err
+		}
+		if _, exists := type1Metrics.glyphs[glyphs[0].Name]; !exists {
+			return Glyph{}, false, nil
+		}
+	}
+	if f.Subtype == Name("Type3") {
+		state := f.type3ProcState[Name(glyphs[0].Name)]
+		if state == 2 {
+			return Glyph{}, false, nil
+		}
+		if state == 0 {
+			_, hasW := f.widths[glyphs[0].Code]
+			if (glyphs[0].Name != "space" && glyphs[0].Name != "nonbreakingspace") || (!hasW && !f.defaultWidthDeclared) {
+				return Glyph{}, false, nil
+			}
+		}
+	}
 	return glyphs[0], true, nil
 }
