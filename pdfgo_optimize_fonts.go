@@ -601,6 +601,21 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 								}
 							}
 						}
+						if gsVal, err := resolve(drDict["ExtGState"], false); err == nil {
+							if gsDict, ok := gsVal.(Dictionary); ok {
+								for _, gsObj := range gsDict {
+									if stateVal, err := resolve(gsObj, false); err == nil {
+										if stateDict, ok := stateVal.(Dictionary); ok && stateDict["Font"] != nil {
+											if fontArrVal, err := resolve(stateDict["Font"], false); err == nil {
+												if fontArr, ok := fontArrVal.(Array); ok && len(fontArr) > 0 {
+													markFontUnsafe(fontArr[0])
+												}
+											}
+										}
+									}
+								}
+							}
+						}
 					}
 				}
 			}
@@ -1310,6 +1325,97 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		}
 		return nil
 	}
+	annotHasText := func(value Object) (bool, error) {
+		if value == nil {
+			return false, nil
+		}
+		resolved, err := resolveMeta(value)
+		if err != nil {
+			return false, err
+		}
+		if resolved == nil {
+			return false, nil
+		}
+		if s, ok := resolved.(String); ok && len(s) == 0 {
+			return false, nil
+		}
+		return true, nil
+	}
+	annotNeedsPageFonts := func(annotDict Dictionary) (bool, error) {
+		subtype, err := resolveMeta(annotDict["Subtype"])
+		if err != nil {
+			return false, err
+		}
+		switch subtype {
+		case Name("FreeText"):
+		case Name("Line"):
+			capVal, err := resolveMeta(annotDict["Cap"])
+			if err != nil {
+				return false, err
+			}
+			if capVal != Boolean(true) {
+				return false, nil
+			}
+		default:
+			return false, nil
+		}
+		if has, err := annotHasText(annotDict["Contents"]); err != nil || has {
+			return has, err
+		}
+		return annotHasText(annotDict["RC"])
+	}
+	markResourcesFontsUnsafe := func(res Dictionary) error {
+		if res == nil {
+			return nil
+		}
+		if res["Font"] != nil {
+			fontsVal, err := resolveMeta(res["Font"])
+			if err != nil {
+				return err
+			}
+			if fontsDict, ok := fontsVal.(Dictionary); ok {
+				for _, fontObj := range fontsDict {
+					ref, isTarget, valid := resolveFontTarget(fontObj)
+					if !valid {
+						return fmt.Errorf("invalid annotation page font resource")
+					}
+					if isTarget {
+						unsafe[ref] = true
+					}
+				}
+			}
+		}
+		if res["ExtGState"] != nil {
+			gsVal, err := resolveMeta(res["ExtGState"])
+			if err != nil {
+				return err
+			}
+			if gsDict, ok := gsVal.(Dictionary); ok {
+				for _, gsObj := range gsDict {
+					stateVal, err := resolveMeta(gsObj)
+					if err != nil {
+						return err
+					}
+					if stateDict, ok := stateVal.(Dictionary); ok && stateDict["Font"] != nil {
+						fontArrVal, err := resolveMeta(stateDict["Font"])
+						if err != nil {
+							return err
+						}
+						if fontArr, ok := fontArrVal.(Array); ok && len(fontArr) > 0 {
+							ref, isTarget, valid := resolveFontTarget(fontArr[0])
+							if !valid {
+								return fmt.Errorf("invalid annotation page graphics state font")
+							}
+							if isTarget {
+								unsafe[ref] = true
+							}
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
 	run := func() error {
 		if err := r.WalkPages(ctx, func(_ int, page *Page) error {
 			defer cleanup()
@@ -1329,48 +1435,68 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 					return err
 				}
 				if annots, ok := annotsVal.(Array); ok {
+					pageFontsUnsafe := false
 					for _, item := range annots {
 						annotVal, err := resolveMeta(item)
 						if err != nil {
 							return err
 						}
 						annotDict, ok := annotVal.(Dictionary)
-						if !ok || annotDict["AP"] == nil {
-							continue
-						}
-						apVal, err := resolveMeta(annotDict["AP"])
-						if err != nil {
-							return err
-						}
-						apDict, ok := apVal.(Dictionary)
 						if !ok {
 							continue
 						}
-						for _, apKey := range []Name{"N", "R", "D"} {
-							if apDict[apKey] == nil {
-								continue
-							}
-							entryVal, apRef, err := r.resolveOptimizationObject(apDict[apKey], nil, cached)
+						hasNormalAP := false
+						if annotDict["AP"] != nil {
+							apVal, err := resolveMeta(annotDict["AP"])
 							if err != nil {
 								return err
 							}
-							switch v := entryVal.(type) {
-							case *Stream:
-								if err := scanAPStream(page.Resources, v, apRef); err != nil {
-									return err
-								}
-							case Dictionary:
-								for _, stateEntry := range v {
-									stateObj, stateRef, err := r.resolveOptimizationObject(stateEntry, nil, cached)
+							if apDict, ok := apVal.(Dictionary); ok {
+								for _, apKey := range []Name{"N", "R", "D"} {
+									if apDict[apKey] == nil {
+										continue
+									}
+									entryVal, apRef, err := r.resolveOptimizationObject(apDict[apKey], nil, cached)
 									if err != nil {
 										return err
 									}
-									if stateStream, ok := stateObj.(*Stream); ok {
-										if err := scanAPStream(page.Resources, stateStream, stateRef); err != nil {
+									switch v := entryVal.(type) {
+									case *Stream:
+										if apKey == "N" {
+											hasNormalAP = true
+										}
+										if err := scanAPStream(page.Resources, v, apRef); err != nil {
 											return err
+										}
+									case Dictionary:
+										for _, stateEntry := range v {
+											stateObj, stateRef, err := r.resolveOptimizationObject(stateEntry, nil, cached)
+											if err != nil {
+												return err
+											}
+											if stateStream, ok := stateObj.(*Stream); ok {
+												if apKey == "N" {
+													hasNormalAP = true
+												}
+												if err := scanAPStream(page.Resources, stateStream, stateRef); err != nil {
+													return err
+												}
+											}
 										}
 									}
 								}
+							}
+						}
+						if !hasNormalAP && !pageFontsUnsafe {
+							needs, err := annotNeedsPageFonts(annotDict)
+							if err != nil {
+								return err
+							}
+							if needs {
+								if err := markResourcesFontsUnsafe(page.Resources); err != nil {
+									return err
+								}
+								pageFontsUnsafe = true
 							}
 						}
 					}

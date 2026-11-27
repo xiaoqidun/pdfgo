@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // maxCMapEntries 限制展开为字符映射表时的最大总条目数，防止大范围区间展开耗尽内存
@@ -287,6 +288,8 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 				var baseTarget String
 				var listTarget Array
 				var scratch String
+				var baseRune rune
+				hasSurrogateTail := false
 				switch v := to.(type) {
 				case String:
 					if len(v) > maxCMapTargetBytes {
@@ -294,6 +297,15 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 					}
 					baseTarget = v
 					scratch = make(String, len(v))
+					if len(v) >= 4 && len(v)%2 == 0 {
+						hi := binary.BigEndian.Uint16(v[len(v)-4:])
+						lo := binary.BigEndian.Uint16(v[len(v)-2:])
+						if hi >= 0xD800 && hi <= 0xDBFF && lo >= 0xDC00 && lo <= 0xDFFF {
+							baseRune = utf16.DecodeRune(rune(hi), rune(lo))
+							hasSurrogateTail = true
+							copy(scratch, baseTarget)
+						}
+					}
 				case Array:
 					if uint64(len(v)) != span {
 						return p.fail("CMap destination count mismatch")
@@ -310,15 +322,25 @@ func parseUnicodeMapIntoContext(ctx context.Context, target UnicodeMap, data []b
 					}
 					var targetCode String
 					if listTarget == nil {
-						copy(scratch, baseTarget)
-						carry := code - a
-						for n := len(scratch) - 1; n >= 0 && carry != 0; n-- {
-							carry += uint64(scratch[n])
-							scratch[n] = byte(carry)
-							carry >>= 8
-						}
-						if carry != 0 {
-							return p.fail("CMap destination overflow")
+						if hasSurrogateTail {
+							delta := code - a
+							if delta > uint64(utf8.MaxRune-baseRune) {
+								return p.fail("CMap destination overflow")
+							}
+							r1, r2 := utf16.EncodeRune(baseRune + rune(delta))
+							binary.BigEndian.PutUint16(scratch[len(scratch)-4:], uint16(r1))
+							binary.BigEndian.PutUint16(scratch[len(scratch)-2:], uint16(r2))
+						} else {
+							copy(scratch, baseTarget)
+							carry := code - a
+							for n := len(scratch) - 1; n >= 0 && carry != 0; n-- {
+								carry += uint64(scratch[n])
+								scratch[n] = byte(carry)
+								carry >>= 8
+							}
+							if carry != 0 {
+								return p.fail("CMap destination overflow")
+							}
 						}
 						targetCode = scratch
 					} else {

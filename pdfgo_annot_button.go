@@ -62,10 +62,44 @@ func (r *Reader) writeAnnotationPushButton(ctx context.Context, annotation Annot
 		}
 	}
 	caption := ""
+	hasCaption := false
 	if position != 1 {
 		caption, err = r.readAnnotationText(ctx, Annotation{Dictionary: mk}, "CA", nil)
 		if err != nil {
-			return err
+			if ctx.Err() != nil || isFatalReaderError(err) {
+				return err
+			}
+			caValue, resolveErr := r.Resolve(mk["CA"])
+			if resolveErr != nil {
+				return resolveErr
+			}
+			raw, ok := annotationRawSingleByte(caValue)
+			if !ok {
+				return err
+			}
+			if len(raw) > annotationRichContentLimit(r) {
+				return fmt.Errorf("%w: annotation text limit exceeded", ErrStreamLimitExceeded)
+			}
+			daValue, resolveErr := r.Resolve(annotation.Dictionary["DA"])
+			if resolveErr != nil {
+				return resolveErr
+			}
+			if daValue == nil {
+				return err
+			}
+			p, _, _, stateErr := r.annotationTextState(ctx, annotation.Dictionary["DA"], resources)
+			if stateErr != nil {
+				return stateErr
+			}
+			if p.state.font == nil || p.state.font.Name != "ZapfDingbats" {
+				return err
+			}
+			if _, letterErr := annotationZapfDingbatsLetters(ctx, p.state.font, raw); letterErr != nil {
+				return letterErr
+			}
+			hasCaption = true
+		} else {
+			hasCaption = caption != ""
 		}
 	}
 	var icon *Stream
@@ -98,7 +132,7 @@ func (r *Reader) writeAnnotationPushButton(ctx context.Context, annotation Annot
 		}
 	}
 	textFrame, iconFrame := frame, frame
-	if icon != nil && caption != "" {
+	if icon != nil && hasCaption {
 		x, y := frame.XMin+(frame.XMax-frame.XMin)/2, frame.YMin+(frame.YMax-frame.YMin)/2
 		switch position {
 		case 2:
@@ -123,7 +157,7 @@ func (r *Reader) writeAnnotationPushButton(ctx context.Context, annotation Annot
 			return err
 		}
 	}
-	if caption != "" {
+	if hasCaption {
 		return r.writeAnnotationButtonCaption(ctx, annotation, mk, caption, nil, textFrame, border, resources, content)
 	}
 	return nil

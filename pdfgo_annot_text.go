@@ -968,6 +968,9 @@ func (r *Reader) writeAnnotationText(ctx context.Context, annotation Annotation,
 			}
 		}
 		size = low
+		if size == 0 {
+			size = math.Min(12, height)
+		}
 	}
 	if size <= 0 || math.IsNaN(size) || math.IsInf(size, 0) {
 		return fmt.Errorf("invalid automatic font size")

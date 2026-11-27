@@ -94,6 +94,20 @@ func (m *SoftMask) Walk(ctx context.Context, visitor Visitor) error {
 	}
 	p.visitor = visitor
 	p.maskGroup = m.stream
+	resources, err := p.reader.Resolve(m.stream.Dictionary["Resources"])
+	if err != nil {
+		return err
+	}
+	if resources == nil {
+		p.resources = p.pageResources
+	} else if dict, ok := resources.(Dictionary); ok {
+		p.resources = dict
+	}
+	for _, operator := range []string{"g", "G"} {
+		if err := p.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
+			return err
+		}
+	}
 	return p.form(m.stream)
 }
 
@@ -145,6 +159,19 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 	}
 	m := &SoftMask{Subtype: subtype, interpreter: *p, stream: stream}
 	m.interpreter.resetTransient()
+	m.interpreter.state = graphicsState{
+		matrix:      p.state.matrix,
+		hscale:      1,
+		fillSpace:   "DeviceGray",
+		strokeSpace: "DeviceGray",
+		style: Style{
+			Fill:       Paint{SourceSpace: "DeviceGray", Space: &ColorSpace{Model: "DeviceGray"}, Alpha: 1},
+			Stroke:     Paint{SourceSpace: "DeviceGray", Space: &ColorSpace{Model: "DeviceGray"}, Alpha: 1},
+			LineWidth:  1,
+			MiterLimit: 10,
+			BlendMode:  "Normal",
+		},
+	}
 	v, err = p.reader.Resolve(group["CS"])
 	if err != nil {
 		return nil, err
@@ -179,11 +206,6 @@ func (p *pageInterpreter) readSoftMask(value Object) (*SoftMask, error) {
 			copy(m.Backdrop, values[:])
 		}
 	}
-	m.interpreter.state.style.SoftMask = nil
-	m.interpreter.state.style.BlendMode = "Normal"
-	m.interpreter.state.style.AlphaIsShape = false
-	m.interpreter.state.style.Clips = nil
-	m.interpreter.state.style.Fill.Alpha, m.interpreter.state.style.Stroke.Alpha = 1, 1
 	if m.Subtype == "Luminosity" {
 		v, err := p.reader.Resolve(dict["BC"])
 		if err != nil {

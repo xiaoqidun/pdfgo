@@ -16,7 +16,6 @@ package pdfgo
 
 import (
 	"bytes"
-	"fmt"
 	"sort"
 	"unicode/utf8"
 
@@ -951,23 +950,10 @@ func passwordRangeContains(ranges [][2]rune, value rune) bool {
 	return i < len(ranges) && ranges[i][0] <= value
 }
 
-// encodePassword 按加密版本转换用户输入，不改变调用方的密码字节
-// 入参: password UTF-8密码
+// encodePasswordForRevision 按已校验的加密修订版转换UTF-8密码，不改变调用方的密码字节
+// 入参: password UTF-8密码, revision 标准安全处理器修订号
 // 返回: []byte 已编码密码, error 编码或准备错误
-func (r *Reader) encodePassword(password []byte) ([]byte, error) {
-	object, err := r.Resolve(r.Trailer["Encrypt"])
-	if err != nil || object == nil {
-		return nil, err
-	}
-	dict, ok := object.(Dictionary)
-	if !ok {
-		return nil, fmt.Errorf("invalid encryption dictionary")
-	}
-	rObj, err := r.Resolve(dict["R"])
-	if err != nil {
-		return nil, err
-	}
-	revision, _ := rObj.(Integer)
+func encodePasswordForRevision(password []byte, revision int) ([]byte, error) {
 	if revision >= 5 {
 		return preparePassword(password)
 	}

@@ -3440,6 +3440,30 @@ func (r *Reader) optimizePDFPixelImage(ctx context.Context, orig *Stream, dict D
 	return r.optimizePDFDecodedImage(ctx, orig, orig, w, h, space, targetSpace, options, size, colorResources, ignoreSMask, false)
 }
 
+// hasNonZeroSMaskInData 判断图像流字典是否声明非零SMaskInData，解析异常时保守返回真
+// 入参: ctx 取消上下文, dict 图像流字典
+// 返回: bool 是否含非零SMaskInData或异常属性, error 致命读取或取消错误
+func (r *Reader) hasNonZeroSMaskInData(ctx context.Context, dict Dictionary) (bool, error) {
+	if dict["SMaskInData"] == nil {
+		return false, ctx.Err()
+	}
+	val, err := r.optimizationValue(dict["SMaskInData"])
+	if err != nil {
+		if isFatalOptimizationReadError(ctx, err) {
+			return true, err
+		}
+		return true, nil
+	}
+	if val == nil {
+		return false, ctx.Err()
+	}
+	mode, ok := val.(Integer)
+	if !ok {
+		return true, ctx.Err()
+	}
+	return mode != 0, ctx.Err()
+}
+
 // optimizeStreamWithOwnedSMask 优化带独享软遮罩的主图，全不透明直接剔除，半透明支持同比例同步降采样
 // 入参: ctx 取消上下文, mainStream 主图像流, smaskStream 独享软遮罩流, options 压缩配置, size 主图显示像素需求, colorResources 可选默认颜色空间资源
 // 返回: *Stream 主图输出流, *Stream 软遮罩输出流，被剔除时为空, bool 是否已剔除软遮罩, error 取消或编码错误
@@ -3455,9 +3479,27 @@ func (r *Reader) optimizeStreamWithOwnedSMask(ctx context.Context, mainStream, s
 		return nil, nil, false, err
 	}
 	if opaque {
+		hasEmbeddedMask, maskErr := r.hasNonZeroSMaskInData(ctx, mainStream.Dictionary)
+		if maskErr != nil {
+			return nil, nil, false, maskErr
+		}
+		if hasEmbeddedMask {
+			losslessOpts := options
+			losslessOpts.Mode = CompressionLossless
+			baseSMask, err := r.optimizeStreamSize(ctx, smaskStream, losslessOpts, image.Point{})
+			if err != nil {
+				return nil, nil, false, err
+			}
+			baseMain, err := r.optimizeStreamSizeWithContext(ctx, mainStream, losslessOpts, image.Point{}, colorResources, false)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			return finish(baseMain, baseSMask, false)
+		}
 		stripped := *mainStream
 		stripped.Dictionary = maps.Clone(mainStream.Dictionary)
 		delete(stripped.Dictionary, "SMask")
+		delete(stripped.Dictionary, "Mask")
 		optMain, err := r.optimizeStreamSizeWithContext(ctx, &stripped, options, size, colorResources, false)
 		if err != nil {
 			return nil, nil, false, err

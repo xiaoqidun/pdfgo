@@ -124,6 +124,9 @@ func (v annotationVerticalText) write(p *pageInterpreter, content *strings.Build
 			}
 		}
 		size = low
+		if size == 0 {
+			size = min(12, scaledWidth)
+		}
 	}
 	if size <= 0 || math.IsInf(size, 0) || math.IsNaN(size) {
 		return fmt.Errorf("invalid vertical font size")

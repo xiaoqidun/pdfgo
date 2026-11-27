@@ -431,6 +431,9 @@ func (v annotationShapedText) write(ctx context.Context, shape TextShaper, p *pa
 			}
 		}
 		size = low
+		if size == 0 {
+			size = min(12, height)
+		}
 	}
 	if size <= 0 || math.IsNaN(size) || math.IsInf(size, 0) {
 		return fmt.Errorf("invalid shaped font size")

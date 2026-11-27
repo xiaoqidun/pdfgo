@@ -222,9 +222,6 @@ func (v annotationRichVertical) write(ctx context.Context, content *strings.Buil
 					}
 					top := baseline + v.state.rise + origin.rise
 					length := advance
-					if v.comb > 0 {
-						length = -height / float64(v.comb)
-					}
 					if index, ok := lastDecoration[origin]; ok {
 						previous := &decorations[index]
 						if previous.x == x && previous.y+previous.height == top && previous.size == n && previous.height*length > 0 {

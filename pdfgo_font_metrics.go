@@ -144,7 +144,7 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 		if token == "eexec" {
 			break
 		}
-		if token != "/FontMatrix" {
+		if matrixFound || token != "/FontMatrix" {
 			continue
 		}
 		close := "]"
@@ -231,6 +231,7 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 	subrs := map[int][]byte{}
 	glyphs := map[string][]byte{}
 	section := ""
+	charStringsDict := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -251,21 +252,43 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 				}
 				return nil, fmt.Errorf("invalid Type1 metric lenIV")
 			}
-		case "/Subrs", "/CharStrings":
+		case "/Subrs":
 			section = token
 			count, err := strconv.Atoi(scanner.next())
-			if err != nil || count < 0 || count > len(plain) {
+			if err != nil || count < 0 || count > math.MaxInt32 {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
 				return nil, fmt.Errorf("invalid Type1 metric dictionary size")
+			}
+		case "/CharStrings":
+			section = token
+			charStringsDict = false
+			next := scanner.next()
+			if next == "<<" {
+				charStringsDict = true
+				continue
+			}
+			count, err := strconv.Atoi(next)
+			if err != nil || count < 0 || count > math.MaxInt32 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("invalid Type1 metric dictionary size")
+			}
+		case ">>":
+			if section == "/CharStrings" && charStringsDict {
+				section = ""
+				charStringsDict = false
+			} else if section == "/Subrs" {
+				section = ""
 			}
 		case "def", "ND", "|-":
 			if section == "/Subrs" {
 				section = ""
 			}
 		case "end":
-			if section == "/CharStrings" {
+			if section == "/CharStrings" && !charStringsDict {
 				section = ""
 			}
 		case "dup":
@@ -273,7 +296,7 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 				continue
 			}
 			index, err := strconv.Atoi(scanner.next())
-			if err != nil || index < 0 || index > len(plain) {
+			if err != nil || index < 0 || index > math.MaxInt32 {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
@@ -285,6 +308,10 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 			}
 			subrs[index] = raw
 		default:
+			if section == "/Subrs" && len(token) > 1 && token[0] == '/' {
+				section = ""
+				continue
+			}
 			if section != "/CharStrings" || len(token) < 2 || token[0] != '/' {
 				continue
 			}

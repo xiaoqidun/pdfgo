@@ -137,9 +137,9 @@ func (r *Reader) Encryption() *EncryptionInfo {
 }
 
 // openSecurity 解析加密字典并认证用户或所有者密码
-// 入参: password 用户或所有者密码
+// 入参: password 用户或所有者密码, utf8Password 是否按修订版编码UTF-8密码
 // 返回: error 认证或加密参数错误
-func (r *Reader) openSecurity(password []byte) error {
+func (r *Reader) openSecurity(password []byte, utf8Password bool) error {
 	if r.Trailer["Encrypt"] == nil {
 		return nil
 	}
@@ -178,11 +178,20 @@ func (r *Reader) openSecurity(password []byte) error {
 	}
 	v, vok := vObj.(Integer)
 	revision, rok := rObj.(Integer)
-	if vok && rok && v == 5 && (revision == 5 || revision == 6) {
-		return r.openAES256Security(dict, password, int(revision), unencrypted)
-	}
-	if !vok || !rok || !(v == 1 && (revision == 2 || revision == 3) || v == 2 && revision == 3 || v == 4 && revision == 4) {
+	aes256 := vok && rok && v == 5 && (revision == 5 || revision == 6)
+	if !aes256 && (!vok || !rok || !(v == 1 && (revision == 2 || revision == 3) || v == 2 && revision == 3 || v == 4 && revision == 4)) {
 		return &UnsupportedError{Feature: "PDF encryption revision"}
+	}
+	if utf8Password {
+		encoded, err := encodePasswordForRevision(password, int(revision))
+		if err != nil {
+			return err
+		}
+		defer clear(encoded)
+		password = encoded
+	}
+	if aes256 {
+		return r.openAES256Security(dict, password, int(revision), unencrypted)
 	}
 	s := &standardSecurity{info: EncryptionInfo{Revision: int(revision)}, encryptMetadata: true, streamFilter: "V2", stringFilter: "V2", embeddedFilter: "V2", unencrypted: unencrypted}
 	if v == 4 {

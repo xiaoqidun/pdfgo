@@ -325,15 +325,7 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		r.xref, r.Trailer = index, trailer
 		r.warning(Diagnostic{Message: "rebuilt cross-reference from validated object boundaries: " + err.Error()})
 	}
-	password := options.Password
-	if options.PasswordUTF8 {
-		password, err = r.encodePassword(password)
-		if err != nil {
-			return nil, err
-		}
-		defer clear(password)
-	}
-	if err := r.openSecurity(password); err != nil {
+	if err := r.openSecurity(options.Password, options.PasswordUTF8); err != nil {
 		return nil, err
 	}
 	root, err := r.Resolve(r.Trailer["Root"])
@@ -1123,6 +1115,7 @@ func (r *Reader) loadCrossReferences() error {
 	visited := map[int64]bool{}
 	sections := 0
 	var totalEntries int64
+	var rebaseBase int64
 	for {
 		sections++
 		if sections > maxXrefSections {
@@ -1136,9 +1129,16 @@ func (r *Reader) loadCrossReferences() error {
 			return fmt.Errorf("cyclic cross-reference chain")
 		}
 		visited[offset] = true
-		trailer, entries, actual, err := r.readXref(offset, maxXrefEntries-totalEntries)
+		trailer, entries, actual, rebased, err := r.readXref(offset, maxXrefEntries-totalEntries, rebaseBase == 0)
 		if err != nil {
 			return err
+		}
+		if rebased > 0 {
+			rebaseBase = rebased
+		} else if rebaseBase > 0 {
+			if err := r.applyXrefBase(rebaseBase, trailer, entries); err != nil {
+				return err
+			}
 		}
 		totalEntries += int64(len(entries))
 		if actual != offset {
@@ -1163,6 +1163,11 @@ func (r *Reader) loadCrossReferences() error {
 			_, supplement, err := r.readXrefStream(int64(hybrid), maxXrefEntries-totalEntries)
 			if err != nil {
 				return err
+			}
+			if rebaseBase > 0 {
+				if err := r.applyXrefBase(rebaseBase, nil, supplement); err != nil {
+					return err
+				}
 			}
 			totalEntries += int64(len(supplement))
 			for id, entry := range supplement {
@@ -1918,13 +1923,13 @@ func (p *objectParser) objectBoundary() bool {
 	return err == nil && generation >= 0 && generation <= 65535 && p.token() == "obj"
 }
 
-// readXref 读取传统或流式交叉引用区段，并返回实际定位的区段偏移
-// 入参: offset 交叉引用区段的字节偏移, limit 剩余允许加载的最大条目数
-// 返回: Dictionary 尾字典或交叉引用流字典, map[int64]xrefEntry 交叉引用条目, int64 实际区段偏移, error 读取或解析错误
-func (r *Reader) readXref(offset int64, limit int64) (Dictionary, map[int64]xrefEntry, int64, error) {
+// readXref 读取传统或流式交叉引用区段，并返回实际定位的区段偏移与嵌入基址
+// 入参: offset 交叉引用区段的字节偏移, limit 剩余允许加载的最大条目数, allowRebase 是否允许探测嵌入PDF基址
+// 返回: Dictionary 尾字典或交叉引用流字典, map[int64]xrefEntry 交叉引用条目, int64 实际区段偏移, int64 嵌入PDF基址, error 读取或解析错误
+func (r *Reader) readXref(offset int64, limit int64, allowRebase bool) (Dictionary, map[int64]xrefEntry, int64, int64, error) {
 	trailer, entries, original := r.readXrefAt(offset, limit)
 	if original == nil || r.warning == nil || !readerStructuralError(original) {
-		return trailer, entries, offset, original
+		return trailer, entries, offset, 0, original
 	}
 	start, stop := max(int64(0), offset-1024), min(r.size, offset+1024)
 	if offset < 0 || offset >= r.size {
@@ -1936,37 +1941,30 @@ func (r *Reader) readXref(offset int64, limit int64) (Dictionary, map[int64]xref
 	}{{start, stop, false}, {max(int64(0), r.size-readerTailLimit), r.size, true}} {
 		trailer, entries, candidate, err := r.findXrefOffset(offset, region.start, region.stop, region.claim, limit)
 		if err != nil {
-			return nil, nil, -1, err
+			return nil, nil, -1, 0, err
 		}
 		if candidate >= 0 {
-			if err := r.rebaseXrefEntries(offset, candidate, trailer, entries); err != nil {
-				if !readerStructuralError(err) {
-					return nil, nil, -1, err
+			var base int64
+			if allowRebase {
+				base, err = r.rebaseXrefEntries(offset, candidate, trailer, entries)
+				if err != nil {
+					if !readerStructuralError(err) {
+						return nil, nil, -1, 0, err
+					}
+					continue
 				}
-				continue
 			}
 			r.warning(Diagnostic{Offset: candidate, Message: fmt.Sprintf("cross-reference offset %d recovered at %d", offset, candidate)})
-			return trailer, entries, candidate, nil
+			return trailer, entries, candidate, base, nil
 		}
 	}
-	return nil, nil, -1, original
+	return nil, nil, -1, 0, original
 }
 
-// rebaseXrefEntries 验证嵌入PDF文件头及全部在用对象头后修正相对该文件头的xref偏移
-// 入参: declared 声明xref偏移, actual 实际xref偏移, trailer 尾字典, entries 在用索引
+// applyXrefBase 校验并平移相对嵌入PDF文件头的xref条目及链式偏移
+// 入参: base 嵌入PDF文件头偏移, trailer 尾字典，可为空, entries 在用索引
 // 返回: error 源错误或不能一致验证的偏移
-func (r *Reader) rebaseXrefEntries(declared, actual int64, trailer Dictionary, entries map[int64]xrefEntry) error {
-	base := actual - declared
-	if base <= 0 || base > r.size-8 {
-		return nil
-	}
-	header, err := r.readRange(base, 8)
-	if err != nil {
-		return err
-	}
-	if !bytes.HasPrefix(header, []byte("%PDF-")) {
-		return nil
-	}
+func (r *Reader) applyXrefBase(base int64, trailer Dictionary, entries map[int64]xrefEntry) error {
 	if len(entries) > 100000 {
 		return fmt.Errorf("relative cross-reference validation limit exceeded")
 	}
@@ -1988,6 +1986,13 @@ func (r *Reader) rebaseXrefEntries(declared, actual int64, trailer Dictionary, e
 			return fmt.Errorf("inconsistent relative cross-reference object header")
 		}
 	}
+	for _, key := range []Name{"Prev", "XRefStm"} {
+		if value, ok := trailer[key].(Integer); ok && value > 0 {
+			if int64(value) >= r.size-base {
+				return fmt.Errorf("relative cross-reference chain outside file")
+			}
+		}
+	}
 	for number, entry := range entries {
 		if entry.kind == 1 && number != 0 {
 			entry.position += base
@@ -1996,14 +2001,32 @@ func (r *Reader) rebaseXrefEntries(declared, actual int64, trailer Dictionary, e
 	}
 	for _, key := range []Name{"Prev", "XRefStm"} {
 		if value, ok := trailer[key].(Integer); ok && value > 0 {
-			if int64(value) >= r.size-base {
-				return fmt.Errorf("relative cross-reference chain outside file")
-			}
 			trailer[key] = value + Integer(base)
 		}
 	}
-	r.warning(Diagnostic{Offset: base, Message: "xref offsets relative to embedded PDF header validated and rebased"})
 	return nil
+}
+
+// rebaseXrefEntries 验证嵌入PDF文件头及全部在用对象头后修正相对该文件头的xref偏移
+// 入参: declared 声明xref偏移, actual 实际xref偏移, trailer 尾字典, entries 在用索引
+// 返回: int64 已应用的嵌入基址, error 源错误或不能一致验证的偏移
+func (r *Reader) rebaseXrefEntries(declared, actual int64, trailer Dictionary, entries map[int64]xrefEntry) (int64, error) {
+	if declared < 0 || actual <= declared || actual-declared > r.size-8 {
+		return 0, nil
+	}
+	base := actual - declared
+	header, err := r.readRange(base, 8)
+	if err != nil {
+		return 0, err
+	}
+	if !bytes.HasPrefix(header, []byte("%PDF-")) {
+		return 0, nil
+	}
+	if err := r.applyXrefBase(base, trailer, entries); err != nil {
+		return 0, err
+	}
+	r.warning(Diagnostic{Offset: base, Message: "xref offsets relative to embedded PDF header validated and rebased"})
+	return base, nil
 }
 
 // findXrefOffset 在限定范围校验唯一xref候选，远距离修复须与该区段的startxref声明相互印证

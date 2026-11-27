@@ -294,6 +294,7 @@ func type1BuiltInEncoding(ctx context.Context, program []byte) (map[uint32]strin
 		program = header
 	}
 	scanner := type1EncodingScanner{ctx: ctx, data: program}
+	dictDepth := 0
 	for steps := 0; ; steps++ {
 		if steps&255 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -309,6 +310,16 @@ func type1BuiltInEncoding(ctx context.Context, program []byte) (map[uint32]strin
 		}
 		if token == "eexec" {
 			break
+		}
+		if token == "<<" {
+			dictDepth++
+			continue
+		}
+		if token == ">>" {
+			if dictDepth > 0 {
+				dictDepth--
+			}
+			continue
 		}
 		if token != "/Encoding" {
 			continue
@@ -331,6 +342,7 @@ func type1BuiltInEncoding(ctx context.Context, program []byte) (map[uint32]strin
 			for code := 0; code < 256; code++ {
 				names[uint32(code)] = ".notdef"
 			}
+			braceDepth := 0
 			for entrySteps := 0; ; entrySteps++ {
 				if entrySteps&255 == 0 {
 					if err := ctx.Err(); err != nil {
@@ -347,7 +359,23 @@ func type1BuiltInEncoding(ctx context.Context, program []byte) (map[uint32]strin
 				if token == "eexec" {
 					break
 				}
+				if token == "{" {
+					braceDepth++
+					continue
+				}
+				if token == "}" {
+					if braceDepth > 0 {
+						braceDepth--
+					}
+					continue
+				}
+				if braceDepth > 0 {
+					continue
+				}
 				if token == "def" {
+					return names, ctx.Err()
+				}
+				if dictDepth > 0 && (token == ">>" || token[0] == '/') {
 					return names, ctx.Err()
 				}
 				if token != "dup" {
@@ -445,7 +473,11 @@ func (s *type1EncodingScanner) next() string {
 		}
 		return string(s.data[start:s.pos])
 	}
-	if s.data[s.pos] == '<' && (s.pos+1 == len(s.data) || s.data[s.pos+1] != '<') {
+	if s.pos+1 < len(s.data) && (s.data[s.pos] == '<' && s.data[s.pos+1] == '<' || s.data[s.pos] == '>' && s.data[s.pos+1] == '>') {
+		s.pos += 2
+		return string(s.data[start:s.pos])
+	}
+	if s.data[s.pos] == '<' {
 		for steps := 0; s.pos < len(s.data) && s.data[s.pos] != '>'; steps++ {
 			if steps&4095 == 0 && s.ctx != nil && s.ctx.Err() != nil {
 				return ""
