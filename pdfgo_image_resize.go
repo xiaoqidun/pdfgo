@@ -81,8 +81,13 @@ func ResizeImage(ctx context.Context, src image.Image, size image.Point) (image.
 	} else {
 		dst = image.NewNRGBA(rect)
 	}
-	if _, ok := src.(image.RGBA64Image); !ok {
+	switch src.(type) {
+	case *image.CMYK, *image.Paletted:
 		src = imageScaleSource{Image: src}
+	default:
+		if _, ok := src.(image.RGBA64Image); !ok {
+			src = imageScaleSource{Image: src}
+		}
 	}
 	if int64(width) > optimizationBufferLimit/32/int64(bounds.Dy()) || int64(bounds.Dx()) > optimizationBufferLimit/32 || int64(bounds.Dy()) > optimizationBufferLimit/32 {
 		rows := max(1, min(32, 65536/width))
@@ -326,6 +331,13 @@ func scaleCatmullRom(ctx context.Context, dst draw.Image, src image.RGBA64Image,
 	return ctx.Err()
 }
 
+// At 返回与十六位预乘采样一致的颜色，避免通用缩放回退绕过色彩转换
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 预乘颜色
+func (s imageScaleSource) At(x, y int) color.Color {
+	return s.RGBA64At(x, y)
+}
+
 // RGBA64At 保留源图像的采样精度，按缩放器要求返回预乘颜色
 // 入参: x 横向坐标, y 纵向坐标
 // 返回: color.RGBA64 预乘颜色
@@ -352,7 +364,7 @@ func (i *Image) DecodeImageSizeContext(ctx context.Context, size image.Point) (i
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	decoded, err := i.decodeImageSize(ctx, nil, false, size)

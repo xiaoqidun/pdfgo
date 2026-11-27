@@ -504,7 +504,7 @@ func (i *Image) JPXLosslessContext(ctx context.Context) (bool, int, error) {
 	if i == nil || i.Stream == nil {
 		return false, 0, nil
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return false, 0, os.ErrClosed
 	}
 	data, _, err := i.encodedFileContext(ctx, "JPXDecode")

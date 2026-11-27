@@ -139,7 +139,7 @@ func (r *Reader) resolveIndirect(object Object) (Reference, Object, error) {
 	if r == nil {
 		return Reference{}, nil, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return Reference{}, nil, os.ErrClosed
 	}
 	ref, ok := object.(Reference)
@@ -234,7 +234,7 @@ func (r *Reader) ReadThreeDContext(ctx context.Context, annotation Annotation) (
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return result, os.ErrClosed
 	}
 	if annotation.Subtype != "3D" {
@@ -463,7 +463,7 @@ func (r *Reader) ReadRichMedia(ctx context.Context, annotation Annotation) (Rich
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return result, os.ErrClosed
 	}
 	if annotation.Subtype != "RichMedia" {

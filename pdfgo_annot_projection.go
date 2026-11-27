@@ -35,7 +35,7 @@ func (r *Reader) ReadProjectionAnnotation(annotation Annotation) (ProjectionAnno
 	if r == nil {
 		return result, fmt.Errorf("invalid projection annotation")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return result, os.ErrClosed
 	}
 	if annotation.Subtype != "Projection" {

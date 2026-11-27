@@ -435,7 +435,12 @@ func imageRGBA64At(source image.Image, x, y int) color.RGBA64 {
 		if idx >= len(s.Palette) || s.Palette[idx] == nil {
 			return color.RGBA64{}
 		}
-		r, g, b, a := s.Palette[idx].RGBA()
+		entry := s.Palette[idx]
+		if _, ok := entry.(color.CMYK); ok {
+			pixel := imageNRGBASample(entry)
+			return color.RGBA64{R: pixel.R, G: pixel.G, B: pixel.B, A: pixel.A}
+		}
+		r, g, b, a := entry.RGBA()
 		return color.RGBA64{R: uint16(r), G: uint16(g), B: uint16(b), A: uint16(a)}
 	}
 	if s, ok := source.(image.RGBA64Image); ok {

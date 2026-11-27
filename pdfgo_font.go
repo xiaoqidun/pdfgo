@@ -177,7 +177,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	ref, indirect := object.(Reference)

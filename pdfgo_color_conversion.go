@@ -49,7 +49,7 @@ func (r *Reader) readColorFunctionContext(ctx context.Context, object Object) (*
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	value, err := r.Resolve(object)

@@ -249,7 +249,7 @@ func (r *Reader) Info() (DocumentInfo, error) {
 	if r == nil {
 		return result, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return result, os.ErrClosed
 	}
 	value, err := r.Resolve(r.Trailer["Info"])

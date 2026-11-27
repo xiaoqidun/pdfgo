@@ -129,7 +129,7 @@ func padPassword(password []byte) []byte {
 // Encryption 返回加密信息副本，未加密文档返回nil
 // 返回: *EncryptionInfo 加密信息
 func (r *Reader) Encryption() *EncryptionInfo {
-	if r == nil || r.closed || r.security == nil {
+	if r == nil || r.isClosed() || r.security == nil {
 		return nil
 	}
 	info := r.security.info

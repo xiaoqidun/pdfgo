@@ -565,7 +565,7 @@ func (i *Image) HasMask() (bool, error) {
 	if i == nil {
 		return false, fmt.Errorf("missing image")
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return false, os.ErrClosed
 	}
 	if i.ImageMask {
@@ -601,7 +601,7 @@ func (i *Image) HasSoftMaskContext(ctx context.Context) (bool, error) {
 	if i == nil {
 		return false, fmt.Errorf("missing image")
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return false, os.ErrClosed
 	}
 	if i.Stream == nil {
@@ -725,7 +725,7 @@ func (i *Image) JBIG2FileContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if i.ImageMask || i.BitsPerComponent != 1 || normalizeDeviceColorSpace(i.ColorSpace) != Name("DeviceGray") || len(i.Decode) != 0 || i.Stream.Dictionary["Matte"] != nil {
@@ -1345,7 +1345,7 @@ func (i *Image) decodeSamplesRowsContext(ctx context.Context, size image.Point, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if i.Width <= 0 || i.Height <= 0 {
@@ -1877,7 +1877,7 @@ func (i *Image) decodeImageRows(ctx context.Context, target *ImageComponents, sa
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if i.Width <= 0 || i.Height <= 0 {

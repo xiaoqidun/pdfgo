@@ -410,7 +410,7 @@ func pngSampleFormat(ctx context.Context, source image.Image) (int, int, int, er
 		return depth, 1, 0, nil
 	}
 	switch s := source.(type) {
-	case *image.CMYK:
+	case *image.CMYK, *image.YCbCr:
 		return depth, 3, 2, nil
 	case *image.NRGBA, *image.NRGBA64:
 		opaque, err := imageOpaqueContext(ctx, s)

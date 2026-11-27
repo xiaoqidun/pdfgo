@@ -658,7 +658,7 @@ func (r *Reader) Fork(options ForkOptions) *Reader {
 		cache.mu.Lock()
 		defer cache.mu.Unlock()
 	}
-	if r.closed || cache != nil && cache.isClosed() {
+	if r.isClosed() {
 		return &Reader{closed: true}
 	}
 	source := options.Source
@@ -711,7 +711,7 @@ func (r *Reader) Fork(options ForkOptions) *Reader {
 // 入参: page 原阅读器页面
 // 返回: *Page 绑定到当前视图的页面副本
 func (r *Reader) BindPage(page *Page) *Page {
-	if r == nil || r.closed || page == nil {
+	if r == nil || r.isClosed() || page == nil {
 		return nil
 	}
 	if page.reader != nil && !r.ownsObject(page.reader, page.cache) {
@@ -733,7 +733,7 @@ func (r *Reader) WalkPage(ctx context.Context, page *Page, visitor Visitor) erro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if page == nil || page.reader != r {
@@ -900,7 +900,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if r == nil {
 		return fmt.Errorf("invalid Type3 glyph reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visitor.Halftones == nil {
@@ -916,7 +916,7 @@ func (r *Reader) WalkType3Glyph(ctx context.Context, mark TextMark, index int, v
 	if r == nil {
 		return fmt.Errorf("invalid Type3 glyph reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if mark.Mode == 3 {
@@ -2482,7 +2482,7 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 			}
 		}
 		if target != nil {
-			if target.reader == nil || target.reader.closed {
+			if target.reader == nil || target.reader.isClosed() {
 				return fmt.Errorf("reference XObject target reader unavailable")
 			}
 			matches, err := target.reader.ReferenceIDMatches(reference)

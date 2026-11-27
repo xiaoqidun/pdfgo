@@ -626,7 +626,7 @@ func (r *Reader) ReadThreeDViewBox(annotation Annotation) (Rectangle, error) {
 	if r == nil {
 		return Rectangle{}, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return Rectangle{}, os.ErrClosed
 	}
 	if annotation.Subtype != "3D" {

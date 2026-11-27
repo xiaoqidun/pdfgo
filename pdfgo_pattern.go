@@ -80,7 +80,7 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if p.reader.closed {
+	if p.reader.isClosed() {
 		return os.ErrClosed
 	}
 	if p.empty {
@@ -147,7 +147,7 @@ func (p *pageInterpreter) tilingPattern(name Name) (*TilingPattern, error) {
 	if err := p.ctx.Err(); err != nil {
 		return nil, err
 	}
-	if p.reader.closed {
+	if p.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if p.tilings != nil {

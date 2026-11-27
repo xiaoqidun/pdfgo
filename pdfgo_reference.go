@@ -114,7 +114,7 @@ func (r *Reader) WalkPageLabelRanges(ctx context.Context, visit func(PageLabelRa
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {
@@ -255,7 +255,7 @@ func (r *Reader) ReferenceIDMatches(reference ReferenceXObject) (bool, error) {
 	if r == nil {
 		return false, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return false, os.ErrClosed
 	}
 	if len(reference.ID) == 0 {
@@ -282,10 +282,43 @@ func (r *Reader) ReferenceIDMatches(reference ReferenceXObject) (bool, error) {
 	return true, nil
 }
 
-// referencePage 绘制目标页面及其可打印注解外观，保留引用表单的变换与裁剪
+// referencePage 重置目标页面独立初始图形状态并绘制内容及可打印注解外观，保留引用表单的变换、裁剪及外层透明合成属性
 // 入参: page 目标页面
 // 返回: error 内容、注解或访问错误
 func (p *pageInterpreter) referencePage(page *Page) error {
+	prev := p.state
+	p.state = graphicsState{
+		matrix: prev.matrix,
+		hscale: 1,
+		style: Style{
+			Clips:        prev.style.Clips,
+			LineWidth:    1,
+			MiterLimit:   10,
+			BlendMode:    prev.style.BlendMode,
+			AlphaIsShape: prev.style.AlphaIsShape,
+			SoftMask:     prev.style.SoftMask,
+		},
+	}
+	p.textMatrix, p.lineMatrix = Identity(), Identity()
+	if p.uncoloredPattern || p.uncoloredType3 {
+		p.state.style.Fill, p.state.style.Stroke = prev.style.Fill, prev.style.Stroke
+		p.state.fillSpace, p.state.strokeSpace = prev.fillSpace, prev.strokeSpace
+		p.state.fillPatternBase, p.state.strokePatternBase = prev.fillPatternBase, prev.strokePatternBase
+		p.state.fillICC, p.state.strokeICC = prev.fillICC, prev.strokeICC
+		p.state.fillICCValues, p.state.strokeICCValues = prev.fillICCValues, prev.strokeICCValues
+		p.state.fillSeparation, p.state.strokeSeparation = prev.fillSeparation, prev.strokeSeparation
+		p.state.fillDeviceN, p.state.strokeDeviceN = prev.fillDeviceN, prev.strokeDeviceN
+		p.state.fillColor, p.state.strokeColor = prev.fillColor, prev.strokeColor
+	} else {
+		p.state.fillSpace, p.state.strokeSpace = "DeviceGray", "DeviceGray"
+		p.state.style.Fill = Paint{SourceSpace: "DeviceGray", Alpha: prev.style.Fill.Alpha}
+		p.state.style.Stroke = Paint{SourceSpace: "DeviceGray", Alpha: prev.style.Stroke.Alpha}
+		for _, operator := range []string{"g", "G"} {
+			if err := p.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
+				return err
+			}
+		}
+	}
 	initial := *p
 	data, err := page.readContentBytes(p.ctx)
 	if err != nil {

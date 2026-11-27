@@ -68,7 +68,7 @@ func (r *Reader) ReadOpenAction(ctx context.Context) (OpenAction, error) {
 	if err := ctx.Err(); err != nil {
 		return OpenAction{}, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return OpenAction{}, os.ErrClosed
 	}
 	catalog, err := r.catalogDictionary()
@@ -107,7 +107,7 @@ func (r *Reader) ReadDocumentTriggers(ctx context.Context) ([]ActionTrigger, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	catalog, err := r.catalogDictionary()
@@ -136,7 +136,7 @@ func (r *Reader) ReadPageTriggers(ctx context.Context, page *Page) ([]ActionTrig
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if page == nil {
@@ -158,7 +158,7 @@ func (r *Reader) readAdditionalActions(ctx context.Context, object Object, event
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	value, err := r.Resolve(object)

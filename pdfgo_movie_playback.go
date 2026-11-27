@@ -41,7 +41,7 @@ func (r *Reader) ReadMoviePlayback(ctx context.Context, page *Page, object Objec
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return result, os.ErrClosed
 	}
 	if page == nil || page.reader != r {

@@ -66,7 +66,7 @@ func (r *Reader) WalkActions(ctx context.Context, object Object, visit func(Acti
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {
@@ -196,7 +196,7 @@ func (r *Reader) actionDictionary(ctx context.Context, object Object, kind Name)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	value, err := r.Resolve(object)

@@ -46,7 +46,7 @@ func (r *Reader) WalkOutlines(ctx context.Context, visit func(int, OutlineItem) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {

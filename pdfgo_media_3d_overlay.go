@@ -100,7 +100,7 @@ func (r *Reader) WalkThreeDOverlay(ctx context.Context, page *Page, source Three
 	if r == nil {
 		return fmt.Errorf("3D overlay reader unavailable")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if page == nil || page.reader != r {

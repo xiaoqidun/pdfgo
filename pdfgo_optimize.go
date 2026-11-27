@@ -260,7 +260,7 @@ func (r *Reader) rewriteTo(ctx context.Context, writer io.Writer, options Optimi
 	if r == nil || ctx == nil {
 		return report, fmt.Errorf("invalid PDF optimize context")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return report, os.ErrClosed
 	}
 	if err := options.Compression.Validate(); err != nil {

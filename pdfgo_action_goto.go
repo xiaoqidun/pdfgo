@@ -60,7 +60,7 @@ func (r *Reader) ReadExternalGoToAction(ctx context.Context, object Object) (Ext
 	if err := ctx.Err(); err != nil {
 		return ExternalGoToAction{}, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return ExternalGoToAction{}, os.ErrClosed
 	}
 	value, err := r.Resolve(object)
@@ -213,7 +213,7 @@ func (r *Reader) ResolveRemoteDestination(ctx context.Context, remote RemoteDest
 	if err := ctx.Err(); err != nil {
 		return Destination{}, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return Destination{}, os.ErrClosed
 	}
 	var destination Destination

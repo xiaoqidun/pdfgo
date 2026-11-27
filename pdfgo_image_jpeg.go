@@ -492,7 +492,7 @@ func (i *Image) JPEGFileContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	colorSpace := normalizeDeviceColorSpace(i.ColorSpace)

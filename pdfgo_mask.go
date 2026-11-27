@@ -66,7 +66,7 @@ func (m *SoftMask) Walk(ctx context.Context, visitor Visitor) error {
 	if m == nil || m.stream == nil || m.interpreter.reader == nil {
 		return fmt.Errorf("invalid soft mask group")
 	}
-	if m.interpreter.reader.closed {
+	if m.interpreter.reader.isClosed() {
 		return os.ErrClosed
 	}
 	p := m.interpreter

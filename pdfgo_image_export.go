@@ -30,7 +30,7 @@ func (i *Image) EncodePNG(ctx context.Context, writer io.Writer) error {
 	if ctx == nil || writer == nil || i == nil || i.Stream == nil || i.reader == nil {
 		return fmt.Errorf("missing image export context, writer or source")
 	}
-	if i.reader.closed {
+	if i.reader.isClosed() {
 		return os.ErrClosed
 	}
 	_, err := i.decodeImageOutput(ctx, nil, false, image.Point{}, writer)

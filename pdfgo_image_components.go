@@ -57,7 +57,7 @@ func (i *Image) ColorSpaceFamily() (Name, error) {
 	if i == nil || i.reader == nil {
 		return "", fmt.Errorf("invalid image reader")
 	}
-	if i.reader.closed {
+	if i.reader.isClosed() {
 		return "", os.ErrClosed
 	}
 	if i.ImageMask {
@@ -89,7 +89,7 @@ func (i *Image) ColorSpaceComponents() (int, error) {
 	if i == nil || i.reader == nil {
 		return 0, fmt.Errorf("invalid image reader")
 	}
-	if i.reader.closed {
+	if i.reader.isClosed() {
 		return 0, os.ErrClosed
 	}
 	if i.ImageMask {
@@ -272,7 +272,7 @@ func (i *Image) colorantSpace() (Object, error) {
 	if i == nil {
 		return nil, fmt.Errorf("invalid image reader")
 	}
-	if i.reader != nil && i.reader.closed {
+	if i.reader != nil && i.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if i.ImageMask {

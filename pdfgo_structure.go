@@ -84,7 +84,7 @@ func (r *Reader) StructureContent(item StructureItem) (StructureContent, error) 
 	if r == nil {
 		return StructureContent{}, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return StructureContent{}, os.ErrClosed
 	}
 	var result StructureContent
@@ -212,7 +212,7 @@ func (r *Reader) ResolveStructureRole(ctx context.Context, tag Name, accepts fun
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return "", false, os.ErrClosed
 	}
 	if accepts == nil {
@@ -271,7 +271,7 @@ func (r *Reader) WalkStructure(ctx context.Context, visit func(int, StructureIte
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {
@@ -371,7 +371,7 @@ func (r *Reader) StructureAttributes(ctx context.Context, item StructureItem) ([
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if item.Type != "StructElem" || item.Dictionary == nil {
@@ -484,7 +484,7 @@ func (r *Reader) WalkStructureIDs(ctx context.Context, visit func(string, Struct
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {
@@ -529,7 +529,7 @@ func (r *Reader) WalkStructureParents(ctx context.Context, visit func(StructureP
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {

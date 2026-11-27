@@ -84,7 +84,7 @@ func (r *Reader) newOptionalContentEvaluator(ctx context.Context) (*optionalCont
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, false, os.ErrClosed
 	}
 	root, err := r.optionalDictionary(r.Trailer["Root"])
@@ -522,7 +522,7 @@ func (e *optionalContentEvaluator) groupState(currentRef Reference, group Dictio
 			if e.steps > maxOptionalContentSteps {
 				return false, fmt.Errorf("%w: optional content evaluation step limit exceeded", ErrStreamLimitExceeded)
 			}
-			if e.configIntentSet[x] {
+			if e.configIntentSet[x] || x == Name("All") && len(e.configIntentSet) > 0 {
 				match = true
 				break
 			}

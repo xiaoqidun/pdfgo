@@ -34,7 +34,7 @@ func rewriteFile(ctx context.Context, r *Reader, file FileSpecification, result 
 		if !r.ownsObject(embedded.reader, embedded.cache) {
 			source = embedded.reader
 		}
-		if source != nil && source.closed {
+		if source != nil && source.isClosed() {
 			return Reference{}, os.ErrClosed
 		}
 		copier := rewriteObjectCopy{ctx: ctx, source: source, objects: result, number: number, copied: make(map[rewriteObjectIdentity]Reference)}

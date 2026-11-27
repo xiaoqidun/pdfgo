@@ -970,7 +970,7 @@ func (r *Reader) CreateImage(ctx context.Context, source image.Image, options Im
 	if ctx == nil || r == nil {
 		return nil, fmt.Errorf("invalid image creation context")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if err := ctx.Err(); err != nil {

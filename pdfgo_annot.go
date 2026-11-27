@@ -168,7 +168,7 @@ func (p *Page) AnnotationsContext(ctx context.Context) ([]Annotation, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if p.reader.closed {
+	if p.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	value, err := p.reader.Resolve(p.Dictionary["Annots"])
@@ -391,7 +391,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if page == nil || page.reader != r {
@@ -599,7 +599,7 @@ func (r *Reader) ReadField(annotation Annotation) (Dictionary, error) {
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if annotation.Subtype != "Widget" {
@@ -672,7 +672,7 @@ func (r *Reader) BaseURI() (string, error) {
 	if r == nil {
 		return "", fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return "", os.ErrClosed
 	}
 	root, err := r.Resolve(r.Trailer["Root"])

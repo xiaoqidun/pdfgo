@@ -71,7 +71,7 @@ func rewriteSound(ctx context.Context, r *Reader, sound Sound, result map[Refere
 	if !r.ownsObject(stream.reader, stream.cache) {
 		source = stream.reader
 	}
-	if source != nil && source.closed {
+	if source != nil && source.isClosed() {
 		return nil, os.ErrClosed
 	}
 	copier := rewriteObjectCopy{ctx: ctx, source: source, objects: result, number: number, copied: make(map[rewriteObjectIdentity]Reference)}

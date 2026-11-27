@@ -158,7 +158,7 @@ func (r *Reader) ReadRedactionRegions(ctx context.Context, annotation Annotation
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if ctx == nil {

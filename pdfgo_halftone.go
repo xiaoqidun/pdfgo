@@ -181,7 +181,7 @@ func (r *Reader) ReadHalftone(ctx context.Context, object Object) (*Halftone, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	ref, indirect := object.(Reference)
@@ -210,7 +210,7 @@ func (r *Reader) ReadHalftoneForDevice(ctx context.Context, object Object, named
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if len(named) == 0 {
@@ -644,7 +644,7 @@ func (h *Halftone) identityTransferContext(ctx context.Context, reader *Reader) 
 		if r == nil {
 			return false, fmt.Errorf("missing halftone reader")
 		}
-		if r.closed {
+		if r.isClosed() {
 			return false, os.ErrClosed
 		}
 		if node.TransferFunction != nil {

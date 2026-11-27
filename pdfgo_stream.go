@@ -1765,7 +1765,7 @@ func (r *Reader) DecodeStreamContext(ctx context.Context, stream *Stream) ([]byt
 	if r == nil {
 		return nil, fmt.Errorf("invalid stream reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if stream == nil {
@@ -1796,7 +1796,7 @@ func (s *Stream) DecodeContext(ctx context.Context) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s.cache != nil && (s.cache.closed.Load() || (s.cache.origin != nil && s.cache.origin.closed.Load())) {
+	if s.cache != nil && s.cache.isClosed() {
 		return nil, os.ErrClosed
 	}
 	shared := s.cache != nil && s.cache.shared.Load()

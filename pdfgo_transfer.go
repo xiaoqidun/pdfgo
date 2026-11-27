@@ -61,7 +61,7 @@ func (r *Reader) readTransferFunctionContext(ctx context.Context, object Object)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	value, err := r.Resolve(object)
@@ -121,7 +121,7 @@ func (r *Reader) DeviceTransfer(fallback *TransferFunction, halftone *Halftone, 
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	var colorants [4]Name
@@ -202,7 +202,7 @@ func (r *Reader) ColorantTransfer(fallback *TransferFunction, halftone *Halftone
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if colorant == "" || colorant == "All" || colorant == "None" || colorant == "Default" {
@@ -288,7 +288,7 @@ func (r *Reader) halftoneTransferContext(ctx context.Context, h *Halftone) (*Tra
 	if r == nil {
 		return nil, false, fmt.Errorf("missing halftone reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, false, os.ErrClosed
 	}
 	value, err := r.Resolve(h.TransferFunction)

@@ -123,7 +123,7 @@ func (r *Reader) ReadThreeDMeasurements(ctx context.Context, object Object) ([]T
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	value, err := r.Resolve(object)
@@ -180,7 +180,7 @@ func (r *Reader) ReadThreeDMeasurement(object Object) (ThreeDMeasurement, error)
 	if r == nil {
 		return result, fmt.Errorf("invalid 3D measurement reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return result, os.ErrClosed
 	}
 	budget := newTextStringBudget(r)

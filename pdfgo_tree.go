@@ -32,7 +32,7 @@ func (r *Reader) WalkNameTree(ctx context.Context, root Object, visit func(strin
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {
@@ -158,7 +158,7 @@ func (r *Reader) WalkNumberTree(ctx context.Context, root Object, visit func(int
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {
@@ -369,7 +369,7 @@ func (r *Reader) LookupNumberTree(ctx context.Context, root Object, key int64) (
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, false, os.ErrClosed
 	}
 	seenRefs := make(map[Reference]bool)
@@ -904,7 +904,7 @@ func (r *Reader) WalkEmbeddedFiles(ctx context.Context, visit func(string, FileS
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {
@@ -938,7 +938,7 @@ func (r *Reader) catalogDictionary() (Dictionary, error) {
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	value, err := r.Resolve(r.Trailer["Root"])

@@ -73,7 +73,7 @@ func (f *Font) GlyphFontContext(ctx context.Context, glyphs []GlyphWidth) (*Font
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if f.reader.closed {
+	if f.reader.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if len(f.Program) == 0 || len(glyphs) == 0 {

@@ -91,7 +91,7 @@ func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options Halft
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	if h == nil {
@@ -130,7 +130,7 @@ func (r *Reader) CompileHalftone(ctx context.Context, h *Halftone, options Halft
 		defer forked.Close()
 		r = forked
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	return r.compileHalftone(ctx, h, options, transferReader, requireTransfer)

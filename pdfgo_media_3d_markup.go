@@ -44,7 +44,7 @@ func (r *Reader) ThreeDArtworkChecksum(ctx context.Context, stream *Stream) ([16
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return result, os.ErrClosed
 	}
 	if stream == nil {
@@ -88,7 +88,7 @@ func (m ThreeDMarkup) MatchesView(view Dictionary) bool {
 	if reflect.ValueOf(m.View).Pointer() == target {
 		return true
 	}
-	if m.ViewReference != (Reference{}) && m.reader != nil && !m.reader.closed {
+	if m.ViewReference != (Reference{}) && m.reader != nil && !m.reader.isClosed() {
 		if resolved, err := m.reader.Object(m.ViewReference); err == nil {
 			if dict, ok := resolved.(Dictionary); ok && dict != nil {
 				return reflect.ValueOf(dict).Pointer() == target
@@ -116,7 +116,7 @@ func (r *Reader) ReadThreeDMarkups(ctx context.Context, annotations []Annotation
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	var result []*ThreeDMarkup

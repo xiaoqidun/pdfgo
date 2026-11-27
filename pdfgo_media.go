@@ -64,7 +64,7 @@ func (r *Reader) ReadFileData(ctx context.Context, file FileSpecification, resol
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	var data []byte

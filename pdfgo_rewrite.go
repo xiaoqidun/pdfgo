@@ -132,7 +132,7 @@ func (r *Reader) RewriteTo(ctx context.Context, writer io.Writer, options Rewrit
 	if r == nil || ctx == nil {
 		return OptimizeReport{}, fmt.Errorf("invalid PDF rewrite context")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return OptimizeReport{}, os.ErrClosed
 	}
 	if err := ctx.Err(); err != nil {

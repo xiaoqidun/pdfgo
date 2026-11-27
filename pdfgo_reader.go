@@ -274,6 +274,9 @@ func NewReaderWithOptions(source io.ReaderAt, size int64, options ReaderOptions)
 		if err != nil {
 			return nil, err
 		}
+		if space.profile == nil || space.profile.lab {
+			return nil, fmt.Errorf("invalid device color profile")
+		}
 		deviceProfile = &Stream{Dictionary: Dictionary{"N": Integer(space.Components())}, Data: bytes.Clone(options.DeviceColorProfile)}
 	}
 	data := make([]byte, min(size, 1024))
@@ -700,7 +703,13 @@ func (r *Reader) setXrefEntry(number int64, entry xrefEntry) {
 	r.xref[number] = entry
 }
 
-// Close 释放源数据、缓存与解密密钥并关闭Open持有的文件（不关闭NewReader外部源，可重复调用），关闭后读取方法及关联流均返回os.ErrClosed，共享底层os.File的Fork视图随之失效
+// isClosed 判断阅读器自身或共享源缓存是否已关闭，支持派生视图并发安全检查
+// 返回: bool 是否已关闭
+func (r *Reader) isClosed() bool {
+	return r != nil && (r.closed || r.cache != nil && r.cache.isClosed())
+}
+
+// Close 释放源数据、缓存与解密密钥并关闭Open持有的文件（不关闭NewReader外部源，可重复调用），关闭后读取方法、关联流及派生Fork视图均返回os.ErrClosed
 // 返回: error 关闭错误
 func (r *Reader) Close() error {
 	if r == nil {
@@ -791,7 +800,7 @@ func (r *Reader) resolve(object Object, embedded bool) (Object, error) {
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	ref, ok := object.(Reference)
@@ -851,7 +860,7 @@ func (r *Reader) object(ref Reference, embedded bool) (Object, error) {
 	if r == nil {
 		return nil, fmt.Errorf("invalid reader")
 	}
-	if r.closed {
+	if r.isClosed() {
 		return nil, os.ErrClosed
 	}
 	useEmbedded := embedded && r.security != nil && r.security.embeddedFilter != r.security.streamFilter

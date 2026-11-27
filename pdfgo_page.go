@@ -63,7 +63,7 @@ func (r *Reader) WalkPages(ctx context.Context, visit func(int, *Page) error) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if r.closed {
+	if r.isClosed() {
 		return os.ErrClosed
 	}
 	if visit == nil {
@@ -256,7 +256,7 @@ func (p *Page) WriteContent(ctx context.Context, writer io.Writer) (int64, error
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if p.reader.closed {
+	if p.reader.isClosed() {
 		return 0, os.ErrClosed
 	}
 	value, err := p.reader.Resolve(p.Dictionary["Contents"])
