@@ -26,7 +26,7 @@ import (
 
 // TextReplacement 为连续文字对象指定整段原文，不改变绘制操作及字体编码
 // First为页面合并内容流中从零开始的BT序号，Count须大于零，不包含表单内部文字对象
-// Text使用UTF-8，允许为空；区段不得重叠、跨越已有内容标记边界或位于已有ActualText内部
+// Text使用UTF-8，允许为空；区段不得重叠、跨越已有内容标记边界，也不得位于已有ActualText内部或包含已有ActualText
 type TextReplacement struct {
 	First int
 	Count int
@@ -240,6 +240,9 @@ func (r *Reader) replaceContentText(ctx context.Context, data []byte, resources 
 		case "BMC", "BDC", "EMC", "MP", "DP":
 			if err := p.markedContent(op); err != nil {
 				return err
+			}
+			if replacing && p.replacement != nil {
+				return fmt.Errorf("PDF text replacement contains ActualText")
 			}
 			if op.Operator == "BMC" || op.Operator == "BDC" {
 				frames = append(frames, op.Offset)

@@ -1054,16 +1054,30 @@ func (r *Reader) jpxColorSpace(ctx context.Context, data []byte, dict Dictionary
 				}
 				continue
 			}
-			components := map[string]Integer{"GRAY": 1, "RGB ": 3, "CMYK": 4}[string(profile[16:20])]
+			model := string(profile[16:20])
+			components := map[string]Integer{"GRAY": 1, "RGB ": 3, "CMYK": 4, "Lab ": 3}[model]
 			if components == 0 || r == nil {
 				continue
 			}
-			space := Array{Name("ICCBased"), &Stream{Dictionary: Dictionary{"N": components}, Data: profile, reader: r, cache: r.cache, hasWarning: r.warning != nil}}
-			if _, err := r.readICCSourceSpaceContext(ctx, space, false); err == nil {
-				return space, false, nil
-			} else if ctx.Err() != nil {
-				return nil, false, ctx.Err()
+			profile = bytes.Clone(profile)
+			parsed, err := r.readICCProfileData(profile, int(components))
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, false, ctx.Err()
+				}
+				if isFatalReaderError(err) {
+					return nil, false, err
+				}
+				continue
 			}
+			if parsed == nil {
+				continue
+			}
+			streamDict := Dictionary{"N": components}
+			if model == "Lab " {
+				streamDict["Range"] = Array{Integer(0), Integer(100), Integer(-128), Integer(127), Integer(-128), Integer(127)}
+			}
+			return Array{Name("ICCBased"), &Stream{Dictionary: streamDict, Data: profile, reader: r, cache: r.cache, hasWarning: r.warning != nil}}, false, nil
 		}
 	}
 	if definitions != nil {

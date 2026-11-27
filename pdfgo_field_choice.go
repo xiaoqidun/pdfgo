@@ -227,44 +227,64 @@ func (r *Reader) readChoiceFieldContext(ctx context.Context, field Dictionary) (
 	if err != nil {
 		return result, err
 	}
+	resolveFromValues := value == nil
 	if value != nil {
-		indices, ok := value.(Array)
-		if !ok {
-			return result, fmt.Errorf("invalid choice selection indices")
-		}
-		if len(indices) > 1 && !result.MultiSelect {
+		var selected []int
+		var selectedValues []string
+		valid := false
+		if indices, ok := value.(Array); ok && (len(indices) <= 1 || result.MultiSelect) {
+			previous := Integer(-1)
+			selected = make([]int, 0, len(indices))
+			selectedValues = make([]string, 0, len(indices))
+			valid = true
+			for _, object := range indices {
+				if err := ctx.Err(); err != nil {
+					return result, err
+				}
+				item, err := r.Resolve(object)
+				if err != nil {
+					if !hasValue || isFatalReaderError(err) {
+						return result, err
+					}
+					valid = false
+					break
+				}
+				index, ok := item.(Integer)
+				if !ok || index <= previous || index < 0 || index >= Integer(len(options)) {
+					valid = false
+					break
+				}
+				previous = index
+				selected = append(selected, int(index))
+				selectedValues = append(selectedValues, result.Options[index].Value)
+			}
+		} else if !hasValue {
+			if _, ok := value.(Array); !ok {
+				return result, fmt.Errorf("invalid choice selection indices")
+			}
 			return result, fmt.Errorf("multiple indices in single choice field")
 		}
-		previous := Integer(-1)
-		selectedValues := make([]string, 0, len(indices))
-		for _, object := range indices {
-			if err := ctx.Err(); err != nil {
-				return result, err
-			}
-			value, err := r.Resolve(object)
-			if err != nil {
-				return result, err
-			}
-			index, ok := value.(Integer)
-			if !ok || index <= previous || index < 0 || index >= Integer(len(options)) {
+		if !valid {
+			if !hasValue {
 				return result, fmt.Errorf("invalid choice selection index")
 			}
-			previous = index
-			result.Selected = append(result.Selected, int(index))
-			selectedValues = append(selectedValues, result.Options[index].Value)
-		}
-		if hasValue {
+			resolveFromValues = true
+		} else if hasValue {
 			values := slices.Clone(result.Values)
 			expected := slices.Clone(selectedValues)
 			slices.Sort(values)
 			slices.Sort(expected)
-			if !slices.Equal(values, expected) && !(len(values) == 1 && len(expected) == 0 && (values[0] == "" || result.Editable)) {
-				return result, fmt.Errorf("choice values and indices differ")
+			if slices.Equal(values, expected) {
+				result.Selected = selected
+			} else {
+				resolveFromValues = true
 			}
 		} else {
+			result.Selected = selected
 			result.Values = selectedValues
 		}
-	} else {
+	}
+	if resolveFromValues {
 		for _, text := range result.Values {
 			if err := ctx.Err(); err != nil {
 				return result, err

@@ -55,19 +55,19 @@ type tilingPatternCache struct {
 
 // patternBaseColor 按底层颜色空间解释无色图案的颜色分量
 // 入参: paint 当前画刷, space 底层色空间, operands 颜色分量, intent 渲染意图
-// 返回: error 分量或颜色转换错误
-func patternBaseColor(paint *Paint, space *patternColorSpace, operands []Object, intent Name) error {
+// 返回: []float64 解析后的底层分量, error 分量或颜色转换错误
+func patternBaseColor(paint *Paint, space *patternColorSpace, operands []Object, intent Name) ([]float64, error) {
 	values, err := numbers(operands, space.components)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	base, err := space.convert(values, intent)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	base.Alpha = paint.Alpha
 	*paint = base
-	return nil
+	return values, nil
 }
 
 // Walk 独立解释图案单元内容，保留图案边界与无色图案的基色
@@ -117,6 +117,7 @@ func (p *TilingPattern) Walk(ctx context.Context, base Paint, visitor Visitor) e
 		child.state.style.Fill, child.state.style.Stroke = base, base
 		child.state.fillSpace, child.state.strokeSpace = "DeviceRGB", "DeviceRGB"
 		child.state.fillICC, child.state.strokeICC = nil, nil
+		child.state.fillICCValues, child.state.strokeICCValues = [4]float64{}, [4]float64{}
 		child.state.fillSeparation, child.state.strokeSeparation = nil, nil
 		child.state.fillDeviceN, child.state.strokeDeviceN = nil, nil
 		child.state.fillColor, child.state.strokeColor = nil, nil

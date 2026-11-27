@@ -1125,6 +1125,26 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 		}
 		return true, ctx.Err()
 	}
+	resolveFormResources := func(stream *Stream, fallback Dictionary) (Dictionary, error) {
+		res := fallback
+		if stream.Dictionary["Resources"] != nil {
+			resVal, err := r.Resolve(stream.Dictionary["Resources"])
+			if err != nil {
+				if isFatalOptimizationReadError(ctx, err) {
+					return nil, err
+				}
+				return nil, errUnsafe
+			}
+			if resVal != nil {
+				dict, ok := resVal.(Dictionary)
+				if !ok {
+					return nil, errUnsafe
+				}
+				res = dict
+			}
+		}
+		return res, nil
+	}
 	markType3Fonts := func(res Dictionary, target map[Reference]bool, seenRes map[uintptr]Dictionary, budget *int) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1389,21 +1409,16 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 						return errUnsafe
 					}
 				} else if sub == Name("Form") {
-					fResVal, err := r.Resolve(s.Dictionary["Resources"])
+					fRes, err := resolveFormResources(s, res)
 					if err != nil {
-						if isFatalOptimizationReadError(ctx, err) {
-							return err
-						}
-						continue
+						return err
 					}
-					if fRes, ok := fResVal.(Dictionary); ok {
-						ok, err := markResourcesUnsafe(fRes, target, map[Reference]bool{xref: true}, 0)
-						if err != nil {
-							return err
-						}
-						if !ok {
-							return errUnsafe
-						}
+					ok, err := markResourcesUnsafe(fRes, target, map[Reference]bool{xref: true}, 0)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return errUnsafe
 					}
 				}
 			}
@@ -1865,26 +1880,6 @@ func (r *Reader) imageOutputSizes(ctx context.Context, dpi int) (map[Reference]i
 			return err
 		}
 		return walkPatterns(resources, initialMatrix, depth, budget, collector, localUnsafe, type3Seen)
-	}
-	resolveFormResources := func(stream *Stream, fallback Dictionary) (Dictionary, error) {
-		res := fallback
-		if stream.Dictionary["Resources"] != nil {
-			resVal, err := r.Resolve(stream.Dictionary["Resources"])
-			if err != nil {
-				if isFatalOptimizationReadError(ctx, err) {
-					return nil, err
-				}
-				return nil, errUnsafe
-			}
-			if resVal != nil {
-				dict, ok := resVal.(Dictionary)
-				if !ok {
-					return nil, errUnsafe
-				}
-				res = dict
-			}
-		}
-		return res, nil
 	}
 	walkAnnotationStream := func(page *Page, unit float64, rect Rectangle, rectValid bool, apStream *Stream) error {
 		apRes, err := resolveFormResources(apStream, page.Resources)

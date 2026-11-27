@@ -130,12 +130,15 @@ func fontCmapContext(ctx context.Context, data []byte, symbolic bool, warning fu
 			}
 			if platform == 0 && encoding != 5 {
 				priority = 1
+				if encoding == 4 {
+					priority = 2
+				}
 			}
 			if platform == 3 && encoding == 1 {
 				priority = 3
 			}
 			if platform == 3 && encoding == 10 {
-				priority = 2
+				priority = 4
 			}
 		}
 		if priority >= 0 {

@@ -253,7 +253,7 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 	unsafeMetadata := false
 	ended := false
 	var density, iccpChunk, gamaChunk, chrmChunk []byte
-	srgbChunk, hdrColor, hasExif := false, false, false
+	srgbChunk, hdrColor, hasMetadata := false, false, false
 	imageData := false
 	imageDataEnded := false
 	palette := false
@@ -309,6 +309,7 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 			plain = false
 		}
 		switch kind {
+		case "IHDR", "IDAT", "IEND", "PLTE", "tRNS":
 		case "pHYs":
 			if n != 9 || density != nil || imageData || raw[16] > 1 || binary.BigEndian.Uint32(raw[8:]) > math.MaxInt32 || binary.BigEndian.Uint32(raw[12:]) > math.MaxInt32 {
 				return nil, fmt.Errorf("invalid PNG physical dimensions")
@@ -324,8 +325,8 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 			chrmChunk = raw[8 : len(raw)-4]
 		case "cICP", "mDCV", "cLLI":
 			hdrColor = true
-		case "eXIf":
-			hasExif = true
+		default:
+			hasMetadata = true
 		}
 		imageDataEnded = imageDataEnded || imageData && kind != "IDAT"
 		imageData = imageData || kind == "IDAT"
@@ -458,7 +459,7 @@ func optimizePNGSource(ctx context.Context, data []byte, options CompressionOpti
 			return nil, err
 		}
 		before := image.Pt(config.Width, config.Height)
-		if resource && !hdrColor && !hasExif {
+		if resource && !hdrColor && !hasMetadata {
 			photo, err := photographicImage(ctx, img)
 			if err != nil {
 				return nil, err

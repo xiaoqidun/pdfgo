@@ -289,33 +289,39 @@ func (r *Reader) annotationAppearanceStream(appearance Dictionary, selected Obje
 	return stream, nil
 }
 
-// annotationAppearanceTransform 校验外观流边界与矩阵并计算映射到注解区域的变换
-// 入参: stream 外观流, rect 注解区域
-// 返回: Matrix 页面映射变换, error 读取或无效外观错误
-func (r *Reader) annotationAppearanceTransform(stream *Stream, rect Rectangle) (Matrix, error) {
-	bounds, err := r.Resolve(stream.Dictionary["BBox"])
-	if err != nil {
-		return Matrix{}, err
+// annotationAppearanceTransform 校验外观流边界与矩阵并计算映射到注解区域的变换与包围盒
+// 入参: stream 外观流, rect 注解区域, noRotate 是否应用页面逆向旋转补偿, rotation 页面旋转角度
+// 返回: Matrix 页面映射变换, Rectangle 变换后包围盒, error 读取或无效外观错误
+func (r *Reader) annotationAppearanceTransform(stream *Stream, rect Rectangle, noRotate bool, rotation int) (Matrix, Rectangle, error) {
+	if rect.XMin > rect.XMax {
+		rect.XMin, rect.XMax = rect.XMax, rect.XMin
 	}
-	box, err := r.rectangle(bounds)
+	if rect.YMin > rect.YMax {
+		rect.YMin, rect.YMax = rect.YMax, rect.YMin
+	}
+	bboxValue, err := r.Resolve(stream.Dictionary["BBox"])
+	if err != nil {
+		return Matrix{}, Rectangle{}, err
+	}
+	box, err := r.rectangle(bboxValue)
 	if err != nil {
 		if isFatalReaderError(err) {
-			return Matrix{}, err
+			return Matrix{}, Rectangle{}, err
 		}
-		return Matrix{}, fmt.Errorf("%w: invalid appearance bounds", ErrInvalidAnnotationAppearance)
+		return Matrix{}, Rectangle{}, fmt.Errorf("%w: invalid appearance bounds", ErrInvalidAnnotationAppearance)
 	}
 	matrix := Identity()
 	value, err := r.Resolve(stream.Dictionary["Matrix"])
 	if err != nil {
-		return Matrix{}, err
+		return Matrix{}, Rectangle{}, err
 	}
 	if value != nil {
 		values, err := r.numberArray(value, 6)
 		if err != nil {
 			if isFatalReaderError(err) {
-				return Matrix{}, err
+				return Matrix{}, Rectangle{}, err
 			}
-			return Matrix{}, fmt.Errorf("%w: invalid appearance matrix", ErrInvalidAnnotationAppearance)
+			return Matrix{}, Rectangle{}, fmt.Errorf("%w: invalid appearance matrix", ErrInvalidAnnotationAppearance)
 		}
 		matrix = Matrix(values)
 	}
@@ -326,14 +332,45 @@ func (r *Reader) annotationAppearanceTransform(stream *Stream, rect Rectangle) (
 		maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
 	}
 	if math.IsInf(minX, 0) || math.IsInf(minY, 0) || math.IsInf(maxX, 0) || math.IsInf(maxY, 0) || math.IsNaN(minX) || math.IsNaN(minY) || math.IsNaN(maxX) || math.IsNaN(maxY) || minX == maxX || minY == maxY {
-		return Matrix{}, fmt.Errorf("%w: invalid appearance bounds", ErrInvalidAnnotationAppearance)
+		return Matrix{}, Rectangle{}, fmt.Errorf("%w: invalid appearance bounds", ErrInvalidAnnotationAppearance)
 	}
-	scaleX, scaleY := (rect.XMax-rect.XMin)/(maxX-minX), (rect.YMax-rect.YMin)/(maxY-minY)
-	tx, ty := rect.XMin-minX*scaleX, rect.YMin-minY*scaleY
+	target := rect
+	bounds := rect
+	var compensate Matrix
+	rotated := false
+	if noRotate {
+		w, h := rect.XMax-rect.XMin, rect.YMax-rect.YMin
+		switch (rotation%360 + 360) % 360 {
+		case 90:
+			target = Rectangle{0, 0, w, h}
+			compensate = Matrix{0, 1, -1, 0, rect.XMin + h, rect.YMax}
+			bounds = Rectangle{rect.XMin, rect.YMax, rect.XMin + h, rect.YMax + w}
+			rotated = true
+		case 180:
+			target = Rectangle{0, 0, w, h}
+			compensate = Matrix{-1, 0, 0, -1, rect.XMin, rect.YMax + h}
+			bounds = Rectangle{rect.XMin - w, rect.YMax, rect.XMin, rect.YMax + h}
+			rotated = true
+		case 270:
+			target = Rectangle{0, 0, w, h}
+			compensate = Matrix{0, -1, 1, 0, rect.XMin - h, rect.YMax}
+			bounds = Rectangle{rect.XMin - h, rect.YMax - w, rect.XMin, rect.YMax}
+			rotated = true
+		}
+	}
+	scaleX, scaleY := (target.XMax-target.XMin)/(maxX-minX), (target.YMax-target.YMin)/(maxY-minY)
+	tx, ty := target.XMin-minX*scaleX, target.YMin-minY*scaleY
 	if math.IsInf(scaleX, 0) || math.IsNaN(scaleX) || scaleX == 0 || math.IsInf(scaleY, 0) || math.IsNaN(scaleY) || scaleY == 0 || math.IsInf(tx, 0) || math.IsNaN(tx) || math.IsInf(ty, 0) || math.IsNaN(ty) {
-		return Matrix{}, fmt.Errorf("%w: invalid appearance transform", ErrInvalidAnnotationAppearance)
+		return Matrix{}, Rectangle{}, fmt.Errorf("%w: invalid appearance transform", ErrInvalidAnnotationAppearance)
 	}
-	return Matrix{scaleX, 0, 0, scaleY, tx, ty}, nil
+	transform := Matrix{scaleX, 0, 0, scaleY, tx, ty}
+	if rotated {
+		transform = compensate.Mul(transform)
+		if !matrixFinite(transform) || !rectFinite(bounds) {
+			return Matrix{}, Rectangle{}, fmt.Errorf("%w: invalid appearance transform", ErrInvalidAnnotationAppearance)
+		}
+	}
+	return transform, bounds, nil
 }
 
 // WalkAnnotationAppearance 解释注解当前外观并映射到页面用户空间
@@ -360,14 +397,12 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if page == nil || page.reader != r {
 		return fmt.Errorf("page belongs to another reader")
 	}
-	if !annotation.IsStandard() {
-		flags, err := r.ReadAnnotationFlags(annotation)
-		if err != nil {
-			return err
-		}
-		if flags&1 != 0 {
-			return ctx.Err()
-		}
+	flags, err := r.ReadAnnotationFlags(annotation)
+	if err != nil {
+		return err
+	}
+	if !annotation.IsStandard() && flags&1 != 0 {
+		return ctx.Err()
 	}
 	optional, err := r.Resolve(annotation.Dictionary["OC"])
 	if err != nil {
@@ -480,10 +515,12 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		return &UnsupportedError{Feature: "annotation appearance"}
 	}
+	noRotate := parent == nil && page.Rotation != 0 && (flags&16 != 0 || annotation.Subtype == "Text")
 	var transform Matrix
+	var bounds Rectangle
 	stream, err := r.annotationAppearanceStream(appearance, annotation.Dictionary["AS"])
 	if err == nil && stream != nil {
-		transform, err = r.annotationAppearanceTransform(stream, annotation.Rect)
+		transform, bounds, err = r.annotationAppearanceTransform(stream, annotation.Rect, noRotate, page.Rotation)
 	}
 	if errors.Is(err, ErrInvalidAnnotationAppearance) && annotation.Subtype == "Widget" && visitor.Warning != nil {
 		recovered, synthErr := r.widgetAppearance(ctx, page, annotation)
@@ -498,7 +535,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 			return ctx.Err()
 		}
 		if recovered != nil {
-			transform, err = r.annotationAppearanceTransform(recovered, annotation.Rect)
+			transform, bounds, err = r.annotationAppearanceTransform(recovered, annotation.Rect, noRotate, page.Rotation)
 			if err == nil {
 				stream = recovered
 				visitor.Warning(Diagnostic{Message: "invalid PDF widget appearance replaced from field properties"})
@@ -535,7 +572,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 			stream = &copy
 		}
 	}
-	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: annotation.Rect}
+	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: bounds}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: transform, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
 	for _, operator := range []string{"g", "G"} {

@@ -285,6 +285,9 @@ func (f *Font) characterLookup(ctx context.Context, wanted map[rune]bool) (map[r
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if f.isUnassignedWinAnsiFallback(code) {
+			continue
+		}
 		glyph, ok, err := f.encodingGlyph(ctx, code)
 		if err != nil {
 			if ignorableEncodingGlyphError(err) {
@@ -340,6 +343,9 @@ func (f *Font) sequenceLookup(ctx context.Context, text string) (map[string]font
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if f.isUnassignedWinAnsiFallback(code) {
+			continue
+		}
 		glyph, ok, err := f.encodingGlyph(ctx, code)
 		if err != nil {
 			if ignorableEncodingGlyphError(err) {
@@ -358,6 +364,24 @@ func (f *Font) sequenceLookup(ctx context.Context, text string) (map[string]font
 		return nil, err
 	}
 	return lookup, nil
+}
+
+// isUnassignedWinAnsiFallback 判断单字节字符码是否为未显式声明的WinAnsi未分配回退槽位
+// 入参: code 候选字符码
+// 返回: bool 是否应在编码路径中跳过
+func (f *Font) isUnassignedWinAnsiFallback(code string) bool {
+	if f.composite || f.simpleCmap != nil && f.symbolic || f.encoding != "WinAnsiEncoding" || len(code) != 1 {
+		return false
+	}
+	b := code[0]
+	if b != 0x7f && b != 0x81 && b != 0x8d && b != 0x8f && b != 0x90 && b != 0x9d {
+		return false
+	}
+	if _, overridden := f.differences[uint32(b)]; overridden {
+		return false
+	}
+	_, overridden := f.Unicode[code]
+	return !overridden
 }
 
 // ignorableEncodingGlyphError 判断单候选字符码的解码错误是否仅表示该槽位无可用字形

@@ -33,6 +33,17 @@ type contentImageSamples struct {
 	recovered bool
 }
 
+// missingColorSpaceResourceError 表示颜色空间资源字典中不存在指定名称
+type missingColorSpaceResourceError struct {
+	name Name
+}
+
+// Error 返回缺失颜色空间资源的描述文本
+// 返回: string 错误信息
+func (e missingColorSpaceResourceError) Error() string {
+	return "missing ColorSpace resource " + string(e.name)
+}
+
 // inlineByteReader 限制解码器预读，避免读取内联图像后的内容操作符
 type inlineByteReader struct {
 	ctx  context.Context
@@ -505,77 +516,162 @@ func (p *objectParser) inlineImage(ctx context.Context, resolve func(Object) (Ob
 	sep := p.pos
 	p.pos++
 	colorSpaceAliases := map[Name]Name{"G": "DeviceGray", "RGB": "DeviceRGB", "CMYK": "DeviceCMYK", "I": "Indexed"}
-	expandWith := func(value Object, table map[Name]Name) Object {
+	foldAlias := func(name Name, table map[Name]Name) (Name, bool) {
+		for alias, full := range table {
+			if strings.EqualFold(string(name), string(alias)) {
+				return full, true
+			}
+		}
+		return "", false
+	}
+	expandFilter := func(value Object) Object {
 		if name, ok := value.(Name); ok {
-			if full, ok := table[name]; ok {
+			if full, ok := streamFilterAliases[name]; ok {
 				return full
 			}
 			if p.warning != nil {
-				for alias, full := range table {
-					if strings.EqualFold(string(name), string(alias)) {
-						p.warning(Diagnostic{Offset: int64(p.pos), Message: "inline image abbreviation case normalized: " + string(name)})
-						return full
-					}
+				if full, ok := foldAlias(name, streamFilterAliases); ok {
+					p.warning(Diagnostic{Offset: int64(p.pos), Message: "inline image abbreviation case normalized: " + string(name)})
+					return full
 				}
 			}
 		}
 		return value
 	}
-	var expandColorSpace func(Object, int) Object
-	expandColorSpace = func(value Object, depth int) Object {
-		if depth > 4 {
-			return value
+	foldColorSpace := func(name Name) (Name, bool) {
+		if p.warning == nil {
+			return "", false
 		}
-		if array, ok := value.(Array); ok && len(array) > 0 {
-			array[0] = expandWith(array[0], colorSpaceAliases)
-			if array[0] == Name("Indexed") && len(array) >= 2 {
-				array[1] = expandColorSpace(array[1], depth+1)
-			}
-			return array
+		full, ok := foldAlias(name, colorSpaceAliases)
+		if !ok {
+			return "", false
 		}
-		return expandWith(value, colorSpaceAliases)
+		p.warning(Diagnostic{Offset: int64(p.pos), Message: "inline image abbreviation case normalized: " + string(name)})
+		return full, true
 	}
-	if dict["ColorSpace"] != nil {
-		dict["ColorSpace"] = expandColorSpace(dict["ColorSpace"], 0)
+	missingColorSpace := func(err error, name Name) bool {
+		var missing missingColorSpaceResourceError
+		return ctx.Err() == nil && errors.As(err, &missing) && missing.name == name
+	}
+	var resolveColorSpace func(Object, int, bool) (Object, error)
+	resolveColorSpace = func(value Object, depth int, top bool) (Object, error) {
+		if depth > 4 {
+			return value, nil
+		}
+		if name, ok := value.(Name); ok {
+			if full, ok := colorSpaceAliases[name]; ok {
+				return full, nil
+			}
+			if resolve != nil {
+				resolved, err := resolve(name)
+				if err == nil {
+					if top {
+						return resolved, nil
+					}
+					return name, nil
+				}
+				if !missingColorSpace(err, name) {
+					return nil, err
+				}
+				if full, ok := foldColorSpace(name); ok {
+					return full, nil
+				}
+				if top {
+					return nil, err
+				}
+				return name, nil
+			}
+			if full, ok := foldColorSpace(name); ok {
+				return full, nil
+			}
+			return name, nil
+		}
+		array, ok := value.(Array)
+		if !ok || len(array) == 0 {
+			if resolve != nil && top {
+				return resolve(value)
+			}
+			return value, nil
+		}
+		if len(array) == 1 {
+			item, err := resolveColorSpace(array[0], depth+1, top)
+			if err != nil {
+				return nil, err
+			}
+			if top {
+				if _, isArr := item.(Array); isArr {
+					return item, nil
+				}
+			}
+			array = slices.Clone(array)
+			array[0] = item
+			return array, nil
+		}
+		cloned := false
+		if headName, ok := array[0].(Name); ok {
+			if full, ok := colorSpaceAliases[headName]; ok {
+				array = slices.Clone(array)
+				cloned = true
+				array[0] = full
+			} else if full, ok := foldColorSpace(headName); ok {
+				array = slices.Clone(array)
+				cloned = true
+				array[0] = full
+			}
+		}
+		if array[0] == Name("Indexed") && len(array) >= 2 {
+			base, err := resolveColorSpace(array[1], depth+1, false)
+			if err != nil {
+				return nil, err
+			}
+			if !cloned {
+				array = slices.Clone(array)
+				cloned = true
+			}
+			array[1] = base
+		}
+		return array, nil
 	}
 	if dict["Filter"] != nil {
 		if array, ok := dict["Filter"].(Array); ok {
 			for i := range array {
-				array[i] = expandWith(array[i], streamFilterAliases)
+				array[i] = expandFilter(array[i])
 			}
 		} else {
-			dict["Filter"] = expandWith(dict["Filter"], streamFilterAliases)
+			dict["Filter"] = expandFilter(dict["Filter"])
 		}
 	}
-	if resolve != nil && dict["ColorSpace"] != nil {
-		value, err := resolve(dict["ColorSpace"])
+	if dict["ColorSpace"] != nil {
+		value, err := resolveColorSpace(dict["ColorSpace"], 0, true)
 		if err != nil {
 			return nil, err
 		}
-		if array, ok := value.(Array); ok && len(array) > 0 {
-			cloned := false
-			if _, ok := array[0].(Reference); ok {
-				head, err := resolve(array[0])
-				if err != nil {
-					return nil, err
-				}
-				array = slices.Clone(array)
-				array[0] = head
-				cloned = true
-			}
-			if (array[0] == Name("ICCBased") && len(array) == 2) || (array[0] == Name("DeviceN") && len(array) >= 2) {
-				if _, ok := array[1].(Reference); ok {
-					item, err := resolve(array[1])
+		if resolve != nil {
+			if array, ok := value.(Array); ok && len(array) > 0 {
+				cloned := false
+				if _, ok := array[0].(Reference); ok {
+					head, err := resolve(array[0])
 					if err != nil {
 						return nil, err
 					}
-					if !cloned {
-						array = slices.Clone(array)
-					}
-					array[1] = item
+					array = slices.Clone(array)
+					array[0] = head
+					cloned = true
 				}
+				if (array[0] == Name("ICCBased") && len(array) == 2) || (array[0] == Name("DeviceN") && len(array) >= 2) {
+					if _, ok := array[1].(Reference); ok {
+						item, err := resolve(array[1])
+						if err != nil {
+							return nil, err
+						}
+						if !cloned {
+							array = slices.Clone(array)
+						}
+						array[1] = item
+					}
+				}
+				value = array
 			}
-			value = array
 		}
 		dict["ColorSpace"] = value
 	}

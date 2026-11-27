@@ -120,6 +120,9 @@ func (f *Font) glyphLookup(ctx context.Context, wanted map[uint16]int) (map[uint
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if f.isUnassignedWinAnsiFallback(code) {
+			continue
+		}
 		glyph, ok, err := f.encodingGlyph(ctx, code)
 		if err != nil {
 			if ignorableEncodingGlyphError(err) {

@@ -1265,6 +1265,20 @@ func (p *pageInterpreter) operation(op Operation) error {
 		p.type3Metrics = true
 		p.uncoloredType3 = p.uncoloredType3 || op.Operator == "d1"
 		if op.Operator == "d1" {
+			syncStroke := func(state *graphicsState) {
+				state.style.Stroke = state.style.Fill
+				state.strokeSpace = state.fillSpace
+				state.strokePatternBase = state.fillPatternBase
+				state.strokeICC = state.fillICC
+				state.strokeICCValues = state.fillICCValues
+				state.strokeSeparation = state.fillSeparation
+				state.strokeDeviceN = state.fillDeviceN
+				state.strokeColor = state.fillColor
+			}
+			syncStroke(&p.state)
+			for i := range p.stack {
+				syncStroke(&p.stack[i])
+			}
 			bounds := transformedBounds(Rectangle{v[2], v[3], v[4], v[5]}, p.state.matrix)
 			if !rectFinite(bounds) {
 				return p.operationWarning(op, "nonfinite Type3 glyph bounds")
@@ -1754,9 +1768,16 @@ func (p *pageInterpreter) operation(op Operation) error {
 				patternBase = nil
 				a = a[len(a)-1:]
 			}
+			var patternICC *iccColorSpace
+			var patternICCValues [4]float64
 			if patternBase != nil {
-				if err := patternBaseColor(&paint, patternBase, a[:len(a)-1], p.state.style.RenderingIntent); err != nil {
+				values, err := patternBaseColor(&paint, patternBase, a[:len(a)-1], p.state.style.RenderingIntent)
+				if err != nil {
 					return err
+				}
+				if patternBase.blending != nil && patternBase.blending.profile != nil && patternBase.blending.profile.alternate != nil {
+					patternICC = patternBase.blending.profile
+					copy(patternICCValues[:], values)
 				}
 			} else if len(a) != 1 {
 				return fmt.Errorf("invalid colored pattern operands")
@@ -1771,8 +1792,10 @@ func (p *pageInterpreter) operation(op Operation) error {
 					paint.Tiling, paint.Axial, paint.Radial, paint.Mesh, paint.Function, paint.Shading = pattern, nil, nil, nil, nil, nil
 				}
 				if operator == "g" {
+					p.state.fillICC, p.state.fillICCValues = patternICC, patternICCValues
 					p.state.style.Fill = paint
 				} else {
+					p.state.strokeICC, p.state.strokeICCValues = patternICC, patternICCValues
 					p.state.style.Stroke = paint
 				}
 				return nil
@@ -1785,9 +1808,11 @@ func (p *pageInterpreter) operation(op Operation) error {
 				return err
 			}
 			if operator == "g" {
+				p.state.fillICC, p.state.fillICCValues = nil, [4]float64{}
 				gradient.Alpha = p.state.style.Fill.Alpha
 				p.state.style.Fill = gradient
 			} else {
+				p.state.strokeICC, p.state.strokeICCValues = nil, [4]float64{}
 				gradient.Alpha = p.state.style.Stroke.Alpha
 				p.state.style.Stroke = gradient
 			}
@@ -2190,7 +2215,16 @@ func (p *pageInterpreter) resource(kind, name Name) (Object, error) {
 		return nil, err
 	}
 	dict, ok := value.(Dictionary)
-	if !ok || dict[name] == nil {
+	if !ok {
+		if value == nil && kind == "ColorSpace" {
+			return nil, missingColorSpaceResourceError{name: name}
+		}
+		return nil, fmt.Errorf("missing %s resource %s", kind, name)
+	}
+	if dict[name] == nil {
+		if kind == "ColorSpace" {
+			return nil, missingColorSpaceResourceError{name: name}
+		}
 		return nil, fmt.Errorf("missing %s resource %s", kind, name)
 	}
 	return dict[name], nil
@@ -2324,13 +2358,16 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 	if fill && p.state.fillSpace == "Pattern" && p.state.style.Fill.Axial == nil && p.state.style.Fill.Radial == nil && p.state.style.Fill.Mesh == nil && p.state.style.Fill.Tiling == nil && p.state.style.Fill.Function == nil && p.state.style.Fill.Shading == nil || stroke && p.state.strokeSpace == "Pattern" && p.state.style.Stroke.Axial == nil && p.state.style.Stroke.Radial == nil && p.state.style.Stroke.Mesh == nil && p.state.style.Stroke.Tiling == nil && p.state.style.Stroke.Function == nil && p.state.style.Stroke.Shading == nil {
 		return fmt.Errorf("missing pattern color")
 	}
+	if p.uncoloredPattern {
+		return nil
+	}
 	for _, target := range []struct {
 		used    bool
 		profile *iccColorSpace
 		paint   *Paint
 		values  [4]float64
 	}{{fill, p.state.fillICC, &p.state.style.Fill, p.state.fillICCValues}, {stroke, p.state.strokeICC, &p.state.style.Stroke, p.state.strokeICCValues}} {
-		if !target.used || target.paint.None || target.paint.Axial != nil || target.paint.Radial != nil || target.paint.Function != nil || target.paint.Mesh != nil || target.paint.Tiling != nil || target.paint.Shading != nil {
+		if !target.used || target.paint.None || target.paint.Axial != nil || target.paint.Radial != nil || target.paint.Function != nil || target.paint.Mesh != nil || target.paint.Tiling != nil && target.paint.Tiling.PaintType == 1 || target.paint.Shading != nil {
 			continue
 		}
 		profile := target.profile
@@ -2346,6 +2383,7 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 				return err
 			}
 			paint.Alpha = target.paint.Alpha
+			paint.Tiling = target.paint.Tiling
 			*target.paint = paint
 			continue
 		}

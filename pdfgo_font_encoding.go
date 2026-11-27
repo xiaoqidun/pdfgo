@@ -390,6 +390,13 @@ func type1EncodingSpace(value byte) bool {
 	return value == ' ' || value == '\t' || value == '\r' || value == '\n' || value == '\f' || value == 0
 }
 
+// type1EexecSpace 判断Type1规范7.2节允许在eexec后跳过的前导空白字节
+// 入参: value 待检查的字节
+// 返回: bool 是否为eexec前导空白字节
+func type1EexecSpace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
+}
+
 // next 读取Type1明文段的下一个PostScript词项
 // 返回: string 词项
 func (s *type1EncodingScanner) next() string {

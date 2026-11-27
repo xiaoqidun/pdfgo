@@ -181,29 +181,23 @@ func readType1FontMetrics(ctx context.Context, data []byte) (*type1FontMetrics, 
 		return nil, fmt.Errorf("Type1 metrics lack FontMatrix")
 	}
 	if !pfb {
-		if scanner.pos >= len(data) || !type1EncodingSpace(data[scanner.pos]) {
+		if scanner.pos >= len(data) || !type1EexecSpace(data[scanner.pos]) {
 			return nil, fmt.Errorf("missing Type1 eexec separator")
 		}
-		separator := data[scanner.pos]
-		scanner.pos++
-		if separator == '\r' && scanner.pos < len(data) && data[scanner.pos] == '\n' {
+		for steps := 0; scanner.pos < len(data) && type1EexecSpace(data[scanner.pos]); steps++ {
+			if steps&4095 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			scanner.pos++
 		}
 		encrypted = data[scanner.pos:]
-		digits := 0
-		for _, b := range encrypted {
-			if type1EncodingSpace(b) {
-				continue
-			}
-			if bytes.IndexByte([]byte("0123456789abcdefABCDEF"), b) < 0 {
-				break
-			}
-			digits++
-			if digits == 4 {
-				break
-			}
+		isHex := len(encrypted) >= 4
+		for i := 0; i < 4 && isHex; i++ {
+			isHex = bytes.IndexByte([]byte("0123456789abcdefABCDEF"), encrypted[i]) >= 0
 		}
-		if digits == 4 {
+		if isHex {
 			if end := bytes.Index(encrypted, []byte("cleartomark")); end >= 0 {
 				encrypted = encrypted[:end]
 			}
