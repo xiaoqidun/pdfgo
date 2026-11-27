@@ -303,18 +303,26 @@ func (r *Reader) annotationButtonState(ctx context.Context, annotation Annotatio
 		if err != nil {
 			return "", err
 		}
+		mergedField := false
 		if widgets == nil && parentValue != nil {
-			parent, ok := parentValue.(Dictionary)
-			if !ok {
-				return "", fmt.Errorf("invalid button parent")
-			}
-			widgets, err = r.Resolve(parent["Kids"])
+			ownName, err := r.Resolve(field["T"])
 			if err != nil {
 				return "", err
 			}
+			mergedField = ownName != nil
+			if !mergedField {
+				parent, ok := parentValue.(Dictionary)
+				if !ok {
+					return "", fmt.Errorf("invalid button parent")
+				}
+				widgets, err = r.Resolve(parent["Kids"])
+				if err != nil {
+					return "", err
+				}
+			}
 		}
 		index := -1
-		if widgets == nil && parentValue == nil && len(options) == 1 {
+		if widgets == nil && (parentValue == nil || mergedField) && len(options) == 1 {
 			index = 0
 		} else {
 			kids, ok := widgets.(Array)
@@ -351,7 +359,13 @@ func (r *Reader) annotationButtonState(ctx context.Context, annotation Annotatio
 			return "", err
 		}
 		if parentValue != nil {
-			return "", &UnsupportedError{Feature: "radio widget without appearance state"}
+			ownName, err := r.Resolve(field["T"])
+			if err != nil {
+				return "", err
+			}
+			if ownName == nil {
+				return "", &UnsupportedError{Feature: "radio widget without appearance state"}
+			}
 		}
 	}
 	return state, nil
@@ -394,6 +408,7 @@ func (r *Reader) writeAnnotationButtonCaption(ctx context.Context, annotation An
 					return err
 				}
 			}
+			caption = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ").Replace(caption)
 			encoded, err := r.annotationCaptionFont(ctx, resources, caption)
 			if err != nil {
 				return err

@@ -2396,6 +2396,27 @@ func (p *pageInterpreter) validatePaint(fill, stroke bool) error {
 	return nil
 }
 
+// initFormDefaultColors 按表单自身或页面资源作用域初始化默认填充与描边颜色
+// 入参: stream 表单内容流
+// 返回: error 资源解析或默认颜色设置错误
+func (p *pageInterpreter) initFormDefaultColors(stream *Stream) error {
+	resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
+	if err != nil {
+		return err
+	}
+	if resources == nil {
+		p.resources = p.pageResources
+	} else if dict, ok := resources.(Dictionary); ok {
+		p.resources = dict
+	}
+	for _, operator := range []string{"g", "G"} {
+		if err := p.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // form 在独立图形状态中解释表单内容及透明度组
 // 入参: stream 表单内容流
 // 返回: error 解析或访问错误
@@ -2484,7 +2505,15 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 	child.uncoloredType3 = p.uncoloredType3
 	child.formStreams = append(append([]*Stream(nil), p.formStreams...), source)
 	child.stream = source
-	if target == nil {
+	var groupMark *GroupMark
+	var groupObject Object
+	if stream.Dictionary["Group"] != nil {
+		groupObject, err = p.reader.Resolve(stream.Dictionary["Group"])
+		if err != nil {
+			return err
+		}
+	}
+	if target == nil || groupObject != nil {
 		resources, err := p.reader.Resolve(stream.Dictionary["Resources"])
 		if err != nil {
 			return err
@@ -2497,16 +2526,8 @@ func (p *pageInterpreter) formContentRef(stream, source *Stream, formRef Referen
 			return err
 		}
 	}
-	var groupMark *GroupMark
-	var groupObject Object
 	groupReader := p.reader
 	groupResources := child.resources
-	if stream.Dictionary["Group"] != nil {
-		groupObject, err = p.reader.Resolve(stream.Dictionary["Group"])
-		if err != nil {
-			return err
-		}
-	}
 	if groupObject == nil && target != nil {
 		groupReader = target.reader
 		groupResources = target.Resources

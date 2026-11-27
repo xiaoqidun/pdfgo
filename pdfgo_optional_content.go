@@ -32,13 +32,26 @@ type optionalContentKey struct {
 	length int
 }
 
-// optionalContentEvaluator 维护单次可选内容求值的缓存、环路与步数状态
+// optionalContentDirectEntry 保存单次求值中直接对象的强引用与可见性结果
+type optionalContentDirectEntry struct {
+	keep    Object
+	visible bool
+}
+
+// optionalContentDictState 保存直接OCG字典的强引用与默认开关状态
+type optionalContentDictState struct {
+	dict Dictionary
+	on   bool
+}
+
+// optionalContentEvaluator 维护可选内容求值的缓存、环路与步数状态
 type optionalContentEvaluator struct {
 	reader          *Reader
 	ctx             context.Context
 	config          Dictionary
 	steps           int
-	memo            map[optionalContentKey]bool
+	refMemo         map[Reference]bool
+	directMemo      map[optionalContentKey]optionalContentDirectEntry
 	active          map[optionalContentKey]bool
 	intentsReady    bool
 	configIntentSet map[Name]bool
@@ -47,7 +60,7 @@ type optionalContentEvaluator struct {
 	baseState       bool
 	groupStates     map[Reference]bool
 	dictReady       bool
-	dictStates      map[uintptr]bool
+	dictStates      map[uintptr]optionalContentDictState
 }
 
 // OptionalContentVisible 按文档默认配置判断可选内容的可见性，供固定版式输出使用
@@ -90,11 +103,12 @@ func (r *Reader) newOptionalContentEvaluator(ctx context.Context) (*optionalCont
 		return nil, false, err
 	}
 	return &optionalContentEvaluator{
-		reader: r,
-		ctx:    ctx,
-		config: config,
-		memo:   map[optionalContentKey]bool{},
-		active: map[optionalContentKey]bool{},
+		reader:     r,
+		ctx:        ctx,
+		config:     config,
+		refMemo:    map[Reference]bool{},
+		directMemo: map[optionalContentKey]optionalContentDirectEntry{},
+		active:     map[optionalContentKey]bool{},
 	}, true, nil
 }
 
@@ -128,6 +142,9 @@ func (r *Reader) optionalDictionary(object Object) (Dictionary, error) {
 // 入参: object 组或表达式, depth 嵌套深度
 // 返回: bool 是否可见, error 解析、环路、超限或取消错误
 func (e *optionalContentEvaluator) eval(object Object, depth int) (bool, error) {
+	if depth == 0 {
+		defer clear(e.directMemo)
+	}
 	if err := e.ctx.Err(); err != nil {
 		return false, err
 	}
@@ -142,9 +159,10 @@ func (e *optionalContentEvaluator) eval(object Object, depth int) (bool, error) 
 	if err != nil {
 		return false, err
 	}
+	isRef := ref != (Reference{})
 	var key optionalContentKey
 	hasKey := false
-	if ref != (Reference{}) {
+	if isRef {
 		key, hasKey = optionalContentKey{ref: ref}, true
 	} else {
 		switch current := value.(type) {
@@ -164,8 +182,12 @@ func (e *optionalContentEvaluator) eval(object Object, depth int) (bool, error) 
 		if e.active[key] {
 			return false, fmt.Errorf("cyclic optional content reference")
 		}
-		if cached, ok := e.memo[key]; ok {
-			return cached, nil
+		if isRef {
+			if cached, ok := e.refMemo[ref]; ok {
+				return cached, nil
+			}
+		} else if cached, ok := e.directMemo[key]; ok {
+			return cached.visible, nil
 		}
 		e.active[key] = true
 		defer delete(e.active, key)
@@ -175,10 +197,14 @@ func (e *optionalContentEvaluator) eval(object Object, depth int) (bool, error) 
 		return false, err
 	}
 	if hasKey {
-		if len(e.memo) >= maxOptionalContentSteps {
-			clear(e.memo)
+		if isRef {
+			if len(e.refMemo) >= maxOptionalContentSteps {
+				clear(e.refMemo)
+			}
+			e.refMemo[ref] = result
+		} else {
+			e.directMemo[key] = optionalContentDirectEntry{keep: value, visible: result}
 		}
-		e.memo[key] = result
 	}
 	return result, nil
 }
@@ -432,7 +458,7 @@ func (e *optionalContentEvaluator) loadDictStates() error {
 	if len(e.groupStates) > maxOptionalContentSteps-e.steps {
 		return fmt.Errorf("%w: optional content evaluation step limit exceeded", ErrStreamLimitExceeded)
 	}
-	dictStates := map[uintptr]bool{}
+	dictStates := map[uintptr]optionalContentDictState{}
 	index := 0
 	for ref, on := range e.groupStates {
 		if index&255 == 0 {
@@ -448,7 +474,7 @@ func (e *optionalContentEvaluator) loadDictStates() error {
 		}
 		if dict, ok := resolved.(Dictionary); ok {
 			if ptr := reflect.ValueOf(dict).Pointer(); ptr != 0 {
-				dictStates[ptr] = on
+				dictStates[ptr] = optionalContentDictState{dict: dict, on: on}
 			}
 		}
 	}
@@ -519,7 +545,7 @@ func (e *optionalContentEvaluator) groupState(currentRef Reference, group Dictio
 	}
 	if ptr := reflect.ValueOf(group).Pointer(); ptr != 0 {
 		if state, ok := e.dictStates[ptr]; ok {
-			return state, nil
+			return state.on, nil
 		}
 	}
 	return e.baseState, nil

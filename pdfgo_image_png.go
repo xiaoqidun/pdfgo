@@ -123,7 +123,8 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 	output := pngContextWriter{ctx: ctx, writer: writer}
 	_, direct := source.(interface{ NRGBA64At(int, int) color.NRGBA64 })
 	nrgba, _ := source.(*image.NRGBA)
-	if _, packed := source.(*packedGrayImage); !direct && !packed && nrgba == nil {
+	_, cmyk := source.(*image.CMYK)
+	if _, packed := source.(*packedGrayImage); !direct && !packed && !cmyk && nrgba == nil {
 		if _, rowBytes, err := imageBufferSize(bounds.Dx(), 6, 8); err != nil || bounds.Dx() > imageBufferLimit()/64 || rowBytes > optimizationBufferLimit {
 			return fmt.Errorf("PNG row exceeds platform buffer range")
 		}
@@ -409,6 +410,8 @@ func pngSampleFormat(ctx context.Context, source image.Image) (int, int, int, er
 		return depth, 1, 0, nil
 	}
 	switch s := source.(type) {
+	case *image.CMYK:
+		return depth, 3, 2, nil
 	case *image.NRGBA, *image.NRGBA64:
 		opaque, err := imageOpaqueContext(ctx, s)
 		if err != nil {

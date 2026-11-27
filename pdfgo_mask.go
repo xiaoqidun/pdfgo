@@ -94,19 +94,8 @@ func (m *SoftMask) Walk(ctx context.Context, visitor Visitor) error {
 	}
 	p.visitor = visitor
 	p.maskGroup = m.stream
-	resources, err := p.reader.Resolve(m.stream.Dictionary["Resources"])
-	if err != nil {
+	if err := p.initFormDefaultColors(m.stream); err != nil {
 		return err
-	}
-	if resources == nil {
-		p.resources = p.pageResources
-	} else if dict, ok := resources.(Dictionary); ok {
-		p.resources = dict
-	}
-	for _, operator := range []string{"g", "G"} {
-		if err := p.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
-			return err
-		}
 	}
 	return p.form(m.stream)
 }

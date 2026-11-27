@@ -428,11 +428,11 @@ func encodeOptimalPNGFromPixels(ctx context.Context, source image.Image, best []
 // 返回: bool 是否可能需要16位PNG编码
 func sourceNeeds16BitPNG(ctx context.Context, img image.Image) bool {
 	switch img.(type) {
-	case *image.RGBA, *image.NRGBA, *image.Gray, *image.YCbCr, *image.CMYK, *image.Alpha, *packedGrayImage:
+	case *image.RGBA, *image.NRGBA, *image.Gray, *image.YCbCr, *image.Alpha, *packedGrayImage:
 		return false
 	case *image.Paletted:
 		return !palettedByteExact(img.(*image.Paletted).Palette)
-	case *image.RGBA64, *image.NRGBA64, *image.Gray16, *image.Alpha16:
+	case *image.RGBA64, *image.NRGBA64, *image.Gray16, *image.Alpha16, *image.CMYK:
 		return true
 	}
 	if palette, ok := img.ColorModel().(color.Palette); ok {

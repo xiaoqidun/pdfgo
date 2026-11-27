@@ -39,22 +39,118 @@ type jpegFrame struct {
 	displayMetadata bool
 }
 
-// jpegEncodingImage 为不透明八位图像复用预乘视图，避免编码器逐像素接口分配
+// jpegCMYKImage 为超大CMYK图像提供零拷贝印刷色彩视图，避免超预算缓冲分配
+type jpegCMYKImage struct {
+	source *image.CMYK
+	origin image.Point
+	bounds image.Rectangle
+}
+
+// ColorModel 返回十六位非预乘sRGB颜色模型
+// 返回: color.Model 颜色模型
+func (j *jpegCMYKImage) ColorModel() color.Model {
+	return color.NRGBA64Model
+}
+
+// Bounds 返回原点归一化后的图像边界
+// 返回: image.Rectangle 图像边界
+func (j *jpegCMYKImage) Bounds() image.Rectangle {
+	return j.bounds
+}
+
+// At 按内置印刷配置读取像素sRGB颜色
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.Color 十六位非预乘颜色
+func (j *jpegCMYKImage) At(x, y int) color.Color {
+	return imageNRGBA64At(j.source, j.origin.X+x, j.origin.Y+y)
+}
+
+// RGBA64At 按内置印刷配置读取像素十六位预乘颜色
+// 入参: x 横向坐标, y 纵向坐标
+// 返回: color.RGBA64 十六位预乘颜色
+func (j *jpegCMYKImage) RGBA64At(x, y int) color.RGBA64 {
+	return imageRGBA64At(j.source, j.origin.X+x, j.origin.Y+y)
+}
+
+// jpegEncodingImage 为不透明八位及CMYK图像生成一致的JPEG编码视图，避免朴素CMYK公式与逐像素接口分配
 // 入参: ctx 取消上下文, source 待编码图像
-// 返回: image.Image 只读编码视图, error 取消错误
+// 返回: image.Image 只读编码视图, error 缓冲或取消错误
 func jpegEncodingImage(ctx context.Context, source image.Image) (image.Image, error) {
-	s, ok := source.(*image.NRGBA)
-	if !ok {
+	switch s := source.(type) {
+	case *image.NRGBA:
+		opaque, err := imageOpaqueContext(ctx, s)
+		if err != nil {
+			return nil, err
+		}
+		if !opaque {
+			return source, nil
+		}
+		return &image.RGBA{Pix: s.Pix, Stride: s.Stride, Rect: s.Rect}, nil
+	case *image.CMYK:
+		return jpegCMYKEncodingImage(ctx, s)
+	default:
 		return source, ctx.Err()
 	}
-	opaque, err := imageOpaqueContext(ctx, s)
-	if err != nil {
+}
+
+// jpegCMYKEncodingImage 按内置印刷配置将CMYK图像转换为原点对齐的不透明RGBA，超预算时退回零拷贝视图
+// 入参: ctx 取消上下文, src 四色像素图像
+// 返回: image.Image sRGB编码视图, error 缓冲或取消错误
+func jpegCMYKEncodingImage(ctx context.Context, src *image.CMYK) (image.Image, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !opaque {
-		return source, nil
+	bounds := src.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+	if bounds.Empty() || w <= 0 || h <= 0 {
+		return src, nil
 	}
-	return &image.RGBA{Pix: s.Pix, Stride: s.Stride, Rect: s.Rect}, nil
+	if err := validateNativePixelBuffer(src.Pix, src.Stride, w, h, 4); err != nil {
+		return nil, err
+	}
+	if !pixelsWithinBudget(int64(w), int64(h), optimizationBufferLimit/4) {
+		return &jpegCMYKImage{source: src, origin: bounds.Min, bounds: image.Rect(0, 0, w, h)}, nil
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	type cmykCacheEntry struct {
+		key   uint32
+		rgb   [3]uint8
+		valid bool
+	}
+	var cache [4096]cmykCacheEntry
+	for y := 0; y < h; y++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		srcRow := src.Pix[src.PixOffset(bounds.Min.X, bounds.Min.Y+y):]
+		dstRow := dst.Pix[y*dst.Stride:]
+		for x := 0; x < w; x++ {
+			if x&4095 == 4095 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			off := x * 4
+			c, m, yv, k := srcRow[off], srcRow[off+1], srcRow[off+2], srcRow[off+3]
+			key := uint32(c) | uint32(m)<<8 | uint32(yv)<<16 | uint32(k)<<24
+			slot := (key * 2654435761) >> 20
+			entry := &cache[slot]
+			var rgb [3]uint8
+			if entry.valid && entry.key == key {
+				rgb = entry.rgb
+			} else {
+				pixel := imageNRGBASample(color.CMYK{C: c, M: m, Y: yv, K: k})
+				rgb = [3]uint8{
+					uint8((uint32(pixel.R) + 128) / 257),
+					uint8((uint32(pixel.G) + 128) / 257),
+					uint8((uint32(pixel.B) + 128) / 257),
+				}
+				entry.key, entry.rgb, entry.valid = key, rgb, true
+			}
+			dstRow[off], dstRow[off+1], dstRow[off+2], dstRow[off+3] = rgb[0], rgb[1], rgb[2], 255
+		}
+	}
+	return dst, ctx.Err()
 }
 
 // jpegAdobeMarker 构建四通道CMYK或YCCK的Adobe APP14标记

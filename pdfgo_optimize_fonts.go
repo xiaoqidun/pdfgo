@@ -545,34 +545,6 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 		ref, ok := descDict["FontFile2"].(Reference)
 		return ref, ok
 	}
-	markFontUnsafe := func(value Object) {
-		resolved, err := resolve(value, false)
-		if err != nil {
-			return
-		}
-		dict, ok := resolved.(Dictionary)
-		if !ok {
-			return
-		}
-		if ref, ok := fontFileRef(dict); ok {
-			unsafe[ref] = true
-		}
-		if subtype, err := resolve(dict["Subtype"], false); err == nil && subtype == Name("Type0") {
-			if arrVal, err := resolve(dict["DescendantFonts"], false); err == nil {
-				if arr, ok := arrVal.(Array); ok {
-					for _, item := range arr {
-						if descVal, err := resolve(item, false); err == nil {
-							if descDict, ok := descVal.(Dictionary); ok {
-								if ref, ok := fontFileRef(descDict); ok {
-									unsafe[ref] = true
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
 	var scanType0 func(Object, int)
 	scanType0 = func(value Object, depth int) {
 		if depth > 256 {
@@ -594,28 +566,7 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 			if v["DR"] != nil {
 				if drVal, err := resolve(v["DR"], false); err == nil {
 					if drDict, ok := drVal.(Dictionary); ok {
-						if fontsVal, err := resolve(drDict["Font"], false); err == nil {
-							if fontsDict, ok := fontsVal.(Dictionary); ok {
-								for _, fontObj := range fontsDict {
-									markFontUnsafe(fontObj)
-								}
-							}
-						}
-						if gsVal, err := resolve(drDict["ExtGState"], false); err == nil {
-							if gsDict, ok := gsVal.(Dictionary); ok {
-								for _, gsObj := range gsDict {
-									if stateVal, err := resolve(gsObj, false); err == nil {
-										if stateDict, ok := stateVal.(Dictionary); ok && stateDict["Font"] != nil {
-											if fontArrVal, err := resolve(stateDict["Font"], false); err == nil {
-												if fontArr, ok := fontArrVal.(Array); ok && len(fontArr) > 0 {
-													markFontUnsafe(fontArr[0])
-												}
-											}
-										}
-									}
-								}
-							}
-						}
+						_ = r.markResourceFontsUnsafe(drDict, metadata, cached, unsafe)
 					}
 				}
 			}
@@ -730,13 +681,21 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 		}
 	}
 	targets := make(map[Reference]bool)
-	for ref := range identityFonts {
+	hasCandidate := false
+	for ref := range used {
 		if !unsafe[ref] && !other[ref] {
-			targets[ref] = true
+			hasCandidate = true
+			if identityFonts[ref] {
+				targets[ref] = true
+			}
 		}
 	}
 	if len(targets) > 0 {
 		if err := r.collectIdentityFontGlyphs(ctx, metadata, cached, targets, used, unsafe); err != nil {
+			return nil, err
+		}
+	} else if hasCandidate {
+		if err := r.protectAnnotationPageFonts(ctx, metadata, cached, used, unsafe); err != nil {
 			return nil, err
 		}
 	}
@@ -749,9 +708,316 @@ func (r *Reader) optimizationFontGlyphs(ctx context.Context, metadata map[Refere
 	return result, ctx.Err()
 }
 
+// markFontDescriptorUnsafe 将字体字典描述符中的FontFile2流引用标为不可裁剪
+// 入参: dict 字体字典, metadata 对象属性, cached 原有缓存, unsafe 不安全集合
+// 返回: error 描述符解析或引用结构异常错误
+func (r *Reader) markFontDescriptorUnsafe(dict Dictionary, metadata map[Reference]Object, cached map[Reference]bool, unsafe map[Reference]bool) error {
+	if dict["FontDescriptor"] == nil {
+		return nil
+	}
+	fdVal, _, err := r.resolveOptimizationObject(dict["FontDescriptor"], metadata, cached)
+	if err != nil {
+		return err
+	}
+	if fdVal == nil {
+		return nil
+	}
+	fdDict, ok := fdVal.(Dictionary)
+	if !ok {
+		return fmt.Errorf("invalid font descriptor")
+	}
+	if fdDict["FontFile2"] != nil {
+		ref, ok := fdDict["FontFile2"].(Reference)
+		if !ok {
+			return fmt.Errorf("invalid font program reference")
+		}
+		unsafe[ref] = true
+	}
+	return nil
+}
+
+// markFontObjectUnsafe 标记字体对象及其Type0后代中的全部FontFile2为不可裁剪
+// 入参: value 字体对象, metadata 对象属性, cached 原有缓存, unsafe 不安全集合
+// 返回: error 字体或后代结构解析异常错误
+func (r *Reader) markFontObjectUnsafe(value Object, metadata map[Reference]Object, cached map[Reference]bool, unsafe map[Reference]bool) error {
+	resolved, _, err := r.resolveOptimizationObject(value, metadata, cached)
+	if err != nil {
+		return err
+	}
+	if resolved == nil {
+		return nil
+	}
+	dict, ok := resolved.(Dictionary)
+	if !ok {
+		return fmt.Errorf("invalid font resource")
+	}
+	firstErr := r.markFontDescriptorUnsafe(dict, metadata, cached, unsafe)
+	record := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	subtype, _, err := r.resolveOptimizationObject(dict["Subtype"], metadata, cached)
+	if err != nil {
+		record(err)
+		return firstErr
+	}
+	if subtype != Name("Type0") {
+		return firstErr
+	}
+	arrVal, _, err := r.resolveOptimizationObject(dict["DescendantFonts"], metadata, cached)
+	if err != nil {
+		record(err)
+		return firstErr
+	}
+	arr, ok := arrVal.(Array)
+	if !ok {
+		record(fmt.Errorf("invalid descendant fonts"))
+		return firstErr
+	}
+	for _, item := range arr {
+		descVal, _, err := r.resolveOptimizationObject(item, metadata, cached)
+		if err != nil {
+			record(err)
+			continue
+		}
+		descDict, ok := descVal.(Dictionary)
+		if !ok {
+			record(fmt.Errorf("invalid descendant font"))
+			continue
+		}
+		record(r.markFontDescriptorUnsafe(descDict, metadata, cached, unsafe))
+	}
+	return firstErr
+}
+
+// markResourceFontsUnsafe 将资源字典Font与ExtGState引用的全部FontFile2标为不可裁剪
+// 入参: res 资源字典, metadata 对象属性, cached 原有缓存, unsafe 不安全集合
+// 返回: error 资源字典或字体引用异常错误
+func (r *Reader) markResourceFontsUnsafe(res Dictionary, metadata map[Reference]Object, cached map[Reference]bool, unsafe map[Reference]bool) error {
+	if res == nil {
+		return nil
+	}
+	var firstErr error
+	record := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if res["Font"] != nil {
+		fontsVal, _, err := r.resolveOptimizationObject(res["Font"], metadata, cached)
+		if err != nil {
+			record(err)
+		} else if fontsVal != nil {
+			if fontsDict, ok := fontsVal.(Dictionary); !ok {
+				record(fmt.Errorf("invalid font resources"))
+			} else {
+				for _, fontObj := range fontsDict {
+					record(r.markFontObjectUnsafe(fontObj, metadata, cached, unsafe))
+				}
+			}
+		}
+	}
+	if res["ExtGState"] == nil {
+		return firstErr
+	}
+	gsVal, _, err := r.resolveOptimizationObject(res["ExtGState"], metadata, cached)
+	if err != nil {
+		record(err)
+		return firstErr
+	}
+	if gsVal == nil {
+		return firstErr
+	}
+	gsDict, ok := gsVal.(Dictionary)
+	if !ok {
+		record(fmt.Errorf("invalid graphics state resources"))
+		return firstErr
+	}
+	for _, gsObj := range gsDict {
+		stateVal, _, err := r.resolveOptimizationObject(gsObj, metadata, cached)
+		if err != nil {
+			record(err)
+			continue
+		}
+		if stateVal == nil {
+			continue
+		}
+		stateDict, ok := stateVal.(Dictionary)
+		if !ok {
+			record(fmt.Errorf("invalid graphics state"))
+			continue
+		}
+		if stateDict["Font"] == nil {
+			continue
+		}
+		fontArrVal, _, err := r.resolveOptimizationObject(stateDict["Font"], metadata, cached)
+		if err != nil {
+			record(err)
+			continue
+		}
+		if fontArrVal == nil {
+			continue
+		}
+		fontArr, ok := fontArrVal.(Array)
+		if !ok {
+			record(fmt.Errorf("invalid graphics state font"))
+			continue
+		}
+		if len(fontArr) > 0 {
+			record(r.markFontObjectUnsafe(fontArr[0], metadata, cached, unsafe))
+		}
+	}
+	return firstErr
+}
+
+// annotHasText 判断注释文本字段是否非空
+// 入参: value 注释文本对象, metadata 对象属性, cached 原有缓存
+// 返回: bool 是否含非空文本, error 解析错误
+func (r *Reader) annotHasText(value Object, metadata map[Reference]Object, cached map[Reference]bool) (bool, error) {
+	if value == nil {
+		return false, nil
+	}
+	resolved, _, err := r.resolveOptimizationObject(value, metadata, cached)
+	if err != nil {
+		return false, err
+	}
+	if resolved == nil {
+		return false, nil
+	}
+	if s, ok := resolved.(String); ok && len(s) == 0 {
+		return false, nil
+	}
+	return true, nil
+}
+
+// annotNeedsPageFonts 判断无正常外观的注释在合成外观时是否会使用页面资源字体
+// 入参: annotDict 注释字典, metadata 对象属性, cached 原有缓存
+// 返回: bool 是否依赖页面资源字体, error 解析错误
+func (r *Reader) annotNeedsPageFonts(annotDict Dictionary, metadata map[Reference]Object, cached map[Reference]bool) (bool, error) {
+	subtype, _, err := r.resolveOptimizationObject(annotDict["Subtype"], metadata, cached)
+	if err != nil {
+		return false, err
+	}
+	switch subtype {
+	case Name("FreeText"):
+	case Name("Line"):
+		capVal, _, err := r.resolveOptimizationObject(annotDict["Cap"], metadata, cached)
+		if err != nil {
+			return false, err
+		}
+		if capVal != Boolean(true) {
+			return false, nil
+		}
+	default:
+		return false, nil
+	}
+	if has, err := r.annotHasText(annotDict["Contents"], metadata, cached); err != nil || has {
+		return has, err
+	}
+	return r.annotHasText(annotDict["RC"], metadata, cached)
+}
+
+// annotHasNormalAP 判断注释是否携带有效的正常外观流
+// 入参: annotDict 注释字典, metadata 对象属性, cached 原有缓存
+// 返回: bool 是否含有效正常外观流, error 解析错误
+func (r *Reader) annotHasNormalAP(annotDict Dictionary, metadata map[Reference]Object, cached map[Reference]bool) (bool, error) {
+	if annotDict["AP"] == nil {
+		return false, nil
+	}
+	apVal, _, err := r.resolveOptimizationObject(annotDict["AP"], metadata, cached)
+	if err != nil {
+		return false, err
+	}
+	apDict, ok := apVal.(Dictionary)
+	if !ok || apDict["N"] == nil {
+		return false, nil
+	}
+	entryVal, _, err := r.resolveOptimizationObject(apDict["N"], nil, cached)
+	if err != nil {
+		return false, err
+	}
+	switch v := entryVal.(type) {
+	case *Stream:
+		return true, nil
+	case Dictionary:
+		for _, stateEntry := range v {
+			stateObj, _, err := r.resolveOptimizationObject(stateEntry, nil, cached)
+			if err != nil {
+				return false, err
+			}
+			if _, ok := stateObj.(*Stream); ok {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// protectAnnotationPageFonts 在无Identity扫描目标时遍历页面注释并保护无正常外观注释引用的页面资源字体
+// 入参: ctx 取消上下文, metadata 对象属性, cached 原有缓存, used 候选字体集合, unsafe 不安全集合
+// 返回: error 仅返回取消错误，结构异常时保守保护全部候选字体
+func (r *Reader) protectAnnotationPageFonts(ctx context.Context, metadata map[Reference]Object, cached map[Reference]bool, used map[Reference]map[uint16]bool, unsafe map[Reference]bool) error {
+	cleanup := func() {
+		r.cache.prune(cached)
+	}
+	defer cleanup()
+	err := r.WalkPages(ctx, func(_ int, page *Page) error {
+		defer cleanup()
+		if page.Dictionary["Annots"] == nil {
+			return nil
+		}
+		annotsVal, _, err := r.resolveOptimizationObject(page.Dictionary["Annots"], metadata, cached)
+		if err != nil {
+			return err
+		}
+		if annotsVal == nil {
+			return nil
+		}
+		annots, ok := annotsVal.(Array)
+		if !ok {
+			return fmt.Errorf("invalid page annotations")
+		}
+		for _, item := range annots {
+			annotVal, _, err := r.resolveOptimizationObject(item, metadata, cached)
+			if err != nil {
+				return err
+			}
+			annotDict, ok := annotVal.(Dictionary)
+			if !ok {
+				continue
+			}
+			needs, err := r.annotNeedsPageFonts(annotDict, metadata, cached)
+			if err != nil {
+				return err
+			}
+			if !needs {
+				continue
+			}
+			hasNormalAP, err := r.annotHasNormalAP(annotDict, metadata, cached)
+			if err != nil {
+				return err
+			}
+			if !hasNormalAP {
+				return r.markResourceFontsUnsafe(page.Resources, metadata, cached, unsafe)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		for ref := range used {
+			unsafe[ref] = true
+		}
+	}
+	return ctx.Err()
+}
+
 // collectIdentityFontGlyphs 扫描页面、表单、注释外观、图案与Type3内容流收集Identity字体的2字节CID字形
 // 入参: ctx 取消上下文, metadata 对象属性, cached 原有缓存, targets 目标字体流集合, used 收集结果, unsafe 不安全集合
-// 返回: error 仅返回取消错误，内容流异常时保守将目标字体标为不安全
+// 返回: error 仅返回取消错误，页面阶段异常保护全部候选字体，后续阶段异常保护目标字体
 func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Reference]Object, cached map[Reference]bool, targets map[Reference]bool, used map[Reference]map[uint16]bool, unsafe map[Reference]bool) error {
 	cleanup := func() {
 		r.cache.prune(cached)
@@ -1325,97 +1591,7 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		}
 		return nil
 	}
-	annotHasText := func(value Object) (bool, error) {
-		if value == nil {
-			return false, nil
-		}
-		resolved, err := resolveMeta(value)
-		if err != nil {
-			return false, err
-		}
-		if resolved == nil {
-			return false, nil
-		}
-		if s, ok := resolved.(String); ok && len(s) == 0 {
-			return false, nil
-		}
-		return true, nil
-	}
-	annotNeedsPageFonts := func(annotDict Dictionary) (bool, error) {
-		subtype, err := resolveMeta(annotDict["Subtype"])
-		if err != nil {
-			return false, err
-		}
-		switch subtype {
-		case Name("FreeText"):
-		case Name("Line"):
-			capVal, err := resolveMeta(annotDict["Cap"])
-			if err != nil {
-				return false, err
-			}
-			if capVal != Boolean(true) {
-				return false, nil
-			}
-		default:
-			return false, nil
-		}
-		if has, err := annotHasText(annotDict["Contents"]); err != nil || has {
-			return has, err
-		}
-		return annotHasText(annotDict["RC"])
-	}
-	markResourcesFontsUnsafe := func(res Dictionary) error {
-		if res == nil {
-			return nil
-		}
-		if res["Font"] != nil {
-			fontsVal, err := resolveMeta(res["Font"])
-			if err != nil {
-				return err
-			}
-			if fontsDict, ok := fontsVal.(Dictionary); ok {
-				for _, fontObj := range fontsDict {
-					ref, isTarget, valid := resolveFontTarget(fontObj)
-					if !valid {
-						return fmt.Errorf("invalid annotation page font resource")
-					}
-					if isTarget {
-						unsafe[ref] = true
-					}
-				}
-			}
-		}
-		if res["ExtGState"] != nil {
-			gsVal, err := resolveMeta(res["ExtGState"])
-			if err != nil {
-				return err
-			}
-			if gsDict, ok := gsVal.(Dictionary); ok {
-				for _, gsObj := range gsDict {
-					stateVal, err := resolveMeta(gsObj)
-					if err != nil {
-						return err
-					}
-					if stateDict, ok := stateVal.(Dictionary); ok && stateDict["Font"] != nil {
-						fontArrVal, err := resolveMeta(stateDict["Font"])
-						if err != nil {
-							return err
-						}
-						if fontArr, ok := fontArrVal.(Array); ok && len(fontArr) > 0 {
-							ref, isTarget, valid := resolveFontTarget(fontArr[0])
-							if !valid {
-								return fmt.Errorf("invalid annotation page graphics state font")
-							}
-							if isTarget {
-								unsafe[ref] = true
-							}
-						}
-					}
-				}
-			}
-		}
-		return nil
-	}
+	pagesScanned := false
 	run := func() error {
 		if err := r.WalkPages(ctx, func(_ int, page *Page) error {
 			defer cleanup()
@@ -1434,7 +1610,11 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 				if err != nil {
 					return err
 				}
-				if annots, ok := annotsVal.(Array); ok {
+				if annotsVal != nil {
+					annots, ok := annotsVal.(Array)
+					if !ok {
+						return fmt.Errorf("invalid page annotations")
+					}
 					pageFontsUnsafe := false
 					for _, item := range annots {
 						annotVal, err := resolveMeta(item)
@@ -1488,12 +1668,12 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 							}
 						}
 						if !hasNormalAP && !pageFontsUnsafe {
-							needs, err := annotNeedsPageFonts(annotDict)
+							needs, err := r.annotNeedsPageFonts(annotDict, metadata, cached)
 							if err != nil {
 								return err
 							}
 							if needs {
-								if err := markResourcesFontsUnsafe(page.Resources); err != nil {
+								if err := r.markResourceFontsUnsafe(page.Resources, metadata, cached, unsafe); err != nil {
 									return err
 								}
 								pageFontsUnsafe = true
@@ -1506,6 +1686,7 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		}); err != nil {
 			return err
 		}
+		pagesScanned = true
 		for ref, value := range metadata {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -1567,8 +1748,14 @@ func (r *Reader) collectIdentityFontGlyphs(ctx context.Context, metadata map[Ref
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		for ref := range targets {
-			unsafe[ref] = true
+		if !pagesScanned {
+			for ref := range used {
+				unsafe[ref] = true
+			}
+		} else {
+			for ref := range targets {
+				unsafe[ref] = true
+			}
 		}
 	}
 	return ctx.Err()

@@ -575,10 +575,8 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: bounds}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: transform, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
-	for _, operator := range []string{"g", "G"} {
-		if err := interpreter.operation(Operation{Operator: operator, Operands: []Object{Integer(0)}}); err != nil {
-			return err
-		}
+	if err := interpreter.initFormDefaultColors(stream); err != nil {
+		return err
 	}
 	if parent != nil {
 		interpreter.sequence = parent.sequence

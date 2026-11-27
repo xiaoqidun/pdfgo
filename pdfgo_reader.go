@@ -1300,15 +1300,17 @@ func (r *Reader) scanCrossReferences() (map[int64]xrefEntry, Dictionary, error) 
 			break
 		}
 		if token == "xref" {
-			_, entries, xrefErr := r.readXrefAt(start, maxXrefEntries-xrefEntries)
+			xrefTrailer, entries, xrefErr := r.readXrefAt(start, maxXrefEntries-xrefEntries)
 			if xrefErr != nil && !readerStructuralError(xrefErr) {
 				return nil, nil, xrefErr
 			}
 			if xrefErr == nil {
 				xrefEntries += int64(len(entries))
-				for id, entry := range entries {
-					if entry.kind == 0 {
-						index[id] = entry
+				if xrefTrailer["XRefStm"] == nil {
+					for id, entry := range entries {
+						if entry.kind == 0 {
+							index[id] = entry
+						}
 					}
 				}
 			}
