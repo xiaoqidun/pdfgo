@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 )
 
@@ -102,6 +101,9 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 					selections[key] = selection
 				}
 			}
+			if !zero && annotationNeedsShaping(run.text) {
+				return nil, &UnsupportedError{Feature: "generated complex-script rich text"}
+			}
 			for _, ch := range run.text {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -109,9 +111,6 @@ func annotationRichGlyphs(ctx context.Context, fonts *annotationRichFonts, parag
 				if zero {
 					glyphs[i] = append(glyphs[i], annotationRichGlyph{letter: annotationLetter{text: ch}, style: &run.style})
 					continue
-				}
-				if unicode.IsMark(ch) || unicode.IsLetter(ch) && !unicode.In(ch, unicode.Latin, unicode.Greek, unicode.Cyrillic, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
-					return nil, &UnsupportedError{Feature: "generated complex-script rich text"}
 				}
 				font, letter, err := selection.letter(ch)
 				if err != nil {

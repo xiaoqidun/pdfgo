@@ -105,6 +105,9 @@ func (r *Reader) readRichLineCaption(ctx context.Context, page *Page, object Obj
 			if run.style.size != nil && *run.style.size == 0 || run.text == "" {
 				continue
 			}
+			if annotationNeedsShaping(run.text) {
+				return nil, &UnsupportedError{Feature: "generated complex-script rich text"}
+			}
 			visible = true
 			requested = requested || len(run.style.families) != 0 || run.style.weight != 0 || run.style.italic != nil || run.style.stretch != 0
 			if len(run.style.families) == 0 {

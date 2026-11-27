@@ -146,8 +146,6 @@ func imageEncodingSpec(img image.Image) (bits, channels int, space Name, alwaysO
 		channels, space = 1, Name("DeviceGray")
 	case color.CMYKModel:
 		bits, channels, space = 8, 4, Name("DeviceCMYK")
-	case color.YCbCrModel:
-		bits = 8
 	case color.NRGBAModel, color.AlphaModel:
 		bits = 8
 	}
@@ -594,7 +592,6 @@ func encodePDFImagePass(ctx context.Context, img image.Image, bounds image.Recta
 	}
 	preblend := allowPreblend
 	preblendedZero := false
-	ycbcr, _ := img.(*image.YCbCr)
 	nrgba, _ := img.(*image.NRGBA)
 	nrgba64, _ := img.(*image.NRGBA64)
 	rgba, _ := img.(*image.RGBA)
@@ -611,19 +608,6 @@ func encodePDFImagePass(ctx context.Context, img image.Image, bounds image.Recta
 		case directPix != nil:
 			offset := rowIndex * directStride
 			row = directPix[offset : offset+rowSize]
-		case ycbcr != nil:
-			for x := 0; x < width; x++ {
-				if x&4095 == 0 {
-					if err := ctx.Err(); err != nil {
-						return nil, nil, false, false, err
-					}
-				}
-				yi := ycbcr.YOffset(bounds.Min.X+x, y)
-				ci := ycbcr.COffset(bounds.Min.X+x, y)
-				r8, g8, b8 := color.YCbCrToRGB(ycbcr.Y[yi], ycbcr.Cb[ci], ycbcr.Cr[ci])
-				p := x * 3
-				row[p], row[p+1], row[p+2] = r8, g8, b8
-			}
 		case nrgba != nil:
 			src := nrgba.Pix[rowIndex*nrgba.Stride : rowIndex*nrgba.Stride+width*4]
 			for x := 0; x < width; x++ {

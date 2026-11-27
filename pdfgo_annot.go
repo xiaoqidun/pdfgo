@@ -575,16 +575,37 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	interpreter := pageInterpreter{reader: r, page: page, resources: page.Resources, pageResources: page.Resources, visitor: visitor, ctx: ctx, textMatrix: Identity(), lineMatrix: Identity(), bounds: bounds}
 	interpreter.patternMatrix = Identity()
 	interpreter.state = graphicsState{matrix: transform, hscale: 1, fillSpace: "DeviceGray", strokeSpace: "DeviceGray", style: Style{Fill: Paint{SourceSpace: "DeviceGray", Alpha: 1}, Stroke: Paint{SourceSpace: "DeviceGray", Alpha: 1}, LineWidth: 1, MiterLimit: 10, BlendMode: "Normal"}}
-	if err := interpreter.initFormDefaultColors(stream); err != nil {
-		return err
-	}
 	if parent != nil {
 		interpreter.sequence = parent.sequence
-		interpreter.state.matrix = parent.state.matrix.Mul(interpreter.state.matrix)
-		interpreter.state.style.Clips = append([]Path(nil), parent.state.style.Clips...)
 		interpreter.bounds = parent.bounds
 		interpreter.depth = parent.depth
 		interpreter.patternMatrix = parent.patternMatrix
+		interpreter.formStreams = parent.formStreams
+		interpreter.glyphStreams = parent.glyphStreams
+		interpreter.patternStreams = parent.patternStreams
+		interpreter.walk = parent.walk
+		interpreter.opaqueGroup = parent.opaqueGroup
+		interpreter.blendingSpace = parent.blendingSpace
+		interpreter.maskGroup = parent.maskGroup
+		interpreter.uncoloredPattern = parent.uncoloredPattern
+		interpreter.uncoloredType3 = parent.uncoloredType3
+		interpreter.replacement = parent.replacement
+		interpreter.state.matrix = parent.state.matrix.Mul(transform)
+		interpreter.state.style.Clips = append([]Path(nil), parent.state.style.Clips...)
+		interpreter.state.style.BlendMode = parent.state.style.BlendMode
+		interpreter.state.style.AlphaIsShape = parent.state.style.AlphaIsShape
+		interpreter.state.style.SoftMask = parent.state.style.SoftMask
+	}
+	if parent != nil && (parent.uncoloredPattern || parent.uncoloredType3) {
+		copyUncoloredGraphicsState(&interpreter.state, parent.state)
+	} else {
+		if err := interpreter.initFormDefaultColors(stream); err != nil {
+			return err
+		}
+		if parent != nil {
+			interpreter.state.style.Fill.Alpha = parent.state.style.Fill.Alpha
+			interpreter.state.style.Stroke.Alpha = parent.state.style.Stroke.Alpha
+		}
 	}
 	if annotation.Reference != (Reference{}) && annotation.Dictionary["StructParent"] != nil {
 		interpreter.sequence = &ContentSequence{Reader: r, Page: page, Stream: source, Object: annotation.Reference, Parent: interpreter.sequence}

@@ -282,6 +282,25 @@ func (r *Reader) ReferenceIDMatches(reference ReferenceXObject) (bool, error) {
 	return true, nil
 }
 
+// copyUncoloredGraphicsState 复制无色图案或无色Type3字形需保留的全部颜色及相关图形状态
+// 入参: dst 目标图形状态, src 源图形状态
+func copyUncoloredGraphicsState(dst *graphicsState, src graphicsState) {
+	dst.style.Fill, dst.style.Stroke = src.style.Fill, src.style.Stroke
+	dst.fillSpace, dst.strokeSpace = src.fillSpace, src.strokeSpace
+	dst.fillPatternBase, dst.strokePatternBase = src.fillPatternBase, src.strokePatternBase
+	dst.fillICC, dst.strokeICC = src.fillICC, src.strokeICC
+	dst.fillICCValues, dst.strokeICCValues = src.fillICCValues, src.strokeICCValues
+	dst.fillSeparation, dst.strokeSeparation = src.fillSeparation, src.strokeSeparation
+	dst.fillDeviceN, dst.strokeDeviceN = src.fillDeviceN, src.strokeDeviceN
+	dst.fillColor, dst.strokeColor = src.fillColor, src.strokeColor
+	dst.style.RenderingIntent = src.style.RenderingIntent
+	dst.style.BlackPointCompensation = src.style.BlackPointCompensation
+	dst.style.Halftone = src.style.Halftone
+	dst.style.HalftoneOrigin = src.style.HalftoneOrigin
+	dst.style.Transfer = src.style.Transfer
+	dst.style.ColorConversion = src.style.ColorConversion
+}
+
 // referencePage 重置目标页面独立初始图形状态并绘制内容及可打印注解外观，保留引用表单的变换、裁剪及外层透明合成属性
 // 入参: page 目标页面
 // 返回: error 内容、注解或访问错误
@@ -301,14 +320,7 @@ func (p *pageInterpreter) referencePage(page *Page) error {
 	}
 	p.textMatrix, p.lineMatrix = Identity(), Identity()
 	if p.uncoloredPattern || p.uncoloredType3 {
-		p.state.style.Fill, p.state.style.Stroke = prev.style.Fill, prev.style.Stroke
-		p.state.fillSpace, p.state.strokeSpace = prev.fillSpace, prev.strokeSpace
-		p.state.fillPatternBase, p.state.strokePatternBase = prev.fillPatternBase, prev.strokePatternBase
-		p.state.fillICC, p.state.strokeICC = prev.fillICC, prev.strokeICC
-		p.state.fillICCValues, p.state.strokeICCValues = prev.fillICCValues, prev.strokeICCValues
-		p.state.fillSeparation, p.state.strokeSeparation = prev.fillSeparation, prev.strokeSeparation
-		p.state.fillDeviceN, p.state.strokeDeviceN = prev.fillDeviceN, prev.strokeDeviceN
-		p.state.fillColor, p.state.strokeColor = prev.fillColor, prev.strokeColor
+		copyUncoloredGraphicsState(&p.state, prev)
 	} else {
 		p.state.fillSpace, p.state.strokeSpace = "DeviceGray", "DeviceGray"
 		p.state.style.Fill = Paint{SourceSpace: "DeviceGray", Alpha: prev.style.Fill.Alpha}

@@ -84,6 +84,12 @@ type pngPrecisionImage struct {
 	image.Image
 }
 
+// pngNormalizedPaletteImage 统一八位精确调色板为非预乘颜色，保留索引PNG编码路径
+type pngNormalizedPaletteImage struct {
+	image.PalettedImage
+	palette color.Palette
+}
+
 // EncodePNG 按行无损编码图像，保留颜色精度及透明度，不展开整幅延迟图像
 // 图像解码由调用方完成，取消或写入失败时输出可能不完整
 // 入参: ctx 取消上下文, writer 输出流, source 已解码图像
@@ -106,18 +112,42 @@ func EncodePNG(ctx context.Context, writer io.Writer, source image.Image) error 
 		return err
 	}
 	if palette, ok := source.ColorModel().(color.Palette); ok {
-		precise := false
-		for _, entry := range palette {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			pixel := imageNRGBASample(entry)
-			if pixel.R%257 != 0 || pixel.G%257 != 0 || pixel.B%257 != 0 || pixel.A%257 != 0 {
-				precise = true
+		palImg, isPalImg := source.(image.PalettedImage)
+		precise := !isPalImg || len(palette) > 256
+		needsNormalize := false
+		if !precise {
+			for _, entry := range palette {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				pixel := imageNRGBASample(entry)
+				if pixel.R%257 != 0 || pixel.G%257 != 0 || pixel.B%257 != 0 || pixel.A%257 != 0 {
+					precise = true
+					break
+				}
+				if _, ok := entry.(color.NRGBA); !ok {
+					needsNormalize = true
+				}
 			}
 		}
 		if precise {
 			source = &pngPrecisionImage{source}
+		} else if needsNormalize {
+			normalized := make(color.Palette, len(palette))
+			for i, entry := range palette {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				pixel := imageNRGBASample(entry)
+				normalized[i] = color.NRGBA{R: uint8(pixel.R >> 8), G: uint8(pixel.G >> 8), B: uint8(pixel.B >> 8), A: uint8(pixel.A >> 8)}
+			}
+			if pal, ok := source.(*image.Paletted); ok {
+				copied := *pal
+				copied.Palette = normalized
+				source = &copied
+			} else {
+				source = &pngNormalizedPaletteImage{PalettedImage: palImg, palette: normalized}
+			}
 		}
 	}
 	output := pngContextWriter{ctx: ctx, writer: writer}
@@ -410,9 +440,9 @@ func pngSampleFormat(ctx context.Context, source image.Image) (int, int, int, er
 		return depth, 1, 0, nil
 	}
 	switch s := source.(type) {
-	case *image.CMYK, *image.YCbCr:
+	case *image.CMYK, *image.YCbCr, *packedCMYKImage:
 		return depth, 3, 2, nil
-	case *image.NRGBA, *image.NRGBA64:
+	case *image.NRGBA, *image.NRGBA64, *image.RGBA64, *image.NYCbCrA, *image.Paletted, *pngPrecisionImage:
 		opaque, err := imageOpaqueContext(ctx, s)
 		if err != nil {
 			return 0, 0, 0, err
@@ -712,11 +742,40 @@ func pngInterpolate(a, b, c, d uint16, x, y float64) uint16 {
 	return integer
 }
 
+// Unwrap 返回被包装的底层图像
+// 返回: image.Image 底层图像
+func (p *pngPrecisionImage) Unwrap() image.Image {
+	return p.Image
+}
+
 // NRGBA64At 读取非预乘颜色及独立透明度
 // 入参: x 横坐标, y 纵坐标
 // 返回: color.NRGBA64 十六位颜色
 func (p *pngPrecisionImage) NRGBA64At(x, y int) color.NRGBA64 {
 	return imageNRGBA64At(p.Image, x, y)
+}
+
+// ColorModel 返回归一化后的八位非预乘调色板
+// 返回: color.Model 调色板颜色模型
+func (p *pngNormalizedPaletteImage) ColorModel() color.Model {
+	return p.palette
+}
+
+// At 按索引返回归一化后的八位非预乘颜色
+// 入参: x 横坐标, y 纵坐标
+// 返回: color.Color 非预乘颜色
+func (p *pngNormalizedPaletteImage) At(x, y int) color.Color {
+	if len(p.palette) == 0 {
+		return color.NRGBA{}
+	}
+	if !image.Pt(x, y).In(p.Bounds()) {
+		return p.palette[0]
+	}
+	idx := int(p.ColorIndexAt(x, y))
+	if idx >= len(p.palette) {
+		return color.NRGBA{}
+	}
+	return p.palette[idx]
 }
 
 // writeRow 写入当前样本行并交换前后行缓冲，不保留已写像素
