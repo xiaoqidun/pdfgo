@@ -236,9 +236,14 @@ func (r *Reader) redactionAppearance(ctx context.Context, annotation Annotation)
 		return nil, err
 	}
 	if stroke {
+		minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
 		for _, region := range regions {
 			if err := ctx.Err(); err != nil {
 				return nil, err
+			}
+			for _, point := range region {
+				minX, minY = math.Min(minX, point.X), math.Min(minY, point.Y)
+				maxX, maxY = math.Max(maxX, point.X), math.Max(maxY, point.Y)
 			}
 			writeAnnotationOperation(&content, "m", region[0].X, region[0].Y)
 			for _, point := range region[1:] {
@@ -248,6 +253,9 @@ func (r *Reader) redactionAppearance(ctx context.Context, annotation Annotation)
 			if content.Len() > contentLimit {
 				return nil, fmt.Errorf("%w: redaction appearance content limit exceeded", ErrStreamLimitExceeded)
 			}
+		}
+		if minX <= maxX && minY <= maxY {
+			annotation.Rect = annotationExpandedBounds(minX, minY, maxX, maxY, border.width/2, annotation.Rect)
 		}
 	}
 	if err := ctx.Err(); err != nil {

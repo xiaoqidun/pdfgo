@@ -112,6 +112,11 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 	if err != nil {
 		return nil, err
 	}
+	minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
+	extendBounds := func(px, py float64) {
+		minX, minY = math.Min(minX, px), math.Min(minY, py)
+		maxX, maxY = math.Max(maxX, px), math.Max(maxY, py)
+	}
 	if leader[0] != 0 {
 		sign := math.Copysign(1, leader[0])
 		shift := leader[0] + sign*leader[2]
@@ -129,10 +134,16 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 				}
 			}
 			if stroke {
+				extendBounds(x0, y0)
+				extendBounds(x1, y1)
 				writeAnnotationOperation(&content, "m", x0, y0)
 				writeAnnotationOperation(&content, "l S", x1, y1)
 			}
 		}
+	}
+	if stroke {
+		extendBounds(main[0], main[1])
+		extendBounds(main[2], main[3])
 	}
 	gap0, gap1 := length, length
 	if caption != nil && !caption.top {
@@ -177,6 +188,12 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 		cx, cy := main[0]+ux*(length/2+x)-uy*y, main[1]+uy*(length/2+x)+ux*y
 		if math.IsNaN(cx) || math.IsInf(cx, 0) || math.IsNaN(cy) || math.IsInf(cy, 0) {
 			return nil, fmt.Errorf("annotation caption coordinate overflow")
+		}
+		hw, hh := caption.width/2, caption.height/2
+		for _, sx := range [2]float64{-hw, hw} {
+			for _, sy := range [2]float64{-hh, hh} {
+				extendBounds(cx+ux*sx-uy*sy, cy+uy*sx+ux*sy)
+			}
 		}
 		content.WriteString("q\n")
 		writeAnnotationOperation(&content, "cm", ux, uy, -uy, ux, cx, cy)
@@ -248,6 +265,16 @@ func (r *Reader) lineAppearance(ctx context.Context, page *Page, annotation Anno
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if stroke || caption != nil {
+		pad := 0.0
+		if stroke {
+			pad = border.width / 2
+			if annotation.Dictionary["LE"] != nil {
+				pad = math.Max(pad, 4.5*border.width)
+			}
+		}
+		annotation.Rect = annotationExpandedBounds(minX, minY, maxX, maxY, pad, annotation.Rect)
 	}
 	return r.annotationAppearance(annotation, content.String(), resources)
 }

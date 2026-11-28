@@ -817,6 +817,11 @@ func (r *Reader) readGradientFunctionNode(ctx context.Context, object Object, ch
 				stops = nil
 				break
 			}
+			if i < len(parts)-1 {
+				for len(partStops) >= 2 && partStops[len(partStops)-1].Position == 1 && partStops[len(partStops)-2].Position == 1 {
+					partStops = partStops[:len(partStops)-1]
+				}
+			}
 			for _, stop := range partStops {
 				position := gradientPosition(points[i], points[i+1], stop.Position)
 				stop.Position = functionPosition(position, domain[0], domain[1])

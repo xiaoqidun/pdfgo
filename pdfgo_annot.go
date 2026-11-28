@@ -443,6 +443,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	if value == nil && !annotation.IsStandard() {
 		return ctx.Err()
 	}
+	targetRect := annotation.Rect
 	if value == nil {
 		var stream *Stream
 		var synthErr error
@@ -505,6 +506,14 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 		}
 		if synthesized {
 			value = Dictionary{"N": stream}
+			switch annotation.Subtype {
+			case "Text", "Highlight", "Underline", "StrikeOut", "Squiggly", "Ink", "Polygon", "PolyLine", "Line", "Redact":
+				if stream != nil {
+					if bbox, err := r.rectangle(stream.Dictionary["BBox"]); err == nil && bbox.XMax > bbox.XMin && bbox.YMax > bbox.YMin {
+						targetRect = bbox
+					}
+				}
+			}
 		}
 	}
 	appearance, ok := value.(Dictionary)
@@ -520,7 +529,7 @@ func (r *Reader) walkAnnotationAppearance(ctx context.Context, page *Page, annot
 	var bounds Rectangle
 	stream, err := r.annotationAppearanceStream(appearance, annotation.Dictionary["AS"])
 	if err == nil && stream != nil {
-		transform, bounds, err = r.annotationAppearanceTransform(stream, annotation.Rect, noRotate, page.Rotation)
+		transform, bounds, err = r.annotationAppearanceTransform(stream, targetRect, noRotate, page.Rotation)
 	}
 	if errors.Is(err, ErrInvalidAnnotationAppearance) && annotation.Subtype == "Widget" && visitor.Warning != nil {
 		recovered, synthErr := r.widgetAppearance(ctx, page, annotation)

@@ -422,16 +422,19 @@ func (s *ColorSpace) convert(values []float64, source *ColorSpace, intent Name, 
 	return result, nil
 }
 
-// Luminosity 按PDF蒙版规则计算亮度，ICC使用连接空间的Y分量
+// Luminosity 按PDF蒙版规则计算感知亮度，校准空间先映射至sRGB再按标准权重求值
 // 入参: values 已合成的颜色分量, intent 渲染意图
 // 返回: float64 单位亮度, error 分量或变换错误
 func (s *ColorSpace) Luminosity(values []float64, intent Name) (float64, error) {
 	if err := s.validate(values); err != nil {
 		return 0, err
 	}
-	if p := s.profile; p != nil {
-		xyz, err := s.xyz(values, normalizeRenderingIntent(intent))
-		return math.Max(0, math.Min(1, xyz[1])), err
+	if s.profile != nil {
+		rgb, err := s.srgb(values, intent)
+		if err != nil {
+			return 0, err
+		}
+		return math.Max(0, math.Min(1, .3*rgb[0]+.59*rgb[1]+.11*rgb[2])), nil
 	}
 	switch s.Model {
 	case "DeviceGray":

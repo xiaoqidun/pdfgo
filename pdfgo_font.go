@@ -34,7 +34,7 @@ const maxFontCacheBytes int64 = 128 << 20
 
 // Font 保存PDF字体程序、字符映射及字宽（不依赖渲染后端），可由阅读器缓存共享，所有字段及切片均只读
 // Vertical为true时采用竖排度量（字形仍以横排原点描述）；Recovered表示已诊断恢复，Dictionary仍保留原始声明
-// BoundingBox为非Type3描述符边界，FallbackBoundingBox为未内嵌标准字体AFM保守边界（千分之一文字空间，不用于排版）
+// MissingWidths表示非复合未内嵌且非标准核心字体缺失Widths与默认字宽并在诊断模式按标准回退；BoundingBox为非Type3描述符边界，FallbackBoundingBox为未内嵌标准字体AFM保守边界（千分之一文字空间，不用于排版）
 type Font struct {
 	Name                 string
 	Subtype              Name
@@ -46,10 +46,10 @@ type Font struct {
 	Unicode              UnicodeMap
 	Vertical             bool
 	Recovered            bool
+	MissingWidths        bool
 	widths               map[uint32]float64
 	defaultWidth         float64
 	defaultWidthDeclared bool
-	allowMissingWidth    bool
 	programMetrics       *fontProgramMetrics
 	ttfMetrics           *ttfFontMetrics
 	coreName             string
@@ -57,6 +57,7 @@ type Font struct {
 	verticals            cidMetrics[VerticalMetrics]
 	defaultVertical      [2]float64
 	composite            bool
+	cidType2             bool
 	encoding             Name
 	cidMap               *cidCMap
 	cidUnicode           UnicodeMap
@@ -803,6 +804,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 	if font.composite && len(font.Program) != 0 && cidSubtype == Name("CIDFontType0") && font.cffGlyphs == nil {
 		return nil, &UnsupportedError{Feature: "CID CFF glyph mapping without CFF program"}
 	}
+	font.cidType2 = font.composite && cidSubtype == Name("CIDFontType2")
 	if invalidGIDMap {
 		font.Recovered = true
 		r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q invalid non-stream CIDToGIDMap; default Identity mapping retained", font.Name)})
@@ -897,7 +899,7 @@ func (r *Reader) ReadFontContext(ctx context.Context, object Object) (*Font, err
 			isCore = fonts[name] != nil
 		}
 		if !isCore {
-			font.allowMissingWidth = true
+			font.MissingWidths = true
 			font.Recovered = true
 			r.warning(Diagnostic{Message: fmt.Sprintf("PDF font %q missing Widths without embedded program; standard MissingWidth=0 used", font.Name)})
 		}
@@ -1178,6 +1180,9 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 		if !ok && f.composite && len(f.Program) != 0 && f.cffGlyphs == nil {
 			ok = true
 		}
+		if !ok && f.composite && f.cidType2 && f.reader != nil && f.reader.warning != nil {
+			ok = true
+		}
 		if !ok {
 			if f.composite {
 				return nil, &UnsupportedError{Feature: "CID without Unicode mapping"}
@@ -1233,7 +1238,7 @@ func (f *Font) DecodeContext(ctx context.Context, data []byte) ([]Glyph, error) 
 				width *= f.type3Matrix[0] * 1000
 			}
 		}
-		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && !f.defaultWidthDeclared && !f.allowMissingWidth && (core == nil || name != ".notdef") {
+		if !ok && width == 0 && len(f.widths) == 0 && !f.composite && !f.defaultWidthDeclared && !f.MissingWidths && (core == nil || name != ".notdef") {
 			if len(f.Program) != 0 {
 				return nil, &UnsupportedError{Feature: "embedded font metrics"}
 			}
@@ -1352,6 +1357,29 @@ func (f *Font) resolvedSimpleGlyphContext(ctx context.Context, code uint32, name
 		return 0, nil
 	}
 	return id, nil
+}
+
+// CIDGlyphID 按CIDFont字形映射表解析字符标识对应的字形编号，不依赖内嵌字体程序
+// 入参: cid 复合字体字符标识
+// 返回: uint16 字形编号, bool 字体是否提供确定CID到GID映射
+func (f *Font) CIDGlyphID(cid uint16) (uint16, bool) {
+	if f == nil || !f.composite {
+		return 0, false
+	}
+	if f.cffGlyphs != nil {
+		gid, ok := f.cffGlyphs[uint32(cid)]
+		return gid, ok
+	}
+	if !f.cidType2 {
+		return 0, false
+	}
+	if f.glyphMap != nil {
+		if int(cid)*2+1 >= len(f.glyphMap) {
+			return 0, true
+		}
+		return binary.BigEndian.Uint16(f.glyphMap[int(cid)*2:]), true
+	}
+	return cid, true
 }
 
 // hasCIDGlyph 检查内嵌字体是否提供指定CID的有效字形

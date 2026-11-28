@@ -20,6 +20,12 @@ import (
 	"strings"
 )
 
+// textAnnotationIconSize 定义无AP便签注解的标准图标边长，textAnnotationMinRectSize 区分点状微框与显式小图标框
+const (
+	textAnnotationIconSize    = 20.0
+	textAnnotationMinRectSize = 12.0
+)
+
 // annotationIcons 保存标准和附加注解名称对应的矢量图标，不依赖外部字体
 var annotationIcons = map[Name]string{
 	"Note":         "2 2 12 12 re B 4 11 m 12 11 l 4 8 m 12 8 l 4 5 m 9 5 l S",
@@ -101,8 +107,13 @@ func (r *Reader) iconAppearance(annotation Annotation) (*Stream, error) {
 		return nil, fmt.Errorf("invalid annotation icon bounds")
 	}
 	if annotation.Subtype == "Text" {
-		width, height = min(width, 20), min(height, 20)
+		if width < textAnnotationMinRectSize || height < textAnnotationMinRectSize {
+			width, height = textAnnotationIconSize, textAnnotationIconSize
+		} else {
+			width, height = min(width, textAnnotationIconSize), min(height, textAnnotationIconSize)
+		}
 		y = box.YMax - height
+		annotation.Rect = Rectangle{XMin: x, YMin: y, XMax: x + width, YMax: box.YMax}
 	}
 	var content strings.Builder
 	writeAnnotationOperation(&content, "cm", width/16, 0, 0, height/16, x, y)

@@ -224,9 +224,13 @@ func (c *ColorantGroupCompositor) Composite(target *ColorantPixel, initial, resu
 		target.Values[parentComponents+index] = compositeComponent(b, s, colorantSpotBlend(b, s, c.mode), target.Alpha, alpha, combined)
 	}
 	copy(target.Values[:parentComponents], values[:parentComponents])
+	bounded := target.Effect <= target.Shape && result.Effect <= result.Shape
 	target.Alpha = combined
 	target.Effect = alpha + target.Effect*(1-alpha)
-	target.Shape += result.Shape * (1 - target.Shape)
+	target.Shape = result.Shape + target.Shape*(1-result.Shape)
+	if bounded && target.Effect > target.Shape {
+		target.Effect = target.Shape
+	}
 	return nil
 }
 
@@ -281,7 +285,7 @@ func (p *ColorantPixel) Knockout(initial, source ColorantPixel) error {
 	}
 	p.Alpha = math.Max(0, math.Min(1, alpha))
 	p.Effect = math.Max(0, math.Min(1, p.Effect*(1-f)+source.Effect))
-	p.Shape = math.Max(0, math.Min(1, p.Shape+f*(1-p.Shape)))
+	p.Shape = math.Max(0, math.Min(1, p.Shape*(1-f)+f))
 	return nil
 }
 

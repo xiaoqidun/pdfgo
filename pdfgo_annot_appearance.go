@@ -385,6 +385,7 @@ func (r *Reader) inkAppearance(ctx context.Context, annotation Annotation) (*Str
 		return nil, fmt.Errorf("%w: ink appearance content limit exceeded", ErrStreamLimitExceeded)
 	}
 	var validated map[Reference]bool
+	minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -451,6 +452,8 @@ func (r *Reader) inkAppearance(ctx context.Context, annotation Annotation) (*Str
 			if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) {
 				return nil, fmt.Errorf("invalid ink coordinates")
 			}
+			minX, minY = math.Min(minX, x), math.Min(minY, y)
+			maxX, maxY = math.Max(maxX, x), math.Max(maxY, y)
 			if i == 0 {
 				writeAnnotationOperation(&content, "m", x, y)
 				if len(points) == 2 {
@@ -472,6 +475,9 @@ func (r *Reader) inkAppearance(ctx context.Context, annotation Annotation) (*Str
 		return nil, err
 	}
 	box := annotation.Rect
+	if stroke && minX <= maxX && minY <= maxY {
+		box = annotationExpandedBounds(minX, minY, maxX, maxY, border.width/2, box)
+	}
 	resources := Dictionary{"ExtGState": Dictionary{"Opacity": Dictionary{"CA": Real(alpha), "ca": Real(alpha)}}}
 	return &Stream{Dictionary: Dictionary{"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": Array{Real(box.XMin), Real(box.YMin), Real(box.XMax), Real(box.YMax)}, "Resources": resources}, Data: []byte(content.String()), reader: r, cache: r.cache, hasWarning: r.warning != nil}, nil
 }
@@ -506,6 +512,8 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 	}
 	contentLimit := annotationRichContentLimit(r)
 	totalWaves := 0
+	minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
+	pad := 0.0
 	for i := 0; i < len(values); i += 8 {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -530,6 +538,10 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 		if !visible {
 			continue
 		}
+		for _, pt := range points {
+			minX, minY = math.Min(minX, pt.X), math.Min(minY, pt.Y)
+			maxX, maxY = math.Max(maxX, pt.X), math.Max(maxY, pt.Y)
+		}
 		if annotation.Subtype == "Highlight" {
 			writeAnnotationOperation(&content, "m", a.X, a.Y)
 			writeAnnotationOperation(&content, "l", b.X, b.Y)
@@ -542,6 +554,7 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 			continue
 		}
 		writeAnnotationOperation(&content, "w", width)
+		pad = math.Max(pad, width)
 		if annotation.Subtype == "StrikeOut" {
 			adx, ady, bcx, bcy := d.X-a.X, d.Y-a.Y, c.X-b.X, c.Y-b.Y
 			a, b = Point{a.X + adx/2, a.Y + ady/2}, Point{b.X + bcx/2, b.Y + bcy/2}
@@ -577,6 +590,9 @@ func (r *Reader) textMarkupAppearance(ctx context.Context, annotation Annotation
 		if content.Len() > contentLimit {
 			return nil, fmt.Errorf("%w: text markup appearance content limit exceeded", ErrStreamLimitExceeded)
 		}
+	}
+	if visible {
+		annotation.Rect = annotationExpandedBounds(minX, minY, maxX, maxY, pad, annotation.Rect)
 	}
 	return r.annotationAppearance(annotation, content.String(), nil)
 }
@@ -752,6 +768,24 @@ func (r *Reader) shapeAppearanceContext(ctx context.Context, annotation Annotati
 		if err := r.writeAnnotationEndings(&content, annotation, border, vertices, stroke); err != nil {
 			return nil, err
 		}
+	}
+	if (annotation.Subtype == "Polygon" || annotation.Subtype == "PolyLine") && (stroke || fill) {
+		minX, minY, maxX, maxY := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
+		for j := 0; j < len(vertices); j += 2 {
+			minX, minY = math.Min(minX, vertices[j]), math.Min(minY, vertices[j+1])
+			maxX, maxY = math.Max(maxX, vertices[j]), math.Max(maxY, vertices[j+1])
+		}
+		pad := 0.0
+		if stroke {
+			pad = border.width
+			if annotation.Subtype == "PolyLine" && annotation.Dictionary["LE"] != nil {
+				pad = math.Max(pad, 4.5*border.width)
+			}
+		}
+		if cloud > 0 {
+			pad = math.Max(pad, 6*cloud+border.width)
+		}
+		annotation.Rect = annotationExpandedBounds(minX, minY, maxX, maxY, pad, annotation.Rect)
 	}
 	if content.Len() > contentLimit {
 		return nil, fmt.Errorf("%w: shape appearance content limit exceeded", ErrStreamLimitExceeded)
@@ -953,6 +987,21 @@ func (r *Reader) annotationContentBounds(annotation Annotation) (Rectangle, erro
 		return Rectangle{}, fmt.Errorf("empty annotation content bounds")
 	}
 	return box, nil
+}
+
+// annotationExpandedBounds 按实际图元范围和笔画余量计算有限非空外观边界，退化或溢出时沿用原边界
+// 入参: minX 最小横坐标, minY 最小纵坐标, maxX 最大横坐标, maxY 最大纵坐标, pad 笔画外扩余量, fallback 退化时使用的原边界
+// 返回: Rectangle 合法外观边界
+func annotationExpandedBounds(minX, minY, maxX, maxY, pad float64, fallback Rectangle) Rectangle {
+	if math.IsInf(minX, 0) || math.IsInf(minY, 0) || math.IsInf(maxX, 0) || math.IsInf(maxY, 0) || math.IsNaN(minX) || math.IsNaN(minY) || math.IsNaN(maxX) || math.IsNaN(maxY) || math.IsInf(pad, 0) || math.IsNaN(pad) || pad < 0 {
+		return fallback
+	}
+	x0, y0, x1, y1 := minX-pad, minY-pad, maxX+pad, maxY+pad
+	w, h := x1-x0, y1-y0
+	if w <= 0 || h <= 0 || math.IsInf(x0, 0) || math.IsInf(y0, 0) || math.IsInf(x1, 0) || math.IsInf(y1, 0) || math.IsInf(w, 0) || math.IsInf(h, 0) || math.IsNaN(w) || math.IsNaN(h) {
+		return fallback
+	}
+	return Rectangle{XMin: x0, YMin: y0, XMax: x1, YMax: y1}
 }
 
 // annotationAppearance 将组合图形的不透明度应用一次，避免填充和描边重叠变暗
